@@ -131,6 +131,12 @@
  * ============================================================ */
 
 /* --- Linux-compatible (kept at Linux number for toolchain compat) --- */
+#define SYS_READ              63   /* read(fd, buf, n) — host-only,
+                                    * not auto-installed; see
+                                    * vm_host_stdio.h */
+#define SYS_WRITE             64   /* write(fd, buf, n) — host-only,
+                                    * not auto-installed; see
+                                    * vm_host_stdio.h */
 #define SYS_EXIT              93   /* clean exit (matches Linux RISC-V) */
 
 /* --- Identity / introspection (1024..1039) --- */
@@ -218,6 +224,57 @@
  *  Format: arguments in a0..a5 (only those actually used), return
  *  in a0. "→" marks return values. Errors are always negative
  *  numbers matching the VM_E* errno values defined below.
+ *
+ *  -----------------------------------------------------------
+ *  SYS_READ          (a7 = 63)  [host-only, not auto-installed]
+ *  -----------------------------------------------------------
+ *    a0 = file descriptor (0 = stdin; others → -EBADF)
+ *    a1 = guest address of buffer to fill
+ *    a2 = maximum byte count
+ *    → a0 = number of bytes read (0 = nothing available right now,
+ *           NOT end-of-stream — call again later)
+ *    → a0 = -EBADF  if fd is not 0
+ *    → a0 = -EFAULT if [a1, a1+a2) is not writable in the caller
+ *    → a0 = -EIO    if the underlying stream signaled a hard error
+ *
+ *  Non-blocking by design. A return of 0 means "no bytes ready",
+ *  not "stream closed" — the guest should poll again (typically
+ *  after SYS_YIELD). This matches game-loop / TUI patterns where
+ *  the guest can't afford to block waiting for input.
+ *
+ *  When the underlying stream actually does close (e.g., the
+ *  remote end of a pipe), subsequent reads return -EIO. The guest
+ *  can distinguish "no input yet" (0) from "input source gone"
+ *  (-EIO) by checking the return value.
+ *
+ *  Like SYS_WRITE, this is NOT installed by vm_system_init.
+ *  vm_host_install_stdio() registers both. A system with no host
+ *  stdin (pure embedded) just doesn't install it, and SYS_READ
+ *  returns -ENOSYS to the guest via the default fallback.
+ *
+ *  Whether the stream is raw or cooked is a host-side decision
+ *  made when stdio is installed (see VmHostStdioConfig.raw_mode).
+ *  The guest cannot change this — it gets whatever bytes the host
+ *  hands it. For interactive TUI / game-style input, the host
+ *  enables raw mode so each keystroke arrives immediately as
+ *  bytes (arrow keys as ESC [ A etc., per xterm conventions).
+ *
+ *  -----------------------------------------------------------
+ *  SYS_WRITE         (a7 = 64)  [host-only, not auto-installed]
+ *  -----------------------------------------------------------
+ *    a0 = file descriptor (1 = stdout, 2 = stderr; others → -EBADF)
+ *    a1 = guest address of bytes to write
+ *    a2 = byte count
+ *    → a0 = number of bytes written on success
+ *    → a0 = -EBADF  if fd is not 1 or 2
+ *    → a0 = -EFAULT if [a1, a1+a2) is not readable in the caller
+ *
+ *  This syscall is NOT installed by vm_system_init. A host that
+ *  wants to expose its stdout to guests calls
+ *  vm_host_install_stdio(sys) (see vm_host_stdio.h) to register
+ *  the handler. Embedded firmware that has no host stdout simply
+ *  doesn't install it, and SYS_WRITE returns -ENOSYS (the default
+ *  fallback) to the guest.
  *
  *  -----------------------------------------------------------
  *  SYS_EXIT          (a7 = 93)
@@ -482,6 +539,8 @@
 
 #define VM_EPERM           1   /* not permitted (whitelist denial) */
 #define VM_ENOENT          2   /* no such entity (vm_id, address)  */
+#define VM_EIO             5   /* I/O error (stream closed, hw fail) */
+#define VM_EBADF           9   /* bad file descriptor (read/write)  */
 #define VM_EAGAIN         11   /* try again later (mailbox full, poll empty) */
 #define VM_ENOMEM         12   /* out of memory (slab exhausted)   */
 #define VM_EFAULT         14   /* bad address (out-of-bounds ptr)  */

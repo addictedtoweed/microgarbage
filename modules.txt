@@ -9,3 +9,10 @@ music_player	audio	audio_mixer	Intro-and-loop music playback with stream callbac
 trashdrive	storage	-	RAM-backed block device for mounting BYO filesystems (FatFs, Petit FatFs)
 bump	memory	(slab_stack optional)	Bump allocator; can stand alone or draw memory from slab_stack
 slab_stack	memory	-	Two-layer slab allocator: 16 power-of-2 bins, bitmap + per-bin stacks
+vm_core	vm	-	RV32IMC dispatcher: portable switch-on-opcode interpreter for the I+M+C subset
+vm_loader	vm	vm_core,bump	ELF32 loader; copies code/rodata/data into address regions, sets up SP and entry
+vm_ecall	vm	vm_core	ECALL syscall router; numbered slots in Linux-compat (0-255) and VM (1024-1279) ranges
+vm_mailbox	vm	fifo_queue,ring_buffer	Per-VM bounded mailbox with sender whitelist; the IPC primitive
+vm_sched	vm	vm_core,vm_ecall	Cooperative round-robin scheduler with adaptive quantum and critical-section debt
+vm_system	vm	vm_core,vm_loader,vm_ecall,vm_mailbox,vm_sched,slab_stack,bump	Top-level composition of the VM library; one-call setup of a complete system
+vm_host_stdio	vm	vm_system	Optional host stdio bridge: SYS_READ and SYS_WRITE forwarded to host stdin/stdout, raw-mode tty support

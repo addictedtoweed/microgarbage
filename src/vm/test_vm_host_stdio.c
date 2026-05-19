@@ -127,7 +127,7 @@ static int run_with_captured_stdout(const char *elf_path,
 
 static void test_counter_writes_to_stdout(void) {
     char buf[4096];
-    int n = run_with_captured_stdout("examples/counter/counter.elf",
+    int n = run_with_captured_stdout("examples/02_counter/build/guest.elf",
                                       /*max_cycles=*/2000,
                                       buf, sizeof(buf));
     if (n < 0) {
@@ -164,12 +164,154 @@ static void test_install_stdio_null_safe(void) {
     ASSERT(!vm_host_install_stdio(NULL));
 }
 
+/* ============================================================
+ *  SYS_READ tests
+ *
+ *  Use pipes to inject known bytes into the VM's stdin and a
+ *  redirected stdout to read back what the guest wrote in
+ *  response. Tests the keydump.elf guest, which echoes each
+ *  input byte as a hex-bracketed string and exits on 'q'.
+ * ============================================================ */
+
+/* Run keydump.elf with controlled stdin/stdout. Returns the
+ * bytes written to stdout via the out_buf parameter (null-terminated).
+ * input bytes are fed via a pipe. */
+static int run_keydump_with_input(const char *input, size_t input_len,
+                                   char *out_buf, size_t out_cap) {
+    uint8_t *elf = NULL;
+    size_t elf_size = 0;
+    if (load_file("examples/04_keydump/build/guest.elf", &elf, &elf_size) != 0) {
+        return -1;
+    }
+
+    /* Build a stdin pipe: we'll write `input` to the write end,
+     * the VM reads from the read end. */
+    int in_pipe[2];
+    if (pipe(in_pipe) != 0) { free(elf); return -1; }
+    if (write(in_pipe[1], input, input_len) != (ssize_t)input_len) {
+        close(in_pipe[0]); close(in_pipe[1]);
+        free(elf); return -1;
+    }
+    close(in_pipe[1]);  /* Close write end so guest sees EOF after
+                         * consuming all bytes. */
+
+    FILE *stdin_file = fdopen(in_pipe[0], "r");
+    if (!stdin_file) {
+        close(in_pipe[0]); free(elf); return -1;
+    }
+
+    /* Redirect stdout to a temp file. */
+    fflush(stdout);
+    int saved_stdout = dup(1);
+    if (saved_stdout < 0) {
+        fclose(stdin_file); free(elf); return -1;
+    }
+    char tmp_path[64];
+    snprintf(tmp_path, sizeof(tmp_path),
+             "/tmp/vm_keydump_test_%d.out", (int)getpid());
+    FILE *tmp = fopen(tmp_path, "w+");
+    if (!tmp) {
+        close(saved_stdout); fclose(stdin_file); free(elf); return -1;
+    }
+    dup2(fileno(tmp), 1);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage      = g_shared,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage       = g_local,
+        .local_storage_size  = LOCAL_BYTES,
+        .baseline_quantum    = 200,
+    };
+    bool init_ok = vm_system_init(&sys, &cfg);
+
+    if (init_ok) {
+        VmHostStdioConfig sio = {
+            .stdin_src = stdin_file,
+            /* stdout_dest left NULL — uses (redirected) host stdout */
+            .raw_mode = false,
+        };
+        vm_host_install_stdio_ex(&sys, &sio);
+
+        VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size,
+                                               16 * 1024,
+                                               VM_BACKING_COPY_RAM,
+                                               VM_BACKING_COPY_RAM);
+        if (lr.code == VM_SYS_OK) {
+            /* Run with a generous cap; the keydump halts itself on
+             * 'q' or on EIO when the pipe closes. */
+            vm_system_run(&sys, 10000);
+        }
+        vm_system_destroy(&sys);
+    }
+
+    fflush(stdout);
+    dup2(saved_stdout, 1);
+    close(saved_stdout);
+
+    fseek(tmp, 0, SEEK_SET);
+    size_t n = fread(out_buf, 1, out_cap - 1, tmp);
+    out_buf[n] = '\0';
+    fclose(tmp);
+    remove(tmp_path);
+    fclose(stdin_file);   /* also closes in_pipe[0] */
+
+    free(elf);
+    return init_ok ? (int)n : -1;
+}
+
+static void test_sys_read_basic_characters(void) {
+    /* Feed "hiq" to keydump. Expect to see [68][69][71] in output
+     * (h=0x68, i=0x69, q=0x71). The 'q' causes guest to exit. */
+    char out[1024];
+    int n = run_keydump_with_input("hiq", 3, out, sizeof(out));
+    if (n < 0) {
+        FAIL("could not run keydump.elf");
+        return;
+    }
+    ASSERT(strstr(out, "[68]") != NULL);
+    ASSERT(strstr(out, "[69]") != NULL);
+    ASSERT(strstr(out, "[71]") != NULL);
+    /* Output should also contain the banner and the exit message. */
+    ASSERT(strstr(out, "press 'q' to quit") != NULL);
+    ASSERT(strstr(out, "'q' pressed") != NULL);
+}
+
+static void test_sys_read_escape_sequences(void) {
+    /* Feed an up-arrow (ESC [ A) followed by 'q'. The guest should
+     * print [1B][5B][41][71]. */
+    const char input[] = { 0x1B, '[', 'A', 'q' };
+    char out[1024];
+    int n = run_keydump_with_input(input, sizeof(input), out, sizeof(out));
+    if (n < 0) {
+        FAIL("could not run keydump.elf");
+        return;
+    }
+    ASSERT(strstr(out, "[1B][5B][41]") != NULL);
+    ASSERT(strstr(out, "[71]") != NULL);
+}
+
+static void test_sys_read_eof_handled(void) {
+    /* Feed empty input. Pipe closes immediately; guest should see
+     * EIO and print "stdin closed" then exit. */
+    char out[1024];
+    int n = run_keydump_with_input("", 0, out, sizeof(out));
+    if (n < 0) {
+        FAIL("could not run keydump.elf");
+        return;
+    }
+    ASSERT(strstr(out, "stdin closed") != NULL);
+}
+
 int main(void) {
     TEST_SUITE("vm_host_stdio");
 
     RUN(test_install_stdio_returns_true);
     RUN(test_install_stdio_null_safe);
     RUN(test_counter_writes_to_stdout);
+    RUN(test_sys_read_basic_characters);
+    RUN(test_sys_read_escape_sequences);
+    RUN(test_sys_read_eof_handled);
 
     return TEST_SUITE_RESULT();
 }

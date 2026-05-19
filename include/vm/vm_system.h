@@ -77,11 +77,11 @@
  *    SYS_CRITICAL_EXIT, SYS_ALLOC, SYS_FREE, SYS_SEND, SYS_RECV,
  *    SYS_MAILBOX_INFO, SYS_WHITELIST_ADD, SYS_WHITELIST_REMOVE
  *
- *  The libc memory/string and fixed-point math syscall groups are
- *  NOT installed by default. Call vm_system_install_libc_accel()
- *  and/or vm_system_install_fixed_math() to add them — they're
- *  separate so a system that doesn't need them doesn't pay for
- *  the handler code in flash.
+ *  The libc memory/string and fixed-point math syscall ranges
+ *  (SYS_MEMCPY..SYS_STRCHR and SYS_FIX_SIN..SYS_FIX_TO_DOUBLE)
+ *  are reserved in the ABI but not provided by this library.
+ *  A guest that wants them implements them itself, or links
+ *  against a separately-distributed accelerator package.
  *
  *  Caller can register additional handlers or override any of the
  *  standard ones via vm_ecall_register on the system's router
@@ -296,22 +296,6 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
  * find the recipient. Returns NULL if vm_id is invalid or
  * unregistered. */
 VmMailbox *vm_system_get_mailbox(VmSystem *sys, uint16_t vm_id);
-
-/* ============================================================
- *  Optional handler groups
- *
- *  These install entire syscall groups. Separate from
- *  vm_system_init so a system that doesn't need them doesn't pay
- *  for the handler code in flash.
- * ============================================================ */
-
-/* Install SYS_MEMCPY, SYS_MEMSET, SYS_MEMMOVE, SYS_MEMCMP,
- * SYS_STRLEN, SYS_STRCMP, SYS_STRCHR. Returns false on error
- * (slot conflict). */
-bool vm_system_install_libc_accel(VmSystem *sys);
-
-/* Install SYS_FIX_SIN..SYS_FIX_TO_DOUBLE. Same return semantics. */
-bool vm_system_install_fixed_math(VmSystem *sys);
 
 /* ============================================================
  *  Execution

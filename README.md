@@ -33,9 +33,17 @@ garbage/
 │   │   └── music_player.h
 │   ├── storage/
 │   │   └── trashdrive.h
-│   └── memory/
-│       ├── bump.h
-│       └── slab_stack.h
+│   ├── memory/
+│   │   ├── bump.h
+│   │   └── slab_stack.h
+│   └── vm/
+│       ├── vm_core.h
+│       ├── vm_ecall.h
+│       ├── vm_host_stdio.h
+│       ├── vm_loader.h
+│       ├── vm_mailbox.h
+│       ├── vm_sched.h
+│       └── vm_system.h
 │
 └── src/                        ← implementation + tests, mirrors include/
     ├── containers/
@@ -55,12 +63,37 @@ garbage/
     ├── storage/
     │   ├── trashdrive.c
     │   └── test_trashdrive.c
-    └── memory/
-        ├── bump.c
-        ├── slab_stack.c
-        ├── test_bump.c
-        ├── test_slab_stack.c
-        └── test_bump_on_slab.c
+    ├── memory/
+    │   ├── bump.c
+    │   ├── slab_stack.c
+    │   ├── test_bump.c
+    │   ├── test_slab_stack.c
+    │   └── test_bump_on_slab.c
+    └── vm/                       ← RV32IMC interpreter + scheduler
+        ├── vm_core.c             ← dispatcher (the instruction loop)
+        ├── vm_loader.c           ← ELF32 loader
+        ├── vm_ecall.c            ← syscall router
+        ├── vm_ecall_handlers.c   ← built-in syscall handlers
+        ├── vm_mailbox.c          ← per-VM mailboxes
+        ├── vm_sched.c            ← cooperative scheduler
+        ├── vm_system.c           ← top-level composition
+        ├── vm_host_stdio.c       ← optional host stdin/stdout bridge
+        └── test_vm_*.c           ← 14 test suites
+```
+
+A separate `examples/` directory contains runnable demos that
+embed the VM:
+
+```
+examples/
+├── README.md
+├── common/                       ← shared linker script + build helper
+│   ├── guest.ld
+│   └── vm_objs.sh
+├── 01_hello/                     ← minimal "print and exit" guest
+├── 02_counter/                   ← scheduling demo (SYS_YIELD)
+├── 03_mailbox/                   ← two guests talking via mailbox
+└── 04_keydump/                   ← raw-mode terminal input
 ```
 
 All public headers live under `include/`. The category aggregators
@@ -106,6 +139,13 @@ errors:
 | trashdrive    | (none)                               |
 | bump          | slab_stack (only if using slab path) |
 | slab_stack    | (none)                               |
+| vm_core       | (none)                               |
+| vm_loader     | vm_core, bump                        |
+| vm_ecall      | vm_core                              |
+| vm_mailbox    | fifo_queue, ring_buffer              |
+| vm_sched      | vm_core, vm_ecall                    |
+| vm_system     | all of the above + slab_stack        |
+| vm_host_stdio | vm_system (optional host bridge)     |
 
 So for example, to use `music_player`, copy and build:
 `music_player.c`, `audio_mixer.c`, `ring_buffer.c`, and the
@@ -153,6 +193,25 @@ cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
 cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
    -o test_bump_on_slab src/memory/test_bump_on_slab.c \
    src/memory/bump.c src/memory/slab_stack.c
+
+# vm — many small suites plus a real-ELF integration test
+# (the integration tests need ELFs from examples/01_hello/build/,
+#  02_counter/build/, and 04_keydump/build/ — build those first
+#  via examples/01_hello/build.sh, examples/02_counter/build.sh,
+#  and examples/04_keydump/build.sh; or skip those two suites)
+
+VM_SRCS="src/vm/vm_core.c src/vm/vm_loader.c src/vm/vm_ecall.c \
+         src/vm/vm_ecall_handlers.c src/vm/vm_mailbox.c \
+         src/vm/vm_sched.c src/vm/vm_system.c src/vm/vm_host_stdio.c \
+         src/memory/bump.c src/memory/slab_stack.c \
+         src/containers/fifo_queue.c src/containers/ring_buffer.c"
+
+for suite in vm_core vm_core_alu vm_core_c vm_core_m vm_core_memctl \
+             vm_core_system vm_ecall vm_ecall_handlers vm_host_stdio \
+             vm_loader vm_mailbox vm_real_elf vm_sched vm_system; do
+    cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
+       -o test_$suite src/vm/test_$suite.c $VM_SRCS
+done
 ```
 
 ## Modules
@@ -530,6 +589,67 @@ use, configure the slab with an appropriate locker (typically
 that uses the wrappers. Failing this returns NULL from `project_alloc`
 and the module's `create` will fail. Initialize slab very early in
 your boot sequence.
+
+### vm
+
+#### vm_core, vm_loader, vm_ecall, vm_mailbox, vm_sched, vm_system, vm_host_stdio
+
+A small RV32IMC virtual machine for running multiple guest programs
+cooperatively on a single host. The "core" is a portable
+switch-on-opcode interpreter; the supporting modules add an ELF32
+loader, ECALL syscall routing, per-VM mailbox messaging, a
+cooperative scheduler, and a top-level composition that wires it
+all together.
+
+Why this exists: dynamically loadable, sandboxable programs on
+microcontrollers that don't have an MMU or a "real" OS. Programs
+are built with stock `riscv32-unknown-elf-gcc` (or clang) — no
+custom toolchain. Standard tools work: objdump, addr2line, etc.
+
+Properties:
+- **Single header to embed:** `vm_system.h` (which transitively
+  pulls in the rest).
+- **No mandatory allocator:** caller provides shared and local
+  memory pools; everything is sub-allocated from those.
+- **RV32IMC instruction set:** I (integer), M (multiply/divide),
+  C (compressed). No floats, no atomics, no privilege levels.
+- **Four address regions** (top 2 bits of the 32-bit virtual
+  address select): CODE, RODATA, DATA (per-VM private), SHARED
+  (cross-VM, host-managed).
+- **Up to 64 VMs per system** (`uint64_t` ready/blocked bitmaps
+  in the scheduler).
+- **Cooperative scheduling** with adaptive quantum and critical-
+  section debt amortization. Guests yield voluntarily; the
+  scheduler also wakes blocked guests when their message arrives
+  or their timeout expires.
+- **ECALL syscalls** in two ranges: Linux-compatible low numbers
+  (SYS_EXIT=93, SYS_READ=63, SYS_WRITE=64) and a VM-specific
+  range starting at 1024 (SYS_SELF, SYS_YIELD, SYS_ALLOC,
+  SYS_SEND, etc.). Auto-installed by `vm_system_init`; hosts can
+  add their own.
+- **Optional host stdio bridge** (`vm_host_install_stdio`) for
+  forwarding guest SYS_READ/SYS_WRITE to the host process's
+  stdin/stdout/stderr — including raw-mode terminal input for
+  TUI / game-style guests.
+- **Three working examples in `examples/`**: load and exit, a
+  yielding counter, two guests cooperating via mailbox, and a
+  raw-mode keystroke dumper.
+
+Public domain like the rest of the library. See the
+`vm_*.h` headers for per-module ABI docs. See `examples/README.md`
+for the runnable demos.
+
+API surface (each module's `.h` has full docs):
+- `vm_init`, `vm_step`, `vm_translate_*` (vm_core)
+- `vm_load`, `VmBacking` (vm_loader)
+- `vm_ecall_router_init`, `vm_ecall_register`, `vm_ecall_dispatch` (vm_ecall)
+- `vm_mailbox_init`, `vm_mailbox_send`, `vm_mailbox_recv`,
+  `vm_mailbox_whitelist_*` (vm_mailbox)
+- `vm_sched_init`, `vm_sched_register`, `vm_sched_step` (vm_sched)
+- `vm_system_init`, `vm_system_load_vm`, `vm_system_run`,
+  `vm_system_step` (vm_system)
+- `vm_host_install_stdio`, `vm_host_install_stdio_ex`,
+  `VmHostStdioConfig` (vm_host_stdio)
 
 ## Roadmap
 

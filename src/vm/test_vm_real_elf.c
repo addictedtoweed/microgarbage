@@ -2,7 +2,7 @@
  * riscv64-unknown-elf-gcc with -march=rv32imc.
  *
  * The ELF is loaded as binary data at build time via objcopy
- * (see Makefile in examples/hello). For this test we read it
+ * (the .elf is built by examples/01_hello/build.sh). For this test we read it
  * from disk at run time, since the test build doesn't have
  * a Makefile yet — we just keep the .elf checked in.
  *
@@ -52,9 +52,9 @@ static void test_hello_elf_runs_and_exits(void) {
     /* Path is relative to where the test binary is run from. */
     uint8_t *elf = NULL;
     size_t elf_size = 0;
-    if (load_file("examples/hello/hello.elf", &elf, &elf_size) != 0) {
+    if (load_file("examples/01_hello/build/guest_minimal.elf", &elf, &elf_size) != 0) {
         /* Couldn't open the ELF — skip with a clear failure message. */
-        FAIL("could not open examples/hello/hello.elf "
+        FAIL("could not open examples/01_hello/build/guest_minimal.elf "
              "(run test from repo root)");
         return;
     }
@@ -114,8 +114,8 @@ static void test_hello2_factorial_runs(void) {
      * emitted, which is what we want to exercise. */
     uint8_t *elf = NULL;
     size_t elf_size = 0;
-    if (load_file("examples/hello/hello2.elf", &elf, &elf_size) != 0) {
-        FAIL("could not open examples/hello/hello2.elf");
+    if (load_file("examples/01_hello/build/guest_factorial.elf", &elf, &elf_size) != 0) {
+        FAIL("could not open examples/01_hello/build/guest_factorial.elf");
         return;
     }
 
@@ -162,8 +162,8 @@ static void test_hello3_sum_of_squares_runs(void) {
      *   - sp-relative load/store with non-trivial frame */
     uint8_t *elf = NULL;
     size_t elf_size = 0;
-    if (load_file("examples/hello/hello3.elf", &elf, &elf_size) != 0) {
-        FAIL("could not open examples/hello/hello3.elf");
+    if (load_file("examples/01_hello/build/guest_squares.elf", &elf, &elf_size) != 0) {
+        FAIL("could not open examples/01_hello/build/guest_squares.elf");
         return;
     }
 

@@ -213,3 +213,12 @@ local/
 #
 # Reproducibility > convenience.
 # =========================================================
+# ---------------------------------------------------------
+# VM example outputs (host binaries + guest ELFs)
+# ---------------------------------------------------------
+#
+# Already covered by `build/` and `*.elf` above; calling it
+# out here so future maintainers know where these come from.
+# Pre-built ELFs are NOT committed: examples/NN_name/build.sh
+# rebuilds them via gcc-riscv64-unknown-elf.
+
