@@ -1,0 +1,774 @@
+/* Tests for vm_system.
+ *
+ * Most tests build a small ELF in memory, load it, run it, and
+ * check the result. The ELF synthesizer is the same pattern as
+ * test_vm_loader.c. Programs are hand-assembled small enough to
+ * fit a few syscalls and check a register state. */
+
+#include "test_runner.h"
+#include "vm/vm_system.h"
+
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+
+/* ============================================================
+ *  Storage pools — generous enough for several VMs
+ * ============================================================ */
+
+#define SHARED_BYTES  (64 * 1024)
+#define LOCAL_BYTES   (256 * 1024)
+
+static uint8_t g_shared_storage[SHARED_BYTES];
+static uint8_t g_local_storage[LOCAL_BYTES];
+
+/* ============================================================
+ *  ELF synthesizer — minimal, just code + entry point
+ *
+ *  Builds an RV32 ELF with a single PT_LOAD covering a code
+ *  region populated with caller-supplied bytes. No rodata, no
+ *  data segment in the ELF (so the loader supplies data_region
+ *  fresh from the arena). entry = 0.
+ * ============================================================ */
+
+#define EHDR_SIZE  52u
+#define PHDR_SIZE  32u
+
+static void wr16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+static void wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;        p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* Builds a minimal ELF into buf with one PT_LOAD for code.
+ * code is placed at file offset 84 (EHDR + 1 PHDR + 0 pad).
+ * Returns total ELF size. */
+static size_t build_code_only_elf(uint8_t *buf, size_t cap,
+                                  const uint8_t *code, size_t code_size) {
+    if (cap < EHDR_SIZE + PHDR_SIZE + code_size) return 0;
+
+    memset(buf, 0, cap);
+
+    /* ELF header */
+    buf[0] = 0x7F; buf[1] = 'E'; buf[2] = 'L'; buf[3] = 'F';
+    buf[4] = 1;    /* ELFCLASS32 */
+    buf[5] = 1;    /* ELFDATA2LSB */
+    buf[6] = 1;    /* EV_CURRENT */
+    wr16(buf + 16, 2);       /* e_type = ET_EXEC */
+    wr16(buf + 18, 0xF3);    /* e_machine = EM_RISCV */
+    wr32(buf + 20, 1);       /* e_version */
+    wr32(buf + 24, 0);       /* e_entry = 0 (region 0 / CODE) */
+    wr32(buf + 28, EHDR_SIZE);  /* e_phoff */
+    wr32(buf + 32, 0);       /* e_shoff */
+    wr32(buf + 36, 0);       /* e_flags */
+    wr16(buf + 40, EHDR_SIZE);  /* e_ehsize */
+    wr16(buf + 42, PHDR_SIZE);  /* e_phentsize */
+    wr16(buf + 44, 1);       /* e_phnum */
+
+    /* PT_LOAD program header — places code at vaddr 0 (region 0). */
+    uint8_t *ph = buf + EHDR_SIZE;
+    uint32_t code_offset = EHDR_SIZE + PHDR_SIZE;
+    wr32(ph + 0,  1);                /* PT_LOAD */
+    wr32(ph + 4,  code_offset);      /* p_offset */
+    wr32(ph + 8,  0);                /* p_vaddr = 0 */
+    wr32(ph + 12, 0);                /* p_paddr */
+    wr32(ph + 16, (uint32_t)code_size);  /* p_filesz */
+    wr32(ph + 20, (uint32_t)code_size);  /* p_memsz */
+    wr32(ph + 24, 0x5);              /* p_flags = R | X */
+    wr32(ph + 28, 4);                /* p_align */
+
+    memcpy(buf + code_offset, code, code_size);
+    return code_offset + code_size;
+}
+
+/* ============================================================
+ *  Small RISC-V code helpers
+ *
+ *  Hand-assemble specific instructions we need.
+ * ============================================================ */
+
+/* addi rd, rs1, imm */
+static uint32_t addi(uint32_t rd, uint32_t rs1, int32_t imm) {
+    return ((((uint32_t)imm) & 0xFFFu) << 20) | (rs1 << 15) |
+           (0u << 12) | (rd << 7) | 0x13u;
+}
+
+/* lui rd, imm (imm in upper 20 bits as-is) */
+static uint32_t lui(uint32_t rd, uint32_t imm20) {
+    return ((imm20 & 0xFFFFFu) << 12) | (rd << 7) | 0x37u;
+}
+
+/* ecall */
+static uint32_t ecall(void) { return 0x00000073u; }
+
+/* ebreak — used to stop execution cleanly (the trap handler
+ * terminates the VM). */
+static uint32_t ebreak(void) { return 0x00100073u; }
+
+/* sw rs2, imm(rs1) */
+static uint32_t sw_(uint32_t rs2, uint32_t rs1, int32_t imm) {
+    uint32_t uimm = ((uint32_t)imm) & 0xFFFu;
+    uint32_t hi = (uimm >> 5) & 0x7Fu;
+    uint32_t lo = uimm & 0x1Fu;
+    return (hi << 25) | (rs2 << 20) | (rs1 << 15) |
+           (2u << 12) | (lo << 7) | 0x23u;
+}
+
+/* lw rd, imm(rs1) */
+static uint32_t lw_(uint32_t rd, uint32_t rs1, int32_t imm) {
+    return ((((uint32_t)imm) & 0xFFFu) << 20) | (rs1 << 15) |
+           (2u << 12) | (rd << 7) | 0x03u;
+}
+
+#define REG_A0  10
+#define REG_A1  11
+#define REG_A2  12
+#define REG_A7  17
+
+/* Load a 32-bit constant into rd: lui then addi.
+ * Writes 2 instructions to buf and returns 8 (bytes written). */
+static size_t load_imm32(uint8_t *buf, uint32_t rd, uint32_t value) {
+    /* Sign-extend addi part: if low 12 bits have bit 11 set, the
+     * lui needs to compensate by adding 1 to the upper 20 bits. */
+    uint32_t lo = value & 0xFFFu;
+    uint32_t hi = (value - (int32_t)((lo & 0x800u) ? (lo | 0xFFFFF000u) : lo)) >> 12;
+    hi &= 0xFFFFFu;
+
+    uint32_t lui_insn = lui(rd, hi);
+    uint32_t addi_insn = addi(rd, rd, (int32_t)((lo & 0x800u) ? (lo | 0xFFFFF000u) : lo));
+    wr32(buf + 0, lui_insn);
+    wr32(buf + 4, addi_insn);
+    return 8;
+}
+
+/* ============================================================
+ *  Init / destroy
+ * ============================================================ */
+
+static void test_init_succeeds(void) {
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    ASSERT(sys.ecall_router != NULL);
+    ASSERT(sys.sched != NULL);
+    ASSERT(sys.shared_slab != NULL);
+    ASSERT(sys.local_arena != NULL);
+    /* Defaults filled in */
+    ASSERT_EQ_INT(5000, (int)sys.config.baseline_quantum);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_init_rejects_missing_storage(void) {
+    VmSystem sys;
+    VmSystemConfig cfg = {0};   /* no storage pointers */
+    ASSERT(!vm_system_init(&sys, &cfg));
+}
+
+static void test_init_rejects_null_args(void) {
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+    };
+    ASSERT(!vm_system_init(NULL, &cfg));
+
+    VmSystem sys;
+    ASSERT(!vm_system_init(&sys, NULL));
+}
+
+/* ============================================================
+ *  Load a tiny VM and run it
+ * ============================================================ */
+
+static void test_load_and_run_exit_vm(void) {
+    /* Program: set a7=SYS_EXIT, ecall.
+     *   addi a7, x0, 93
+     *   ecall
+     *   ebreak  ; safety, won't be reached
+     */
+    uint8_t code[64];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+    wr32(code + pos, ebreak()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+    ASSERT(elf_size > 0);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size,
+                                           /*data_region=*/4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+    ASSERT_EQ_INT(0, lr.assigned_vm_id);
+
+    /* Run the system; should complete (all halted) very quickly. */
+    bool done = vm_system_run(&sys, 100);
+    ASSERT(done);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_load_and_run_self_vm(void) {
+    /* Program: a7 = SYS_SELF, ecall, then a7 = SYS_EXIT, ecall.
+     * After exit, the VM should have its vm_id in a0 (from SELF). */
+    uint8_t code[64];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 1024)); pos += 4;  /* SYS_SELF */
+    wr32(code + pos, ecall()); pos += 4;
+    /* Save a0 to a1 so SYS_EXIT's a0 (exit code) doesn't clobber it */
+    wr32(code + pos, addi(REG_A1, REG_A0, 0)); pos += 4;  /* mv a1, a0 */
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+
+    bool done = vm_system_run(&sys, 100);
+    ASSERT(done);
+
+    /* a1 should hold the vm_id (=0) */
+    VmCpu *cpu = vm_sched_get(sys.sched, (uint16_t)lr.assigned_vm_id);
+    ASSERT(cpu != NULL);
+    ASSERT_EQ_INT(0, (int)cpu->regs[REG_A1]);
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
+ *  Alloc and free
+ * ============================================================ */
+
+static void test_alloc_and_free(void) {
+    /* Program: SYS_ALLOC 64 bytes, save pointer, SYS_FREE, exit.
+     *
+     *   addi a0, x0, 64
+     *   addi a7, x0, 1056  ; SYS_ALLOC
+     *   ecall
+     *   addi a1, a0, 0     ; save pointer
+     *   ; check that pointer is in shared region (not negative)
+     *   addi a2, a0, 0     ; save again before free
+     *   addi a7, x0, 1057  ; SYS_FREE
+     *   ecall              ; a0 still has the pointer
+     *   addi a7, x0, 93
+     *   ecall
+     */
+    uint8_t code[128];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A0, 0, 64)); pos += 4;
+    pos += load_imm32(code + pos, REG_A7, 1056);  /* SYS_ALLOC */
+    wr32(code + pos, ecall()); pos += 4;
+    wr32(code + pos, addi(REG_A1, REG_A0, 0)); pos += 4;  /* save ptr */
+    /* a0 already has the pointer; SYS_FREE wants it in a0 */
+    pos += load_imm32(code + pos, REG_A7, 1057);  /* SYS_FREE */
+    wr32(code + pos, ecall()); pos += 4;
+    wr32(code + pos, addi(REG_A2, REG_A0, 0)); pos += 4;  /* save free result */
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+
+    bool done = vm_system_run(&sys, 200);
+    ASSERT(done);
+
+    VmCpu *cpu = vm_sched_get(sys.sched, (uint16_t)lr.assigned_vm_id);
+    ASSERT(cpu != NULL);
+    /* a1 saved the alloc result; should be a valid shared-region address
+     * (≥ 0xC0000000) */
+    ASSERT((cpu->regs[REG_A1] & 0xC0000000u) == 0xC0000000u);
+    /* a2 saved the free result; should be 0 */
+    ASSERT_EQ_INT(0, (int)cpu->regs[REG_A2]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_alloc_zero_returns_einval(void) {
+    /* SYS_ALLOC with size=0 should return -EINVAL */
+    uint8_t code[128];
+    size_t pos = 0;
+    /* a0 = 0 already (registers init to 0) */
+    pos += load_imm32(code + pos, REG_A7, 1056);
+    wr32(code + pos, ecall()); pos += 4;
+    wr32(code + pos, addi(REG_A1, REG_A0, 0)); pos += 4;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+    vm_system_run(&sys, 100);
+
+    VmCpu *cpu = vm_sched_get(sys.sched, (uint16_t)lr.assigned_vm_id);
+    /* a1 saved the alloc result; should be -EINVAL = -22 = 0xFFFFFFEA */
+    ASSERT_EQ_INT(-22, (int32_t)cpu->regs[REG_A1]);
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
+ *  Mailbox info
+ * ============================================================ */
+
+static void test_mailbox_info_on_self(void) {
+    /* Program: add x0 to whitelist (self-whitelist), SYS_MAILBOX_INFO on self,
+     * save result in a2 (so SYS_EXIT's a0 doesn't clobber).
+     *
+     * We need to first whitelist ourselves so MAILBOX_INFO doesn't return -EPERM.
+     */
+    uint8_t code[256];
+    size_t pos = 0;
+    /* SYS_WHITELIST_ADD a0=0 (self) */
+    wr32(code + pos, addi(REG_A0, 0, 0)); pos += 4;
+    pos += load_imm32(code + pos, REG_A7, 1075);
+    wr32(code + pos, ecall()); pos += 4;
+    /* SYS_MAILBOX_INFO a0=0 */
+    wr32(code + pos, addi(REG_A0, 0, 0)); pos += 4;
+    pos += load_imm32(code + pos, REG_A7, 1074);
+    wr32(code + pos, ecall()); pos += 4;
+    wr32(code + pos, addi(REG_A2, REG_A0, 0)); pos += 4;  /* save slot_size to a2 */
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[512];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+    vm_system_run(&sys, 200);
+
+    VmCpu *cpu = vm_sched_get(sys.sched, (uint16_t)lr.assigned_vm_id);
+    /* a2 should hold slot_size (the default = 32) */
+    ASSERT_EQ_INT(32, (int)cpu->regs[REG_A2]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_mailbox_info_without_whitelist_returns_eperm(void) {
+    /* MAILBOX_INFO on a VM that hasn't whitelisted us */
+    uint8_t code[128];
+    size_t pos = 0;
+    /* Don't whitelist self — call MAILBOX_INFO directly */
+    wr32(code + pos, addi(REG_A0, 0, 0)); pos += 4;
+    pos += load_imm32(code + pos, REG_A7, 1074);
+    wr32(code + pos, ecall()); pos += 4;
+    wr32(code + pos, addi(REG_A2, REG_A0, 0)); pos += 4;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+    vm_system_run(&sys, 200);
+
+    VmCpu *cpu = vm_sched_get(sys.sched, (uint16_t)lr.assigned_vm_id);
+    /* a2 should be -EPERM = -1 = 0xFFFFFFFF */
+    ASSERT_EQ_INT(-1, (int32_t)cpu->regs[REG_A2]);
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
+ *  Multi-VM: load several VMs, verify they all run
+ * ============================================================ */
+
+static void test_three_vms_all_exit(void) {
+    /* Three VMs, each just SYS_EXIT */
+    uint8_t code[64];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    for (int i = 0; i < 3; i++) {
+        VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                               VM_BACKING_COPY_RAM,
+                                               VM_BACKING_COPY_RAM);
+        ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+        ASSERT_EQ_INT(i, lr.assigned_vm_id);
+    }
+
+    ASSERT_EQ_INT(3, (int)vm_system_ready_count(&sys));
+
+    bool done = vm_system_run(&sys, 100);
+    ASSERT(done);
+
+    /* All VMs halted */
+    ASSERT_EQ_INT(0, (int)vm_system_ready_count(&sys));
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
+ *  Send/recv between two VMs
+ *
+ *  VM 0: whitelists VM 1, calls SYS_RECV with timeout 0 (non-blocking),
+ *  saves result to a2, exits. Expected: -EAGAIN because no message yet.
+ *
+ *  Actually let me do a more interesting test:
+ *
+ *  VM 0: whitelists VM 1, polls recv until success, saves payload, exits
+ *  VM 1: writes 0x12345678 to its data region, sends it to VM 0, exits
+ *
+ *  This requires both VMs to make progress, exercising the scheduler's
+ *  round-robin and the send/recv handlers.
+ *
+ *  Simpler version: just verify a single send-then-recv pair via direct
+ *  manipulation, since hand-assembling a full poll loop is tedious.
+ * ============================================================ */
+
+static void test_send_and_recv_direct(void) {
+    /* Exercise the per-VM mailbox API directly (bypasses ECALL).
+     * The full ECALL round-trip is tested below in
+     * test_send_and_recv_blocking. */
+    uint8_t code[64];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    vm_system_load_vm(&sys, elf, elf_size, 4096,
+                       VM_BACKING_COPY_RAM, VM_BACKING_COPY_RAM);
+    vm_system_load_vm(&sys, elf, elf_size, 4096,
+                       VM_BACKING_COPY_RAM, VM_BACKING_COPY_RAM);
+
+    VmMailbox *mbox_a = vm_system_get_mailbox(&sys, 0);
+    VmMailbox *mbox_b = vm_system_get_mailbox(&sys, 1);
+    ASSERT(mbox_a != NULL);
+    ASSERT(mbox_b != NULL);
+    ASSERT(mbox_a != mbox_b);
+
+    /* B allows A as a sender */
+    vm_mailbox_whitelist_set(mbox_b, 0);
+
+    /* A sends "hello" to B (32 bytes payload — the default slot size) */
+    uint8_t payload[32];
+    memset(payload, 0xAB, sizeof(payload));
+    payload[0] = 'H'; payload[1] = 'i';
+    VmMailboxResult r = vm_mailbox_send(mbox_b, /*sender=*/0,
+                                          payload, 32);
+    ASSERT_EQ_INT(VM_MBOX_OK, r);
+    ASSERT_EQ_INT(1, (int)vm_mailbox_count(mbox_b));
+
+    /* B receives it */
+    uint8_t received[32];
+    uint16_t sender = 0xFFFF;
+    r = vm_mailbox_recv(mbox_b, received, &sender);
+    ASSERT_EQ_INT(VM_MBOX_OK, r);
+    ASSERT_EQ_INT(0, (int)sender);
+    ASSERT_EQ_INT('H', received[0]);
+    ASSERT_EQ_INT('i', received[1]);
+    ASSERT_EQ_INT(0xAB, received[31]);
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
+ *  End-to-end send/recv through ECALL — synchronous wake
+ *
+ *  VM 0 (receiver): whitelists VM 1, calls SYS_RECV with timeout,
+ *  blocks. On wake, saves the sender id to s0 (x8) and the first
+ *  byte of the received payload to s1 (x9). Then exits.
+ *
+ *  VM 1 (sender): writes a known payload into its data region,
+ *  calls SYS_SEND targeting VM 0. The synchronous-delivery path
+ *  in handle_send writes the payload directly to VM 0's dest
+ *  buffer and unblocks VM 0. Then VM 1 exits.
+ * ============================================================ */
+
+static void test_send_and_recv_blocking(void) {
+    /* ===== Receiver program (VM 0) ===== */
+    /* Layout (data region starts at 0x80000000):
+     *   We use vaddr 0x80000000 as our recv dest buffer (top of
+     *   region 2, well below the stack which grows down from
+     *   region_size). */
+    uint8_t recv_code[256];
+    size_t pos = 0;
+    /* SYS_WHITELIST_ADD: a0=1 (VM 1), a7=1075 */
+    wr32(recv_code + pos, addi(REG_A0, 0, 1)); pos += 4;
+    pos += load_imm32(recv_code + pos, REG_A7, 1075);
+    wr32(recv_code + pos, ecall()); pos += 4;
+    /* SYS_RECV: a0 = dest = 0x80000000, a1 = timeout = 10000, a7 = 1073 */
+    pos += load_imm32(recv_code + pos, REG_A0, 0x80000000u);
+    pos += load_imm32(recv_code + pos, REG_A1, 10000);
+    pos += load_imm32(recv_code + pos, REG_A7, 1073);
+    wr32(recv_code + pos, ecall()); pos += 4;
+    /* Save sender id (a0) into s0 (x8) */
+    wr32(recv_code + pos, addi(/*x8*/ 8, REG_A0, 0)); pos += 4;
+    /* Load the first byte of dest into s1 (x9): lbu x9, 0(t0)
+     * where t0 = 0x80000000. Need to load the constant first. */
+    pos += load_imm32(recv_code + pos, /*x5 (t0)*/ 5, 0x80000000u);
+    /* lbu x9, 0(x5): opcode 0x03, funct3 0x4 (LBU), rd=9, rs1=5, imm=0 */
+    wr32(recv_code + pos,
+         (0u << 20) | (5u << 15) | (4u << 12) | (9u << 7) | 0x03u);
+    pos += 4;
+    /* SYS_EXIT */
+    wr32(recv_code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(recv_code + pos, ecall()); pos += 4;
+
+    uint8_t recv_elf[512];
+    size_t recv_elf_size = build_code_only_elf(recv_elf, sizeof(recv_elf),
+                                                recv_code, pos);
+    ASSERT(recv_elf_size > 0);
+
+    /* ===== Sender program (VM 1) ===== */
+    uint8_t send_code[256];
+    pos = 0;
+    /* Write a payload byte (0x5A) into our data region at vaddr 0x80000010.
+     * SB x10, 0(x5) where x5 = 0x80000010, x10 = 0x5A. */
+    pos += load_imm32(send_code + pos, /*x5*/ 5, 0x80000010u);
+    wr32(send_code + pos, addi(/*x10*/ 10, 0, 0x5A)); pos += 4;
+    /* sb x10, 0(x5): opcode 0x23, funct3 0x0 (SB) */
+    wr32(send_code + pos,
+         (0u << 25) | (10u << 20) | (5u << 15) | (0u << 12) | (0u << 7) | 0x23u);
+    pos += 4;
+    /* SYS_SEND: a0 = target = 0, a1 = payload addr = 0x80000010, a2 = 32 */
+    wr32(send_code + pos, addi(REG_A0, 0, 0)); pos += 4;
+    pos += load_imm32(send_code + pos, REG_A1, 0x80000010u);
+    wr32(send_code + pos, addi(REG_A2, 0, 32)); pos += 4;
+    pos += load_imm32(send_code + pos, REG_A7, 1072);
+    wr32(send_code + pos, ecall()); pos += 4;
+    /* Save send result to s0 */
+    wr32(send_code + pos, addi(/*x8*/ 8, REG_A0, 0)); pos += 4;
+    /* SYS_EXIT */
+    wr32(send_code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(send_code + pos, ecall()); pos += 4;
+
+    uint8_t send_elf[512];
+    size_t send_elf_size = build_code_only_elf(send_elf, sizeof(send_elf),
+                                                send_code, pos);
+    ASSERT(send_elf_size > 0);
+
+    /* ===== Set up system and load both VMs ===== */
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 200,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    VmLoadVmResult lr0 = vm_system_load_vm(&sys, recv_elf, recv_elf_size,
+                                            4096, VM_BACKING_COPY_RAM,
+                                            VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr0.code);
+    ASSERT_EQ_INT(0, lr0.assigned_vm_id);
+
+    VmLoadVmResult lr1 = vm_system_load_vm(&sys, send_elf, send_elf_size,
+                                            4096, VM_BACKING_COPY_RAM,
+                                            VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr1.code);
+    ASSERT_EQ_INT(1, lr1.assigned_vm_id);
+
+    /* Run until everyone halts (or cap). */
+    bool done = vm_system_run(&sys, 500);
+    ASSERT(done);
+
+    /* ===== Verify results ===== */
+    VmCpu *recv_cpu = vm_sched_get(sys.sched, 0);
+    VmCpu *send_cpu = vm_sched_get(sys.sched, 1);
+
+    /* Receiver: s0 should hold sender id (= 1). */
+    ASSERT_EQ_INT(1, (int)recv_cpu->regs[8]);
+    /* Receiver: s1 should hold the first payload byte (0x5A). */
+    ASSERT_EQ_INT(0x5A, (int)recv_cpu->regs[9]);
+    /* Sender: s0 should hold the send result (0 = success). */
+    ASSERT_EQ_INT(0, (int)send_cpu->regs[8]);
+}
+
+/* ============================================================
+ *  Bump arena bookkeeping
+ * ============================================================ */
+
+static void test_local_bytes_used_grows(void) {
+    /* Loading VMs should consume bump arena space proportionally. */
+    uint8_t code[64];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    size_t used0 = vm_system_local_bytes_used(&sys);
+    vm_system_load_vm(&sys, elf, elf_size, 4096,
+                       VM_BACKING_COPY_RAM, VM_BACKING_COPY_RAM);
+    size_t used1 = vm_system_local_bytes_used(&sys);
+    ASSERT(used1 > used0);
+
+    vm_system_load_vm(&sys, elf, elf_size, 4096,
+                       VM_BACKING_COPY_RAM, VM_BACKING_COPY_RAM);
+    size_t used2 = vm_system_local_bytes_used(&sys);
+    ASSERT(used2 > used1);
+
+    /* Each load consumes a similar amount (VmCpu + mailbox storage
+     * + data region of 4096) */
+    size_t per_vm = used1 - used0;
+    size_t second_vm = used2 - used1;
+    /* Should be the same size for both VMs */
+    ASSERT_EQ_INT((int)per_vm, (int)second_vm);
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
+ *  Test runner
+ * ============================================================ */
+
+int main(void) {
+    TEST_SUITE("vm_system");
+
+    /* Lifecycle */
+    RUN(test_init_succeeds);
+    RUN(test_init_rejects_missing_storage);
+    RUN(test_init_rejects_null_args);
+
+    /* Loading + running VMs */
+    RUN(test_load_and_run_exit_vm);
+    RUN(test_load_and_run_self_vm);
+
+    /* Alloc/free */
+    RUN(test_alloc_and_free);
+    RUN(test_alloc_zero_returns_einval);
+
+    /* Mailbox info */
+    RUN(test_mailbox_info_on_self);
+    RUN(test_mailbox_info_without_whitelist_returns_eperm);
+
+    /* Multi-VM */
+    RUN(test_three_vms_all_exit);
+
+    /* Send/recv */
+    RUN(test_send_and_recv_direct);
+    RUN(test_send_and_recv_blocking);
+
+    /* Arena */
+    RUN(test_local_bytes_used_grows);
+
+    /* Suppress unused warnings */
+    (void)sw_; (void)lw_;
+
+    return TEST_SUITE_RESULT();
+}
