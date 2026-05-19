@@ -44,6 +44,7 @@ Or clean:
 | `02_counter`| Cooperative scheduling with SYS_YIELD; manual scheduler loop. |
 | `03_mailbox`| Two guests talking via SYS_SEND/SYS_RECV. The "VM OS" pattern. |
 | `04_keydump`| Raw-mode terminal input via SYS_READ. Foundation for TUI work. |
+| `05_shell`  | Interactive file-system shell. Demonstrates the file ECALL group (openat/read/write/close/lseek/mkdirat/unlinkat/readdir) against a FatFs volume mounted on a trashdrive. **Requires FatFs** (see `third_party/fatfs/PLACEHOLDER.md`). |
 
 ## Shared bits
 
