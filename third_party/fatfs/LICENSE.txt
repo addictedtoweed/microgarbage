@@ -1,0 +1,15 @@
+FatFs - Generic FAT Filesystem Module - License
+================================================
+
+(stub — FatFs source not yet extracted)
+
+After you download FatFs from http://elm-chan.org/fsw/ff/ and
+extract it into third_party/fatfs/source/, re-run
+
+    ./setup_licenses.sh
+
+from the repo root, and this file will be replaced with the
+license block from ff.h verbatim.
+
+The expected license is BSD-1-clause, which requires only that
+the copyright notice be retained when source is redistributed.
