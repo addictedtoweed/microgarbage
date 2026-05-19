@@ -45,6 +45,7 @@ garbage/
 │       ├── vm_core.h
 │       ├── vm_ecall.h
 │       ├── vm_host_stdio.h
+│       ├── vm_host_fs.h        ← optional file syscalls (needs FatFs)
 │       ├── vm_loader.h
 │       ├── vm_mailbox.h
 │       ├── vm_sched.h
@@ -85,6 +86,7 @@ garbage/
         ├── vm_sched.c            ← cooperative scheduler
         ├── vm_system.c           ← top-level composition
         ├── vm_host_stdio.c       ← optional host stdin/stdout bridge
+        ├── vm_host_fs.c          ← optional host file syscalls (FatFs)
         └── test_vm_*.c           ← 14 test suites
 ```
 
@@ -167,6 +169,7 @@ errors:
 | vm_sched      | vm_core, vm_ecall                    |
 | vm_system     | all of the above + slab_stack        |
 | vm_host_stdio | vm_system (optional host bridge)     |
+| vm_host_fs    | vm_system, vm_host_stdio, trashdrive_fatfs |
 
 So for example, to use `music_player`, copy and build:
 `music_player.c`, `audio_mixer.c`, `ring_buffer.c`, and the
@@ -738,6 +741,48 @@ API surface (each module's `.h` has full docs):
   `vm_system_step` (vm_system)
 - `vm_host_install_stdio`, `vm_host_install_stdio_ex`,
   `VmHostStdioConfig` (vm_host_stdio)
+- `vm_host_install_fs`, `vm_host_install_fs_atexit`,
+  `vm_host_fs_reset`, `VmDirent` (vm_host_fs)
+
+#### vm_host_fs — file syscalls for guests
+
+Exposes POSIX-shaped file operations to guest VMs via ECALL:
+
+| Syscall      | # | What it does |
+|--------------|---|--------------|
+| SYS_OPENAT   | 56 | open or create a file/dir; returns fd |
+| SYS_CLOSE    | 57 | close a fd |
+| SYS_LSEEK    | 62 | seek within an open file |
+| SYS_READ     | 63 | (also handles file fds when fs installed) |
+| SYS_WRITE    | 64 | (same) |
+| SYS_MKDIRAT  | 34 | create a directory |
+| SYS_UNLINKAT | 35 | remove a file or empty directory |
+| SYS_READDIR  | 120 | read one directory entry |
+
+Syscall numbers match Linux's RISC-V generic ABI for compatibility
+with stock libc wrappers (picolibc, newlib). The host backs them
+with FatFs (via `trashdrive_fatfs`), giving the guest a real
+read-write filesystem inside a RAM region.
+
+The fd table holds up to `VM_HOST_FS_MAX_FILES` (default 16) open
+files. fd 0/1/2 stay reserved for stdio (managed by
+`vm_host_stdio`); file fds start at 3. The two modules cooperate
+via a small setter hook so `read`/`write`/`close` work uniformly
+across stdio and file fds.
+
+Guests can use POSIX-ish paths starting with `/` — they get
+rewritten to `0:/...` for FatFs's volume convention. Guests that
+need to access multiple volumes can use the FatFs-native form
+`<digit>:/...` directly.
+
+The VM has no concept of current working directory. The *at-style
+syscalls require `dirfd = AT_FDCWD (-100)` and interpret paths as
+absolute. Adding chdir/getcwd support is straightforward (flip
+`FF_FS_RPATH` to 2 in ffconf.h) but not done by default.
+
+Build dependency: requires FatFs (see `third_party/fatfs/`). The
+tests (`test_vm_host_fs.c`) compile in two modes — with or without
+`-DHAVE_FATFS` — for the same reason as `test_trashdrive_fatfs.c`.
 
 ## Roadmap
 

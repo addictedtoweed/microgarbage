@@ -139,6 +139,31 @@
                                     * vm_host_stdio.h */
 #define SYS_EXIT              93   /* clean exit (matches Linux RISC-V) */
 
+/* --- Filesystem (Linux RISC-V numbers, host-only, not auto-installed) ---
+ *
+ * These match Linux's generic ABI numbers so that a guest built
+ * against picolibc or a similar libc with Linux-compatible syscall
+ * wrappers will work without translation. Like SYS_READ and
+ * SYS_WRITE, these are NOT installed by vm_system_init — the host
+ * application opts in by calling vm_host_install_fs() (see
+ * vm_host_fs.h).
+ *
+ * Most are *at-style ("openat", "mkdirat", ...) where the dirfd
+ * argument is required to be AT_FDCWD (-100), meaning "interpret
+ * paths as absolute". The VM has no per-fd current directory.
+ *
+ * Note: 56 (openat) sits ABOVE the range we use for stdio (63, 64)
+ * but is documented here for clustering with the other fs calls. */
+#define SYS_MKDIRAT           34   /* mkdirat(AT_FDCWD, path, mode) */
+#define SYS_UNLINKAT          35   /* unlinkat(AT_FDCWD, path, flags) */
+#define SYS_OPENAT            56   /* openat(AT_FDCWD, path, flags, mode) → fd */
+#define SYS_CLOSE             57   /* close(fd) */
+#define SYS_LSEEK             62   /* lseek(fd, offset, whence) → new pos */
+/* SYS_READ (63) and SYS_WRITE (64) — see above */
+#define SYS_READDIR          120   /* VM-specific: readdir(fd, &VmDirent)
+                                    * Not Linux's getdents64 — see vm_host_fs.h
+                                    * for the simpler dirent layout we use. */
+
 /* --- Identity / introspection (1024..1039) --- */
 #define SYS_SELF            1024   /* get this VM's ID */
 
@@ -545,8 +570,15 @@
 #define VM_ENOMEM         12   /* out of memory (slab exhausted)   */
 #define VM_EFAULT         14   /* bad address (out-of-bounds ptr)  */
 #define VM_EBUSY          16   /* resource busy (block-in-critical) */
+#define VM_EEXIST         17   /* file already exists              */
+#define VM_ENOTDIR        20   /* not a directory                  */
+#define VM_EISDIR         21   /* is a directory                   */
 #define VM_EINVAL         22   /* invalid argument                  */
+#define VM_EMFILE         24   /* too many open files               */
+#define VM_ENOSPC         28   /* no space left on device           */
+#define VM_EROFS          30   /* read-only filesystem              */
 #define VM_ENOSYS         38   /* function not implemented          */
+#define VM_ENAMETOOLONG   36   /* path component too long           */
 #define VM_ETIMEDOUT     110   /* operation timed out               */
 
 /* ============================================================

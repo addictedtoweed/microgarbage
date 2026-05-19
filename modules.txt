@@ -17,3 +17,4 @@ vm_mailbox	vm	fifo_queue,ring_buffer	Per-VM bounded mailbox with sender whitelis
 vm_sched	vm	vm_core,vm_ecall	Cooperative round-robin scheduler with adaptive quantum and critical-section debt
 vm_system	vm	vm_core,vm_loader,vm_ecall,vm_mailbox,vm_sched,slab_stack,bump	Top-level composition of the VM library; one-call setup of a complete system
 vm_host_stdio	vm	vm_system	Optional host stdio bridge: SYS_READ and SYS_WRITE forwarded to host stdin/stdout, raw-mode tty support
+vm_host_fs	vm	vm_system,vm_host_stdio,trashdrive_fatfs	Optional host file syscalls: openat, read, write, close, lseek, mkdirat, unlinkat, readdir against a host-mounted FatFs volume

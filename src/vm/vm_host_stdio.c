@@ -40,6 +40,38 @@ static FILE *g_in_file  = NULL;
 static FILE *g_out_file = NULL;
 static FILE *g_err_file = NULL;
 
+/* ============================================================
+ *  Delegate hooks for file fds
+ *
+ *  When vm_host_fs is also installed, it calls the setter below
+ *  to install function pointers that handle fd >= 3. Our
+ *  read/write/close handlers consult the hooks for any fd
+ *  outside the stdio range (0/1/2) and delegate the actual work.
+ *  When fs is NOT installed (hooks remain NULL), reads/writes
+ *  to fd >= 3 return -EBADF.
+ *
+ *  The hooks are stored as static here (not extern from fs)
+ *  so that vm_host_stdio.c can be linked without vm_host_fs.c.
+ *  The fs module only needs to know about the setter function. */
+typedef int32_t (*vm_host_fs_read_hook_t)(int fd, void *buf, uint32_t n);
+typedef int32_t (*vm_host_fs_write_hook_t)(int fd, const void *buf, uint32_t n);
+typedef int32_t (*vm_host_fs_close_hook_t)(int fd);
+
+static vm_host_fs_read_hook_t  g_fs_read_hook  = NULL;
+static vm_host_fs_write_hook_t g_fs_write_hook = NULL;
+static vm_host_fs_close_hook_t g_fs_close_hook = NULL;
+
+/* Called by vm_host_install_fs to wire up the delegate. Pass NULL
+ * for all three to disconnect. Public so vm_host_fs.c can reach it
+ * without including vm_host_stdio.h's private types. */
+void vm_host_stdio_set_fs_hooks(vm_host_fs_read_hook_t r,
+                                vm_host_fs_write_hook_t w,
+                                vm_host_fs_close_hook_t c) {
+    g_fs_read_hook  = r;
+    g_fs_write_hook = w;
+    g_fs_close_hook = c;
+}
+
 /* Whether we've already saved and modified stdin's termios. If
  * true, the atexit hook will restore it. */
 static bool          g_termios_saved = false;
@@ -116,6 +148,27 @@ static void handle_write(VmCpu *cpu, void *system) {
     uint32_t guest_p = cpu->regs[VM_REG_A1];
     uint32_t n       = cpu->regs[VM_REG_A2];
 
+    /* Delegate file fds to vm_host_fs if installed. */
+    if (fd >= 3) {
+        if (!g_fs_write_hook) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
+            return;
+        }
+        if (n == 0) {
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        const void *host_buf = vm_translate_read(cpu, guest_p, n);
+        if (!host_buf) {
+            cpu->trap_cause = TRAP_NONE;
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
+            return;
+        }
+        int32_t r = g_fs_write_hook((int)fd, host_buf, n);
+        cpu->regs[VM_REG_A0] = (uint32_t)r;
+        return;
+    }
+
     FILE *dest = NULL;
     if (fd == 1) dest = g_out_file;
     else if (fd == 2) dest = g_err_file;
@@ -170,6 +223,27 @@ static void handle_read(VmCpu *cpu, void *system) {
     uint32_t fd      = cpu->regs[VM_REG_A0];
     uint32_t guest_p = cpu->regs[VM_REG_A1];
     uint32_t n       = cpu->regs[VM_REG_A2];
+
+    /* Delegate file fds to vm_host_fs if installed. */
+    if (fd >= 3) {
+        if (!g_fs_read_hook) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
+            return;
+        }
+        if (n == 0) {
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        void *host_buf = vm_translate_write(cpu, guest_p, n);
+        if (!host_buf) {
+            cpu->trap_cause = TRAP_NONE;
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
+            return;
+        }
+        int32_t r = g_fs_read_hook((int)fd, host_buf, n);
+        cpu->regs[VM_REG_A0] = (uint32_t)r;
+        return;
+    }
 
     if (fd != 0 || !g_in_file) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
