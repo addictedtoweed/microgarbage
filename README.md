@@ -7,6 +7,10 @@ The targets in mind are M0/M3/M4-class microcontrollers, but
 nothing here is architecture-specific — these will work fine on a
 hosted system too.
 
+A small amount of third-party code (FatFs, used by
+`trashdrive_fatfs`) lives under `third_party/` with its own
+license — see `third_party/README.md`.
+
 ## Layout
 
 ```
@@ -32,7 +36,8 @@ garbage/
 │   │   ├── audio_mixer.h
 │   │   └── music_player.h
 │   ├── storage/
-│   │   └── trashdrive.h
+│   │   ├── trashdrive.h
+│   │   └── trashdrive_fatfs.h    ← FatFs bridge (needs third_party/fatfs)
 │   ├── memory/
 │   │   ├── bump.h
 │   │   └── slab_stack.h
@@ -62,7 +67,9 @@ garbage/
     │   └── test_*.c
     ├── storage/
     │   ├── trashdrive.c
-    │   └── test_trashdrive.c
+    │   ├── trashdrive_fatfs.c    ← FatFs diskio shim
+    │   ├── test_trashdrive.c
+    │   └── test_trashdrive_fatfs.c
     ├── memory/
     │   ├── bump.c
     │   ├── slab_stack.c
@@ -94,6 +101,19 @@ examples/
 ├── 02_counter/                   ← scheduling demo (SYS_YIELD)
 ├── 03_mailbox/                   ← two guests talking via mailbox
 └── 04_keydump/                   ← raw-mode terminal input
+```
+
+A `third_party/` directory holds vendored code that uses a
+different license from the rest of the repo:
+
+```
+third_party/
+├── README.md
+└── fatfs/                        ← Elm Chan FatFs (BSD-1-clause)
+    ├── LICENSE.txt
+    ├── ffconf.h                  ← OUR tuned config
+    └── source/                   ← from elm-chan.org (NOT committed —
+                                   ←  see PLACEHOLDER.md for setup)
 ```
 
 All public headers live under `include/`. The category aggregators
@@ -137,6 +157,7 @@ errors:
 | audio_mixer   | ring_buffer, fixed_point             |
 | music_player  | audio_mixer (and its deps)           |
 | trashdrive    | (none)                               |
+| trashdrive_fatfs | trashdrive, FatFs (third_party)   |
 | bump          | slab_stack (only if using slab path) |
 | slab_stack    | (none)                               |
 | vm_core       | (none)                               |
@@ -423,6 +444,73 @@ f_close(&f);
 
 API: `trash_init`, `trash_clear`, `trash_read`, `trash_write`,
 `trash_sector_count`, `trash_sector_size`, `trash_total_bytes`.
+
+#### trashdrive_fatfs
+
+Bridges `trashdrive` to Elm Chan's [FatFs](http://elm-chan.org/fsw/ff/)
+library so you can mount a real FAT filesystem inside a RAM
+region. After registration you use FatFs's standard API
+(`f_open`, `f_read`, `f_write`, `f_mkdir`, `f_unlink`, etc.) —
+the diskio shim in this module routes the underlying sector
+reads and writes to the registered TrashDrive.
+
+This is a thin C file (~150 lines) that implements the five
+`disk_*` functions FatFs requires. The actual filesystem logic
+lives in FatFs proper, under `third_party/fatfs/`. **FatFs is
+NOT public domain** like the rest of this library — it's
+BSD-1-clause licensed by Elm Chan. See `third_party/README.md`
+and `third_party/fatfs/LICENSE.txt` for the details.
+
+```c
+#include "storage/trashdrive.h"
+#include "storage/trashdrive_fatfs.h"
+#include "ff.h"
+
+static uint8_t  pool[64 * 1024];
+static TrashDrive drive;
+static FATFS fs;
+
+/* Initialize the block device, then register it as FatFs drive 0. */
+trash_init(&drive, pool, sizeof(pool));
+trash_fatfs_register(0, &drive);
+
+/* Format and mount. */
+BYTE work[FF_MAX_SS];
+f_mkfs("0:", NULL, work, sizeof(work));
+f_mount(&fs, "0:", 1);
+
+/* Use standard FatFs from here. */
+FIL f;
+f_open(&f, "0:/hello.txt", FA_WRITE | FA_CREATE_ALWAYS);
+UINT bw;
+f_write(&f, "hi", 2, &bw);
+f_close(&f);
+```
+
+API: `trash_fatfs_register`, `trash_fatfs_get`. Everything else
+is FatFs (see `third_party/fatfs/source/ff.h` for the full API
+once you've extracted FatFs).
+
+**Setting it up:**
+
+1. Run `./setup_licenses.sh` from the repo root (writes `LICENSE`
+   and creates `third_party/` scaffold). See the script's
+   comments for what it does.
+2. Download FatFs from <http://elm-chan.org/fsw/ff/> and extract
+   the source files into `third_party/fatfs/source/`. The exact
+   files needed are documented in
+   `third_party/fatfs/PLACEHOLDER.md`.
+3. Build with the extra include paths:
+   `-Ithird_party/fatfs/source -Ithird_party/fatfs -DHAVE_FATFS`
+4. Link `src/storage/trashdrive_fatfs.c`, `src/storage/trashdrive.c`,
+   `third_party/fatfs/source/ff.c`, and
+   `third_party/fatfs/source/ffsystem.c`.
+
+The tests in `src/storage/test_trashdrive_fatfs.c` will compile
+without FatFs (they print "skipped" and exit cleanly) so CI
+keeps green even when FatFs isn't present. With `-DHAVE_FATFS`
+and the FatFs source in place, they run real `f_open`/`f_write`/
+`f_mkdir`/`f_unlink` operations against a 64 KB RAM volume.
 
 ### memory
 
