@@ -2,15 +2,24 @@
 /  Configurations of FatFs Module
 /---------------------------------------------------------------------------*/
 
-#define FFCONF_DEF	86631	/* Revision ID */
+#define FFCONF_DEF	86631	/* Revision ID — MUST match FF_DEFINED in ff.h.
+                             * R0.15p3 used 86631. R0.16 (and any later
+                             * release) will be different. When upgrading
+                             * FatFs: open the new ff.h, look for
+                             *   #define FF_DEFINED  xxxxx
+                             * and update the value here to match. ff.c
+                             * has a #error guard that fires if they
+                             * disagree, so you'll know immediately if
+                             * this is wrong. */
 
 /*---------------------------------------------------------------------------/
 /  THIS FILE IS NOT STOCK FATFS.
 /
 /  This is microgarbage's tuned ffconf.h for use with the trashdrive
 /  FatFs integration. It replaces FatFs's default ffconf.h. The format
-/  of this file matches FatFs R0.15p3; if you upgrade FatFs, diff this
-/  against the new upstream ffconf.h to catch added options.
+/  was last verified against FatFs R0.15p3 / R0.16; if you upgrade FatFs,
+/  diff this against the new upstream ffconf.h to catch added options
+/  and update FFCONF_DEF above.
 /
 /  Rationale for our settings:
 /  - We need writes (FF_FS_READONLY = 0)

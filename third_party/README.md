@@ -18,7 +18,7 @@ block device in this library).
 
 - **Upstream:** http://elm-chan.org/fsw/ff/ (canonical source)
 - **License:** BSD-1-clause (see `fatfs/LICENSE.txt`)
-- **Pinned version:** R0.15p3 (others should work but are untested)
+- **Pinned version:** R0.16 (R0.15p3 was the previous; others should work but only these two have been verified)
 - **What we customized:** `fatfs/ffconf.h` is OUR build of the
   FatFs config file, tuned for this project (no LFN, no RTC,
   single volume, writable). The rest of FatFs is unmodified
