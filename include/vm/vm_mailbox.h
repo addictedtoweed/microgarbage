@@ -43,12 +43,14 @@
  *  ---------------------------------------------------------------
  *
  *  Stored as a bitmap of allowed sender vm_ids, one bit per VM.
- *  Default size: 32 bits (so up to 32 VMs in the system). Adjust
- *  VM_MAILBOX_WHITELIST_BITS if you need more; choose 64 if you
- *  have 33–64 VMs. Beyond that, switch to a different
- *  representation (sorted array, bloom filter + linear fallback,
- *  hashtable) — the bitmap stops being the right structure once
- *  you have hundreds of VMs.
+ *  Default size: 64 bits, matching the scheduler's default
+ *  VM_SCHED_MAX_VMS. Use VM_MAILBOX_WHITELIST_BITS=32 if you're
+ *  building a smaller system where every saved byte matters; the
+ *  two macros must agree across the build so that a vm_id is
+ *  valid in both the scheduler and the mailbox. Beyond 64 VMs,
+ *  switch to a different representation (multi-word bitmap,
+ *  sorted array, hashtable) — the single-word bitmap stops being
+ *  the right structure once you have more.
  *
  *  Bit 0 corresponds to vm_id 0, bit 1 to vm_id 1, etc. A VM is
  *  allowed to whitelist itself (self-messaging is a valid
@@ -94,10 +96,11 @@
 
 /* Width of the whitelist bitmap. Must be 32 or 64. Caps the
  * maximum vm_id (and therefore the maximum number of VMs in the
- * system) at this value minus one. Default 32 matches a small
- * MCU's typical task count. */
+ * system) at this value minus one. Default 64, matching the
+ * scheduler's VM_SCHED_MAX_VMS default — these two must agree
+ * so that a vm_id valid in one is valid in the other. */
 #ifndef VM_MAILBOX_WHITELIST_BITS
-#define VM_MAILBOX_WHITELIST_BITS  32
+#define VM_MAILBOX_WHITELIST_BITS  64
 #endif
 
 #if VM_MAILBOX_WHITELIST_BITS == 32
