@@ -462,6 +462,84 @@ static void test_spawn_and_wait_minimal_elf(void) {
     fixture_teardown();
 }
 
+/* The vm_host_fs_route_* functions are the entry point for hosts
+ * that REPLACE vm_host_stdio with their own SYS_READ/SYS_WRITE
+ * handlers (e.g., the 05_shell pipe transport on Cygwin). They
+ * must accept fd values that came back from a SYS_OPENAT ecall
+ * and read/write the file in those slots.
+ *
+ * This test does the open via the syscall (so the fd is allocated
+ * the same way the guest would see it), then calls the route_*
+ * functions directly with a host-side buffer — proving the
+ * routing path doesn't go through stdio at all. */
+static void test_route_functions_handle_file_fds(void) {
+    ASSERT(fixture_init());
+
+    /* Create a file and write some content via the syscall path. */
+    uint32_t path = put_string("/routed.txt", 0);
+    uint32_t data = put_string("from the guest", 256);
+
+    int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
+                                 VM_O_RDWR | VM_O_CREAT, 0);
+    ASSERT(fd >= 3);
+
+    int32_t written = invoke_syscall(SYS_WRITE, (uint32_t)fd, data, 14, 0);
+    ASSERT_EQ_INT(14, written);
+
+    /* lseek to start. */
+    int32_t pos = invoke_syscall(SYS_LSEEK, (uint32_t)fd, 0, VM_SEEK_SET, 0);
+    ASSERT_EQ_INT(0, pos);
+
+    /* Read via the public routing function with a HOST buffer. */
+    char host_buf[64];
+    memset(host_buf, 0, sizeof(host_buf));
+    int32_t rr = vm_host_fs_route_read(fd, host_buf, sizeof(host_buf));
+    ASSERT_EQ_INT(14, rr);
+    ASSERT_EQ_INT(0, memcmp(host_buf, "from the guest", 14));
+
+    /* Write via the public routing function: overwrite the start. */
+    pos = invoke_syscall(SYS_LSEEK, (uint32_t)fd, 0, VM_SEEK_SET, 0);
+    ASSERT_EQ_INT(0, pos);
+    int32_t wr = vm_host_fs_route_write(fd, "FROM THE HOST!", 14);
+    ASSERT_EQ_INT(14, wr);
+
+    /* Verify via the syscall path: the host-written bytes are visible. */
+    pos = invoke_syscall(SYS_LSEEK, (uint32_t)fd, 0, VM_SEEK_SET, 0);
+    ASSERT_EQ_INT(0, pos);
+    uint32_t guest_buf = 0x80000000 + 512;
+    int32_t br = invoke_syscall(SYS_READ, (uint32_t)fd, guest_buf, 64, 0);
+    ASSERT_EQ_INT(14, br);
+    ASSERT_EQ_INT(0, memcmp(g_data + 512, "FROM THE HOST!", 14));
+
+    /* Close via the public routing function. */
+    int32_t cr = vm_host_fs_route_close(fd);
+    ASSERT_EQ_INT(0, cr);
+
+    /* After close, a route_read on the same fd should fail. */
+    rr = vm_host_fs_route_read(fd, host_buf, sizeof(host_buf));
+    ASSERT(rr < 0);
+
+    fixture_teardown();
+}
+
+/* stdio fds (0, 1, 2) are NOT the routing functions' responsibility
+ * — they belong to the host's own SYS_READ/SYS_WRITE handlers. The
+ * router returns a sentinel (VM_HOST_FS_NOT_OURS) to signal that
+ * the caller should handle the fd itself. */
+static void test_route_functions_reject_stdio_fds(void) {
+    ASSERT(fixture_init());
+
+    char host_buf[8];
+    int32_t r0 = vm_host_fs_route_read(0, host_buf, 8);
+    ASSERT_EQ_INT(VM_HOST_FS_NOT_OURS, r0);
+    int32_t r1 = vm_host_fs_route_write(1, "x", 1);
+    ASSERT_EQ_INT(VM_HOST_FS_NOT_OURS, r1);
+    int32_t r2 = vm_host_fs_route_close(2);
+    ASSERT_EQ_INT(VM_HOST_FS_NOT_OURS, r2);
+
+    fixture_teardown();
+}
+
 int main(void) {
     TEST_SUITE("vm_host_fs");
     RUN(test_openat_create_writes_and_reads_back);
@@ -473,6 +551,8 @@ int main(void) {
     RUN(test_open_fd_limit);
     RUN(test_path_translation_strips_volume_prefix);
     RUN(test_spawn_and_wait_minimal_elf);
+    RUN(test_route_functions_handle_file_fds);
+    RUN(test_route_functions_reject_stdio_fds);
     return TEST_SUITE_RESULT();
 }
 

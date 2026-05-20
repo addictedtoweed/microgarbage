@@ -219,6 +219,24 @@ static void pipe_sys_read(VmCpu *cpu, void *system) {
     uint32_t guest_p = cpu->regs[VM_REG_A1];
     uint32_t n = cpu->regs[VM_REG_A2];
 
+    /* File-fd path: any fd >= 3 belongs to vm_host_fs (FatFs or
+     * the /host passthrough). Translate the guest pointer here
+     * since vm_host_fs's routing function takes a host pointer. */
+    if (fd >= 3) {
+        if (n == 0) {
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        void *host_buf = vm_translate_write(cpu, guest_p, n);
+        if (!host_buf) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-14;  /* -EFAULT */
+            return;
+        }
+        int32_t r = vm_host_fs_route_read((int)fd, host_buf, n);
+        cpu->regs[VM_REG_A0] = (uint32_t)r;
+        return;
+    }
+
     if (fd != 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)-9;  /* -EBADF */
         return;
@@ -277,6 +295,25 @@ static void pipe_sys_write(VmCpu *cpu, void *system) {
     uint32_t fd = cpu->regs[VM_REG_A0];
     uint32_t guest_p = cpu->regs[VM_REG_A1];
     uint32_t n = cpu->regs[VM_REG_A2];
+
+    /* File-fd path: any fd >= 3 belongs to vm_host_fs. We DON'T
+     * do the \n -> \r\n translation here — file content is
+     * supposed to be byte-exact. The translation only applies
+     * to the pipe transport's TTY emulation for stdout/stderr. */
+    if (fd >= 3) {
+        if (n == 0) {
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        const void *host_buf = vm_translate_read(cpu, guest_p, n);
+        if (!host_buf) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-14;
+            return;
+        }
+        int32_t r = vm_host_fs_route_write((int)fd, host_buf, n);
+        cpu->regs[VM_REG_A0] = (uint32_t)r;
+        return;
+    }
 
     if (fd != 1 && fd != 2) {
         cpu->regs[VM_REG_A0] = (uint32_t)-9;  /* -EBADF */

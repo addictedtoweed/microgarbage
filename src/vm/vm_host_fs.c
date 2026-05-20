@@ -304,9 +304,10 @@ static int translate_open_flags(uint32_t flags, BYTE *out_mode) {
  *  fread/fwrite/fclose.
  * ============================================================ */
 
-/* Returns bytes read, -errno on error, or VM_FS_NOT_OURS if fd
- * is not a file fd (caller should fall back to other handling). */
-#define VM_FS_NOT_OURS  (-12345678)
+/* Returns bytes read, -errno on error, or VM_HOST_FS_NOT_OURS if
+ * fd is not a file fd (caller should fall back to other handling).
+ * Internal alias VM_FS_NOT_OURS retained for in-file readability. */
+#define VM_FS_NOT_OURS  VM_HOST_FS_NOT_OURS
 
 static int32_t fs_read_fd(int fd, void *buf, uint32_t n) {
     if (fd < FD_BASE) return VM_FS_NOT_OURS;
@@ -1154,4 +1155,36 @@ unsigned vm_host_fs_open_count(void) {
 
 unsigned vm_host_fs_max_files(void) {
     return VM_HOST_FS_MAX_FILES;
+}
+
+/* ============================================================
+ *  File-fd routing for alternate transports
+ *
+ *  These let hosts that install their OWN SYS_READ/SYS_WRITE/
+ *  SYS_CLOSE handlers — instead of using vm_host_stdio's
+ *  handle_read/handle_write/handle_close — delegate file-fd
+ *  operations to us. The 05_shell example's pipe transport
+ *  uses these.
+ *
+ *  The behavior matches the static fs_*_fd helpers above, which
+ *  is also what gets called via vm_host_stdio's hook plumbing
+ *  when the stdio bridge is in use. The public name avoids
+ *  any confusion about being a "hook"-flavored back door.
+ *
+ *  Note: the static helpers return a sentinel VM_FS_NOT_OURS
+ *  for fd < FD_BASE; the public function uses the same value
+ *  (re-exported via the header as VM_HOST_FS_NOT_OURS) so
+ *  callers don't need an internal include.
+ * ============================================================ */
+
+int32_t vm_host_fs_route_read(int fd, void *buf, uint32_t n) {
+    return fs_read_fd(fd, buf, n);
+}
+
+int32_t vm_host_fs_route_write(int fd, const void *buf, uint32_t n) {
+    return fs_write_fd(fd, buf, n);
+}
+
+int32_t vm_host_fs_route_close(int fd) {
+    return fs_close_fd(fd);
 }

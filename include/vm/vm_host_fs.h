@@ -289,6 +289,33 @@ unsigned vm_host_fs_open_count(void);
  * Compile-time fixed at VM_HOST_FS_MAX_FILES (default 16). */
 unsigned vm_host_fs_max_files(void);
 
+/* ============================================================
+ *  File-fd routing for alternate transports
+ *
+ *  Hosts that install their own SYS_READ/SYS_WRITE/SYS_CLOSE
+ *  handlers (instead of using vm_host_stdio's) — for example
+ *  the named-pipe transport in the 05_shell example on
+ *  Cygwin — should call these for fds >= 3. They route to
+ *  FatFs or to the host-passthrough mount as appropriate.
+ *
+ *  Returns:
+ *    > 0   bytes transferred (read/write only)
+ *    = 0   end of file (read), zero-length op accepted
+ *    < 0   -errno on failure
+ *
+ *  The default vm_host_stdio bridge calls these internally;
+ *  you only need them if you've REPLACED that bridge.
+ * ============================================================ */
+
+int32_t vm_host_fs_route_read (int fd, void *buf, uint32_t n);
+int32_t vm_host_fs_route_write(int fd, const void *buf, uint32_t n);
+int32_t vm_host_fs_route_close(int fd);
+
+/* As above, but returns a sentinel (VM_HOST_FS_NOT_OURS) when
+ * the fd is not in the file-fd range (i.e., < 3). Caller is
+ * expected to handle stdio routing itself in that case. */
+#define VM_HOST_FS_NOT_OURS  (-12345678)
+
 #ifndef VM_HOST_FS_MAX_FILES
 #define VM_HOST_FS_MAX_FILES 16
 #endif
