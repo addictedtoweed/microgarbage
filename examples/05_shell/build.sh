@@ -48,7 +48,7 @@ mkdir -p "$BUILD_DIR"
 echo "05_shell: compiling host (with FatFs)..."
 $CC $CFLAGS \
     -DHAVE_FATFS \
-    -I"$FATFS_SOURCE" -I"$FATFS_DIR" \
+    -I"$FATFS_DIR" -I"$FATFS_SOURCE" \
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
     $VM_CORE_SRCS \
