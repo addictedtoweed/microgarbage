@@ -26,6 +26,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE                /* needed for fopencookie on Cygwin */
 
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
@@ -48,10 +49,8 @@
 #  define PIPE_MODE_SUPPORTED 1
 #  include <windows.h>
 #  include <fcntl.h>       /* O_RDWR */
-#  include <unistd.h>      /* close */
-#  if defined(__CYGWIN__)
-#    include <sys/cygwin.h>   /* cygwin_attach_handle_to_fd */
-#  else
+#  include <unistd.h>      /* close, ssize_t */
+#  if !defined(__CYGWIN__)
 #    include <io.h>           /* _open_osfhandle on MSVC/MinGW */
 #  endif
 #endif
@@ -147,6 +146,17 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
  *  stderr" arrive at the PuTTY end interleaved with stdout bytes,
  *  same as a real serial line.
  *
+ *  On Cygwin we don't use cygwin_attach_handle_to_fd + fdopen —
+ *  that combination fails with EBADF on some Cygwin versions
+ *  because the fd produced by cygwin_attach_handle_to_fd lacks
+ *  some metadata fdopen expects. Instead we use fopencookie
+ *  (a GNU extension Cygwin supports) and call ReadFile/WriteFile
+ *  directly in the callbacks. This sidesteps Cygwin's fd table
+ *  entirely.
+ *
+ *  Native MinGW / MSVC builds use the simpler _open_osfhandle +
+ *  fdopen path since those CRTs handle it correctly.
+ *
  *  Why this lives in host.c instead of vm_host_stdio.c:
  *    - It's host-application-policy (which transport to use) rather
  *      than VM-bridge functionality (how the guest sees stdio).
@@ -156,6 +166,55 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
  * --------------------------------------------------------------- */
 
 static HANDLE g_pipe_handle = INVALID_HANDLE_VALUE;
+
+#if defined(__CYGWIN__)
+/* fopencookie callbacks — talk directly to the HANDLE. The cookie
+ * is the HANDLE itself, cast to void*. */
+
+static ssize_t pipe_cookie_read(void *cookie, char *buf, size_t size) {
+    HANDLE h = (HANDLE)cookie;
+    /* The pipe is in PIPE_NOWAIT mode (see open_named_pipe_for_stdio
+     * below). In nonblocking mode ReadFile returns FALSE with
+     * GetLastError()==ERROR_NO_DATA when no bytes are available,
+     * which we translate to read-returned-zero — same semantics
+     * the bridge expects for a non-blocking stdin. */
+    DWORD got = 0;
+    if (!ReadFile(h, buf, (DWORD)size, &got, NULL)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_NO_DATA || err == ERROR_PIPE_LISTENING) {
+            return 0;
+        }
+        if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
+            /* PuTTY closed the connection. Return 0 = EOF. */
+            return 0;
+        }
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)got;
+}
+
+static ssize_t pipe_cookie_write(void *cookie, const char *buf, size_t size) {
+    HANDLE h = (HANDLE)cookie;
+    DWORD wrote = 0;
+    if (!WriteFile(h, buf, (DWORD)size, &wrote, NULL)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
+            errno = EPIPE;
+            return -1;
+        }
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)wrote;
+}
+
+static int pipe_cookie_close(void *cookie) {
+    HANDLE h = (HANDLE)cookie;
+    CloseHandle(h);
+    return 0;
+}
+#endif  /* __CYGWIN__ */
 
 static FILE *open_named_pipe_for_stdio(const char *name) {
     /* Pipe naming: callers can pass either a fully-qualified
@@ -170,8 +229,8 @@ static FILE *open_named_pipe_for_stdio(const char *name) {
 
     /* PIPE_ACCESS_DUPLEX     — bidirectional
      * PIPE_TYPE_BYTE         — stream-oriented, not message-oriented
-     * PIPE_WAIT              — synchronous reads/writes (we set
-     *                          O_NONBLOCK on the wrapping fd later)
+     * PIPE_WAIT initially    — needed for the blocking ConnectNamedPipe
+     *                          below; switched to NOWAIT after connect
      * 1 instance, 4 KB buffers, default timeout. */
     g_pipe_handle = CreateNamedPipeA(
         full,
@@ -208,50 +267,61 @@ static FILE *open_named_pipe_for_stdio(const char *name) {
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Wrap the HANDLE in a POSIX fd, then in a FILE*. From this
-     * point the FILE* can be passed wherever the bridge expects
-     * stdin/stdout/stderr.
-     *
-     * Two different APIs depending on the toolchain:
-     *
-     *   - Cygwin: cygwin_attach_handle_to_fd is the canonical
-     *     way to turn a Win32 HANDLE into a POSIX fd. The 'name'
-     *     argument is a label Cygwin will use in /proc/self/fd
-     *     listings — useful for debugging, ignored otherwise.
-     *     bin=1 means "binary mode" (no CRLF translation, which
-     *     is exactly right for a serial-style stream).
-     *
-     *   - MSVC / native MinGW: _open_osfhandle from <io.h> does
-     *     the same thing using Microsoft's CRT fd table.
-     *
-     * Both return -1 on error. */
-#if defined(__CYGWIN__)
-    int fd = cygwin_attach_handle_to_fd(
-        (char *)"/dev/pipe-microgarbage",   /* descriptive label */
-        -1,                                  /* let Cygwin pick fd */
-        g_pipe_handle,
-        1,                                   /* binary mode */
-        GENERIC_READ | GENERIC_WRITE);
-#else
-    int fd = _open_osfhandle((intptr_t)g_pipe_handle, O_RDWR);
-#endif
-    if (fd < 0) {
-        fprintf(stderr, "host: handle-to-fd failed: %s\n",
-                strerror(errno));
+    /* Switch to non-blocking mode. The VM's SYS_READ is non-blocking
+     * (returns 0 if no data ready) and we want ReadFile to honor
+     * that. PIPE_NOWAIT makes ReadFile/WriteFile return immediately
+     * with ERROR_NO_DATA / written-0 if they'd otherwise have to
+     * wait. MSDN deprecates this for "real" async I/O but it's
+     * exactly right for our polled-I/O case. */
+    DWORD nowait = PIPE_NOWAIT | PIPE_READMODE_BYTE;
+    if (!SetNamedPipeHandleState(g_pipe_handle, &nowait, NULL, NULL)) {
+        fprintf(stderr, "host: SetNamedPipeHandleState failed (error %lu)\n",
+                (unsigned long)GetLastError());
         CloseHandle(g_pipe_handle);
         g_pipe_handle = INVALID_HANDLE_VALUE;
         return NULL;
     }
 
-    /* "r+" — read and write, no truncation, no append. */
-    FILE *f = fdopen(fd, "r+");
+    /* Build a FILE* over the HANDLE.
+     *
+     * On Cygwin we use fopencookie with our own ReadFile/WriteFile
+     * callbacks — sidesteps the Cygwin fd-table issues that make
+     * cygwin_attach_handle_to_fd + fdopen fail with EBADF on some
+     * versions.
+     *
+     * On native MinGW/MSVC we use the standard _open_osfhandle +
+     * fdopen path, which works correctly there. */
+#if defined(__CYGWIN__)
+    cookie_io_functions_t cb = {
+        .read  = pipe_cookie_read,
+        .write = pipe_cookie_write,
+        .seek  = NULL,       /* not seekable — pipes never are */
+        .close = pipe_cookie_close,
+    };
+    FILE *f = fopencookie((void *)g_pipe_handle, "r+", cb);
+    if (!f) {
+        fprintf(stderr, "host: fopencookie failed: %s\n", strerror(errno));
+        CloseHandle(g_pipe_handle);
+        g_pipe_handle = INVALID_HANDLE_VALUE;
+        return NULL;
+    }
+#else
+    int fd = _open_osfhandle((intptr_t)g_pipe_handle, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "host: _open_osfhandle failed: %s\n",
+                strerror(errno));
+        CloseHandle(g_pipe_handle);
+        g_pipe_handle = INVALID_HANDLE_VALUE;
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "rb+");
     if (!f) {
         fprintf(stderr, "host: fdopen failed: %s\n", strerror(errno));
-        /* Closing fd will close the underlying handle. */
         close(fd);
         g_pipe_handle = INVALID_HANDLE_VALUE;
         return NULL;
     }
+#endif
 
     /* No buffering — we want every byte to flow immediately, the
      * same way it does on a tty. The VM's SYS_FFLUSH calls won't
