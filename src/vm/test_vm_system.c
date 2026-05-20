@@ -384,6 +384,190 @@ static void test_alloc_zero_returns_einval(void) {
 }
 
 /* ============================================================
+ *  Unload / auto-cleanup
+ * ============================================================ */
+
+static void test_unload_releases_local_slab(void) {
+    /* A trivial guest that immediately calls SYS_EXIT. We're testing
+     * the host's reclaim path, not guest behavior. */
+    uint8_t code[32];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    size_t baseline = sys.local_slab->total_bytes_in_use;
+
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+
+    /* After load: usage should be above baseline (VmCpu + mailbox +
+     * text + data). */
+    ASSERT(sys.local_slab->total_bytes_in_use > baseline);
+
+    vm_system_run(&sys, 200);
+
+    /* After unload: should return exactly to baseline. */
+    ASSERT(vm_system_unload_vm(&sys, (uint16_t)lr.assigned_vm_id));
+    ASSERT_EQ_INT((int)baseline, (int)sys.local_slab->total_bytes_in_use);
+
+    /* Slot should now be free — sys.vms[id] cleared. */
+    ASSERT(sys.vms[lr.assigned_vm_id] == NULL);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_unload_auto_cleans_leaked_sys_alloc(void) {
+    /* Guest:
+     *   SYS_ALLOC(64) → ptr in shared region
+     *   (deliberately don't free it)
+     *   SYS_EXIT
+     *
+     * After unload, the shared slab should report the block freed. */
+    uint8_t code[128];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A0, 0, 64)); pos += 4;
+    pos += load_imm32(code + pos, REG_A7, 1056);   /* SYS_ALLOC */
+    wr32(code + pos, ecall()); pos += 4;
+    /* leak it. Exit without freeing. */
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    size_t shared_baseline = sys.shared_slab->total_bytes_in_use;
+
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                           VM_BACKING_COPY_RAM,
+                                           VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+    vm_system_run(&sys, 200);
+
+    /* While loaded with the leak: shared slab usage above baseline. */
+    ASSERT(sys.shared_slab->total_bytes_in_use > shared_baseline);
+
+    /* Verify the tracking recorded the leak. */
+    ASSERT_EQ_INT(1, (int)sys.alloc_tracking[lr.assigned_vm_id].count);
+
+    /* Unload — auto-cleanup should free the leaked block. */
+    ASSERT(vm_system_unload_vm(&sys, (uint16_t)lr.assigned_vm_id));
+    ASSERT_EQ_INT((int)shared_baseline,
+                  (int)sys.shared_slab->total_bytes_in_use);
+    /* Tracking cleared. */
+    ASSERT_EQ_INT(0, (int)sys.alloc_tracking[lr.assigned_vm_id].count);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_unload_concurrent_non_lifo(void) {
+    /* Load two VMs, unload them in NON-LIFO order (newer first).
+     * The slab makes this trivially correct (any order works);
+     * the bump arena couldn't have. */
+    uint8_t code[32];
+    size_t pos = 0;
+    wr32(code + pos, addi(REG_A7, 0, 93)); pos += 4;
+    wr32(code + pos, ecall()); pos += 4;
+
+    uint8_t elf[256];
+    size_t elf_size = build_code_only_elf(elf, sizeof(elf), code, pos);
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    size_t baseline = sys.local_slab->total_bytes_in_use;
+
+    VmLoadVmResult lr0 = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                            VM_BACKING_COPY_RAM,
+                                            VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr0.code);
+
+    VmLoadVmResult lr1 = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                            VM_BACKING_COPY_RAM,
+                                            VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr1.code);
+
+    size_t loaded = sys.local_slab->total_bytes_in_use;
+    ASSERT(loaded > baseline);
+
+    /* Run both to exit. */
+    vm_system_run(&sys, 1000);
+
+    /* Unload OLDER first (non-LIFO) — bump couldn't do this. */
+    ASSERT(vm_system_unload_vm(&sys, (uint16_t)lr0.assigned_vm_id));
+    /* Half-way: less usage than before, more than baseline. */
+    ASSERT(sys.local_slab->total_bytes_in_use < loaded);
+    ASSERT(sys.local_slab->total_bytes_in_use > baseline);
+
+    /* Unload the other. */
+    ASSERT(vm_system_unload_vm(&sys, (uint16_t)lr1.assigned_vm_id));
+    /* All the way back to baseline. */
+    ASSERT_EQ_INT((int)baseline, (int)sys.local_slab->total_bytes_in_use);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_unload_invalid_args(void) {
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .max_vms = 1,
+        .spawn_data_kb = 4,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    /* NULL sys */
+    ASSERT(!vm_system_unload_vm(NULL, 0));
+    /* Invalid vm_id (out of range) */
+    ASSERT(!vm_system_unload_vm(&sys, VM_SCHED_MAX_VMS));
+    ASSERT(!vm_system_unload_vm(&sys, VM_SCHED_MAX_VMS + 5));
+    /* vm_id in range but not loaded */
+    ASSERT(!vm_system_unload_vm(&sys, 0));
+
+    vm_system_destroy(&sys);
+}
+
+/* ============================================================
  *  Mailbox info
  * ============================================================ */
 
@@ -1272,6 +1456,12 @@ int main(void) {
     /* Alloc/free */
     RUN(test_alloc_and_free);
     RUN(test_alloc_zero_returns_einval);
+
+    /* Unload / auto-cleanup */
+    RUN(test_unload_releases_local_slab);
+    RUN(test_unload_auto_cleans_leaked_sys_alloc);
+    RUN(test_unload_concurrent_non_lifo);
+    RUN(test_unload_invalid_args);
 
     /* Mailbox info */
     RUN(test_mailbox_info_on_self);

@@ -211,6 +211,29 @@
  * control are typically loaded by 'run'). */
 #define SYS_TTY_SET_RAW     1105   /* tty_set_raw(enable) → 0 or -errno */
 
+/* --- Memory introspection (1106..1107) ---
+ *
+ * Report on the host's slab allocators and per-VM memory usage.
+ * Used by the shell's 'meminfo' command and by guests that want
+ * to monitor their own resource consumption.
+ *
+ * SYS_SLAB_STATS:
+ *   a0 = guest pointer to a VmSlabStatsRecord buffer
+ *   a1 = buffer size in bytes (must be >= sizeof(VmSlabStatsRecord))
+ *   → a0 = bytes written on success, -EINVAL / -EFAULT on bad args
+ *
+ * SYS_VM_STATS:
+ *   a0 = vm_id, or 0xFFFF to mean "the calling VM"
+ *   a1 = guest pointer to a VmVmStatsRecord buffer
+ *   a2 = buffer size in bytes (must be >= sizeof(VmVmStatsRecord))
+ *   → a0 = bytes written on success, -EINVAL / -EFAULT / -ENOENT
+ *
+ * Both record shapes are versioned via a leading 'version' field
+ * (currently 1). Future additions append fields without changing
+ * version unless layout breaks. */
+#define SYS_SLAB_STATS      1106
+#define SYS_VM_STATS        1107
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */
@@ -795,5 +818,67 @@ void vm_ecall_set_fallback(VmEcallRouter *r, VmEcallHandler fallback);
  * ============================================================ */
 
 void vm_ecall_dispatch(VmEcallRouter *r, VmCpu *cpu, void *system);
+
+/* ============================================================
+ *  Memory introspection record layouts (ABI)
+ *
+ *  Returned by SYS_SLAB_STATS and SYS_VM_STATS. All fields are
+ *  little-endian on the wire (RV32 is LE, host is presumed LE).
+ *  The version field on each struct allows future field
+ *  additions; bumped only if existing field semantics change.
+ * ============================================================ */
+
+#define VM_SLAB_STATS_VERSION  1
+#define VM_VM_STATS_VERSION    1
+
+/* SLAB_BIN_COUNT shadow — must match memory/slab_stack.h.
+ * Don't include slab_stack.h here (vm_ecall.h is the ABI header,
+ * meant to be importable by guests with no host deps). Guests
+ * see this as a fixed constant. */
+#define VM_SLAB_STATS_BIN_COUNT  16
+
+typedef struct {
+    uint16_t version;            /* = VM_SLAB_STATS_VERSION */
+    uint16_t bin_count;          /* = VM_SLAB_STATS_BIN_COUNT */
+
+    /* Local slab — backs per-VM allocations. */
+    uint32_t local_total;        /* slab.total_bytes_managed */
+    uint32_t local_in_use;       /* slab.total_bytes_in_use */
+    uint32_t local_peak;         /* slab.peak_bytes_in_use */
+    uint32_t local_alloc_count;
+    uint32_t local_free_count;
+    uint32_t local_failed_count;
+
+    /* Shared slab — backs SYS_ALLOC. */
+    uint32_t shared_total;
+    uint32_t shared_in_use;
+    uint32_t shared_peak;
+    uint32_t shared_alloc_count;
+    uint32_t shared_free_count;
+    uint32_t shared_failed_count;
+
+    /* Per-bin info. Each entry: bits 0-15 = bucket_count, bits
+     * 16-31 = blocks_in_use. block_size is implicit: bin i has
+     * size (32 << i). */
+    uint32_t local_bins[VM_SLAB_STATS_BIN_COUNT];
+    uint32_t shared_bins[VM_SLAB_STATS_BIN_COUNT];
+} VmSlabStatsRecord;
+
+typedef struct {
+    uint16_t version;            /* = VM_VM_STATS_VERSION */
+    uint16_t vm_id;
+    uint8_t  state;              /* 0=halted, 1=runnable, 2=blocked */
+    uint8_t  in_critical;        /* 0/1 */
+    uint8_t  alloc_count;        /* SYS_ALLOC blocks currently held */
+    uint8_t  _pad;
+    uint32_t text_bytes;         /* CODE region length */
+    uint32_t rodata_bytes;       /* RODATA region length */
+    uint32_t data_bytes;         /* DATA region length */
+    uint32_t mailbox_bytes;      /* mailbox storage size */
+    uint32_t instructions_retired_lo;
+    uint32_t instructions_retired_hi;
+    uint32_t trap_count;
+    uint32_t ecall_count;
+} VmVmStatsRecord;
 
 #endif /* VM_ECALL_H */

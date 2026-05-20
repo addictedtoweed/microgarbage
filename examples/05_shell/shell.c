@@ -42,6 +42,8 @@
 #define SYS_FFLUSH     82
 #define SYS_EXIT       93
 #define SYS_READDIR   120
+#define SYS_SLAB_STATS 1106
+#define SYS_VM_STATS   1107
 #define SYS_YIELD    1040
 #define SYS_SPAWN_AND_WAIT  1104
 #define SYS_TTY_SET_RAW     1105
@@ -169,6 +171,66 @@ static inline void sys_exit(int code) {
     register int a7 asm("a7") = SYS_EXIT;
     asm volatile ("ecall" :: "r"(a0), "r"(a7));
     __builtin_unreachable();
+}
+
+/* ============================================================
+ *  Memory introspection (must mirror VmSlabStatsRecord and
+ *  VmVmStatsRecord from include/vm/vm_ecall.h).
+ * ============================================================ */
+
+#define MEMINFO_BIN_COUNT 16
+
+typedef struct {
+    unsigned short version;
+    unsigned short bin_count;
+    unsigned int local_total;
+    unsigned int local_in_use;
+    unsigned int local_peak;
+    unsigned int local_alloc_count;
+    unsigned int local_free_count;
+    unsigned int local_failed_count;
+    unsigned int shared_total;
+    unsigned int shared_in_use;
+    unsigned int shared_peak;
+    unsigned int shared_alloc_count;
+    unsigned int shared_free_count;
+    unsigned int shared_failed_count;
+    unsigned int local_bins[MEMINFO_BIN_COUNT];
+    unsigned int shared_bins[MEMINFO_BIN_COUNT];
+} SlabStats;
+
+typedef struct {
+    unsigned short version;
+    unsigned short vm_id;
+    unsigned char  state;
+    unsigned char  in_critical;
+    unsigned char  alloc_count;
+    unsigned char  _pad;
+    unsigned int   text_bytes;
+    unsigned int   rodata_bytes;
+    unsigned int   data_bytes;
+    unsigned int   mailbox_bytes;
+    unsigned int   instructions_retired_lo;
+    unsigned int   instructions_retired_hi;
+    unsigned int   trap_count;
+    unsigned int   ecall_count;
+} VmStats;
+
+static inline int sys_slab_stats(SlabStats *out) {
+    register unsigned a0 asm("a0") = (unsigned)(unsigned long)out;
+    register unsigned a1 asm("a1") = (unsigned)sizeof(SlabStats);
+    register int      a7 asm("a7") = SYS_SLAB_STATS;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    return (int)a0;
+}
+
+static inline int sys_vm_stats(int vm_id, VmStats *out) {
+    register int      a0 asm("a0") = vm_id;
+    register unsigned a1 asm("a1") = (unsigned)(unsigned long)out;
+    register unsigned a2 asm("a2") = (unsigned)sizeof(VmStats);
+    register int      a7 asm("a7") = SYS_VM_STATS;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return a0;
 }
 
 /* Spawn another ELF as a child VM and block until it exits.
@@ -666,6 +728,7 @@ static void cmd_help(void) {
     putln("  write <path> <text>  write text to file (truncating)");
     putln("  run <path>           load and execute an ELF as a child VM");
     putln("  history              show recent commands");
+    putln("  meminfo              show slab allocator + per-VM stats");
     putln("  help                 this message");
     putln("  exit                 leave shell");
     putln("");
@@ -693,6 +756,118 @@ static void cmd_history(void) {
         puts_(p);
         puts_("  ");
         putln(line);
+    }
+}
+
+/* Print a number right-aligned in W columns. Truncates at 24 digits. */
+static void put_num_right(unsigned v, unsigned width) {
+    char buf[24];
+    char *p = fmt_u32(v, buf + sizeof(buf));
+    unsigned len = (unsigned)((buf + sizeof(buf) - 1) - p);
+    while (len < width) { puts_(" "); width--; }
+    puts_(p);
+}
+
+/* Print a byte count with a 'K' suffix when ≥ 1024, else as bytes. */
+static void put_bytes(unsigned v, unsigned width) {
+    char buf[24];
+    if (v >= 1024) {
+        /* Build the digit string, then append 'K' just before the
+         * null. fmt_u32 writes the terminator at buf_end-1 and the
+         * first digit somewhere earlier; we slide a 'K' in by
+         * formatting one byte before the end and overwriting the
+         * resulting null. */
+        char *p = fmt_u32(v / 1024, buf + sizeof(buf) - 1);
+        /* buf_end-2 is where the null currently sits (since the
+         * helper was given buf+sizeof-1 as buf_end). Replace with
+         * 'K', re-null at the next slot. */
+        buf[sizeof(buf) - 2] = 'K';
+        buf[sizeof(buf) - 1] = '\0';
+        unsigned len = (unsigned)((buf + sizeof(buf) - 1) - p);
+        while (len < width) { puts_(" "); width--; }
+        puts_(p);
+    } else {
+        put_num_right(v, width);
+    }
+}
+
+static void cmd_meminfo(void) {
+    SlabStats st;
+    int n = sys_slab_stats(&st);
+    if (n < 0) {
+        putln("meminfo: SYS_SLAB_STATS failed");
+        return;
+    }
+
+    /* Summary lines. */
+    putln("slab allocators:");
+    puts_("  local  ");
+    put_bytes(st.local_in_use, 6);
+    puts_(" / ");
+    put_bytes(st.local_total, 6);
+    puts_("   peak ");
+    put_bytes(st.local_peak, 6);
+    puts_("   allocs ");
+    put_num_right(st.local_alloc_count, 4);
+    puts_("   frees ");
+    put_num_right(st.local_free_count, 4);
+    putln("");
+
+    puts_("  shared ");
+    put_bytes(st.shared_in_use, 6);
+    puts_(" / ");
+    put_bytes(st.shared_total, 6);
+    puts_("   peak ");
+    put_bytes(st.shared_peak, 6);
+    puts_("   allocs ");
+    put_num_right(st.shared_alloc_count, 4);
+    puts_("   frees ");
+    put_num_right(st.shared_free_count, 4);
+    putln("");
+
+    /* Per-bin breakdown for non-empty bins. */
+    putln("");
+    putln("bins (size | local in_use/count | shared in_use/count):");
+    for (unsigned i = 0; i < MEMINFO_BIN_COUNT; i++) {
+        unsigned lc = st.local_bins[i] & 0xFFFFu;
+        unsigned li = (st.local_bins[i] >> 16) & 0xFFFFu;
+        unsigned sc = st.shared_bins[i] & 0xFFFFu;
+        unsigned si = (st.shared_bins[i] >> 16) & 0xFFFFu;
+        if (lc == 0 && sc == 0) continue;
+        unsigned block = 32u << i;
+        puts_("  ");
+        put_bytes(block, 6);
+        puts_("   ");
+        put_num_right(li, 3);
+        puts_(" / ");
+        put_num_right(lc, 3);
+        puts_("           ");
+        put_num_right(si, 3);
+        puts_(" / ");
+        put_num_right(sc, 3);
+        putln("");
+    }
+
+    /* Per-VM info. Iterate from 0 until we hit a not-found. */
+    putln("");
+    putln("VMs (id  text   rodata data   mbox   allocs):");
+    for (int id = 0; id < 16; id++) {
+        VmStats vs;
+        int r = sys_vm_stats(id, &vs);
+        if (r < 0) continue;          /* slot empty */
+        puts_("  ");
+        put_num_right((unsigned)vs.vm_id, 2);
+        puts_("   ");
+        put_bytes(vs.text_bytes, 5);
+        puts_("  ");
+        put_bytes(vs.rodata_bytes, 5);
+        puts_("  ");
+        put_bytes(vs.data_bytes, 5);
+        puts_("  ");
+        put_bytes(vs.mailbox_bytes, 5);
+        puts_("  ");
+        put_num_right(vs.alloc_count, 4);
+        putln("");
     }
 }
 
@@ -923,6 +1098,7 @@ static void dispatch(char *line) {
     else if (scmp(argv[0], "write") == 0) cmd_write(argc, argv);
     else if (scmp(argv[0], "run")   == 0) cmd_run(argc, argv);
     else if (scmp(argv[0], "history") == 0) cmd_history();
+    else if (scmp(argv[0], "meminfo") == 0) cmd_meminfo();
     else if (scmp(argv[0], "exit")  == 0 || scmp(argv[0], "quit") == 0) {
         putln("bye");
         cursor_reset_default();

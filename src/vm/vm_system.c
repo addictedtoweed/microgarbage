@@ -100,6 +100,56 @@ static inline bool addr_in_shared(uint32_t guest_addr) {
  *  the VmSystem* set during vm_system_init.
  * ============================================================ */
 
+/* ============================================================
+ *  Per-VM SYS_ALLOC tracking helpers
+ *
+ *  When a guest calls SYS_ALLOC, the host records the block
+ *  pointer in sys->alloc_tracking[vm_id]. When the guest calls
+ *  SYS_FREE, the host removes it. If the guest terminates with
+ *  any allocations still tracked, vm_system_unload_vm walks the
+ *  list and frees them — preventing shared-slab leaks across
+ *  spawn/exit cycles.
+ *
+ *  Storage cap is VM_PER_VM_ALLOC_CAP entries per VM. Beyond
+ *  that, SYS_ALLOC returns -ENOMEM even if the slab itself has
+ *  space. This bounds the host's tracking memory and turns
+ *  "guest leaks unboundedly" into a fail-loud condition.
+ * ============================================================ */
+
+/* Add a host pointer to the tracking list for a given vm_id.
+ * Returns true on success, false if the list is full or the
+ * vm_id is invalid. */
+static bool track_alloc(VmSystem *sys, uint16_t vm_id, void *host_p) {
+    if (vm_id >= VM_SCHED_MAX_VMS) return false;
+    VmAllocTracking *t = &sys->alloc_tracking[vm_id];
+    if (t->count >= VM_PER_VM_ALLOC_CAP) return false;
+    for (uint8_t i = 0; i < VM_PER_VM_ALLOC_CAP; i++) {
+        if (t->blocks[i] == NULL) {
+            t->blocks[i] = host_p;
+            t->count++;
+            return true;
+        }
+    }
+    /* Count says space but no NULL slot — internal inconsistency. */
+    return false;
+}
+
+/* Remove a host pointer from the tracking list. Returns true if
+ * found and removed, false if the pointer wasn't tracked (likely
+ * a double-free or alien pointer). */
+static bool untrack_alloc(VmSystem *sys, uint16_t vm_id, void *host_p) {
+    if (vm_id >= VM_SCHED_MAX_VMS) return false;
+    VmAllocTracking *t = &sys->alloc_tracking[vm_id];
+    for (uint8_t i = 0; i < VM_PER_VM_ALLOC_CAP; i++) {
+        if (t->blocks[i] == host_p) {
+            t->blocks[i] = NULL;
+            t->count--;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* SYS_ALLOC (a7 = 1056)
  *   a0 = size
  *   → a0 = guest pointer in shared region, or -ENOMEM / -EINVAL */
@@ -113,8 +163,24 @@ static void handle_alloc(VmCpu *cpu, void *system_p) {
         return;
     }
 
+    /* Check the per-VM tracking cap BEFORE allocating, so we
+     * don't leak a slab block if tracking fails. */
+    if (sys->alloc_tracking[cpu->vm_id].count >= VM_PER_VM_ALLOC_CAP) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_ENOMEM);
+        return;
+    }
+
     void *host_p = slab_alloc(sys->shared_slab, size);
     if (!host_p) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_ENOMEM);
+        return;
+    }
+
+    /* Record the allocation for auto-cleanup on VM termination. */
+    if (!track_alloc(sys, cpu->vm_id, host_p)) {
+        /* Tracking failed despite the pre-check — release and
+         * report ENOMEM. Shouldn't reach here in practice. */
+        slab_free(sys->shared_slab, host_p);
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_ENOMEM);
         return;
     }
@@ -126,6 +192,8 @@ static void handle_alloc(VmCpu *cpu, void *system_p) {
     uintptr_t ptr  = (uintptr_t)host_p;
     if (ptr < base || ptr - base >= sys->config.shared_storage_size) {
         /* Shouldn't happen — the slab is bounded by the region. */
+        untrack_alloc(sys, cpu->vm_id, host_p);
+        slab_free(sys->shared_slab, host_p);
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_ENOMEM);
         return;
     }
@@ -153,6 +221,15 @@ static void handle_free(VmCpu *cpu, void *system_p) {
     }
 
     void *host_p = (uint8_t *)sys->config.shared_storage + offset;
+
+    /* Remove from this VM's tracking list. If the pointer isn't
+     * tracked, it's either a double-free or a free across vm_ids
+     * — reject either way. */
+    if (!untrack_alloc(sys, cpu->vm_id, host_p)) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EINVAL);
+        return;
+    }
+
     SlabResult r = slab_free(sys->shared_slab, host_p);
     if (r != SLAB_OK) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EINVAL);
@@ -580,6 +657,138 @@ static void handle_yield_until_reload(VmCpu *cpu, void *system_p) {
 }
 
 /* ============================================================
+ *  Memory introspection handlers
+ * ============================================================ */
+
+/* Pack a SlabBinInfo into the wire format: low 16 bits = count,
+ * high 16 bits = in_use. */
+static uint32_t pack_bin_info(const SlabBinInfo *b) {
+    uint32_t bc = b->bucket_count;
+    uint32_t iu = b->blocks_in_use;
+    return (bc & 0xFFFFu) | ((iu & 0xFFFFu) << 16);
+}
+
+/* SYS_SLAB_STATS (a7 = 1106)
+ *   a0 = guest pointer to VmSlabStatsRecord
+ *   a1 = buffer size in bytes
+ *   → a0 = bytes written, or -EINVAL / -EFAULT */
+static void handle_slab_stats(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys) return;
+
+    uint32_t guest_ptr  = cpu->regs[VM_REG_A0];
+    uint32_t buf_size   = cpu->regs[VM_REG_A1];
+
+    if (buf_size < sizeof(VmSlabStatsRecord)) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EINVAL);
+        return;
+    }
+
+    void *host_buf = vm_translate_write(cpu, guest_ptr,
+                                         sizeof(VmSlabStatsRecord));
+    if (!host_buf) {
+        cpu->trap_cause = TRAP_NONE;
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
+        return;
+    }
+
+    VmSlabStatsRecord rec = {0};
+    rec.version   = VM_SLAB_STATS_VERSION;
+    rec.bin_count = VM_SLAB_STATS_BIN_COUNT;
+
+    const SlabAllocator *ls = sys->local_slab;
+    rec.local_total        = (uint32_t)ls->total_bytes_managed;
+    rec.local_in_use       = (uint32_t)ls->total_bytes_in_use;
+    rec.local_peak         = (uint32_t)ls->peak_bytes_in_use;
+    rec.local_alloc_count  = ls->alloc_count;
+    rec.local_free_count   = ls->free_count;
+    rec.local_failed_count = ls->failed_alloc_count;
+
+    const SlabAllocator *ss = sys->shared_slab;
+    rec.shared_total        = (uint32_t)ss->total_bytes_managed;
+    rec.shared_in_use       = (uint32_t)ss->total_bytes_in_use;
+    rec.shared_peak         = (uint32_t)ss->peak_bytes_in_use;
+    rec.shared_alloc_count  = ss->alloc_count;
+    rec.shared_free_count   = ss->free_count;
+    rec.shared_failed_count = ss->failed_alloc_count;
+
+    for (int i = 0; i < VM_SLAB_STATS_BIN_COUNT && i < SLAB_BIN_COUNT; i++) {
+        rec.local_bins[i]  = pack_bin_info(&ls->bins[i]);
+        rec.shared_bins[i] = pack_bin_info(&ss->bins[i]);
+    }
+
+    memcpy(host_buf, &rec, sizeof(rec));
+    cpu->regs[VM_REG_A0] = (uint32_t)sizeof(VmSlabStatsRecord);
+}
+
+/* SYS_VM_STATS (a7 = 1107)
+ *   a0 = vm_id (0xFFFF = self)
+ *   a1 = guest pointer to VmVmStatsRecord
+ *   a2 = buffer size in bytes
+ *   → a0 = bytes written, or -EINVAL / -EFAULT / -ENOENT */
+static void handle_vm_stats(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys) return;
+
+    uint32_t arg_vm_id  = cpu->regs[VM_REG_A0];
+    uint32_t guest_ptr  = cpu->regs[VM_REG_A1];
+    uint32_t buf_size   = cpu->regs[VM_REG_A2];
+
+    if (buf_size < sizeof(VmVmStatsRecord)) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EINVAL);
+        return;
+    }
+
+    uint16_t target_id;
+    if (arg_vm_id == 0xFFFFu) {
+        target_id = cpu->vm_id;
+    } else if (arg_vm_id >= VM_SCHED_MAX_VMS) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EINVAL);
+        return;
+    } else {
+        target_id = (uint16_t)arg_vm_id;
+    }
+
+    VmCpu *target = sys->vms[target_id];
+    if (!target) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_ENOENT);
+        return;
+    }
+
+    void *host_buf = vm_translate_write(cpu, guest_ptr,
+                                         sizeof(VmVmStatsRecord));
+    if (!host_buf) {
+        cpu->trap_cause = TRAP_NONE;
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
+        return;
+    }
+
+    VmVmStatsRecord rec = {0};
+    rec.version     = VM_VM_STATS_VERSION;
+    rec.vm_id       = target_id;
+    rec.state       = target->halted ? 0 : (target->block_reason ? 2 : 1);
+    rec.in_critical = target->in_critical ? 1 : 0;
+    rec.alloc_count = sys->alloc_tracking[target_id].count;
+
+    rec.text_bytes    = target->regions[VM_REGION_CODE].length;
+    rec.rodata_bytes  = target->regions[VM_REGION_RODATA].length;
+    rec.data_bytes    = target->regions[VM_REGION_DATA].length;
+
+    const VmMailbox *mb = &sys->mailboxes[target_id];
+    rec.mailbox_bytes = (uint32_t)(mb->_fifo.rb.capacity *
+                                    mb->_fifo.rb.element_size);
+
+    rec.instructions_retired_lo = (uint32_t)(target->instructions_retired);
+    rec.instructions_retired_hi =
+        (uint32_t)(target->instructions_retired >> 32);
+    rec.trap_count  = target->trap_count;
+    rec.ecall_count = target->ecall_count;
+
+    memcpy(host_buf, &rec, sizeof(rec));
+    cpu->regs[VM_REG_A0] = (uint32_t)sizeof(VmVmStatsRecord);
+}
+
+/* ============================================================
  *  Install all the system-context handlers.
  *
  *  Best-effort all-or-nothing: rolls back on the first failure.
@@ -600,6 +809,8 @@ static bool install_system_handlers(VmEcallRouter *r) {
         { SYS_SLEEP_UNTIL,          handle_sleep_until        },
         { SYS_SET_RELOAD_PERIOD,    handle_set_reload_period  },
         { SYS_YIELD_UNTIL_RELOAD,   handle_yield_until_reload },
+        { SYS_SLAB_STATS,           handle_slab_stats         },
+        { SYS_VM_STATS,             handle_vm_stats           },
     };
     size_t n = sizeof(entries) / sizeof(entries[0]);
 
@@ -820,6 +1031,13 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
     }
     sys->vms[assigned] = cpu;
 
+    /* Zero the per-VM alloc tracking for this slot. vm_system_unload_vm
+     * should have already cleared it, but be defensive — a slot
+     * could be reused after a prior load failure that didn't go
+     * through unload. */
+    memset(&sys->alloc_tracking[assigned], 0,
+           sizeof(sys->alloc_tracking[assigned]));
+
     size_t mbox_storage_bytes = vm_mailbox_required_storage_bytes(
         mailbox_slot_size, mailbox_depth);
     if (mbox_storage_bytes == 0) {
@@ -939,6 +1157,22 @@ bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id) {
                      * wasn't slab-allocated (XIP). */
         r->base = NULL;
         r->length = 0;
+    }
+
+    /* Walk the per-VM SYS_ALLOC tracking and free any blocks the
+     * guest didn't free explicitly. Without this, every spawn that
+     * leaks a block permanently consumes shared-slab space. */
+    {
+        VmAllocTracking *t = &sys->alloc_tracking[vm_id];
+        if (t->count > 0) {
+            for (uint8_t i = 0; i < VM_PER_VM_ALLOC_CAP; i++) {
+                if (t->blocks[i]) {
+                    slab_free(sys->shared_slab, t->blocks[i]);
+                    t->blocks[i] = NULL;
+                }
+            }
+            t->count = 0;
+        }
     }
 
     /* Free the mailbox storage. The mailbox wraps a FifoQueue

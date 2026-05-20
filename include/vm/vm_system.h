@@ -191,6 +191,24 @@ typedef struct {
  *  inspected; the rest are internal.
  * ============================================================ */
 
+/* Per-VM tracking of SYS_ALLOC blocks. The auto-cleanup path on
+ * vm_system_unload_vm walks this list and frees each entry — so
+ * a guest that crashes or exits without freeing its allocations
+ * doesn't leak shared-slab memory.
+ *
+ * Storage: a fixed-size array of host pointers per VM. Cap at
+ * VM_PER_VM_ALLOC_CAP entries; SYS_ALLOC returns -ENOMEM if the
+ * VM already holds that many. The cap is intentional — it makes
+ * the tracking memory bounded at startup and turns "guest leaks
+ * unboundedly" into a fail-loud condition. */
+#define VM_PER_VM_ALLOC_CAP  32
+
+typedef struct {
+    /* host pointers (NOT guest addresses). NULL entry = free slot. */
+    void   *blocks[VM_PER_VM_ALLOC_CAP];
+    uint8_t count;       /* number of non-NULL entries */
+} VmAllocTracking;
+
 typedef struct {
     /* === Public read-only — pointers to internal subsystems === */
 
@@ -241,6 +259,11 @@ typedef struct {
      * (no extra indirection); its storage buffer comes from the
      * bump arena. */
     VmMailbox mailboxes[VM_SCHED_MAX_VMS];
+
+    /* Per-VM tracking of SYS_ALLOC blocks (shared-slab pointers).
+     * vm_system_unload_vm walks each VM's list and frees any
+     * entries the guest didn't free explicitly. */
+    VmAllocTracking alloc_tracking[VM_SCHED_MAX_VMS];
 
 } VmSystem;
 
