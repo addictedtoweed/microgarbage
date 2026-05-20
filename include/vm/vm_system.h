@@ -137,6 +137,21 @@ typedef struct {
     uint32_t baseline_quantum;       /* default 5000  */
     uint32_t max_critical_overrun;   /* default 50000 */
 
+    /* === External tick source (NULL = step-counted ticks) ===
+     *
+     * Lets the host back ticks with a real-time source — a 1 ms
+     * SysTick on a microcontroller, clock_gettime on a PC. See
+     * VmSchedConfig for full details. The scheduler reads from
+     * this callback on each step and reports its rate via
+     * SYS_TICK_HZ to guests.
+     *
+     * If tick_source is NULL, ticks accumulate as retired
+     * instructions (today's default). In that mode SYS_TICK_HZ
+     * returns 0 so guests can detect the absence of real-time. */
+    uint32_t (*tick_source)(void *userdata);
+    void     *tick_source_userdata;
+    uint32_t  ticks_per_second;
+
     /* === Handler callbacks (NULL = defaults) === */
     VmTrapHandler trap_handler;
     VmIdleHandler idle_handler;

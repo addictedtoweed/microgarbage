@@ -201,6 +201,17 @@ void vm_sched_halt(VmSched *s, uint16_t vm_id) {
  *  deadline (e.g., all are BLOCK_MAILBOX_RECV with no timeout).
  * ============================================================ */
 
+/* Wraparound-safe "now has reached deadline" comparison.
+ *
+ * Treat now and deadline as unsigned 32-bit timestamps that can
+ * wrap. The signed-subtract idiom is safe as long as the gap
+ * between them is less than 2^31 ticks (≈24 days at 1 ms). For
+ * any practical sleep duration that's never violated.
+ */
+static inline bool tick_reached(uint32_t now, uint32_t deadline) {
+    return (int32_t)(now - deadline) >= 0;
+}
+
 static uint32_t wake_expired_timeouts(VmSched *s) {
     uint32_t next_deadline_delta = UINT32_MAX;
     VmSchedBitmap blocked = s->blocked;
@@ -225,7 +236,7 @@ static uint32_t wake_expired_timeouts(VmSched *s) {
             break;
 
         case BLOCK_SLEEP:
-            if (s->global_tick >= cpu->block_deadline) {
+            if (tick_reached(s->global_tick, cpu->block_deadline)) {
                 wake = true;
                 a0_value = 0;
             } else {
@@ -238,7 +249,7 @@ static uint32_t wake_expired_timeouts(VmSched *s) {
             /* Only times out if block_deadline is non-zero. A
              * deadline of 0 means "wait indefinitely". */
             if (cpu->block_deadline != 0) {
-                if (s->global_tick >= cpu->block_deadline) {
+                if (tick_reached(s->global_tick, cpu->block_deadline)) {
                     wake = true;
                     a0_value = -(int32_t)VM_ETIMEDOUT;
                 } else {
@@ -387,7 +398,15 @@ VmSchedStepResult vm_sched_step(VmSched *s) {
         VmStepResult r = vm_step(cpu, budget, &used);
         s->total_quanta_run++;
         s->total_instructions += used;
-        s->global_tick += used;
+
+        /* Update global_tick. If a tick_source callback is set
+         * (host has a real clock), read from it; otherwise fall
+         * back to "ticks == retired instructions". */
+        if (s->config.tick_source) {
+            s->global_tick = s->config.tick_source(s->config.tick_source_userdata);
+        } else {
+            s->global_tick += used;
+        }
 
         if (r == VM_STEP_QUANTUM_EXPIRED) {
             if (cpu->in_critical) {
@@ -500,9 +519,16 @@ bool vm_sched_run(VmSched *s, uint64_t max_cycles) {
             /* Look ahead to find the next deadline */
             uint32_t delta = wake_expired_timeouts(s);
             s->config.idle_handler(delta, s->config.system);
-            /* Advance global_tick by 1 so SLEEP timeouts can
-             * eventually fire even when no VM is running. */
-            s->global_tick++;
+            /* With an external tick source, the host's clock
+             * advances on its own — we just resample on the next
+             * scheduler step. Without one, we bump global_tick by
+             * 1 so SLEEP timeouts can eventually fire even when
+             * no VM is running. */
+            if (!s->config.tick_source) {
+                s->global_tick++;
+            } else {
+                s->global_tick = s->config.tick_source(s->config.tick_source_userdata);
+            }
         }
     }
     return false;

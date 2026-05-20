@@ -247,6 +247,34 @@ typedef struct {
      * ECALLs through this when vm_step returns VM_STEP_ECALL. */
     VmEcallRouter *ecall_router;
 
+    /* === External tick source (optional) ===
+     *
+     * If non-NULL, the scheduler reads global_tick from this
+     * callback instead of incrementing it by retired instructions
+     * on each step. Use this to back ticks with a real-time
+     * source — a 1 ms SysTick on a microcontroller, or
+     * clock_gettime(CLOCK_MONOTONIC) on a PC.
+     *
+     * Behavior:
+     *   - tick_source != NULL: global_tick = tick_source(userdata)
+     *     refreshed on each scheduler step. ticks_per_second tells
+     *     guests how to interpret tick deltas. SYS_TICK_HZ returns
+     *     ticks_per_second.
+     *   - tick_source == NULL: global_tick increments by the number
+     *     of guest instructions retired on each step (today's
+     *     behavior, abstract). SYS_TICK_HZ returns 0 (unknown).
+     *
+     * The callback should be fast — it's called from inside the
+     * scheduler's hot path. A function that just reads a memory-
+     * mapped counter (HAL_GetTick, DWT->CYCCNT) is ideal.
+     *
+     * The userdata pointer is passed through unchanged; useful if
+     * the callback needs context (e.g., pointer to a TIM peripheral).
+     */
+    uint32_t (*tick_source)(void *userdata);
+    void     *tick_source_userdata;
+    uint32_t  ticks_per_second;
+
     /* Opaque pointer passed to all handler callbacks. Typically
      * the VmSystem struct from vm_system.h. */
     void *system;

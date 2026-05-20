@@ -734,6 +734,233 @@ static void test_local_bytes_used_grows(void) {
 }
 
 /* ============================================================
+ *  Timer / clock syscalls
+ *
+ *  Tests SYS_TICKS_NOW, SYS_TICK_HZ, SYS_SLEEP_TICKS, SYS_SLEEP_UNTIL.
+ *  We test the syscall handlers directly (driving cpu state + dispatch)
+ *  rather than building a guest ELF; cleaner since these handlers
+ *  primarily mutate CPU/scheduler state rather than producing a
+ *  computed value that propagates through registers across many
+ *  instructions.
+ * ============================================================ */
+
+/* Test tick_source: a captured value the host increments manually
+ * between steps. */
+static uint32_t g_fake_ticks = 0;
+static uint32_t fake_tick_source(void *userdata) {
+    (void)userdata;
+    return g_fake_ticks;
+}
+
+static void test_tick_hz_zero_without_source(void) {
+    /* No tick_source configured → SYS_TICK_HZ returns 0. */
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A7] = 1044;  /* SYS_TICK_HZ */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_tick_hz_returns_configured_value(void) {
+    g_fake_ticks = 0;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A7] = 1044;  /* SYS_TICK_HZ */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(1000, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_ticks_now_reads_scheduler_tick(void) {
+    g_fake_ticks = 0;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    /* Seed scheduler's global_tick (would normally be set on next
+     * scheduler step). For this direct-handler test we set it
+     * explicitly. */
+    sys.sched->global_tick = 12345;
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A7] = 1043;  /* SYS_TICKS_NOW */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(12345, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_sleep_ticks_sets_block_sleep(void) {
+    g_fake_ticks = 100;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    sys.sched->global_tick = 100;
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A0] = 50;
+    cpu.regs[REG_A7] = 1045;  /* SYS_SLEEP_TICKS */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* Should be set to BLOCK_SLEEP with deadline = now + 50. */
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(150, (int)cpu.block_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_sleep_ticks_zero_yields(void) {
+    g_fake_ticks = 100;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    sys.sched->global_tick = 100;
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A0] = 0;
+    cpu.regs[REG_A7] = 1045;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* n=0 is YIELD. */
+    ASSERT_EQ_INT((int)BLOCK_YIELDED, (int)cpu.block_reason);
+    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_sleep_until_future_blocks(void) {
+    g_fake_ticks = 100;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    sys.sched->global_tick = 100;
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A0] = 200;  /* deadline 100 ticks ahead */
+    cpu.regs[REG_A7] = 1046;  /* SYS_SLEEP_UNTIL */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(200, (int)cpu.block_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_sleep_until_past_yields(void) {
+    g_fake_ticks = 100;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    sys.sched->global_tick = 100;
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A0] = 50;  /* deadline already past */
+    cpu.regs[REG_A7] = 1046;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* Past deadline → yield instead of indefinite block. */
+    ASSERT_EQ_INT((int)BLOCK_YIELDED, (int)cpu.block_reason);
+    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_sleep_until_wraparound_safe(void) {
+    /* If global_tick is near UINT32_MAX and deadline is just past
+     * the wrap (e.g., 5), we should treat the deadline as in the
+     * future, not the past. Tested via the signed-subtract idiom. */
+    g_fake_ticks = 0xFFFFFFF0;
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+    sys.sched->global_tick = 0xFFFFFFF0;
+
+    VmCpu cpu;
+    vm_init(&cpu, 0);
+    cpu.regs[REG_A0] = 5;  /* deadline = 5 = "0xFFFFFFF0 + 21" mod 2^32 */
+    cpu.regs[REG_A7] = 1046;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* Should treat as 21 ticks in the future, not "way in the past." */
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(5, (int)cpu.block_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+
+
+/* ============================================================
  *  Test runner
  * ============================================================ */
 
@@ -766,6 +993,16 @@ int main(void) {
 
     /* Arena */
     RUN(test_local_bytes_used_grows);
+
+    /* Timer / clock syscalls */
+    RUN(test_tick_hz_zero_without_source);
+    RUN(test_tick_hz_returns_configured_value);
+    RUN(test_ticks_now_reads_scheduler_tick);
+    RUN(test_sleep_ticks_sets_block_sleep);
+    RUN(test_sleep_ticks_zero_yields);
+    RUN(test_sleep_until_future_blocks);
+    RUN(test_sleep_until_past_yields);
+    RUN(test_sleep_until_wraparound_safe);
 
     /* Suppress unused warnings */
     (void)sw_; (void)lw_;

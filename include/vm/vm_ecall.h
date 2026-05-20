@@ -186,6 +186,45 @@
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */
 #define SYS_CRITICAL_EXIT   1042   /* end non-preemptible region */
 
+/* --- Timer / clock (1043..1055) ---
+ *
+ * Provide a guest-visible monotonic tick counter and primitives
+ * for sleeping until a deadline. The tick is owned by the host:
+ * the scheduler optionally reads from a host-provided callback
+ * (typically a millisecond SysTick on a microcontroller, or
+ * clock_gettime on a PC). See VmSystemConfig.tick_source.
+ *
+ * Tick semantics:
+ *   - global_tick is uint32; it can wrap (about 49.7 days at
+ *     1 ms). Wraparound-safe comparisons are used internally.
+ *   - SYS_TICK_HZ returns the configured ticks-per-second (e.g.,
+ *     1000 for a 1 ms tick) or 0 if the host hasn't configured a
+ *     tick_source. A guest seeing 0 should fall back to "ticks
+ *     are abstract"; useful for diagnostics.
+ *   - Granularity is "close enough": cooperative scheduling means
+ *     a sleeping VM wakes whenever the scheduler next gets to it
+ *     after the deadline, not at the deadline exactly. Slack is
+ *     bounded by quantum length and other VMs' work.
+ *
+ * Typical autoreload (periodic) loop in a guest:
+ *
+ *     uint32_t period = sys_tick_hz() / 10;     // 10 Hz
+ *     uint32_t next   = sys_ticks_now() + period;
+ *     while (!quit) {
+ *         do_frame();
+ *         sys_sleep_until(next);
+ *         next += period;
+ *     }
+ *
+ * SYS_SLEEP_UNTIL is the right primitive here — it absolute-
+ * targets the deadline, so a slow frame doesn't accumulate
+ * drift across iterations.
+ */
+#define SYS_TICKS_NOW       1043   /* () → current global_tick */
+#define SYS_TICK_HZ         1044   /* () → ticks_per_second (0 if unset) */
+#define SYS_SLEEP_TICKS     1045   /* (n) → block for n ticks; 0 = yield */
+#define SYS_SLEEP_UNTIL     1046   /* (deadline) → block until tick >= deadline */
+
 /* --- Shared-region allocator (1056..1071) --- */
 #define SYS_ALLOC           1056   /* allocate from shared region */
 #define SYS_FREE            1057   /* free to shared region */

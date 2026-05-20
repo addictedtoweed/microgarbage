@@ -416,6 +416,79 @@ static void handle_whitelist_remove(VmCpu *cpu, void *system_p) {
 }
 
 /* ============================================================
+ *  Timer / clock handlers
+ *
+ *  All four read from the scheduler's global_tick (which the
+ *  host's tick_source callback owns — see VmSystemConfig).
+ *  SLEEP variants set BLOCK_SLEEP + block_deadline; the
+ *  scheduler's wake_expired_timeouts handles the rest.
+ * ============================================================ */
+
+/* SYS_TICKS_NOW (1043)
+ *   () → a0 = current global_tick */
+static void handle_ticks_now(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys || !sys->sched) return;
+    cpu->regs[VM_REG_A0] = sys->sched->global_tick;
+}
+
+/* SYS_TICK_HZ (1044)
+ *   () → a0 = configured ticks_per_second (0 if no real-time
+ *             tick_source was provided) */
+static void handle_tick_hz(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys || !sys->sched) return;
+    cpu->regs[VM_REG_A0] = sys->sched->config.ticks_per_second;
+}
+
+/* SYS_SLEEP_TICKS (1045)
+ *   a0 = n        sleep for n ticks
+ *   → on wake: a0 = 0
+ *
+ * n == 0 is equivalent to SYS_YIELD (give someone else a turn,
+ * resume on the next cycle). */
+static void handle_sleep_ticks(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys || !sys->sched) return;
+
+    uint32_t n = cpu->regs[VM_REG_A0];
+
+    if (n == 0) {
+        cpu->regs[VM_REG_A0] = 0;
+        cpu->block_reason = BLOCK_YIELDED;
+        return;
+    }
+
+    cpu->block_reason = BLOCK_SLEEP;
+    cpu->block_deadline = sys->sched->global_tick + n;
+    /* a0 will be set to 0 by the scheduler on wake. */
+}
+
+/* SYS_SLEEP_UNTIL (1046)
+ *   a0 = deadline       block until global_tick >= deadline
+ *   → on wake: a0 = 0
+ *
+ * If deadline is already in the past (within 2^31 ticks), wake
+ * on the next scheduler pass — same as YIELD. Wraparound-safe:
+ * uses signed-subtract comparison. */
+static void handle_sleep_until(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys || !sys->sched) return;
+
+    uint32_t deadline = cpu->regs[VM_REG_A0];
+    uint32_t now      = sys->sched->global_tick;
+
+    if ((int32_t)(now - deadline) >= 0) {
+        cpu->regs[VM_REG_A0] = 0;
+        cpu->block_reason = BLOCK_YIELDED;
+        return;
+    }
+
+    cpu->block_reason = BLOCK_SLEEP;
+    cpu->block_deadline = deadline;
+}
+
+/* ============================================================
  *  Install all the system-context handlers.
  *
  *  Best-effort all-or-nothing: rolls back on the first failure.
@@ -430,6 +503,10 @@ static bool install_system_handlers(VmEcallRouter *r) {
         { SYS_MAILBOX_INFO,     handle_mailbox_info    },
         { SYS_WHITELIST_ADD,    handle_whitelist_add   },
         { SYS_WHITELIST_REMOVE, handle_whitelist_remove},
+        { SYS_TICKS_NOW,        handle_ticks_now       },
+        { SYS_TICK_HZ,          handle_tick_hz         },
+        { SYS_SLEEP_TICKS,      handle_sleep_ticks     },
+        { SYS_SLEEP_UNTIL,      handle_sleep_until     },
     };
     size_t n = sizeof(entries) / sizeof(entries[0]);
 
@@ -520,6 +597,9 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
         .idle_handler         = sys->config.idle_handler,
         .ecall_router         = sys->ecall_router,
         .system               = sys,   /* what the handlers receive */
+        .tick_source          = sys->config.tick_source,
+        .tick_source_userdata = sys->config.tick_source_userdata,
+        .ticks_per_second     = sys->config.ticks_per_second,
     };
     vm_sched_init(sys->sched, &sched_cfg);
 
