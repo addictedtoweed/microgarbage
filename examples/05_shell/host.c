@@ -30,6 +30,8 @@
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_fs.h"
+#include "vm/vm_ecall.h"
+#include "vm/vm_core.h"
 #include "storage/trashdrive.h"
 #include "storage/trashdrive_fatfs.h"
 #include "ff.h"
@@ -47,13 +49,6 @@
 #if defined(__CYGWIN__) || defined(_WIN32)
 #  define PIPE_MODE_SUPPORTED 1
 #  include <windows.h>
-#  include <fcntl.h>       /* O_RDWR */
-#  include <unistd.h>      /* close, ssize_t */
-#  if defined(__CYGWIN__)
-#    include <sys/cygwin.h>   /* cygwin_attach_handle_to_fd */
-#  else
-#    include <io.h>           /* _open_osfhandle on MSVC/MinGW */
-#  endif
 #endif
 
 /* ---------------------------------------------------------------
@@ -139,34 +134,202 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
  *  named-pipe-capable serial client) connects to the pipe and
  *  sees a normal blocking byte stream.
  *
- *  Returns a POSIX fd (>= 0) on success, -1 on error. The bridge
- *  receives this fd via VmHostStdioConfig.stdin_fd_override (and
- *  stdout/stderr equivalents) and uses read()/write() on it
- *  directly — no FILE* wrapping.
+ *  Approach: register our own SYS_READ and SYS_WRITE ECALL
+ *  handlers (replacing the bridge's default ones) that talk
+ *  directly to the HANDLE via Win32 APIs. This avoids two
+ *  Cygwin-specific problems:
  *
- *  Why no FILE*: the bridge calls read(fileno(FILE*), ...) for
- *  the actual I/O, but a Cygwin fopencookie FILE* has no
- *  backing fd (fileno returns -1) and a cygwin_attach_handle_to_fd
- *  fd doesn't reliably round-trip through fdopen (returns EBADF
- *  on some Cygwin versions). The simplest, most portable solution
- *  is to skip the FILE* layer entirely and let the bridge use
- *  raw POSIX I/O on the attached fd.
+ *    1. Attaching a HANDLE to a Cygwin fd via
+ *       cygwin_attach_handle_to_fd works, but read() on that
+ *       fd can block even after fcntl(O_NONBLOCK), because the
+ *       Cygwin POSIX layer may not fully honor non-blocking
+ *       semantics for every kind of attached HANDLE.
+ *    2. fopencookie FILE*s have no backing fd (fileno returns
+ *       -1), which the bridge doesn't tolerate.
  *
- *  Same fd serves stdin, stdout, AND stderr because Windows
- *  named pipes are full-duplex — guest writes to fd=1 and fd=2
- *  both flow to PuTTY interleaved, same as a real serial line.
+ *  By using PeekNamedPipe before each ReadFile, we get
+ *  guaranteed-non-blocking reads on a pipe that remains in
+ *  blocking mode for PuTTY's side (PIPE_NOWAIT would cause
+ *  PuTTY to see EOF immediately and disconnect).
+ *
+ *  We also translate '\n' to '\r\n' on writes — there's no
+ *  terminal driver in the path (OPOST/ONLCR don't apply to
+ *  raw pipes), so the guest's '\n' output would otherwise
+ *  appear in PuTTY as "down one line, same column" instead
+ *  of "down one line, column 1." The translation produces
+ *  cooked-terminal-style line endings.
  *
  *  Why this lives in host.c instead of vm_host_stdio.c:
  *    - Host-application policy (which transport) vs VM-bridge
  *      functionality (how the guest sees stdio)
  *    - Windows-specific; the bridge is portable
- *    - Future hosts (TCP socket, /dev/ttyUSBn, etc.) plug in
- *      here using the same fd-override pattern
+ *    - Future hosts (TCP socket, etc.) plug in here using the
+ *      same custom-handler pattern
  * --------------------------------------------------------------- */
+
+/* Syscall numbers — duplicated from vm_ecall.h for clarity in
+ * this contained section. */
+#define HOST_SYS_READ    63
+#define HOST_SYS_WRITE   64
+#define HOST_SYS_FFLUSH  82
 
 static HANDLE g_pipe_handle = INVALID_HANDLE_VALUE;
 
-static int open_named_pipe_fd(const char *name) {
+/* === Pipe SYS_READ handler ===
+ *
+ * Non-blocking read on the HANDLE via PeekNamedPipe + ReadFile.
+ * Returns:
+ *   > 0  number of bytes read
+ *   = 0  no data available right now (guest polls again later)
+ *   < 0  -EIO on hard error
+ *
+ * The 'no data' case is what makes interactive guests work —
+ * they spin a read+yield loop, and as long as we never block
+ * inside the handler, the spawn pump can step the snake game's
+ * frame loop normally. */
+static void pipe_sys_read(VmCpu *cpu, void *system) {
+    (void)system;
+    if (!cpu) return;
+
+    uint32_t fd = cpu->regs[VM_REG_A0];
+    uint32_t guest_p = cpu->regs[VM_REG_A1];
+    uint32_t n = cpu->regs[VM_REG_A2];
+
+    if (fd != 0) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-9;  /* -EBADF */
+        return;
+    }
+    if (n == 0) {
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+
+    /* PeekNamedPipe tells us how many bytes are queued without
+     * removing them. Zero queued = report 'no data' (read returns
+     * 0) — guest will yield and retry. Nonzero = ReadFile up to
+     * min(want, available), guaranteed not to block. */
+    DWORD avail = 0;
+    if (!PeekNamedPipe(g_pipe_handle, NULL, 0, NULL, &avail, NULL)) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-5;  /* -EIO */
+        return;
+    }
+    if (avail == 0) {
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+
+    /* Bytes ARE available — translate the guest pointer and
+     * read directly into the guest's address space. */
+    void *host_buf = vm_translate_write(cpu, guest_p, n);
+    if (!host_buf) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-14;  /* -EFAULT */
+        return;
+    }
+
+    DWORD want = (DWORD)n;
+    if (want > avail) want = avail;
+    DWORD got = 0;
+    if (!ReadFile(g_pipe_handle, host_buf, want, &got, NULL)) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-5;
+        return;
+    }
+    cpu->regs[VM_REG_A0] = (uint32_t)got;
+}
+
+/* === Pipe SYS_WRITE handler ===
+ *
+ * Writes to the HANDLE via WriteFile, translating '\n' to '\r\n'
+ * so output appears correctly in PuTTY (which has no terminal
+ * driver to do that translation for us).
+ *
+ * The translation uses a small stack-buffered batching strategy:
+ * scan the input for '\n', flush the run before it, emit
+ * '\r\n', then continue. Worst case is one ReadFile per byte
+ * of '\n'-heavy output, which is fine. */
+static void pipe_sys_write(VmCpu *cpu, void *system) {
+    (void)system;
+    if (!cpu) return;
+
+    uint32_t fd = cpu->regs[VM_REG_A0];
+    uint32_t guest_p = cpu->regs[VM_REG_A1];
+    uint32_t n = cpu->regs[VM_REG_A2];
+
+    if (fd != 1 && fd != 2) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-9;  /* -EBADF */
+        return;
+    }
+    if (n == 0) {
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+
+    const void *vbuf = vm_translate_read(cpu, guest_p, n);
+    if (!vbuf) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-14;
+        return;
+    }
+    const char *buf = (const char *)vbuf;
+
+    /* Scan for '\n's. Write the run-up-to-each, then emit '\r\n'. */
+    DWORD written_total = 0;
+    size_t run_start = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] != '\n') continue;
+
+        /* Flush any pending run [run_start .. i) — bytes before
+         * this newline. */
+        if (i > run_start) {
+            DWORD wr = 0;
+            if (!WriteFile(g_pipe_handle, buf + run_start,
+                           (DWORD)(i - run_start), &wr, NULL)) {
+                cpu->regs[VM_REG_A0] = (uint32_t)-5;
+                return;
+            }
+            written_total += wr;
+        }
+        /* Emit "\r\n" for the newline. */
+        DWORD wr = 0;
+        if (!WriteFile(g_pipe_handle, "\r\n", 2, &wr, NULL)) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-5;
+            return;
+        }
+        /* Count one byte (the guest only wrote one '\n', which
+         * we expanded to two — the guest's accounting tracks
+         * its own bytes). */
+        written_total += 1;
+        run_start = i + 1;
+    }
+    /* Flush the trailing run after the last newline. */
+    if (run_start < n) {
+        DWORD wr = 0;
+        if (!WriteFile(g_pipe_handle, buf + run_start,
+                       (DWORD)(n - run_start), &wr, NULL)) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-5;
+            return;
+        }
+        written_total += wr;
+    }
+    cpu->regs[VM_REG_A0] = written_total;
+}
+
+/* === Pipe SYS_FFLUSH handler ===
+ *
+ * No-op: WriteFile on a Windows named pipe doesn't buffer
+ * (the bytes go straight to the kernel pipe object), so
+ * there's nothing for fflush to do. */
+static void pipe_sys_fflush(VmCpu *cpu, void *system) {
+    (void)system;
+    if (!cpu) return;
+    cpu->regs[VM_REG_A0] = 0;
+}
+
+/* Create the named pipe, wait for the client to connect, and
+ * register our SYS_READ/SYS_WRITE/SYS_FFLUSH handlers on the
+ * given VmSystem.
+ *
+ * Returns true on success. On failure, prints a diagnostic and
+ * returns false; the caller should exit. */
+static bool setup_pipe_transport(VmSystem *sys, const char *name) {
     /* Pipe naming: callers can pass either a fully-qualified
      * "\\\\.\\pipe\\foo" or a short "foo". Translate short forms
      * to the full prefix to make the CLI friendlier. */
@@ -193,7 +356,7 @@ static int open_named_pipe_fd(const char *name) {
     if (g_pipe_handle == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "host: CreateNamedPipe('%s') failed (error %lu)\n",
                 full, (unsigned long)GetLastError());
-        return -1;
+        return false;
     }
 
     fprintf(stderr, "host: waiting for client on %s ...\n", full);
@@ -211,39 +374,29 @@ static int open_named_pipe_fd(const char *name) {
                     (unsigned long)err);
             CloseHandle(g_pipe_handle);
             g_pipe_handle = INVALID_HANDLE_VALUE;
-            return -1;
+            return false;
         }
     }
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Attach the HANDLE to a POSIX fd. From here on, read() and
-     * write() on this fd translate to ReadFile/WriteFile on the
-     * HANDLE — no further Windows-specific code needed.
-     *
-     *   - Cygwin: cygwin_attach_handle_to_fd from <sys/cygwin.h>.
-     *     bin=1 = binary mode (no CRLF translation, right for a
-     *     serial-style byte stream).
-     *   - Native MinGW/MSVC: _open_osfhandle from <io.h>. */
-#if defined(__CYGWIN__)
-    int fd = cygwin_attach_handle_to_fd(
-        (char *)"/dev/pipe-microgarbage",
-        -1,
-        g_pipe_handle,
-        1,                                   /* binary */
-        GENERIC_READ | GENERIC_WRITE);
-#else
-    int fd = _open_osfhandle((intptr_t)g_pipe_handle, O_RDWR);
-#endif
-    if (fd < 0) {
-        fprintf(stderr, "host: handle-to-fd failed: %s\n",
-                strerror(errno));
-        CloseHandle(g_pipe_handle);
-        g_pipe_handle = INVALID_HANDLE_VALUE;
-        return -1;
+    /* Register our pipe-aware handlers. They REPLACE whatever
+     * was installed by vm_host_install_stdio (which in pipe mode
+     * shouldn't have been called). */
+    if (!vm_ecall_register(sys->ecall_router, HOST_SYS_READ, pipe_sys_read)) {
+        fprintf(stderr, "host: register SYS_READ failed\n");
+        return false;
+    }
+    if (!vm_ecall_register(sys->ecall_router, HOST_SYS_WRITE, pipe_sys_write)) {
+        fprintf(stderr, "host: register SYS_WRITE failed\n");
+        return false;
+    }
+    if (!vm_ecall_register(sys->ecall_router, HOST_SYS_FFLUSH, pipe_sys_fflush)) {
+        fprintf(stderr, "host: register SYS_FFLUSH failed\n");
+        return false;
     }
 
-    return fd;
+    return true;
 }
 #endif  /* PIPE_MODE_SUPPORTED */
 
@@ -388,30 +541,13 @@ int main(int argc, char **argv) {
     }
 
     /* Stdio install: either default (process stdin/stdout/stderr)
-     * or routed through a named pipe. The pipe call BLOCKS until
-     * a client connects, so the user sees the "waiting" message
-     * first and then the shell banner once their PuTTY is attached. */
+     * via the portable bridge, or routed through a named pipe with
+     * Windows-direct handlers. The pipe call BLOCKS until a client
+     * connects, so the user sees the "waiting" message first and
+     * the shell banner once PuTTY is attached. */
     if (pipe_name) {
 #ifdef PIPE_MODE_SUPPORTED
-        int pipe_fd = open_named_pipe_fd(pipe_name);
-        if (pipe_fd < 0) {
-            return 1;
-        }
-        /* Bridge config: pass stderr as the FILE* for all three
-         * slots (it's only used for fflush which is a no-op on
-         * stderr anyway), and set fd overrides so read()/write()
-         * go through the named-pipe fd. */
-        VmHostStdioConfig sio = {
-            .stdin_src   = stderr,
-            .stdout_dest = stderr,
-            .stderr_dest = stderr,
-            .raw_mode    = false,
-            .stdin_fd_override   = pipe_fd,
-            .stdout_fd_override  = pipe_fd,
-            .stderr_fd_override  = pipe_fd,
-        };
-        if (!vm_host_install_stdio_ex(&sys, &sio)) {
-            fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
+        if (!setup_pipe_transport(&sys, pipe_name)) {
             return 1;
         }
 #else
