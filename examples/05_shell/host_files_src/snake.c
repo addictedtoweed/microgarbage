@@ -1,70 +1,31 @@
-/* host_files_src/snake.c — Nokia-style snake game.
+/* snake.c — classic snake game, built on the tui library.
  *
- * Demonstrates several things together:
+ * Demonstrates:
+ *   - tui_init / tui_shutdown lifecycle
+ *   - Cell-based drawing for the playfield
+ *   - tui_box_double for the border
+ *   - Color attributes (snake head/body distinct from food)
+ *   - Pull-mode input loop with tui_poll_event
+ *   - Kernel-managed periodic timing via SYS_SET_RELOAD_PERIOD
  *
- *   - Raw-mode TTY toggle (SYS_TTY_SET_RAW): turns the terminal
- *     into byte-at-a-time mode so we can read arrow keys as
- *     ANSI escape sequences rather than line-buffered input.
- *   - Periodic game loop using SYS_SLEEP_UNTIL with an autoreload
- *     deadline — slow frames self-correct rather than drifting.
- *   - SYS_TICKS_NOW for a millisecond clock the game uses for
- *     timing AND as a PRNG seed.
- *   - ANSI escape sequences for cursor positioning and screen
- *     clearing (no library; just bytes to stdout).
+ * Controls: WASD, hjkl, or arrow keys to steer. q or Ctrl-C
+ * quits. Walk into a wall or yourself = game over.
  *
- * The game runs until the snake hits a wall, hits itself, or
- * the player presses 'q'. On exit it clears the screen, shows
- * the cursor again, restores cooked TTY mode, and returns to
- * the shell as if nothing happened.
- *
- * Build: dropped into host_files/snake.elf by 05_shell/build.sh.
- * Run from inside the shell:
- *
- *     [/]
- *     $ run /host/snake.elf
+ * Public domain (CC0).
  */
 
-#define SYS_READ                63
-#define SYS_WRITE               64
-#define SYS_FFLUSH              82
+#include "lib/tui.h"
+
+/* ============================================================
+ *  Syscall stubs (not in tui — these are timing / control)
+ * ============================================================ */
+
 #define SYS_EXIT                93
-#define SYS_YIELD             1040
 #define SYS_TICKS_NOW         1043
 #define SYS_TICK_HZ           1044
-#define SYS_SLEEP_TICKS       1045
 #define SYS_SLEEP_UNTIL       1046
 #define SYS_SET_RELOAD_PERIOD 1047
 #define SYS_YIELD_UNTIL_RELOAD 1048
-#define SYS_TTY_SET_RAW       1105
-
-/* ============================================================
- *  Syscall inline asm
- * ============================================================ */
-
-static inline int sys_read(int fd, void *buf, unsigned n) {
-    register int      a0 asm("a0") = fd;
-    register unsigned a1 asm("a1") = (unsigned)(unsigned long)buf;
-    register unsigned a2 asm("a2") = n;
-    register int      a7 asm("a7") = SYS_READ;
-    asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
-    return a0;
-}
-
-static inline int sys_write(int fd, const void *buf, unsigned n) {
-    register int      a0 asm("a0") = fd;
-    register unsigned a1 asm("a1") = (unsigned)(unsigned long)buf;
-    register unsigned a2 asm("a2") = n;
-    register int      a7 asm("a7") = SYS_WRITE;
-    asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
-    return a0;
-}
-
-static inline int sys_fflush(int fd) {
-    register int a0 asm("a0") = fd;
-    register int a7 asm("a7") = SYS_FFLUSH;
-    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
-    return a0;
-}
 
 static inline void sys_exit(int code) {
     register int a0 asm("a0") = code;
@@ -105,121 +66,75 @@ static inline void sys_yield_until_reload(void) {
     asm volatile ("ecall" : "=r"(a0) : "r"(a7) : "memory");
 }
 
-static inline int sys_tty_set_raw(int enable) {
-    register int a0 asm("a0") = enable;
-    register int a7 asm("a7") = SYS_TTY_SET_RAW;
-    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
-    return a0;
-}
-
 /* ============================================================
- *  Output helpers (no libc — we build strings by hand)
+ *  Tiny formatting helpers
  * ============================================================ */
 
 static unsigned slen(const char *s) {
-    unsigned n = 0; while (s[n]) n++; return n;
+    unsigned n = 0;
+    while (s[n]) n++;
+    return n;
 }
 
-static void puts_(const char *s) { sys_write(1, s, slen(s)); }
-
-/* Format an unsigned int in decimal into the END of `buf` and
- * return a pointer to the first digit. Caller passes the
- * sentinel one-past-end position. */
+/* Render unsigned int into a fixed buffer, return start ptr. */
 static char *fmt_u(unsigned v, char *buf_end) {
-    *--buf_end = '\0';
-    if (v == 0) { *--buf_end = '0'; return buf_end; }
-    while (v) { *--buf_end = (char)('0' + v % 10); v /= 10; }
-    return buf_end;
-}
-
-/* Write a decimal integer to stdout (no newline). */
-static void putd(unsigned v) {
-    char buf[16];
-    char *p = fmt_u(v, buf + sizeof(buf));
-    puts_(p);
+    char *p = buf_end;
+    *--p = '\0';
+    if (v == 0) { *--p = '0'; return p; }
+    while (v) { *--p = (char)('0' + (v % 10)); v /= 10; }
+    return p;
 }
 
 /* ============================================================
- *  ANSI control sequences
+ *  PRNG (small, deterministic but seeded)
  * ============================================================ */
 
-static void ansi_clear_screen(void) { puts_("\x1b[2J"); }
-static void ansi_home(void)         { puts_("\x1b[H");  }
-static void ansi_hide_cursor(void)  { puts_("\x1b[?25l"); }
-static void ansi_show_cursor(void)  { puts_("\x1b[?25h"); }
-
-/* DECSCUSR (CSI Ps SP q): cursor shape. The shell sets a
- * steady block (Ps=2) when it starts. We hide the cursor
- * while playing, but we should restore the block on exit so
- * the user sees a consistent cursor when control returns to
- * the shell prompt — NOT the terminal default, which would
- * appear different from the shell's block. */
-static void ansi_cursor_steady_block(void) { puts_("\x1b[2 q"); }
-
-/* Move cursor to row, col (1-indexed, ANSI convention). */
-static void ansi_goto(unsigned row, unsigned col) {
-    char buf[24];
-    char *p = buf;
-    *p++ = 0x1b;
-    *p++ = '[';
-    char numbuf[8];
-    char *n = fmt_u(row, numbuf + sizeof(numbuf));
-    while (*n) *p++ = *n++;
-    *p++ = ';';
-    n = fmt_u(col, numbuf + sizeof(numbuf));
-    while (*n) *p++ = *n++;
-    *p++ = 'H';
-    sys_write(1, buf, (unsigned)(p - buf));
-}
-
-/* ============================================================
- *  Tiny LCG-based PRNG
- *
- *  Numerical Recipes constants. Good enough for picking food
- *  positions; we don't need cryptographic quality.
- * ============================================================ */
-
-static unsigned g_rng_state = 1;
-
-static void rng_seed(unsigned s) { g_rng_state = s ? s : 1; }
+static unsigned g_rng_state = 0xdeadbeefu;
 
 static unsigned rng_next(void) {
-    g_rng_state = g_rng_state * 1664525u + 1013904223u;
-    return g_rng_state;
-}
-
-/* Uniform-ish in [0, limit). */
-static unsigned rng_range(unsigned limit) {
-    return rng_next() % limit;
+    /* xorshift32 — fine for game randomness. */
+    unsigned x = g_rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_rng_state = x;
+    return x;
 }
 
 /* ============================================================
  *  Game state
- *
- *  Playfield is an interior PLAY_W x PLAY_H grid (the border is
- *  drawn outside this). The snake is a queue of cells stored in
- *  a circular buffer so growth is O(1).
  * ============================================================ */
 
-#define PLAY_W       40
-#define PLAY_H       20
-#define MAX_SNAKE   256
+/* Playfield dimensions. Sits inside a double-line border, with a
+ * score banner above. Total screen footprint:
+ *
+ *   Row 1:  "snake -- WASD / hjkl / arrows to move, q to quit"
+ *   Row 2:  "score: NN"
+ *   Row 3:  top border ╔══...══╗
+ *   Rows 4..3+PLAY_H: │ . . . │ playfield rows
+ *   Row 4+PLAY_H: bottom border ╚══...══╝
+ */
+#define PLAY_W 40
+#define PLAY_H 14
+#define MAX_SNAKE (PLAY_W * PLAY_H)
 
 typedef struct { unsigned char x, y; } Cell;
 
 static Cell g_snake[MAX_SNAKE];
-static unsigned g_head_idx;   /* index of head in g_snake */
-static unsigned g_tail_idx;   /* index of tail in g_snake */
-static unsigned g_length;     /* number of valid cells */
+static unsigned g_head_idx;       /* head is at g_snake[head_idx]  */
+static unsigned g_tail_idx;       /* tail is at g_snake[tail_idx]  */
+static unsigned g_length;         /* number of valid cells         */
 
-/* Direction: dx, dy. */
-static signed char g_dx = 1;
+static signed char g_dx = 1;      /* heading right initially       */
 static signed char g_dy = 0;
 
 static Cell g_food;
-static unsigned g_score = 0;
+static unsigned g_score;
 
-/* Cell access helpers */
+/* ============================================================
+ *  Snake-as-ring-buffer access helpers
+ * ============================================================ */
+
 static Cell *snake_head(void) { return &g_snake[g_head_idx]; }
 
 static void snake_push_head(Cell c) {
@@ -233,13 +148,9 @@ static void snake_pop_tail(void) {
     g_length--;
 }
 
-/* Is a cell occupied by the snake's body? (Excludes head — used
- * for collision detection against the new head position.) */
 static int snake_body_contains(unsigned char x, unsigned char y) {
-    if (g_length == 0) return 0;
-    /* Walk from tail toward head, stopping BEFORE the head. */
     unsigned i = g_tail_idx;
-    while (i != g_head_idx) {
+    for (unsigned n = 0; n < g_length; n++) {
         if (g_snake[i].x == x && g_snake[i].y == y) return 1;
         i = (i + 1) % MAX_SNAKE;
     }
@@ -247,230 +158,214 @@ static int snake_body_contains(unsigned char x, unsigned char y) {
 }
 
 /* ============================================================
- *  Drawing
- *
- *  The playfield is rendered once at start; on each frame we
- *  only redraw the head's new position, erase the old tail
- *  cell, and update the score line. Keeps the byte count to
- *  the terminal low so even slow ttys render smoothly.
+ *  Coordinate mapping (game cell → terminal cell)
  * ============================================================ */
 
-static void draw_border(void) {
-    /* Score line at row 1 */
-    ansi_goto(1, 1);
-    puts_("snake -- WASD or hjkl to move, q to quit");
-    ansi_goto(2, 1);
-    puts_("score: ");
-    putd(g_score);
+/* Playfield cell (x, y) → terminal (row, col). Origin of game
+ * is (0,0); origin of terminal is (1,1). Border is at row 3
+ * and PLAY_H+3, columns 1 and PLAY_W+2 respectively. So
+ * interior cells start at row 4 and column 2. */
+static int cell_row(int y) { return 4 + y; }
+static int cell_col(int x) { return 2 + x; }
 
-    /* Top border at row 3, playfield rows 4..3+PLAY_H. */
-    ansi_goto(3, 1);
-    sys_write(1, "+", 1);
-    for (int i = 0; i < PLAY_W; i++) sys_write(1, "-", 1);
-    sys_write(1, "+", 1);
+/* ============================================================
+ *  Drawing
+ * ============================================================ */
 
-    for (int y = 0; y < PLAY_H; y++) {
-        ansi_goto(4 + (unsigned)y, 1);
-        sys_write(1, "|", 1);
-        ansi_goto(4 + (unsigned)y, 2 + PLAY_W);
-        sys_write(1, "|", 1);
-    }
+static void draw_chrome(void) {
+    /* Title and score lines. Reset colors first so partial
+     * frame redraws don't inherit a residual fg. */
+    tui_reset();
+    tui_move(1, 1);
+    tui_set_fg(TUI_BRIGHT_WHITE);
+    tui_puts("snake -- WASD / hjkl / arrows to move, q to quit");
 
-    ansi_goto(4 + PLAY_H, 1);
-    sys_write(1, "+", 1);
-    for (int i = 0; i < PLAY_W; i++) sys_write(1, "-", 1);
-    sys_write(1, "+", 1);
-}
+    tui_move(2, 1);
+    tui_set_fg(TUI_BRIGHT_YELLOW);
+    tui_puts("score: ");
+    char buf[12];
+    char *p = fmt_u(g_score, buf + sizeof(buf));
+    tui_puts(p);
+    /* Pad a few spaces in case score shrank somehow (it can't —
+     * but defensive). */
+    tui_puts("   ");
+    tui_reset();
 
-static void draw_cell(unsigned char x, unsigned char y, char ch) {
-    /* Cell (x,y) maps to terminal row 4+y, col 2+x (1-indexed). */
-    ansi_goto(4 + y, 2 + x);
-    sys_write(1, &ch, 1);
+    /* Border: a double-line box around the playfield. */
+    tui_set_fg(TUI_BRIGHT_CYAN);
+    tui_box_double(3, 1, PLAY_H + 2, PLAY_W + 2);
+    tui_reset();
 }
 
 static void update_score_line(void) {
-    ansi_goto(2, 1);
-    puts_("score: ");
-    putd(g_score);
-    /* Clear to end of line in case length shrank */
-    puts_("\x1b[K");
+    /* Just rewrite the score portion — cheaper than a full
+     * chrome redraw. */
+    tui_move(2, 1);
+    tui_set_fg(TUI_BRIGHT_YELLOW);
+    tui_puts("score: ");
+    char buf[12];
+    char *p = fmt_u(g_score, buf + sizeof(buf));
+    tui_puts(p);
+    tui_puts("   ");
+    tui_reset();
 }
 
-/* Place food at a random empty cell. */
-static void place_food(void) {
-    for (;;) {
-        unsigned char x = (unsigned char)rng_range(PLAY_W);
-        unsigned char y = (unsigned char)rng_range(PLAY_H);
-        /* Reject if on the snake (head or body) */
-        if (snake_head()->x == x && snake_head()->y == y) continue;
-        if (snake_body_contains(x, y)) continue;
-        g_food.x = x;
-        g_food.y = y;
-        draw_cell(x, y, '*');
-        return;
+static void draw_cell(unsigned char x, unsigned char y, char ch,
+                      TuiColor fg) {
+    tui_set_cell(cell_row(y), cell_col(x), ch,
+                 fg, TUI_DEFAULT_COLOR, TUI_ATTR_NONE);
+}
+
+static void draw_snake_initial(void) {
+    /* Walk the snake ring from tail to head, drawing each cell.
+     * Head gets the distinguished '@' character; body gets 'o'. */
+    unsigned i = g_tail_idx;
+    for (unsigned n = 0; n < g_length; n++) {
+        Cell c = g_snake[i];
+        if (i == g_head_idx) {
+            draw_cell(c.x, c.y, '@', TUI_BRIGHT_GREEN);
+        } else {
+            draw_cell(c.x, c.y, 'o', TUI_GREEN);
+        }
+        i = (i + 1) % MAX_SNAKE;
     }
 }
 
+static void draw_food(void) {
+    draw_cell(g_food.x, g_food.y, '*', TUI_BRIGHT_RED);
+}
+
 /* ============================================================
- *  Input: WASD or hjkl
- *
- *  Single-byte keys only. We DELIBERATELY don't parse arrow-key
- *  escape sequences:
- *
- *    - Arrows arrive as 2 or 3 bytes (ESC [ X or ESC O X) that
- *      can be split across reads on a raw-mode TTY. A correct
- *      parser is a small state machine that adds latency (the
- *      direction change doesn't take effect until all bytes
- *      arrive) and complexity (resync on malformed sequences,
- *      handle both ANSI cursor-key modes).
- *    - Different terminals encode arrows differently (xterm,
- *      mintty in cooked vs application modes, Windows Terminal,
- *      etc.) — getting them all right requires terminfo or a
- *      multi-encoding parser.
- *    - WASD and hjkl are single bytes, immediate, and work
- *      identically everywhere.
- *
- *  If you genuinely want arrows back, the input state machine
- *  was at git tag 'pre-arrow-removal' (or just look at the
- *  pre-2abba3d revisions of this file).
+ *  Food placement
  * ============================================================ */
 
-typedef enum {
-    INPUT_NONE = 0,
-    INPUT_UP,
-    INPUT_DOWN,
-    INPUT_RIGHT,
-    INPUT_LEFT,
-    INPUT_QUIT,
-} InputAction;
-
-static InputAction poll_input(void) {
-    InputAction latest = INPUT_NONE;
-    char c;
-    while (sys_read(0, &c, 1) > 0) {
-        switch (c) {
-            case 'q': case 'Q':
-            case 0x03:                       /* Ctrl-C */
-                return INPUT_QUIT;
-
-            /* WASD (case-insensitive) */
-            case 'w': case 'W': case 'k':    latest = INPUT_UP;    break;
-            case 's': case 'S': case 'j':    latest = INPUT_DOWN;  break;
-            case 'a': case 'A': case 'h':    latest = INPUT_LEFT;  break;
-            case 'd': case 'D': case 'l':    latest = INPUT_RIGHT; break;
-
-            /* Silently ignore everything else, including ESC
-             * sequences from arrow keys, function keys, mouse
-             * events, etc. They'd land as multiple bytes here;
-             * none of the individual bytes match a movement key
-             * so they pass through cleanly. */
-            default: break;
-        }
+static void place_food(void) {
+    /* Try random positions until we land on an empty cell. With
+     * a 40x14 playfield (560 cells) and a snake of reasonable
+     * length this terminates fast. */
+    for (int tries = 0; tries < 1000; tries++) {
+        unsigned char x = (unsigned char)(rng_next() % PLAY_W);
+        unsigned char y = (unsigned char)(rng_next() % PLAY_H);
+        if (snake_body_contains(x, y)) continue;
+        g_food.x = x; g_food.y = y;
+        return;
     }
-    return latest;
-}
-
-/* Apply a direction change, refusing 180-degree turns (can't
- * reverse into your own neck). */
-static void apply_direction(InputAction a) {
-    signed char ndx = g_dx, ndy = g_dy;
-    switch (a) {
-        case INPUT_UP:    ndx =  0; ndy = -1; break;
-        case INPUT_DOWN:  ndx =  0; ndy =  1; break;
-        case INPUT_RIGHT: ndx =  1; ndy =  0; break;
-        case INPUT_LEFT:  ndx = -1; ndy =  0; break;
-        default: return;
-    }
-    /* Reject the exact reverse */
-    if (ndx == -g_dx && ndy == -g_dy) return;
-    g_dx = ndx;
-    g_dy = ndy;
+    /* Failsafe: the playfield is essentially full. Game ends. */
+    g_food.x = 0; g_food.y = 0;
 }
 
 /* ============================================================
- *  Main game loop
+ *  Input → direction
+ * ============================================================ */
+
+static void apply_direction(int dx, int dy) {
+    /* Reject 180° reversals — common rule in snake to avoid the
+     * "press opposite, immediately self-collide" trap. */
+    if (dx == -g_dx && g_dx != 0) return;
+    if (dy == -g_dy && g_dy != 0) return;
+    g_dx = (signed char)dx;
+    g_dy = (signed char)dy;
+}
+
+/* Drain accumulated input and apply the LAST direction-changing
+ * keypress. Returns true if the user wants to quit. */
+static int poll_inputs(void) {
+    TuiEvent ev;
+    int dx = g_dx, dy = g_dy;
+    int direction_changed = 0;
+    while (tui_poll_event(&ev)) {
+        if (ev.kind != TUI_EV_KEY) continue;
+        switch (ev.key.key) {
+            case 'q': case 'Q':
+            case 0x03:                    /* Ctrl-C */
+                return 1;
+            case 'w': case 'W':
+            case 'k':
+            case TUI_KEY_UP:
+                dx = 0; dy = -1; direction_changed = 1; break;
+            case 's': case 'S':
+            case 'j':
+            case TUI_KEY_DOWN:
+                dx = 0; dy = 1; direction_changed = 1; break;
+            case 'a': case 'A':
+            case 'h':
+            case TUI_KEY_LEFT:
+                dx = -1; dy = 0; direction_changed = 1; break;
+            case 'd': case 'D':
+            case 'l':
+            case TUI_KEY_RIGHT:
+                dx = 1; dy = 0; direction_changed = 1; break;
+            default:
+                break;
+        }
+    }
+    if (direction_changed) apply_direction(dx, dy);
+    return 0;
+}
+
+/* ============================================================
+ *  Entry point
  * ============================================================ */
 
 void _start(void) {
-    /* Enter raw mode + hide cursor + clear screen */
-    sys_tty_set_raw(1);
-    ansi_hide_cursor();
-    ansi_clear_screen();
+    /* Seed the RNG with the host tick counter so each run is
+     * different. */
+    g_rng_state = sys_ticks_now() ^ 0xa5a5a5a5u;
 
-    /* Initialize snake: 4 cells wide, horizontal, near center */
-    g_length = 4;
+    /* TUI startup. Alt screen keeps the user's shell scrollback
+     * pristine; raw mode disables echo and lets us see keypresses
+     * one at a time; hidden cursor cleans up the display. */
+    tui_init(TUI_USE_ALT_SCREEN | TUI_USE_RAW | TUI_HIDE_CURSOR);
+
+    /* Initial snake: 4 cells, centered, heading right. */
     g_head_idx = 3;
     g_tail_idx = 0;
-    for (unsigned i = 0; i < 4; i++) {
-        g_snake[i].x = (unsigned char)(PLAY_W / 2 - 2 + (int)i);
+    g_length = 4;
+    for (unsigned i = 0; i < g_length; i++) {
+        g_snake[i].x = (unsigned char)(PLAY_W / 2 - 2 + i);
         g_snake[i].y = (unsigned char)(PLAY_H / 2);
     }
+    g_dx = 1; g_dy = 0;
+    g_score = 0;
 
-    rng_seed(sys_ticks_now());
-
-    draw_border();
-    /* Draw initial snake body */
-    for (unsigned i = g_tail_idx; ; i = (i + 1) % MAX_SNAKE) {
-        char ch = (i == g_head_idx) ? 'O' : 'o';
-        draw_cell(g_snake[i].x, g_snake[i].y, ch);
-        if (i == g_head_idx) break;
-    }
     place_food();
+    draw_chrome();
+    draw_snake_initial();
+    draw_food();
+    tui_present();
 
-    /* Drain any stale input that was sitting in stdin before we
-     * entered raw mode (e.g., the Enter that submitted the 'run'
-     * command, or any keystrokes the user happened to type while
-     * the shell was launching us). Without this, a stray byte
-     * could be interpreted as 'q' and we'd exit immediately.
-     *
-     * Read for ~150 ms, discarding everything. The user's
-     * intended input starts after this grace window. */
+    /* Pacing setup: 8 fps (125 ms / frame). */
     unsigned hz = sys_tick_hz();
-    if (hz == 0) hz = 1000;            /* fallback: assume ms */
+    if (hz == 0) hz = 1000;
+
+    /* Drain any input that arrived during startup (e.g., the
+     * Enter key that launched us). 150 ms grace window. */
     {
-        unsigned drain_until = sys_ticks_now() + (hz / 7);  /* ~150 ms */
-        char junk;
+        unsigned drain_until = sys_ticks_now() + (hz / 7);
+        TuiEvent junk;
         while ((int)(sys_ticks_now() - drain_until) < 0) {
-            while (sys_read(0, &junk, 1) > 0) { /* discard */ }
-            /* Small yield so we're not spinning at full speed */
-            register int a7 asm("a7") = SYS_YIELD;
-            asm volatile ("ecall" :: "r"(a7) : "memory");
+            while (tui_poll_event(&junk)) { /* discard */ }
+            sys_sleep_until(sys_ticks_now() + (hz / 100));
         }
     }
 
-    /* Game-loop pacing. tick_hz is 1000 on the PC host (1 ms).
-     * Period 125 ms gives a comfortable ~8 fps.
-     *
-     * The kernel owns the deadline arithmetic — we don't carry a
-     * `next` variable. Each yield_until_reload wakes us at the
-     * next period boundary, FreeRTOS-style: if a frame runs over
-     * by more than a period, the kernel skips ahead to the next
-     * future boundary rather than firing missed events back-to-
-     * back. Phase stays locked to the original grid. */
     sys_set_reload_period(hz / 8);
-
-    /* Flush all the startup drawing to the terminal before the
-     * first frame's sleep. Otherwise ANSI sequences sit in the
-     * host's FILE* buffer (block-buffered when stdout is a pipe,
-     * line-buffered on a TTY but no newline triggers it) and the
-     * player sees nothing until the next read. */
-    sys_fflush(1);
 
     int game_over = 0;
     const char *over_reason = "";
 
     while (!game_over) {
-        /* 1. Drain any pending input. */
-        InputAction a = poll_input();
-        if (a == INPUT_QUIT) break;
-        if (a != INPUT_NONE) apply_direction(a);
+        if (poll_inputs()) {
+            game_over = 0;     /* user-requested quit, no game over screen */
+            break;
+        }
 
-        /* 2. Compute new head position. */
+        /* Compute new head position. */
         Cell h = *snake_head();
         int nx = (int)h.x + g_dx;
         int ny = (int)h.y + g_dy;
 
-        /* 3. Wall collision */
+        /* Wall collision */
         if (nx < 0 || nx >= PLAY_W || ny < 0 || ny >= PLAY_H) {
             game_over = 1;
             over_reason = "hit a wall";
@@ -479,77 +374,69 @@ void _start(void) {
 
         unsigned char ux = (unsigned char)nx;
         unsigned char uy = (unsigned char)ny;
-
-        /* 4. Self-collision (against the body, excluding the
-         * tail cell which is about to vacate — but only if we're
-         * not eating, since eating means we don't pop the tail). */
         int eating = (ux == g_food.x && uy == g_food.y);
+
         if (snake_body_contains(ux, uy)) {
             game_over = 1;
             over_reason = "bit yourself";
             break;
         }
 
-        /* 5. Erase old tail (unless eating, in which case grow) */
+        /* Erase old tail (unless eating, in which case the snake
+         * grows by not popping). */
         if (!eating) {
             Cell t = g_snake[g_tail_idx];
-            draw_cell(t.x, t.y, ' ');
+            draw_cell(t.x, t.y, ' ', TUI_DEFAULT_COLOR);
             snake_pop_tail();
         }
 
-        /* 6. Demote previous head to body, advance head */
+        /* Demote old head to body, install new head. */
         Cell prev_head = *snake_head();
-        draw_cell(prev_head.x, prev_head.y, 'o');
+        draw_cell(prev_head.x, prev_head.y, 'o', TUI_GREEN);
         Cell new_head = { ux, uy };
         snake_push_head(new_head);
-        draw_cell(ux, uy, 'O');
+        draw_cell(ux, uy, '@', TUI_BRIGHT_GREEN);
 
-        /* 7. Food eaten? */
         if (eating) {
             g_score++;
             update_score_line();
             place_food();
+            draw_food();
         }
 
-        /* 8. Flush this frame's writes to the terminal, then
-         * wait for the next period boundary. The flush is what
-         * makes the snake actually appear to move on the screen
-         * — without it, ANSI sequences would queue up in the
-         * stdio buffer. */
-        sys_fflush(1);
+        tui_present();
         sys_yield_until_reload();
     }
 
-    /* Game over: show a centered message for ~1 second, then
-     * clean up. */
+    /* Game-over screen, if applicable. */
     if (game_over) {
-        ansi_goto(4 + PLAY_H / 2, 2 + (PLAY_W / 2 - 8));
-        puts_("GAME OVER -- ");
-        puts_(over_reason);
-        ansi_goto(4 + PLAY_H / 2 + 1, 2 + (PLAY_W / 2 - 7));
-        puts_("score: ");
-        putd(g_score);
-        /* Make sure the message reaches the screen BEFORE we
-         * sleep — otherwise the buffer holds it and the
-         * upcoming ansi_clear_screen wipes it without it ever
-         * being seen. */
-        sys_fflush(1);
-        /* Sleep ~1.5 seconds so the player can read the
-         * message. We use the reload mechanism's primitive here
-         * for one-shot purposes; clear the period first so
-         * yield_until_reload isn't lurking. */
+        /* Centered message inside the playfield. */
+        int msg_row = cell_row(PLAY_H / 2);
+        int msg_col = cell_col(PLAY_W / 2 - 8);
+        tui_move(msg_row, msg_col);
+        tui_set_fg(TUI_BRIGHT_RED);
+        tui_set_attr(TUI_ATTR_BOLD);
+        tui_puts("GAME OVER -- ");
+        tui_puts(over_reason);
+        tui_reset();
+
+        tui_move(msg_row + 1, msg_col + 1);
+        tui_set_fg(TUI_BRIGHT_YELLOW);
+        tui_puts("score: ");
+        char buf[12];
+        char *p = fmt_u(g_score, buf + sizeof(buf));
+        tui_puts(p);
+        tui_reset();
+        tui_present();
+
+        /* Pause ~1.5s so the user can read it. */
         sys_set_reload_period(0);
-        sys_sleep_until(sys_ticks_now() + (hz + hz/2));
+        sys_sleep_until(sys_ticks_now() + (hz + hz / 2));
     }
 
-    /* Cleanup: clear the screen, restore cursor visibility +
-     * shape (block, matching the shell's choice), leave the
-     * terminal in cooked mode for the parent shell. */
-    ansi_clear_screen();
-    ansi_home();
-    ansi_show_cursor();
-    ansi_cursor_steady_block();
-    sys_fflush(1);
-    sys_tty_set_raw(0);
+    /* Clean shutdown: TUI shutdown unwinds alt-screen, raw-mode,
+     * and cursor. The user lands back at the shell prompt with
+     * their scrollback untouched. */
+    tui_shutdown();
     sys_exit(0);
 }

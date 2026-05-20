@@ -72,16 +72,45 @@ if have_guest_cc; then
     # via "/host/<name>.elf". The shell's host process mounts
     # ./host_files/ as /host by default, auto-creating the
     # directory if it doesn't exist.
+    #
+    # Each top-level .c in host_files_src/ becomes one guest ELF.
+    # Sources under host_files_src/lib/ are library code linked
+    # into every guest (small enough that we don't bother building
+    # static-archive form). Guests that don't actually call any
+    # library symbols just leave the dead code in place — the
+    # linker doesn't strip it but the cost is negligible (a few
+    # KB per ELF).
     HOST_FILES_DIR="$EXAMPLE_DIR/host_files"
     mkdir -p "$HOST_FILES_DIR"
+
+    # Gather library sources (host_files_src/lib/*.c).
+    #
+    # Each guest .c links against all library .c files. Most of
+    # the library is small functions and the linker strips unused
+    # ones because we add -ffunction-sections / -fdata-sections /
+    # -Wl,--gc-sections below — so a guest that never calls
+    # tui_init pays only a few bytes overhead instead of the full
+    # library's ~6 KB.
+    GUEST_LIB_SRCS=()
+    GUEST_GC_CFLAGS=(-ffunction-sections -fdata-sections)
+    GUEST_GC_LDFLAGS=(-Wl,--gc-sections)
+    if [ -d "$EXAMPLE_DIR/host_files_src/lib" ]; then
+        for libsrc in "$EXAMPLE_DIR"/host_files_src/lib/*.c; do
+            [ -f "$libsrc" ] || continue
+            GUEST_LIB_SRCS+=("$(guest_path "$libsrc")")
+        done
+    fi
+
     for src in "$EXAMPLE_DIR"/host_files_src/*.c; do
         [ -f "$src" ] || continue
         name=$(basename "$src" .c)
         echo "05_shell: compiling host_files/$name.elf (spawnable)..."
-        "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
+        "$GUEST_CC" "${GUEST_CFLAGS[@]}" "${GUEST_GC_CFLAGS[@]}" \
+            -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
             -Wl,-T,"$(guest_path "$GUEST_LD")" \
+            "${GUEST_GC_LDFLAGS[@]}" \
             -o "$(guest_path "$HOST_FILES_DIR/$name.elf")" \
-            "$(guest_path "$src")"
+            "$(guest_path "$src")" "${GUEST_LIB_SRCS[@]}"
     done
 else
     if [ -f "$BUILD_DIR/shell.elf" ]; then
