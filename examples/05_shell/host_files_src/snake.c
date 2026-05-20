@@ -315,15 +315,23 @@ void _start(void) {
      * different. */
     g_rng_state = sys_ticks_now() ^ 0xa5a5a5a5u;
 
-    /* TUI startup. Alt screen keeps the user's shell scrollback
-     * pristine; raw mode disables echo and lets us see keypresses
-     * one at a time; hidden cursor cleans up the display.
+    /* TUI startup.
+     *   ALT_SCREEN  — keep the shell's scrollback pristine
+     *   RAW         — disable echo, deliver keypresses one at a time
+     *   HIDE_CURSOR — keep PuTTY from drawing a roving cursor as
+     *                 we move it around redrawing cells
+     *   SYNC_OUTPUT — bracket each present in CSI ?2026h/l so the
+     *                 terminal holds off repaint until the frame
+     *                 is complete. Eliminates the mid-frame tearing
+     *                 that makes full-canvas redraws look "jumpy."
+     *                 Modern PuTTY supports it; older terminals
+     *                 ignore the bracket silently.
      *
-     * Canvas dimensions: 24 rows × 80 cols is the classic
-     * minimum. We use 22 rows × 50 cols to give the playfield
-     * border (16 rows × 42 cols) + chrome a comfortable home
-     * without spending bytes on terminal area we won't draw to. */
-    tui_init(TUI_USE_ALT_SCREEN | TUI_USE_RAW | TUI_HIDE_CURSOR,
+     * Canvas dimensions: 22 rows × 50 cols comfortably fits the
+     * border (16×42) plus chrome without wasting cycles on areas
+     * we don't draw to. */
+    tui_init(TUI_USE_ALT_SCREEN | TUI_USE_RAW |
+             TUI_HIDE_CURSOR | TUI_USE_SYNC_OUTPUT,
              22, 50);
 
     /* Initial snake: 4 cells, centered, heading right. */
@@ -341,6 +349,9 @@ void _start(void) {
     draw_chrome();
     draw_snake_initial();
     draw_food();
+    /* First present is full — there's no valid front buffer yet,
+     * so tui_present primes it. Subsequent frames use the diff
+     * path. */
     tui_present();
 
     /* Pacing setup: 8 fps (125 ms / frame). */
@@ -413,7 +424,16 @@ void _start(void) {
             draw_food();
         }
 
-        tui_present();
+        /* Diff present: only cells that changed on the canvas
+         * since last frame go on the wire. For snake that's 3
+         * cells per frame (old tail erased, old head→body, new
+         * head). ~50 bytes per frame instead of ~840 with full
+         * present, which both reduces jitter (less data to push
+         * through the pipe + render) and keeps the per-frame
+         * SGR/move sequence simple enough that synchronized
+         * output can hold the terminal still for a meaningfully
+         * short interval. */
+        tui_present_diff();
         sys_yield_until_reload();
     }
 
@@ -480,7 +500,11 @@ void _start(void) {
         tui_move(hint_row, cell_col(0));
         tui_puts("press any key to exit");
         tui_reset();
-        tui_present();
+        /* Diff present is fine here too — only the dialog box
+         * cells changed since the last gameplay frame, so the
+         * emission is bounded (about 200 cells = a few hundred
+         * bytes). */
+        tui_present_diff();
 
         /* Drain any leftover input that arrived during the
          * collision frame (e.g., the key that turned snake into
