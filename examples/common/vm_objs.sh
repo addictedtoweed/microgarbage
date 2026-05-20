@@ -58,7 +58,32 @@ VM_CORE_SRCS="\
 # ---------------------------------------------------------------
 
 GUEST_LD="${REPO_ROOT}/examples/common/guest.ld"
-GUEST_CC=${GUEST_CC:-riscv64-unknown-elf-gcc}
+
+# Pick the first available RISC-V cross-compiler. Common names:
+#   riscv64-unknown-elf-gcc   — upstream riscv-collab/riscv-gnu-toolchain
+#                               and most Linux distro packages
+#   riscv-none-elf-gcc        — xPack (xpack-dev-tools/riscv-none-elf-gcc-xpack;
+#                               recommended for Windows users)
+#   riscv32-unknown-elf-gcc   — some custom 32-bit-only builds
+#   riscv64-elf-gcc           — Homebrew's riscv-gnu-toolchain formula
+#
+# Override by setting GUEST_CC in the environment before sourcing.
+# The -march=rv32imc and -mabi=ilp32 flags below ensure the right
+# multilib is selected regardless of which prefix is in use.
+if [ -z "${GUEST_CC:-}" ]; then
+    for _candidate in riscv64-unknown-elf-gcc \
+                      riscv-none-elf-gcc \
+                      riscv32-unknown-elf-gcc \
+                      riscv64-elf-gcc; do
+        if command -v "$_candidate" >/dev/null 2>&1; then
+            GUEST_CC=$_candidate
+            break
+        fi
+    done
+    GUEST_CC=${GUEST_CC:-riscv64-unknown-elf-gcc}   # fallback for the error path
+    unset _candidate
+fi
+
 GUEST_CFLAGS=${GUEST_CFLAGS:--march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -O2}
 
 # Whether the cross-compiler exists. Examples that need to

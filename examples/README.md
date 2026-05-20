@@ -9,10 +9,41 @@ the VM library in this repo.
 
 - A C compiler. `cc`, `gcc`, or `clang` all work. Set `CC` to
   override.
-- For rebuilding guest `.elf` files: `gcc-riscv64-unknown-elf`
-  (Ubuntu: `sudo apt install gcc-riscv64-unknown-elf`). If the
+- For rebuilding guest `.elf` files: a 32-bit RISC-V GCC cross
+  compiler with `rv32imc`/`ilp32` multilib support. If the
   cross-compiler is missing, the build script will reuse any
   existing pre-built `.elf` rather than failing.
+
+  The build scripts auto-detect the compiler by trying these
+  prefixes in order:
+    - `riscv64-unknown-elf-gcc` (upstream and most Linux distros)
+    - `riscv-none-elf-gcc` (xPack)
+    - `riscv32-unknown-elf-gcc` (some custom builds)
+    - `riscv64-elf-gcc` (Homebrew)
+
+  Set `GUEST_CC` in the environment to override.
+
+  **How to get one:**
+
+  - **Ubuntu/Debian:** `sudo apt install gcc-riscv64-unknown-elf`
+  - **macOS (Homebrew):** `brew tap riscv-software-src/riscv` then
+    `brew install riscv-tools`
+  - **Windows (Cygwin or native):** Download xPack's prebuilt
+    binary from
+    <https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases>
+    (Look for `xpack-riscv-none-elf-gcc-*-win32-x64.zip`.) Extract
+    to a path with no spaces, e.g. `C:\riscv\`, then add its
+    `bin/` directory to your PATH. The binaries are native Windows
+    .exe files and run fine from Cygwin via `/cygdrive/c/...`.
+  - **Arch:** `sudo pacman -S riscv64-unknown-elf-gcc`
+  - **From source:** clone <https://github.com/riscv-collab/riscv-gnu-toolchain>
+    and follow its README. 30+ minutes on a fast machine. Not
+    recommended unless you have a specific reason — the prebuilt
+    versions are functionally identical.
+
+  Don't try to build the toolchain inside Cygwin — the official
+  README warns that case-insensitive filesystems break the glibc
+  build. Use a prebuilt binary on Windows.
 
 ## Running them
 
