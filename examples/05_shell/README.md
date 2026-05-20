@@ -92,6 +92,11 @@ Two sample spawnable ELFs are built into `./host_files/`:
 
 - `hello.elf` — prints `hi from spawned VM` and exits
 - `count.elf` — counts 1 to 10, one per line, and exits
+- `snake.elf` — interactive snake game (arrows/WASD to move,
+  `q` to quit). Demonstrates raw-mode TTY, ANSI cursor control,
+  and the timer syscalls for a 8 FPS game loop with
+  autoreloading deadline. On exit it cleans up the screen and
+  restores cooked mode automatically.
 
 Example session:
 
