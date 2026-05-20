@@ -148,6 +148,14 @@ static void ansi_home(void)         { puts_("\x1b[H");  }
 static void ansi_hide_cursor(void)  { puts_("\x1b[?25l"); }
 static void ansi_show_cursor(void)  { puts_("\x1b[?25h"); }
 
+/* DECSCUSR (CSI Ps SP q): cursor shape. The shell sets a
+ * steady block (Ps=2) when it starts. We hide the cursor
+ * while playing, but we should restore the block on exit so
+ * the user sees a consistent cursor when control returns to
+ * the shell prompt — NOT the terminal default, which would
+ * appear different from the shell's block. */
+static void ansi_cursor_steady_block(void) { puts_("\x1b[2 q"); }
+
 /* Move cursor to row, col (1-indexed, ANSI convention). */
 static void ansi_goto(unsigned row, unsigned col) {
     char buf[24];
@@ -534,11 +542,13 @@ void _start(void) {
         sys_sleep_until(sys_ticks_now() + (hz + hz/2));
     }
 
-    /* Cleanup: clear the screen, restore cursor, leave the
+    /* Cleanup: clear the screen, restore cursor visibility +
+     * shape (block, matching the shell's choice), leave the
      * terminal in cooked mode for the parent shell. */
     ansi_clear_screen();
     ansi_home();
     ansi_show_cursor();
+    ansi_cursor_steady_block();
     sys_fflush(1);
     sys_tty_set_raw(0);
     sys_exit(0);

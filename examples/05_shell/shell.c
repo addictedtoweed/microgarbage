@@ -679,6 +679,32 @@ static void cmd_run(int argc, char **argv) {
 }
 
 /* ============================================================
+ *  Cursor shape (DECSCUSR — DEC Set Cursor Shape)
+ *
+ *  Modern terminals (mintty, xterm, iTerm2, Windows Terminal,
+ *  Konsole, gnome-terminal) implement DECSCUSR for runtime
+ *  cursor-style selection. The escape is CSI Ps SP q where:
+ *
+ *    Ps = 0  reset to terminal default
+ *    Ps = 1  blinking block
+ *    Ps = 2  steady block
+ *    Ps = 3  blinking underline
+ *    Ps = 4  steady underline
+ *    Ps = 5  blinking bar
+ *    Ps = 6  steady bar
+ *
+ *  We use steady block — thin bars are hard to spot at the
+ *  prompt position. The reset-to-default on exit restores
+ *  whatever the user configured at the terminal level.
+ *
+ *  This sequence is harmless on terminals that don't recognise
+ *  it — they treat unknown escapes as a no-op or print nothing.
+ * ============================================================ */
+
+static void cursor_steady_block(void)   { puts_("\x1b[2 q"); }
+static void cursor_reset_default(void)  { puts_("\x1b[0 q"); }
+
+/* ============================================================
  *  Main loop
  * ============================================================ */
 
@@ -700,6 +726,7 @@ static void dispatch(char *line) {
     else if (scmp(argv[0], "run")   == 0) cmd_run(argc, argv);
     else if (scmp(argv[0], "exit")  == 0 || scmp(argv[0], "quit") == 0) {
         putln("bye");
+        cursor_reset_default();
         sys_exit(0);
     } else {
         puts_(argv[0]);
@@ -707,7 +734,14 @@ static void dispatch(char *line) {
     }
 }
 
+
 void _start(void) {
+    /* Set a steady block cursor — thin bars are hard to spot at
+     * the prompt position, and our shell doesn't currently use
+     * mid-line cursor movement for editing. The terminal-default
+     * reset happens on every exit path. */
+    cursor_steady_block();
+
     putln("VM shell — type 'help' for commands");
 
     char line[LINE_CAP];
@@ -734,6 +768,7 @@ void _start(void) {
         int n = readline(line, sizeof(line));
         if (n < 0) {
             putln("\n(stdin closed)");
+            cursor_reset_default();
             sys_exit(0);
         }
         dispatch(line);
