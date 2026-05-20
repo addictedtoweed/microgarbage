@@ -320,6 +320,11 @@ void tui_box_single(int row, int col, int h, int w);
 /* Draw a double-line box at the same coordinates. */
 void tui_box_double(int row, int col, int h, int w);
 
+/* Draw an ASCII box (+/-/|). Compatible with terminals that
+ * don't render Unicode well, and ~3x smaller in output bytes
+ * because every char is 1 byte instead of 3 (UTF-8). */
+void tui_box_ascii(int row, int col, int h, int w);
+
 /* Fill a rectangle with character c, using current fg/bg/attrs. */
 void tui_fill_rect(int row, int col, int h, int w, char c);
 

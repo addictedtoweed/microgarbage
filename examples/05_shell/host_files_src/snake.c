@@ -191,9 +191,12 @@ static void draw_chrome(void) {
     tui_puts("   ");
     tui_reset();
 
-    /* Border: a double-line box around the playfield. */
+    /* Border: an ASCII box around the playfield. ASCII chars
+     * are 3x cheaper than UTF-8 box-drawing chars (1 byte each
+     * vs 3) — important when the border is rebuilt on every
+     * full redraw. The visual difference is minor. */
     tui_set_fg(TUI_BRIGHT_CYAN);
-    tui_box_double(3, 1, PLAY_H + 2, PLAY_W + 2);
+    tui_box_ascii(3, 1, PLAY_H + 2, PLAY_W + 2);
     tui_reset();
 }
 
@@ -408,30 +411,90 @@ void _start(void) {
         sys_yield_until_reload();
     }
 
-    /* Game-over screen, if applicable. */
+    /* Game-over screen, if applicable. Draws a centered banner
+     * inside a small box, then waits for the user to press any
+     * key before exiting. This replaces the previous fixed 1.5s
+     * timeout, which on slow terminals could be missed entirely
+     * — and now the user explicitly acknowledges the end of the
+     * game rather than blinking back to the shell. */
     if (game_over) {
-        /* Centered message inside the playfield. */
-        int msg_row = cell_row(PLAY_H / 2);
-        int msg_col = cell_col(PLAY_W / 2 - 8);
-        tui_move(msg_row, msg_col);
+        /* Box dimensions: 5 rows tall, wide enough for the
+         * longest expected message. Centered horizontally in
+         * the playfield. */
+        int box_h = 5;
+        int box_w = 36;
+        int box_row = cell_row(PLAY_H / 2 - 2);
+        int box_col = cell_col(PLAY_W / 2 - box_w / 2 + 1);
+
+        /* Clear the box interior first so any snake body or
+         * food underneath gets erased. Use a dark bg to make
+         * the dialog visually distinct. */
+        tui_set_bg(TUI_BLACK);
+        tui_fill_rect(box_row, box_col, box_h, box_w, ' ');
+
+        /* Bright red double-line border. */
         tui_set_fg(TUI_BRIGHT_RED);
         tui_set_attr(TUI_ATTR_BOLD);
-        tui_puts("GAME OVER -- ");
-        tui_puts(over_reason);
+        tui_box_double(box_row, box_col, box_h, box_w);
         tui_reset();
+        tui_set_bg(TUI_BLACK);
 
-        tui_move(msg_row + 1, msg_col + 1);
+        /* "GAME OVER" centered on line 2 of the box. */
+        const char *title = "GAME OVER";
+        int title_col = box_col + (box_w - 9) / 2;
+        tui_move(box_row + 1, title_col);
+        tui_set_fg(TUI_BRIGHT_RED);
+        tui_set_attr(TUI_ATTR_BOLD);
+        tui_puts(title);
+
+        /* Reason on line 3, centered. */
+        tui_set_attr(TUI_ATTR_NONE);
+        tui_set_fg(TUI_BRIGHT_WHITE);
+        /* Figure out reason length to center it. */
+        unsigned reason_len = slen(over_reason);
+        int reason_col = box_col + (box_w - (int)reason_len) / 2;
+        tui_move(box_row + 2, reason_col);
+        tui_puts(over_reason);
+
+        /* "score: N" on line 4, centered. */
+        char score_buf[12];
+        char *score_str = fmt_u(g_score, score_buf + sizeof(score_buf));
+        unsigned score_str_len = slen(score_str);
+        unsigned score_total = 7 + score_str_len;   /* "score: " + digits */
+        int score_col = box_col + (box_w - (int)score_total) / 2;
+        tui_move(box_row + 3, score_col);
         tui_set_fg(TUI_BRIGHT_YELLOW);
         tui_puts("score: ");
-        char buf[12];
-        char *p = fmt_u(g_score, buf + sizeof(buf));
-        tui_puts(p);
+        tui_puts(score_str);
+
+        /* Hint at bottom of playfield. */
+        tui_reset();
+        tui_set_fg(TUI_BRIGHT_BLACK);
+        int hint_row = cell_row(PLAY_H) + 1;
+        tui_move(hint_row, cell_col(0));
+        tui_puts("press any key to exit");
         tui_reset();
         tui_present();
 
-        /* Pause ~1.5s so the user can read it. */
+        /* Drain any leftover input that arrived during the
+         * collision frame (e.g., the key that turned snake into
+         * the wall), then wait for a fresh keypress. We require
+         * a fresh press, not just any byte, so a held-down arrow
+         * doesn't blow past the screen. */
         sys_set_reload_period(0);
-        sys_sleep_until(sys_ticks_now() + (hz + hz / 2));
+        {
+            unsigned drain_until = sys_ticks_now() + (hz / 4); /* 250 ms */
+            TuiEvent junk;
+            while ((int)(sys_ticks_now() - drain_until) < 0) {
+                while (tui_poll_event(&junk)) { /* discard */ }
+                sys_sleep_until(sys_ticks_now() + (hz / 100));
+            }
+        }
+        for (;;) {
+            TuiEvent ev;
+            if (tui_poll_event(&ev) && ev.kind == TUI_EV_KEY) break;
+            sys_sleep_until(sys_ticks_now() + (hz / 50)); /* 20 ms */
+        }
     }
 
     /* Clean shutdown: TUI shutdown unwinds alt-screen, raw-mode,

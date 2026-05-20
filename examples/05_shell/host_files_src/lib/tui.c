@@ -478,6 +478,37 @@ void tui_box_double(int row, int col, int h, int w) {
              BOX2_TL, BOX2_TR, BOX2_BL, BOX2_BR, BOX2_H, BOX2_V);
 }
 
+/* ASCII box drawing — fastest variant (1-byte glyphs vs 3-byte
+ * UTF-8) and compatible everywhere. Looks blocky but is the
+ * right default for performance-sensitive draws. */
+void tui_box_ascii(int row, int col, int h, int w) {
+    if (h < 2 || w < 2) return;
+
+    if (clip_contains(row, col)) {
+        emit_move(row, col);
+        out_byte('+');
+        for (int i = 1; i < w - 1; i++) out_byte('-');
+        out_byte('+');
+    }
+    for (int r = 1; r < h - 1; r++) {
+        int rr = row + r;
+        if (clip_contains(rr, col)) {
+            emit_move(rr, col);
+            out_byte('|');
+        }
+        if (clip_contains(rr, col + w - 1)) {
+            emit_move(rr, col + w - 1);
+            out_byte('|');
+        }
+    }
+    if (clip_contains(row + h - 1, col)) {
+        emit_move(row + h - 1, col);
+        out_byte('+');
+        for (int i = 1; i < w - 1; i++) out_byte('-');
+        out_byte('+');
+    }
+}
+
 void tui_fill_rect(int row, int col, int h, int w, char c) {
     for (int r = row; r < row + h; r++) {
         if (!clip_contains(r, col)) continue;
