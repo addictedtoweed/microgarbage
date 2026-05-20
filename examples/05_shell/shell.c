@@ -595,10 +595,26 @@ void _start(void) {
     putln("VM shell — type 'help' for commands");
 
     char line[LINE_CAP];
+    int first = 1;
     for (;;) {
-        /* Prompt: cwd + "$ " */
+        /* Two-line prompt for breathing room and readability:
+         *
+         *   [<cwd>]
+         *   $ <user input here>
+         *
+         * The blank line before the path separates each command's
+         * output from the next prompt. The path on its own line
+         * stays out of the way of long working directories. The
+         * `$ ` on the input line keeps the cursor at a predictable
+         * column regardless of cwd length.
+         *
+         * Skip the leading newline on the very first prompt — the
+         * welcome banner already provides separation. */
+        if (!first) puts_("\n");
+        first = 0;
+        puts_("[");
         puts_(g_cwd);
-        puts_("$ ");
+        puts_("]\n$ ");
         int n = readline(line, sizeof(line));
         if (n < 0) {
             putln("\n(stdin closed)");
