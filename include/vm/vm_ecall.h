@@ -137,6 +137,16 @@
 #define SYS_WRITE             64   /* write(fd, buf, n) — host-only,
                                     * not auto-installed; see
                                     * vm_host_stdio.h */
+#define SYS_FFLUSH            82   /* fsync(fd) borrowed: flush the
+                                    * host FILE* buffer for fd 1 or 2.
+                                    * Useful for ANSI sequences and
+                                    * other no-newline output that
+                                    * needs to be visible immediately.
+                                    * a0=fd → 0 on success, -EBADF
+                                    * if fd isn't a writable stdio
+                                    * stream. fd=0 (stdin) flushes
+                                    * both stdout and stderr — handy
+                                    * pseudo-syncpoint. */
 #define SYS_EXIT              93   /* clean exit (matches Linux RISC-V) */
 
 /* --- Filesystem (Linux RISC-V numbers, host-only, not auto-installed) ---
@@ -226,7 +236,10 @@
  *     after the deadline, not at the deadline exactly. Slack is
  *     bounded by quantum length and other VMs' work.
  *
- * Typical autoreload (periodic) loop in a guest:
+ * Two flavors of periodic loop are supported. Pick whichever
+ * fits the use case.
+ *
+ * Flavor A — explicit absolute deadline, guest-managed:
  *
  *     uint32_t period = sys_tick_hz() / 10;     // 10 Hz
  *     uint32_t next   = sys_ticks_now() + period;
@@ -236,14 +249,36 @@
  *         next += period;
  *     }
  *
- * SYS_SLEEP_UNTIL is the right primitive here — it absolute-
- * targets the deadline, so a slow frame doesn't accumulate
- * drift across iterations.
- */
-#define SYS_TICKS_NOW       1043   /* () → current global_tick */
-#define SYS_TICK_HZ         1044   /* () → ticks_per_second (0 if unset) */
-#define SYS_SLEEP_TICKS     1045   /* (n) → block for n ticks; 0 = yield */
-#define SYS_SLEEP_UNTIL     1046   /* (deadline) → block until tick >= deadline */
+ * SYS_SLEEP_UNTIL with an absolute deadline keeps phase exactly
+ * — a slow frame doesn't accumulate drift across iterations.
+ * The guest carries the `next` variable in its hot loop.
+ *
+ * Flavor B — kernel-managed auto-reload (preferred when the
+ * period is constant):
+ *
+ *     sys_set_reload_period(125);              // 125 ticks / frame
+ *     while (!quit) {
+ *         sys_yield_until_reload();
+ *         do_frame();
+ *     }
+ *
+ * The deadline lives in the kernel (per VmCpu). No `next +=`
+ * arithmetic in the guest, one fewer register live across the
+ * sleep, one fewer chance of an off-by-one. If a frame overruns
+ * by more than a period, the kernel skips ahead to the next
+ * FUTURE boundary — phase preserved, missed frames dropped
+ * cleanly (no burst-catch-up).
+ *
+ * The reload and explicit-deadline mechanisms are independent;
+ * a guest can use one or the other or both. SYS_SLEEP_* does
+ * not touch the reload state; SYS_SET_RELOAD_PERIOD does not
+ * touch BLOCK_SLEEP. */
+#define SYS_TICKS_NOW           1043   /* () → current global_tick */
+#define SYS_TICK_HZ             1044   /* () → ticks_per_second (0 if unset) */
+#define SYS_SLEEP_TICKS         1045   /* (n) → block for n ticks; 0 = yield */
+#define SYS_SLEEP_UNTIL         1046   /* (deadline) → block until tick >= deadline */
+#define SYS_SET_RELOAD_PERIOD   1047   /* (period) → 0; period=0 clears */
+#define SYS_YIELD_UNTIL_RELOAD  1048   /* () → block until next reload boundary */
 
 /* --- Shared-region allocator (1056..1071) --- */
 #define SYS_ALLOC           1056   /* allocate from shared region */

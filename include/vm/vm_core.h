@@ -499,6 +499,33 @@ typedef struct VmCpu {
      * sensible for BLOCK_MAILBOX_RECV). */
     uint32_t block_deadline;
 
+    /* === Periodic auto-reload timer (per-VM, optional) ===
+     *
+     * Backs SYS_SET_RELOAD_PERIOD / SYS_YIELD_UNTIL_RELOAD.
+     * When the guest sets a period, the kernel advances
+     * reload_next_deadline by that period on each yield, hiding
+     * the per-frame arithmetic from the guest:
+     *
+     *     sys_set_reload_period(125);       // 125 ms
+     *     while (running) {
+     *         sys_yield_until_reload();      // wakes at next tick boundary
+     *         do_frame();
+     *     }
+     *
+     * Catch-up policy (FreeRTOS-style): if do_frame() runs over
+     * budget, the kernel skips ahead to the next FUTURE boundary
+     * rather than firing the missed events back-to-back. So one
+     * slow frame drops a tick but keeps the phase regular —
+     * essential for animations and any cadence that must align
+     * with external time.
+     *
+     * Zero in either field means "not currently in reload mode".
+     * Set by SYS_SET_RELOAD_PERIOD; cleared by passing period=0.
+     * Untouched by any other syscall — SYS_SLEEP_* and the
+     * reload mechanism are independent. */
+    uint32_t reload_period;
+    uint32_t reload_next_deadline;
+
     /* === Identity (set by the host at creation time) === */
 
     /* Visible to guest as mhartid CSR. Also used by mailbox and

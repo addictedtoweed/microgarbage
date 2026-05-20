@@ -223,29 +223,58 @@ static void handle_write(VmCpu *cpu, void *system) {
     }
 
     size_t written = fwrite(host_buf, 1, n, dest);
-
-    /* Flush after every write to stdout/stderr.
+    /* Flushing here would hurt throughput. We rely on the FILE*'s
+     * own buffering policy (line-buffered on TTYs, block-buffered
+     * otherwise), with two exits hatches:
      *
-     * Reasoning: when stdout is a tty, fwrite is line-buffered so
-     * most writes flush on their own — but ANSI escape sequences
-     * (cursor moves, screen clears) contain no newline and would
-     * sit in the buffer indefinitely. When stdout is a file or
-     * pipe, fwrite is block-buffered so almost nothing flushes
-     * unless we say so.
-     *
-     * Real-time guests (games, monitors, anything driving a
-     * terminal UI) need their output to be visible immediately,
-     * not just when the loop happens to write a newline. The cost
-     * is one syscall per ECALL — for the kind of small-write
-     * pattern interactive guests do, this is essentially free
-     * compared to the round-trip through ECALL itself.
-     *
-     * If a future heavy-output guest needs the throughput, we can
-     * add SYS_FFLUSH and let the guest control the policy, but
-     * for now correctness beats throughput. */
-    fflush(dest);
-
+     *   - SYS_READ on fd 0 fflushes stdout/stderr first, so any
+     *     interactive prompt is visible before we block on input.
+     *   - SYS_FFLUSH lets guests flush explicitly when they need
+     *     to push output that has no newline (ANSI sequences,
+     *     game-over screens, etc.). */
     cpu->regs[VM_REG_A0] = (uint32_t)written;
+}
+
+/* ============================================================
+ *  SYS_FFLUSH handler
+ *
+ *    a0 = fd
+ *      1 → fflush stdout
+ *      2 → fflush stderr
+ *      0 → fflush both (convenience; "flush everything")
+ *      anything else → -EBADF
+ *    → a0 = 0 on success, -EBADF on bad fd
+ *
+ *  Use case: guests producing terminal UI (ANSI escape sequences,
+ *  partial lines) need their output to reach the screen at known
+ *  syncpoints — game over messages, status updates, prompts.
+ *  Without an explicit flush, the FILE* buffer can hold output
+ *  indefinitely on a pipe/file destination (block-buffered) or
+ *  until a newline on a TTY (line-buffered).
+ * ============================================================ */
+
+static void handle_fflush(VmCpu *cpu, void *system) {
+    (void)system;
+    if (!cpu) return;
+    uint32_t fd = cpu->regs[VM_REG_A0];
+
+    if (fd == 0) {
+        if (g_out_file) fflush(g_out_file);
+        if (g_err_file && g_err_file != g_out_file) fflush(g_err_file);
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+    if (fd == 1 && g_out_file) {
+        fflush(g_out_file);
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+    if (fd == 2 && g_err_file) {
+        fflush(g_err_file);
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+    cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
 }
 
 /* ============================================================
@@ -395,6 +424,11 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
     }
     if (!vm_ecall_register(sys->ecall_router, SYS_READ, handle_read)) {
         vm_ecall_unregister(sys->ecall_router, SYS_WRITE);
+        return false;
+    }
+    if (!vm_ecall_register(sys->ecall_router, SYS_FFLUSH, handle_fflush)) {
+        vm_ecall_unregister(sys->ecall_router, SYS_WRITE);
+        vm_ecall_unregister(sys->ecall_router, SYS_READ);
         return false;
     }
 

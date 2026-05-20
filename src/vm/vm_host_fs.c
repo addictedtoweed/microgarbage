@@ -25,7 +25,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
-#include <sched.h>
 
 /* ============================================================
  *  File descriptor table
@@ -932,17 +931,33 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
                 child->regs[VM_REG_A0] = 0;
             } else {
                 /* Still asleep. Hand the host CPU back so we
-                 * don't pin a core.
+                 * don't pin a core, then re-check.
                  *
-                 * For waits over 20 ticks, nanosleep most of
-                 * the way and leave a 20-tick tail to absorb
-                 * the host OS timer's coarse granularity
-                 * (15 ms on Windows). Inside the tail, nanosleep
-                 * 1 ms at a time and re-check. */
-                struct timespec ts;
-                int32_t sleep_ticks = (delta > 20) ? (delta - 20) : 1;
-                ts.tv_sec  = sleep_ticks / 1000;
-                ts.tv_nsec = (long)(sleep_ticks % 1000) * 1000000L;
+                 * We use a fixed 1 ms nanosleep regardless of
+                 * how far the deadline is. This is intentional:
+                 *
+                 * - On Linux/macOS with high-res timers, 1 ms
+                 *   sleeps are precise enough that we hit the
+                 *   deadline within ~1 ms of overshoot, which
+                 *   is fine for game-frame pacing.
+                 *
+                 * - On Cygwin/Windows where the OS timer ticks
+                 *   at 15.6 ms by default, ANY sleep rounds up
+                 *   to a multiple of that. Asking for 1 ms or
+                 *   asking for 100 ms doesn't matter — we'll
+                 *   wake when the OS scheduler next runs us.
+                 *   The benefit of asking for the small amount
+                 *   is responsiveness: if the user hits 'q' at
+                 *   tick 50 and the deadline is at tick 1000,
+                 *   we don't sleep for 1 full second before
+                 *   re-checking input — we check every OS tick.
+                 *
+                 * Result: 8 fps on Linux is exactly 8 fps. 8 fps
+                 * on Cygwin is approximately 8 fps with up to
+                 * ±15 ms jitter per frame, but the AVERAGE rate
+                 * is correct because the tick source is read
+                 * fresh each iteration. */
+                struct timespec ts = { 0, 1000000L };   /* 1 ms */
                 nanosleep(&ts, NULL);
                 continue;
             }

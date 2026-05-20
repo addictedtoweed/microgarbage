@@ -488,6 +488,94 @@ static void handle_sleep_until(VmCpu *cpu, void *system_p) {
     cpu->block_deadline = deadline;
 }
 
+/* SYS_SET_RELOAD_PERIOD (1047)
+ *   a0 = period in ticks (0 = clear / disable)
+ *   → a0 = 0
+ *
+ * Anchors the reload state so the FIRST subsequent
+ * yield_until_reload sleeps for one full period. Subsequent
+ * yields fire one period apart from the previous wake. Passing
+ * period=0 clears the state; a guest can switch between flavors.
+ *
+ * Does not change block_reason — the guest stays runnable
+ * after this call. The actual blocking happens in
+ * yield_until_reload. */
+static void handle_set_reload_period(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys || !sys->sched) return;
+
+    uint32_t p = cpu->regs[VM_REG_A0];
+    cpu->reload_period = p;
+
+    if (p == 0) {
+        cpu->reload_next_deadline = 0;
+    } else {
+        cpu->reload_next_deadline = sys->sched->global_tick + p;
+    }
+
+    cpu->regs[VM_REG_A0] = 0;
+}
+
+/* SYS_YIELD_UNTIL_RELOAD (1048)
+ *   (no arguments)
+ *   → a0 = 0 on wake
+ *
+ * Blocks until reload_next_deadline. After waking, the
+ * kernel advances reload_next_deadline by one (or more)
+ * periods using the FreeRTOS-style catch-up policy: if the
+ * guest is more than one period behind, skip ahead to the
+ * next future boundary instead of firing the missed events
+ * back-to-back. Phase is preserved; missed frames are
+ * dropped cleanly.
+ *
+ * Misuse: if the guest calls yield_until_reload without
+ * setting a period, we treat it as a plain yield and return
+ * 0. This avoids surprising "blocks forever" behavior. */
+static void handle_yield_until_reload(VmCpu *cpu, void *system_p) {
+    VmSystem *sys = (VmSystem *)system_p;
+    if (!cpu || !sys || !sys->sched) return;
+
+    if (cpu->reload_period == 0) {
+        /* No period set — degrade to plain yield. */
+        cpu->regs[VM_REG_A0] = 0;
+        cpu->block_reason = BLOCK_YIELDED;
+        return;
+    }
+
+    uint32_t now      = sys->sched->global_tick;
+    uint32_t deadline = cpu->reload_next_deadline;
+    uint32_t period   = cpu->reload_period;
+
+    /* Compute the deadline AFTER this wake.
+     *
+     * Start at deadline + period (the natural next boundary).
+     * If now is already past that — guest ran long — advance
+     * by full periods until the next deadline is in the
+     * future. Bounded loop: at a sane period (>= 1 tick) this
+     * iterates at most a handful of times even in a serious
+     * overrun. The 1024 cap is purely defensive against
+     * pathological inputs (host clock jump, period set to 1
+     * after sleeping a long time, etc.). */
+    uint32_t next = deadline + period;
+    int safety = 1024;
+    while ((int32_t)(now - next) >= 0 && safety-- > 0) {
+        next += period;
+    }
+    cpu->reload_next_deadline = next;
+
+    /* If the CURRENT deadline (the one we were aiming at) is
+     * already in the past, the guest is late — wake right
+     * away on the next scheduler pass via BLOCK_YIELDED.
+     * Otherwise block until the deadline. */
+    if ((int32_t)(now - deadline) >= 0) {
+        cpu->regs[VM_REG_A0] = 0;
+        cpu->block_reason = BLOCK_YIELDED;
+    } else {
+        cpu->block_reason = BLOCK_SLEEP;
+        cpu->block_deadline = deadline;
+    }
+}
+
 /* ============================================================
  *  Install all the system-context handlers.
  *
@@ -496,17 +584,19 @@ static void handle_sleep_until(VmCpu *cpu, void *system_p) {
 
 static bool install_system_handlers(VmEcallRouter *r) {
     struct { uint32_t num; VmEcallHandler h; } entries[] = {
-        { SYS_ALLOC,            handle_alloc           },
-        { SYS_FREE,             handle_free            },
-        { SYS_SEND,             handle_send            },
-        { SYS_RECV,             handle_recv            },
-        { SYS_MAILBOX_INFO,     handle_mailbox_info    },
-        { SYS_WHITELIST_ADD,    handle_whitelist_add   },
-        { SYS_WHITELIST_REMOVE, handle_whitelist_remove},
-        { SYS_TICKS_NOW,        handle_ticks_now       },
-        { SYS_TICK_HZ,          handle_tick_hz         },
-        { SYS_SLEEP_TICKS,      handle_sleep_ticks     },
-        { SYS_SLEEP_UNTIL,      handle_sleep_until     },
+        { SYS_ALLOC,                handle_alloc              },
+        { SYS_FREE,                 handle_free               },
+        { SYS_SEND,                 handle_send               },
+        { SYS_RECV,                 handle_recv               },
+        { SYS_MAILBOX_INFO,         handle_mailbox_info       },
+        { SYS_WHITELIST_ADD,        handle_whitelist_add      },
+        { SYS_WHITELIST_REMOVE,     handle_whitelist_remove   },
+        { SYS_TICKS_NOW,            handle_ticks_now          },
+        { SYS_TICK_HZ,              handle_tick_hz            },
+        { SYS_SLEEP_TICKS,          handle_sleep_ticks        },
+        { SYS_SLEEP_UNTIL,          handle_sleep_until        },
+        { SYS_SET_RELOAD_PERIOD,    handle_set_reload_period  },
+        { SYS_YIELD_UNTIL_RELOAD,   handle_yield_until_reload },
     };
     size_t n = sizeof(entries) / sizeof(entries[0]);
 

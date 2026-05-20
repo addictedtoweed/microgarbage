@@ -958,6 +958,216 @@ static void test_sleep_until_wraparound_safe(void) {
     vm_system_destroy(&sys);
 }
 
+/* ============================================================
+ *  Auto-reload periodic timer
+ * ============================================================ */
+
+/* Helper: stand up a sys + cpu at a known tick. */
+static void reload_setup(VmSystem *sys, VmCpu *cpu, uint32_t at_tick) {
+    g_fake_ticks = at_tick;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .tick_source = fake_tick_source,
+        .ticks_per_second = 1000,
+    };
+    ASSERT(vm_system_init(sys, &cfg));
+    sys->sched->global_tick = at_tick;
+    vm_init(cpu, 0);
+}
+
+static void test_set_reload_period_anchors_deadline(void) {
+    /* set_reload_period(p) should anchor reload_next_deadline at
+     * now + p so the first yield_until_reload sleeps one period. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 100);
+
+    cpu.regs[REG_A0] = 125;             /* period = 125 ticks */
+    cpu.regs[REG_A7] = 1047;             /* SYS_SET_RELOAD_PERIOD */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    ASSERT_EQ_INT(125, (int)cpu.reload_period);
+    ASSERT_EQ_INT(225, (int)cpu.reload_next_deadline);  /* 100 + 125 */
+    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_set_reload_period_zero_clears(void) {
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 100);
+
+    /* First set a real period... */
+    cpu.regs[REG_A0] = 125;
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(125, (int)cpu.reload_period);
+
+    /* ...then clear it. */
+    cpu.regs[REG_A0] = 0;
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    ASSERT_EQ_INT(0, (int)cpu.reload_period);
+    ASSERT_EQ_INT(0, (int)cpu.reload_next_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_yield_until_reload_blocks_until_first_deadline(void) {
+    /* First yield after set_reload_period: deadline is in the
+     * future, so BLOCK_SLEEP until that tick. Next deadline is
+     * advanced by one period for the subsequent yield. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 100);
+
+    /* set_reload_period(125) → next_deadline = 225 */
+    cpu.regs[REG_A0] = 125;
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* yield_until_reload — still at tick 100, deadline 225 is
+     * in the future → block until 225, advance next to 350. */
+    cpu.regs[REG_A7] = 1048;             /* SYS_YIELD_UNTIL_RELOAD */
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(225, (int)cpu.block_deadline);
+    ASSERT_EQ_INT(350, (int)cpu.reload_next_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_yield_until_reload_subsequent_cycles(void) {
+    /* Simulate a sequence of yields where the guest is on time
+     * each frame. Each yield should target the next boundary
+     * exactly. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 100);
+
+    cpu.regs[REG_A0] = 50;               /* period = 50 */
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    /* next_deadline now = 150 */
+
+    /* Yield 1: tick=100, sleep until 150, next=200 */
+    cpu.regs[REG_A7] = 1048;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(150, (int)cpu.block_deadline);
+    ASSERT_EQ_INT(200, (int)cpu.reload_next_deadline);
+
+    /* Advance to tick 150 (the deadline we just hit) and reset
+     * block state as if the scheduler woke us. */
+    cpu.block_reason = BLOCK_NONE;
+    cpu.block_deadline = 0;
+    sys.sched->global_tick = 150;
+
+    /* Yield 2: tick=150, sleep until 200, next=250 */
+    cpu.regs[REG_A7] = 1048;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(200, (int)cpu.block_deadline);
+    ASSERT_EQ_INT(250, (int)cpu.reload_next_deadline);
+
+    /* Yield 3: tick=200, sleep until 250, next=300 */
+    cpu.block_reason = BLOCK_NONE;
+    sys.sched->global_tick = 200;
+    cpu.regs[REG_A7] = 1048;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    ASSERT_EQ_INT(250, (int)cpu.block_deadline);
+    ASSERT_EQ_INT(300, (int)cpu.reload_next_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_yield_until_reload_catchup_skips_to_future(void) {
+    /* The crux of the FreeRTOS-style catch-up policy: if a slow
+     * frame leaves us multiple periods past the planned deadline,
+     * skip forward to the next FUTURE boundary rather than
+     * firing back-to-back. Phase preserved, missed frames
+     * dropped. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 0);
+
+    cpu.regs[REG_A0] = 100;              /* period = 100 */
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    /* next_deadline = 100 */
+
+    /* Pretend the guest got hung up: we're now at tick 350,
+     * way past the deadline of 100. Call yield. */
+    sys.sched->global_tick = 350;
+
+    cpu.regs[REG_A7] = 1048;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* The current deadline (100) is past, so wake immediately
+     * via YIELDED. But reload_next_deadline should have been
+     * advanced past now: 100, 200, 300, 400 — first future is
+     * 400. */
+    ASSERT_EQ_INT((int)BLOCK_YIELDED, (int)cpu.block_reason);
+    ASSERT_EQ_INT(400, (int)cpu.reload_next_deadline);
+    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_yield_until_reload_without_period_yields(void) {
+    /* Calling yield_until_reload before set_reload_period
+     * should NOT block forever (which would be the result of a
+     * naive "wait until tick 0" interpretation). Instead treat
+     * it as a plain yield. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 100);
+
+    /* No set_reload_period was called → reload_period is 0. */
+    ASSERT_EQ_INT(0, (int)cpu.reload_period);
+
+    cpu.regs[REG_A7] = 1048;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    ASSERT_EQ_INT((int)BLOCK_YIELDED, (int)cpu.block_reason);
+    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_yield_until_reload_independent_of_sleep_until(void) {
+    /* SYS_SLEEP_UNTIL should NOT touch the reload state, and
+     * vice versa. A guest mixing the two should see them as
+     * independent timers. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 100);
+
+    /* Set up reload state */
+    cpu.regs[REG_A0] = 50;
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    /* reload_next_deadline = 150 */
+
+    /* Now call SYS_SLEEP_UNTIL for a totally unrelated deadline */
+    cpu.regs[REG_A0] = 999;
+    cpu.regs[REG_A7] = 1046;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* sleep_until set block state — that's expected */
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(999, (int)cpu.block_deadline);
+    /* But reload state untouched */
+    ASSERT_EQ_INT(50, (int)cpu.reload_period);
+    ASSERT_EQ_INT(150, (int)cpu.reload_next_deadline);
+
+    vm_system_destroy(&sys);
+}
+
 
 
 /* ============================================================
@@ -1003,6 +1213,15 @@ int main(void) {
     RUN(test_sleep_until_future_blocks);
     RUN(test_sleep_until_past_yields);
     RUN(test_sleep_until_wraparound_safe);
+
+    /* Auto-reload periodic timer */
+    RUN(test_set_reload_period_anchors_deadline);
+    RUN(test_set_reload_period_zero_clears);
+    RUN(test_yield_until_reload_blocks_until_first_deadline);
+    RUN(test_yield_until_reload_subsequent_cycles);
+    RUN(test_yield_until_reload_catchup_skips_to_future);
+    RUN(test_yield_until_reload_without_period_yields);
+    RUN(test_yield_until_reload_independent_of_sleep_until);
 
     /* Suppress unused warnings */
     (void)sw_; (void)lw_;
