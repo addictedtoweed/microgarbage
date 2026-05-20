@@ -40,6 +40,13 @@ static FILE *g_in_file  = NULL;
 static FILE *g_out_file = NULL;
 static FILE *g_err_file = NULL;
 
+/* fd overrides (used by read()/write() in preference to fileno()
+ * on the FILE*s above). When -1, the bridge falls back to
+ * fileno(FILE*) — the historical behavior. */
+static int   g_in_fd  = -1;
+static int   g_out_fd = -1;
+static int   g_err_fd = -1;
+
 /* ============================================================
  *  Delegate hooks for file fds
  *
@@ -199,13 +206,18 @@ static void handle_write(VmCpu *cpu, void *system) {
     }
 
     FILE *dest = NULL;
-    if (fd == 1) dest = g_out_file;
-    else if (fd == 2) dest = g_err_file;
-    else {
+    int   dest_fd = -1;
+    if (fd == 1) {
+        dest = g_out_file;
+        dest_fd = g_out_fd;
+    } else if (fd == 2) {
+        dest = g_err_file;
+        dest_fd = g_err_fd;
+    } else {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
         return;
     }
-    if (!dest) {
+    if (!dest && dest_fd < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
         return;
     }
@@ -222,7 +234,23 @@ static void handle_write(VmCpu *cpu, void *system) {
         return;
     }
 
-    size_t written = fwrite(host_buf, 1, n, dest);
+    size_t written;
+    if (dest_fd >= 0) {
+        /* fd-override path: write directly via the POSIX syscall.
+         * Used by hosts that supply an fd whose FILE* wrapping
+         * doesn't roundtrip cleanly (e.g., a Cygwin attached
+         * named-pipe HANDLE). The fd may be the same for stdout
+         * and stderr — that's fine, both streams just flow to
+         * the same destination. */
+        ssize_t w = write(dest_fd, host_buf, n);
+        if (w < 0) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO);
+            return;
+        }
+        written = (size_t)w;
+    } else {
+        written = fwrite(host_buf, 1, n, dest);
+    }
     /* Flushing here would hurt throughput. We rely on the FILE*'s
      * own buffering policy (line-buffered on TTYs, block-buffered
      * otherwise), with two exits hatches:
@@ -349,7 +377,7 @@ static void handle_read(VmCpu *cpu, void *system) {
         return;
     }
 
-    int src_fd = fileno(g_in_file);
+    int src_fd = (g_in_fd >= 0) ? g_in_fd : fileno(g_in_file);
     if (src_fd < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO);
         return;
@@ -367,8 +395,18 @@ static void handle_read(VmCpu *cpu, void *system) {
          *
          * g_termios_saved tracks whether we're currently in raw
          * mode (set true by enable_raw_mode, cleared by
-         * disable_raw_mode). Use it to disambiguate. */
-        if (g_termios_saved) {
+         * disable_raw_mode). Use it to disambiguate.
+         *
+         * Additional case: when stdin is a non-tty fd we've put
+         * into non-blocking mode (e.g., a named pipe in a host
+         * that uses --pipe), read() returning 0 USUALLY means
+         * EOF — but for some attachment types it can mean "no
+         * data" instead. We can't easily distinguish without
+         * more context, so when the override path is in use we
+         * report "no data" (returning 0 to the guest) and rely
+         * on the host to detect a real EOF via a separate
+         * mechanism (e.g., a SIGPIPE/SIGINT signal handler). */
+        if (g_termios_saved || g_in_fd >= 0) {
             cpu->regs[VM_REG_A0] = 0;            /* no data ready */
         } else {
             cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO); /* EOF */
@@ -403,9 +441,22 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
     FILE *err = (cfg && cfg->stderr_dest)  ? cfg->stderr_dest  : stderr;
     bool  raw = cfg && cfg->raw_mode;
 
-    /* Set the underlying stdin fd to non-blocking. We do this
-     * unconditionally because SYS_READ is documented non-blocking. */
-    int in_fd = fileno(in);
+    /* fd overrides — when ≥0, used by handle_read/handle_write
+     * instead of fileno(FILE*). Stored separately so a host can
+     * supply both a FILE* (for fflush) and an fd (for raw I/O)
+     * — useful when the FILE* and fd don't reliably roundtrip
+     * (e.g., Cygwin attached HANDLE). */
+    int override_in  = (cfg && cfg->stdin_fd_override  > 0) ? cfg->stdin_fd_override  : -1;
+    int override_out = (cfg && cfg->stdout_fd_override > 0) ? cfg->stdout_fd_override : -1;
+    int override_err = (cfg && cfg->stderr_fd_override > 0) ? cfg->stderr_fd_override : -1;
+
+    /* Note: > 0, not >= 0, because fd=0 is meaningful for the
+     * default path (stdin); a caller that genuinely wants to
+     * override to fd 0 should just use the default behavior. */
+
+    /* Determine the fd to use for nonblock and raw-mode operations.
+     * Prefer the override if set; otherwise fall back to fileno. */
+    int in_fd = (override_in >= 0) ? override_in : fileno(in);
     if (in_fd >= 0) {
         set_nonblock(in_fd);
     }
@@ -437,5 +488,8 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
     g_in_file  = in;
     g_out_file = out;
     g_err_file = err;
+    g_in_fd    = override_in;
+    g_out_fd   = override_out;
+    g_err_fd   = override_err;
     return true;
 }

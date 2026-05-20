@@ -101,6 +101,19 @@ typedef struct {
      *
      * Ignored (no-op) if stdin_src is not a TTY. */
     bool raw_mode;
+
+    /* Optional fd overrides. When >= 0, the bridge uses these fds
+     * directly for read()/write() instead of asking fileno() on
+     * the FILE*s. Useful when the FILE* doesn't have a backing
+     * fd (e.g., when wrapping a Win32 HANDLE via fopencookie),
+     * or when you want to bypass stdio buffering for I/O while
+     * keeping fflush() useful for prompt-flush semantics.
+     *
+     * Defaults to -1 (use fileno on the FILE*) which is the
+     * historical behavior. */
+    int stdin_fd_override;
+    int stdout_fd_override;
+    int stderr_fd_override;
 } VmHostStdioConfig;
 
 /* ============================================================
