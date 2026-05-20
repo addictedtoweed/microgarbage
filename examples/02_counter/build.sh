@@ -53,9 +53,9 @@ echo "02_counter: compiling host..."
 if have_guest_cc; then
     echo "02_counter: compiling guest (RV32IMC)..."
     "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
-        -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/guest.elf" \
-        "$EXAMPLE_DIR/guest.c"
+        -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/guest.elf")" \
+        "$(guest_path "$EXAMPLE_DIR/guest.c")"
 else
     if [ -f "$BUILD_DIR/guest.elf" ]; then
         echo "02_counter: $GUEST_CC not found, using existing guest.elf"

@@ -61,27 +61,27 @@ echo "01_hello: compiling host..."
 if have_guest_cc; then
     echo "01_hello: compiling guest (RV32IMC)..."
     "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
-        -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/guest.elf" \
-        "$EXAMPLE_DIR/guest.c"
+        -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/guest.elf")" \
+        "$(guest_path "$EXAMPLE_DIR/guest.c")"
 
     echo "01_hello: compiling guest_factorial..."
     "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
-        -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/guest_factorial.elf" \
-        "$EXAMPLE_DIR/guest_factorial.c"
+        -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/guest_factorial.elf")" \
+        "$(guest_path "$EXAMPLE_DIR/guest_factorial.c")"
 
     echo "01_hello: compiling guest_squares..."
     "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
-        -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/guest_squares.elf" \
-        "$EXAMPLE_DIR/guest_squares.c"
+        -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/guest_squares.elf")" \
+        "$(guest_path "$EXAMPLE_DIR/guest_squares.c")"
 
     echo "01_hello: compiling guest_minimal (test fixture)..."
     "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
-        -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/guest_minimal.elf" \
-        "$EXAMPLE_DIR/guest_minimal.c"
+        -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/guest_minimal.elf")" \
+        "$(guest_path "$EXAMPLE_DIR/guest_minimal.c")"
 else
     if [ -f "$BUILD_DIR/guest.elf" ]; then
         echo "01_hello: $GUEST_CC not found, using existing guest.elf"

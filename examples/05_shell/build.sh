@@ -62,9 +62,9 @@ echo "05_shell: compiling host (with FatFs)..."
 if have_guest_cc; then
     echo "05_shell: compiling guest (RV32IMC)..."
     "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
-        -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/shell.elf" \
-        "$EXAMPLE_DIR/shell.c"
+        -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/shell.elf")" \
+        "$(guest_path "$EXAMPLE_DIR/shell.c")"
 else
     if [ -f "$BUILD_DIR/shell.elf" ]; then
         echo "05_shell: $GUEST_CC not found, using existing shell.elf"

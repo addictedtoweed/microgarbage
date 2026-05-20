@@ -32,12 +32,12 @@ echo "03_mailbox: compiling host..."
 
 if have_guest_cc; then
     echo "03_mailbox: compiling producer (RV32IMC)..."
-    "$GUEST_CC" "${GUEST_CFLAGS[@]}" -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/producer.elf" "$EXAMPLE_DIR/producer.c"
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/producer.elf")" "$(guest_path "$EXAMPLE_DIR/producer.c")"
 
     echo "03_mailbox: compiling consumer (RV32IMC)..."
-    "$GUEST_CC" "${GUEST_CFLAGS[@]}" -Wl,-T,"$GUEST_LD" \
-        -o "$BUILD_DIR/consumer.elf" "$EXAMPLE_DIR/consumer.c"
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" -Wl,-T,"$(guest_path "$GUEST_LD")" \
+        -o "$(guest_path "$BUILD_DIR/consumer.elf")" "$(guest_path "$EXAMPLE_DIR/consumer.c")"
 else
     if [ -f "$BUILD_DIR/producer.elf" ] && [ -f "$BUILD_DIR/consumer.elf" ]; then
         echo "03_mailbox: $GUEST_CC not found, using existing .elf files"
