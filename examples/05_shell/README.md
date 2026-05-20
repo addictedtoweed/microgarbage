@@ -13,12 +13,17 @@ file operations backed by a FatFs volume on a trashdrive.
   current working directory (since the VM has no native CWD
   concept) and prefixes relative paths before calling into the
   host.
-- **Cooked-mode terminal input** — opposite of `04_keydump`.
-  The terminal handles line editing; the guest reads complete
-  lines from stdin via `SYS_READ` (which arrives one or more
-  bytes at a time and assembles a line in a buffer).
+- **Raw-mode terminal input with history** — the shell runs
+  in raw mode, owns its own line editing, and supports
+  up/down history recall, Ctrl-L (clear screen), Ctrl-U (clear
+  line), Ctrl-C (cancel line), and Ctrl-D (exit).
 - **A real "application" running as a guest** — not a demo
   loop. Most of the code is shell logic, not VM glue.
+- **Optional named-pipe stdio routing** — `--pipe=<name>` on
+  Windows hosts (Cygwin or MSYS2) opens a Win32 named pipe
+  that PuTTY can attach to as a Serial session. Useful on
+  Windows where the local terminal's scheduling can affect
+  VM pacing.
 
 ## Prerequisites
 
@@ -179,10 +184,6 @@ bye
 
 ## What's not here
 
-- **No history / arrow keys**: the shell uses cooked mode for
-  simplicity. To add history you'd switch to raw mode (like
-  `04_keydump`) and implement an input-edit loop with
-  cursor-movement and history buffers.
 - **No pipes / redirection**: the `write` command exists as a
   redirection substitute. Real pipes would need a way to route
   one VM's stdout into another's stdin.
@@ -195,15 +196,65 @@ bye
   runs you'd skip `f_mkfs` and let FatFs auto-detect the
   existing layout — and use file-backed storage instead of RAM.
 
+## Routing stdio through a named pipe (Windows / Cygwin)
+
+By default the host binds to the launching terminal (mintty,
+Windows Terminal, the inherited stdin/stdout). On Windows that
+couples the VM's pacing to the local terminal's scheduling
+quantum, which can stutter under load — and it doesn't reflect
+the eventual deployment story (talking to a real STM32 over
+a UART, which never shares a process with a GUI terminal).
+
+The `--pipe=<name>` flag opens a Windows named pipe and routes
+all VM stdio (stdin, stdout, stderr) through it. PuTTY connects
+to the pipe as a "Serial" session, and the two processes are
+scheduled independently. Pacing improves; the experience is
+much closer to a real serial console.
+
+To use it:
+
+```
+# In a Cygwin shell:
+$ ./build/host --pipe=microgarbage
+host: waiting for client on \\.\pipe\microgarbage ...
+host: in PuTTY: Session type=Serial, Serial line=\\.\pipe\microgarbage, Speed=any
+```
+
+In PuTTY:
+
+1. Open PuTTY.
+2. Connection type: **Serial**
+3. Serial line: `\\.\pipe\microgarbage`  (or whatever name you passed)
+4. Speed: any number (ignored for pipes — pipes have no baud rate)
+5. Click **Open**.
+
+The host prints "client connected" and the shell banner appears
+in the PuTTY window. From there it works exactly like running
+the host directly — `ls`, `cd`, `run /host/snake.elf`, etc.
+Close PuTTY (or hit Ctrl-C in the launching mintty) to end the
+session.
+
+Notes:
+
+- One PuTTY at a time. The pipe has a single instance; a second
+  client gets "pipe busy."
+- If you see double-echo when you type, go to PuTTY's
+  Terminal → Local echo → "Force off."
+- The pipe is created when the host starts and destroyed when
+  it exits — no leftover state on the system.
+- The same approach works with other named-pipe-capable clients
+  (Tera Term, RealTerm). PuTTY's just the most commonly used.
+
 ## Files
 
 - `host.c` — sets up trashdrive + FatFs + VmSystem + stdio/fs
-  bridges, loads `shell.elf`, runs scheduler. Parses `--host-fs=`
-  CLI args and configures the `/host` mount.
-- `shell.c` — the guest shell (~600 lines, no libc)
+  bridges, loads `shell.elf`, runs scheduler. Parses CLI args
+  including `--host-fs=` and `--pipe=`.
+- `shell.c` — the guest shell with a raw-mode line editor
+  including up/down history recall, Ctrl-L, Ctrl-U, etc.
 - `host_files_src/` — sources for the sample spawnable guests
-  (`hello.c`, `count.c`). `build.sh` compiles each into a
-  matching `.elf` under `host_files/`.
+  (`hello.c`, `count.c`, `snake.c`). `build.sh` compiles each
+  into a matching `.elf` under `host_files/`.
 - `host_files/` — auto-populated by `build.sh` with the sample
   ELFs. This directory is what the shell sees as `/host`.
 - `build.sh` — builds the host, the shell guest, and each

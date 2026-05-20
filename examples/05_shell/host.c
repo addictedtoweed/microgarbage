@@ -7,8 +7,15 @@
  *   - shell.elf loaded as the sole VM
  *
  * Then runs the scheduler until the shell calls SYS_EXIT (or
- * Ctrl-C from the user, since this example uses cooked-mode
- * terminal input, not raw mode).
+ * Ctrl-C from the user).
+ *
+ * Stdio routing:
+ *   default        process stdin/stdout/stderr (current behavior)
+ *   --pipe=<name>  bidirectional Windows named pipe; PuTTY (or
+ *                  another client) connects to it as a "serial"
+ *                  line. Decouples VM execution from the local
+ *                  terminal's scheduling/rendering and is also a
+ *                  realistic stand-in for a UART on real hardware.
  *
  * Build dependencies (beyond the standard -Iinclude):
  *   -Ithird_party/fatfs/source -Ithird_party/fatfs -DHAVE_FATFS
@@ -36,6 +43,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+
+#if defined(__CYGWIN__) || defined(_WIN32)
+#  define PIPE_MODE_SUPPORTED 1
+#  include <windows.h>
+#  include <io.h>          /* _open_osfhandle */
+#  include <fcntl.h>       /* _O_RDWR */
+#endif
 
 /* ---------------------------------------------------------------
  * Backing storage
@@ -110,6 +124,115 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
     return 0;
 }
 
+#ifdef PIPE_MODE_SUPPORTED
+/* ---------------------------------------------------------------
+ *  Named-pipe transport (Windows-only)
+ *
+ *  Creates a bidirectional Windows named pipe and waits for a
+ *  single client to connect. The pipe is byte-oriented (not
+ *  message-oriented) and configured to behave as much like a tty
+ *  as we can — that means PIPE_READMODE_BYTE on our side and the
+ *  client (PuTTY) just reads bytes as they arrive.
+ *
+ *  Returns a FILE* that can be used for both reading and writing.
+ *  The same FILE* is suitable for stdin AND stdout/stderr because
+ *  Windows named pipes are full-duplex; the VM's stdio bridge
+ *  will end up wrapping the same underlying HANDLE three times,
+ *  which is exactly what we want — bytes the guest "writes to
+ *  stderr" arrive at the PuTTY end interleaved with stdout bytes,
+ *  same as a real serial line.
+ *
+ *  Why this lives in host.c instead of vm_host_stdio.c:
+ *    - It's host-application-policy (which transport to use) rather
+ *      than VM-bridge functionality (how the guest sees stdio).
+ *    - It's Windows-specific; the bridge is portable.
+ *    - Future hosts (TCP socket, /dev/ttyUSBn, etc.) plug in here
+ *      using the same pattern.
+ * --------------------------------------------------------------- */
+
+static HANDLE g_pipe_handle = INVALID_HANDLE_VALUE;
+
+static FILE *open_named_pipe_for_stdio(const char *name) {
+    /* Pipe naming: callers can pass either a fully-qualified
+     * "\\\\.\\pipe\\foo" or a short "foo". Translate short forms
+     * to the full prefix to make the CLI friendlier. */
+    char full[256];
+    if (strncmp(name, "\\\\.\\pipe\\", 9) == 0) {
+        snprintf(full, sizeof(full), "%s", name);
+    } else {
+        snprintf(full, sizeof(full), "\\\\.\\pipe\\%s", name);
+    }
+
+    /* PIPE_ACCESS_DUPLEX     — bidirectional
+     * PIPE_TYPE_BYTE         — stream-oriented, not message-oriented
+     * PIPE_WAIT              — synchronous reads/writes (we set
+     *                          O_NONBLOCK on the wrapping fd later)
+     * 1 instance, 4 KB buffers, default timeout. */
+    g_pipe_handle = CreateNamedPipeA(
+        full,
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1,                     /* max instances */
+        4096, 4096,            /* out, in buffer sizes */
+        0,                     /* default timeout */
+        NULL);                 /* default security */
+    if (g_pipe_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "host: CreateNamedPipe('%s') failed (error %lu)\n",
+                full, (unsigned long)GetLastError());
+        return NULL;
+    }
+
+    fprintf(stderr, "host: waiting for client on %s ...\n", full);
+    fprintf(stderr, "host: in PuTTY: Session type=Serial, "
+                    "Serial line=%s, Speed=any\n", full);
+    fflush(stderr);
+
+    /* Blocks until a client connects. ERROR_PIPE_CONNECTED means
+     * the client connected between CreateNamedPipe and here,
+     * which is fine. */
+    if (!ConnectNamedPipe(g_pipe_handle, NULL)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_PIPE_CONNECTED) {
+            fprintf(stderr, "host: ConnectNamedPipe failed (error %lu)\n",
+                    (unsigned long)err);
+            CloseHandle(g_pipe_handle);
+            g_pipe_handle = INVALID_HANDLE_VALUE;
+            return NULL;
+        }
+    }
+    fprintf(stderr, "host: client connected.\n");
+    fflush(stderr);
+
+    /* Wrap the HANDLE in a POSIX fd, then in a FILE*. _O_RDWR
+     * matches PIPE_ACCESS_DUPLEX. From this point the FILE* can
+     * be passed wherever the bridge expects stdin/stdout/stderr. */
+    int fd = _open_osfhandle((intptr_t)g_pipe_handle, _O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "host: _open_osfhandle failed: %s\n",
+                strerror(errno));
+        CloseHandle(g_pipe_handle);
+        g_pipe_handle = INVALID_HANDLE_VALUE;
+        return NULL;
+    }
+
+    /* "r+" — read and write, no truncation, no append. */
+    FILE *f = fdopen(fd, "r+");
+    if (!f) {
+        fprintf(stderr, "host: fdopen failed: %s\n", strerror(errno));
+        /* Closing fd will close the underlying handle. */
+        close(fd);
+        g_pipe_handle = INVALID_HANDLE_VALUE;
+        return NULL;
+    }
+
+    /* No buffering — we want every byte to flow immediately, the
+     * same way it does on a tty. The VM's SYS_FFLUSH calls won't
+     * hurt but with _IONBF they're effectively no-ops. */
+    setvbuf(f, NULL, _IONBF, 0);
+    return f;
+}
+#endif  /* PIPE_MODE_SUPPORTED */
+
 int main(int argc, char **argv) {
     /* ----- Parse args -----
      *
@@ -122,6 +245,11 @@ int main(int argc, char **argv) {
      *   --host-fs-rw        Make the /host mount writable. Default
      *                       is read-only for safety.
      *   --no-host-fs        Disable the /host mount entirely.
+     *   --pipe=<name>       (Windows/Cygwin) Route stdio through a
+     *                       named pipe; PuTTY connects to it as a
+     *                       Serial session. Name can be a bare
+     *                       identifier ('microgarbage') or a full
+     *                       \\.\\pipe\\<name> path.
      *
      * Positional: the path to shell.elf. Defaults to build/shell.elf.
      */
@@ -129,6 +257,7 @@ int main(int argc, char **argv) {
     const char *host_fs_root = "host_files";   /* default — created if missing */
     bool host_fs_writable    = false;
     bool host_fs_disabled    = false;
+    const char *pipe_name    = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--host-fs=", 10) == 0) {
@@ -137,11 +266,14 @@ int main(int argc, char **argv) {
             host_fs_writable = true;
         } else if (strcmp(argv[i], "--no-host-fs") == 0) {
             host_fs_disabled = true;
+        } else if (strncmp(argv[i], "--pipe=", 7) == 0) {
+            pipe_name = argv[i] + 7;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
             fprintf(stderr, "  --host-fs=<path>   mount path as /host (default: ./host_files)\n");
             fprintf(stderr, "  --host-fs-rw       allow writes to /host (default: read-only)\n");
             fprintf(stderr, "  --no-host-fs       disable /host mount\n");
+            fprintf(stderr, "  --pipe=<name>      route stdio through a named pipe (Windows)\n");
             return 1;
         } else if (!elf_path) {
             elf_path = argv[i];
@@ -151,6 +283,14 @@ int main(int argc, char **argv) {
         }
     }
     if (!elf_path) elf_path = "build/shell.elf";
+
+#ifndef PIPE_MODE_SUPPORTED
+    if (pipe_name) {
+        fprintf(stderr, "host: --pipe is Windows-only "
+                        "(this build targets a non-Windows platform).\n");
+        return 1;
+    }
+#endif
 
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
@@ -232,9 +372,40 @@ int main(int argc, char **argv) {
         fprintf(stderr, "host: vm_system_init failed\n");
         return 1;
     }
-    if (!vm_host_install_stdio(&sys)) {
-        fprintf(stderr, "host: vm_host_install_stdio failed\n");
+
+    /* Stdio install: either default (process stdin/stdout/stderr)
+     * or routed through a named pipe. The pipe call BLOCKS until
+     * a client connects, so the user sees the "waiting" message
+     * first and then the shell banner once their PuTTY is attached. */
+    if (pipe_name) {
+#ifdef PIPE_MODE_SUPPORTED
+        FILE *pipe_io = open_named_pipe_for_stdio(pipe_name);
+        if (!pipe_io) {
+            return 1;
+        }
+        VmHostStdioConfig sio = {
+            .stdin_src   = pipe_io,
+            .stdout_dest = pipe_io,
+            .stderr_dest = pipe_io,
+            /* No raw_mode: the pipe is already byte-at-a-time
+             * and isn't a tty so the termios calls would no-op
+             * anyway. The guest's SYS_TTY_SET_RAW will harmlessly
+             * fail and the shell falls back to its non-raw path. */
+            .raw_mode    = false,
+        };
+        if (!vm_host_install_stdio_ex(&sys, &sio)) {
+            fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
+            return 1;
+        }
+#else
+        /* unreachable — we checked above */
         return 1;
+#endif
+    } else {
+        if (!vm_host_install_stdio(&sys)) {
+            fprintf(stderr, "host: vm_host_install_stdio failed\n");
+            return 1;
+        }
     }
     if (!vm_host_install_fs(&sys)) {
         fprintf(stderr, "host: vm_host_install_fs failed\n");
