@@ -919,6 +919,35 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
 
 
 /* ============================================================
+ *  TTY control handler
+ *
+ *  Thin wrapper around vm_host_stdio_set_raw_mode. Lives here
+ *  (not in vm_host_stdio.c) because it needs to be registered
+ *  separately from the unconditional stdio syscalls — only
+ *  guests that opt into the fs/spawn handler chain get TTY
+ *  control.
+ * ============================================================ */
+
+extern bool vm_host_stdio_set_raw_mode(bool enable);
+
+/* SYS_TTY_SET_RAW
+ *   a0 = enable (0 = cooked, nonzero = raw)
+ *   → a0 = 0 on success, -ENOTTY if stdin isn't a tty
+ */
+static void handle_tty_set_raw(VmCpu *cpu, void *system) {
+    (void)system;
+    bool enable = (cpu->regs[VM_REG_A0] != 0);
+    if (vm_host_stdio_set_raw_mode(enable)) {
+        cpu->regs[VM_REG_A0] = 0;
+    } else {
+        /* ENOTTY (25 on Linux) — we don't have a VM_ENOTTY define
+         * but the contract documents "not a tty". Use EIO as the
+         * closest existing value. */
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO);
+    }
+}
+
+/* ============================================================
  *  Wire-up with vm_host_stdio
  *
  *  vm_host_stdio's read/write/close handlers delegate fd >= 3
@@ -973,12 +1002,15 @@ bool vm_host_install_fs(VmSystem *sys) {
     if (!vm_ecall_register(sys->ecall_router, SYS_READDIR,  handle_readdir))  goto fail_unlinkat;
     if (!vm_ecall_register(sys->ecall_router, SYS_SPAWN_AND_WAIT,
                                                             handle_spawn_and_wait)) goto fail_readdir;
+    if (!vm_ecall_register(sys->ecall_router, SYS_TTY_SET_RAW,
+                                                            handle_tty_set_raw))   goto fail_spawn;
 
     /* Wire up stdio's hooks so fd >= 3 routes here. */
     vm_host_stdio_set_fs_hooks(fs_read_fd, fs_write_fd, fs_close_fd);
 
     return true;
 
+fail_spawn:    vm_ecall_unregister(sys->ecall_router, SYS_SPAWN_AND_WAIT);
 fail_readdir:  vm_ecall_unregister(sys->ecall_router, SYS_READDIR);
 fail_unlinkat: vm_ecall_unregister(sys->ecall_router, SYS_UNLINKAT);
 fail_mkdirat:  vm_ecall_unregister(sys->ecall_router, SYS_MKDIRAT);

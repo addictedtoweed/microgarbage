@@ -123,6 +123,35 @@ static bool enable_raw_mode(int fd) {
     return true;
 }
 
+/* Restore the saved termios. Returns true if anything changed
+ * (i.e., we were previously in raw mode), false if there was
+ * no saved state to restore. */
+static bool disable_raw_mode(void) {
+    if (!g_termios_saved || g_termios_fd < 0) return false;
+    tcsetattr(g_termios_fd, TCSAFLUSH, &g_termios_orig);
+    g_termios_saved = false;
+    /* Keep g_termios_fd set — if the guest re-enables raw mode
+     * later, we want enable_raw_mode to know which fd to operate
+     * on. (It'll re-tcgetattr its current state and save it again.) */
+    return true;
+}
+
+/* Public: toggle raw mode on the previously-installed stdin
+ * fd. Used by SYS_TTY_SET_RAW. Returns true on success, false
+ * if the fd is not a tty or no stdio was installed. */
+bool vm_host_stdio_set_raw_mode(bool enable) {
+    if (!g_in_file) return false;
+    int fd = fileno(g_in_file);
+    if (fd < 0 || !isatty(fd)) return false;
+
+    if (enable) {
+        if (g_termios_saved) return true;   /* already raw */
+        return enable_raw_mode(fd);
+    } else {
+        return disable_raw_mode();
+    }
+}
+
 /* Set O_NONBLOCK on a fd. Returns 0 on success, -1 on failure. */
 static int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);

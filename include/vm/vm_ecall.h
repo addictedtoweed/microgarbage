@@ -181,6 +181,26 @@
  */
 #define SYS_SPAWN_AND_WAIT  1104   /* spawn_and_wait(path) → exit_code or -errno */
 
+/* --- TTY control (1105..1119) ---
+ *
+ * Lets a guest toggle the host terminal's raw mode at runtime.
+ * Raw mode delivers keystrokes immediately byte-at-a-time, with
+ * no echo and no signal-generation (Ctrl-C arrives as 0x03, not
+ * SIGINT). Used by interactive guests like games and editors
+ * that need to read individual keys including arrow keys
+ * (which arrive as the ANSI escape sequence ESC [ A/B/C/D).
+ *
+ * The host's terminal stays in raw mode only while the guest
+ * has it enabled; the host's atexit hook also restores cooked
+ * mode on process exit, so a crashed guest doesn't leave the
+ * user's terminal broken.
+ *
+ * NOT installed by vm_system_init or vm_host_install_stdio.
+ * The handler is registered by vm_host_install_fs (since the
+ * use cases naturally cluster with spawn — guests using TTY
+ * control are typically loaded by 'run'). */
+#define SYS_TTY_SET_RAW     1105   /* tty_set_raw(enable) → 0 or -errno */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

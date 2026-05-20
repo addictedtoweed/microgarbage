@@ -121,4 +121,20 @@ bool vm_host_install_stdio(VmSystem *sys);
 bool vm_host_install_stdio_ex(VmSystem *sys,
                               const VmHostStdioConfig *cfg);
 
+/* Toggle raw mode on the installed stdin fd at runtime.
+ *
+ *   enable=true   put the tty into raw mode (no echo, no canonical
+ *                 line buffering, no signal generation, immediate
+ *                 byte-at-a-time delivery)
+ *   enable=false  restore the saved termios (cooked mode)
+ *
+ * Returns true on success, false if no stdio is installed, the
+ * fd isn't a tty, or the underlying tcsetattr call fails.
+ *
+ * Used by the SYS_TTY_SET_RAW syscall to let a guest opt into
+ * raw mode while it runs (e.g., a game) and restore cooked mode
+ * before exiting. The original termios is preserved across
+ * toggles, so a guest can flip raw on/off many times. */
+bool vm_host_stdio_set_raw_mode(bool enable);
+
 #endif /* VM_HOST_STDIO_H */
