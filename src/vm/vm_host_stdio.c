@@ -224,6 +224,18 @@ static void handle_read(VmCpu *cpu, void *system) {
     uint32_t guest_p = cpu->regs[VM_REG_A1];
     uint32_t n       = cpu->regs[VM_REG_A2];
 
+    /* Before the guest blocks on stdin, make sure any buffered
+     * stdout/stderr is visible to the user. Otherwise a prompt
+     * like "$ " (no trailing newline) can sit in stdio's buffer
+     * forever, leaving the user staring at a blank line wondering
+     * if the program has hung. This mirrors what real terminals
+     * and most libcs do — flush-before-blocking-read is the rule
+     * that makes interactive prompts work. */
+    if (fd == 0) {
+        if (g_out_file) fflush(g_out_file);
+        if (g_err_file && g_err_file != g_out_file) fflush(g_err_file);
+    }
+
     /* Delegate file fds to vm_host_fs if installed. */
     if (fd >= 3) {
         if (!g_fs_read_hook) {
