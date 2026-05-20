@@ -228,7 +228,7 @@ static int snake_body_contains(unsigned char x, unsigned char y) {
 static void draw_border(void) {
     /* Score line at row 1 */
     ansi_goto(1, 1);
-    puts_("snake — arrows to move, q to quit");
+    puts_("snake — arrows / WASD / hjkl to move, q to quit");
     ansi_goto(2, 1);
     puts_("score: ");
     putd(g_score);
@@ -299,8 +299,22 @@ typedef enum {
     INPUT_QUIT,
 } InputAction;
 
-/* Tiny state machine for the 3-byte ESC sequence. */
-static int g_esc_state = 0;   /* 0=ground, 1=after ESC, 2=after ESC[ */
+/* Tiny state machine for the arrow-key escape sequences.
+ *
+ * Modern terminals use one of two encodings:
+ *   ESC [ A  — "cursor key mode" (the default in xterm-likes)
+ *   ESC O A  — "application cursor key mode" (vt100, some
+ *              configurations of mintty / Windows Terminal)
+ *
+ * We accept both. After the intro (ESC [ or ESC O) we expect
+ * one of A/B/C/D for up/down/right/left.
+ *
+ * States:
+ *   0 — ground
+ *   1 — saw ESC, expecting [ or O
+ *   2 — saw ESC[ or ESCO, expecting A/B/C/D
+ */
+static int g_esc_state = 0;
 
 static InputAction poll_input(void) {
     InputAction latest = INPUT_NONE;
@@ -317,9 +331,17 @@ static InputAction poll_input(void) {
             else if (c == 's' || c == 'S') latest = INPUT_DOWN;
             else if (c == 'a' || c == 'A') latest = INPUT_LEFT;
             else if (c == 'd' || c == 'D') latest = INPUT_RIGHT;
+            /* Vi keys for the keyboard purists. */
+            else if (c == 'k') latest = INPUT_UP;
+            else if (c == 'j') latest = INPUT_DOWN;
+            else if (c == 'h') latest = INPUT_LEFT;
+            else if (c == 'l') latest = INPUT_RIGHT;
         } else if (g_esc_state == 1) {
-            if (c == '[') g_esc_state = 2;
-            else          g_esc_state = 0;   /* malformed; resync */
+            /* Either '[' (cursor-key mode) or 'O' (application
+             * cursor-key mode). Both lead to the same A/B/C/D
+             * suffix. */
+            if (c == '[' || c == 'O') g_esc_state = 2;
+            else                      g_esc_state = 0;   /* malformed; resync */
         } else { /* g_esc_state == 2 */
             switch (c) {
                 case 'A': latest = INPUT_UP;    break;
