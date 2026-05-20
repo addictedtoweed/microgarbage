@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <sched.h>
 
 /* ============================================================
  *  File descriptor table
@@ -922,20 +923,26 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         if (child->block_reason == BLOCK_SLEEP) {
             uint32_t now = sched->global_tick;
             uint32_t deadline = child->block_deadline;
-            if ((int32_t)(now - deadline) >= 0) {
-                /* Wake. */
+            int32_t delta = (int32_t)(deadline - now);
+
+            if (delta <= 0) {
+                /* Deadline reached. Wake. */
                 child->block_reason = BLOCK_NONE;
                 child->block_deadline = 0;
                 child->regs[VM_REG_A0] = 0;
             } else {
-                /* Still asleep. Yield briefly to the host (so
-                 * we don't pin a CPU) and re-check. With a
-                 * ms-granularity tick source, a nanosleep of
-                 * ~1 ms is the natural granularity. We use a
-                 * single 1 ms sleep regardless of how far the
-                 * deadline is — keeps the host responsive to
-                 * Ctrl-C without overshooting the deadline. */
-                struct timespec ts = { 0, 1000000L };   /* 1 ms */
+                /* Still asleep. Hand the host CPU back so we
+                 * don't pin a core.
+                 *
+                 * For waits over 20 ticks, nanosleep most of
+                 * the way and leave a 20-tick tail to absorb
+                 * the host OS timer's coarse granularity
+                 * (15 ms on Windows). Inside the tail, nanosleep
+                 * 1 ms at a time and re-check. */
+                struct timespec ts;
+                int32_t sleep_ticks = (delta > 20) ? (delta - 20) : 1;
+                ts.tv_sec  = sleep_ticks / 1000;
+                ts.tv_nsec = (long)(sleep_ticks % 1000) * 1000000L;
                 nanosleep(&ts, NULL);
                 continue;
             }
@@ -950,6 +957,25 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         if (r == VM_STEP_ECALL) {
             vm_ecall_dispatch(sched->config.ecall_router, child, sys);
         } else if (r == VM_STEP_TRAPPED) {
+            /* The child crashed (illegal instruction, bad memory
+             * access, etc.). Before returning to the parent, do
+             * cleanup the child can't do for itself:
+             *
+             *   1. Restore the terminal to cooked mode. The child
+             *      may have called SYS_TTY_SET_RAW(1) and trapped
+             *      before getting to its SYS_TTY_SET_RAW(0) on
+             *      exit; without this restore, the parent shell
+             *      inherits a broken terminal.
+             *   2. Print a brief diagnostic to stderr so the user
+             *      knows something went wrong (otherwise the only
+             *      sign is a nonzero exit code).
+             *
+             * We don't try to clear the screen or restore cursor
+             * — the host doesn't know what the child was doing on
+             * screen and over-cleaning could hide useful info. */
+            vm_host_stdio_set_raw_mode(false);
+            fprintf(stderr, "\r\nspawn: child trapped (cause=%u, trap_pc=0x%08x)\r\n",
+                    (unsigned)child->trap_cause, child->trap_pc);
             child->halted = true;
             cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
             return;

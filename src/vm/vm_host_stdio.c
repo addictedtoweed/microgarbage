@@ -223,10 +223,28 @@ static void handle_write(VmCpu *cpu, void *system) {
     }
 
     size_t written = fwrite(host_buf, 1, n, dest);
-    /* Flushing here would hurt throughput. We rely on the FILE*'s
-     * own buffering policy (line-buffered on TTYs, block-buffered
-     * otherwise). Guests that need an explicit flush should
-     * append a newline, or — eventually — call SYS_FFLUSH. */
+
+    /* Flush after every write to stdout/stderr.
+     *
+     * Reasoning: when stdout is a tty, fwrite is line-buffered so
+     * most writes flush on their own — but ANSI escape sequences
+     * (cursor moves, screen clears) contain no newline and would
+     * sit in the buffer indefinitely. When stdout is a file or
+     * pipe, fwrite is block-buffered so almost nothing flushes
+     * unless we say so.
+     *
+     * Real-time guests (games, monitors, anything driving a
+     * terminal UI) need their output to be visible immediately,
+     * not just when the loop happens to write a newline. The cost
+     * is one syscall per ECALL — for the kind of small-write
+     * pattern interactive guests do, this is essentially free
+     * compared to the round-trip through ECALL itself.
+     *
+     * If a future heavy-output guest needs the throughput, we can
+     * add SYS_FFLUSH and let the guest control the policy, but
+     * for now correctness beats throughput. */
+    fflush(dest);
+
     cpu->regs[VM_REG_A0] = (uint32_t)written;
 }
 
