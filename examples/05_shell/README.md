@@ -88,15 +88,15 @@ VM. The child runs synchronously — the shell blocks until the
 child halts. Child output appears on the shell's terminal,
 interleaved with the prompts.
 
-Two sample spawnable ELFs are built into `./host_files/`:
+Three sample spawnable ELFs are built into `./host_files/`:
 
 - `hello.elf` — prints `hi from spawned VM` and exits
 - `count.elf` — counts 1 to 10, one per line, and exits
-- `snake.elf` — interactive snake game (arrows/WASD to move,
+- `snake.elf` — interactive snake game (WASD or hjkl to move,
   `q` to quit). Demonstrates raw-mode TTY, ANSI cursor control,
-  and the timer syscalls for a 8 FPS game loop with
-  autoreloading deadline. On exit it cleans up the screen and
-  restores cooked mode automatically.
+  and the kernel-managed auto-reload timer for an 8 FPS game
+  loop. On exit it cleans up the screen and restores cooked
+  mode automatically.
 
 Example session:
 

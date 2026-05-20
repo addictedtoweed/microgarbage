@@ -250,7 +250,7 @@ static int snake_body_contains(unsigned char x, unsigned char y) {
 static void draw_border(void) {
     /* Score line at row 1 */
     ansi_goto(1, 1);
-    puts_("snake — arrows / WASD / hjkl to move, q to quit");
+    puts_("snake -- WASD or hjkl to move, q to quit");
     ansi_goto(2, 1);
     puts_("score: ");
     putd(g_score);
@@ -304,12 +304,27 @@ static void place_food(void) {
 }
 
 /* ============================================================
- *  Input: arrow keys via ANSI escape sequences
+ *  Input: WASD or hjkl
  *
- *  An arrow key arrives as three bytes:  ESC '[' A/B/C/D
- *  We poll non-blockingly each frame, draining whatever's
- *  available, and update direction (with the classic "no
- *  180-degree turn" rule).
+ *  Single-byte keys only. We DELIBERATELY don't parse arrow-key
+ *  escape sequences:
+ *
+ *    - Arrows arrive as 2 or 3 bytes (ESC [ X or ESC O X) that
+ *      can be split across reads on a raw-mode TTY. A correct
+ *      parser is a small state machine that adds latency (the
+ *      direction change doesn't take effect until all bytes
+ *      arrive) and complexity (resync on malformed sequences,
+ *      handle both ANSI cursor-key modes).
+ *    - Different terminals encode arrows differently (xterm,
+ *      mintty in cooked vs application modes, Windows Terminal,
+ *      etc.) — getting them all right requires terminfo or a
+ *      multi-encoding parser.
+ *    - WASD and hjkl are single bytes, immediate, and work
+ *      identically everywhere.
+ *
+ *  If you genuinely want arrows back, the input state machine
+ *  was at git tag 'pre-arrow-removal' (or just look at the
+ *  pre-2abba3d revisions of this file).
  * ============================================================ */
 
 typedef enum {
@@ -321,58 +336,27 @@ typedef enum {
     INPUT_QUIT,
 } InputAction;
 
-/* Tiny state machine for the arrow-key escape sequences.
- *
- * Modern terminals use one of two encodings:
- *   ESC [ A  — "cursor key mode" (the default in xterm-likes)
- *   ESC O A  — "application cursor key mode" (vt100, some
- *              configurations of mintty / Windows Terminal)
- *
- * We accept both. After the intro (ESC [ or ESC O) we expect
- * one of A/B/C/D for up/down/right/left.
- *
- * States:
- *   0 — ground
- *   1 — saw ESC, expecting [ or O
- *   2 — saw ESC[ or ESCO, expecting A/B/C/D
- */
-static int g_esc_state = 0;
-
 static InputAction poll_input(void) {
     InputAction latest = INPUT_NONE;
     char c;
     while (sys_read(0, &c, 1) > 0) {
-        if (g_esc_state == 0) {
-            if (c == 0x1b) { g_esc_state = 1; }
-            else if (c == 'q' || c == 'Q' || c == 0x03 /* Ctrl-C */) {
+        switch (c) {
+            case 'q': case 'Q':
+            case 0x03:                       /* Ctrl-C */
                 return INPUT_QUIT;
-            }
-            /* Direct WASD support too — convenient when arrows
-             * aren't easy to type. */
-            else if (c == 'w' || c == 'W') latest = INPUT_UP;
-            else if (c == 's' || c == 'S') latest = INPUT_DOWN;
-            else if (c == 'a' || c == 'A') latest = INPUT_LEFT;
-            else if (c == 'd' || c == 'D') latest = INPUT_RIGHT;
-            /* Vi keys for the keyboard purists. */
-            else if (c == 'k') latest = INPUT_UP;
-            else if (c == 'j') latest = INPUT_DOWN;
-            else if (c == 'h') latest = INPUT_LEFT;
-            else if (c == 'l') latest = INPUT_RIGHT;
-        } else if (g_esc_state == 1) {
-            /* Either '[' (cursor-key mode) or 'O' (application
-             * cursor-key mode). Both lead to the same A/B/C/D
-             * suffix. */
-            if (c == '[' || c == 'O') g_esc_state = 2;
-            else                      g_esc_state = 0;   /* malformed; resync */
-        } else { /* g_esc_state == 2 */
-            switch (c) {
-                case 'A': latest = INPUT_UP;    break;
-                case 'B': latest = INPUT_DOWN;  break;
-                case 'C': latest = INPUT_RIGHT; break;
-                case 'D': latest = INPUT_LEFT;  break;
-                default: break;
-            }
-            g_esc_state = 0;
+
+            /* WASD (case-insensitive) */
+            case 'w': case 'W': case 'k':    latest = INPUT_UP;    break;
+            case 's': case 'S': case 'j':    latest = INPUT_DOWN;  break;
+            case 'a': case 'A': case 'h':    latest = INPUT_LEFT;  break;
+            case 'd': case 'D': case 'l':    latest = INPUT_RIGHT; break;
+
+            /* Silently ignore everything else, including ESC
+             * sequences from arrow keys, function keys, mouse
+             * events, etc. They'd land as multiple bytes here;
+             * none of the individual bytes match a movement key
+             * so they pass through cleanly. */
+            default: break;
         }
     }
     return latest;
@@ -445,9 +429,6 @@ void _start(void) {
             asm volatile ("ecall" :: "r"(a7) : "memory");
         }
     }
-    /* Reset the escape state machine in case we partially drained
-     * a sequence. */
-    g_esc_state = 0;
 
     /* Game-loop pacing. tick_hz is 1000 on the PC host (1 ms).
      * Period 125 ms gives a comfortable ~8 fps.
