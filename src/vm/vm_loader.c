@@ -228,7 +228,7 @@ static VmLoadResult apply_pt_load(VmCpu *cpu,
             r->writable = false;
         } else {
             /* COPY_RAM: allocate and copy. */
-            void *dst = bump_alloc(cfg->ram_arena, filesz);
+            void *dst = slab_alloc(cfg->ram_arena, filesz);
             if (!dst) return VM_LOAD_ERR_OUT_OF_RAM;
             memcpy(dst, elf_bytes + offset, filesz);
             r->base = (uint8_t *)dst;
@@ -242,7 +242,7 @@ static VmLoadResult apply_pt_load(VmCpu *cpu,
             return VM_LOAD_ERR_DATA_SIZE_TOO_SMALL;
         }
 
-        void *dst = bump_alloc(cfg->ram_arena,
+        void *dst = slab_alloc(cfg->ram_arena,
                                cfg->region_data_size);
         if (!dst) return VM_LOAD_ERR_OUT_OF_RAM;
 
@@ -385,7 +385,7 @@ VmLoadResult vm_load(VmCpu *cpu,
      * that have no data or BSS), region 2 would otherwise be left
      * empty. Allocate it fresh so SP has somewhere to point. */
     if (cpu->regions[VM_REGION_DATA].length == 0) {
-        void *dst = bump_alloc(cfg->ram_arena, cfg->region_data_size);
+        void *dst = slab_alloc(cfg->ram_arena, cfg->region_data_size);
         if (!dst) return VM_LOAD_ERR_OUT_OF_RAM;
         memset(dst, 0, cfg->region_data_size);
         cpu->regions[VM_REGION_DATA].base = (uint8_t *)dst;

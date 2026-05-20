@@ -77,7 +77,9 @@ int main(void) {
  * ============================================================ */
 
 #define SHARED_BYTES (32 * 1024)
-#define LOCAL_BYTES  (64 * 1024)
+/* Sized for max_vms=2 spawn_data_kb=16 in fixture_init below
+ * (vm_system_local_required reports ~211 KB; we round to 256). */
+#define LOCAL_BYTES  (256 * 1024)
 /* 128 KB — needs to be at least ~96 KB for FatFs R0.16 f_mkfs (see
  * test_trashdrive_fatfs.c for the same rationale). */
 #define POOL_BYTES   (128 * 1024)
@@ -122,6 +124,10 @@ static bool fixture_init(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+        /* Small VM count — these tests load at most a guest VM via
+         * the spawn handler. 1-2 slots cover everything. */
+        .max_vms             = 2,
+        .spawn_data_kb       = 16,
     };
     if (!vm_system_init(&g_sys, &cfg)) return false;
     if (!vm_host_install_stdio(&g_sys)) return false;

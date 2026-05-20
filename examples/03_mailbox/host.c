@@ -57,6 +57,8 @@ int main(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+        .max_vms             = 2,
+        .spawn_data_kb       = 8,
     };
     if (!vm_system_init(&sys, &cfg)) {
         fprintf(stderr, "host: vm_system_init failed\n");

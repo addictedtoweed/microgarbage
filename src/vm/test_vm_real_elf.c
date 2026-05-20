@@ -65,6 +65,8 @@ static void test_hello_elf_runs_and_exits(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 16,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -125,6 +127,8 @@ static void test_hello2_factorial_runs(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 16,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -173,6 +177,8 @@ static void test_hello3_sum_of_squares_runs(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 16,
         .baseline_quantum = 1000,
     };
     ASSERT(vm_system_init(&sys, &cfg));

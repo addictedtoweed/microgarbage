@@ -2,7 +2,7 @@
  *  vm_system.c — top-level VM system implementation
  *  See vm/vm_system.h for the public contract.
  *
- *  This file wires up the scheduler + ECALL router + slab + bump
+ *  This file wires up the scheduler + ECALL router + slabs
  *  arena + per-VM mailboxes, and provides the ECALL handlers that
  *  need access to all of those (alloc/free, mailbox send/recv,
  *  whitelist management, mailbox info).
@@ -20,6 +20,7 @@
 #include "memory/slab_stack.h"
 
 #include <string.h>
+#include <stdio.h>
 
 /* ============================================================
  *  Forward declaration: the CPU-only installer lives in
@@ -651,13 +652,17 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
         }
     }
 
+    /* Per-VM sizing defaults. */
+    if (sys->config.max_vms == 0) sys->config.max_vms = 8;
+    if (sys->config.spawn_data_kb == 0) sys->config.spawn_data_kb = 16;
+
     /* Wire public pointers to the internal instances. */
     sys->ecall_router = &sys->_ecall_router;
     sys->sched        = &sys->_sched;
     sys->shared_slab  = &sys->_shared_slab;
-    sys->local_arena  = &sys->_local_arena;
+    sys->local_slab   = &sys->_local_slab;
 
-    /* 1. Initialize the slab. */
+    /* 1. Initialize the shared slab. */
     SlabResult sr = slab_init(sys->shared_slab,
                                sys->config.shared_storage,
                                sys->config.shared_storage_size,
@@ -667,10 +672,65 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
         return false;
     }
 
-    /* 2. Initialize the bump arena over local storage. */
-    bump_init(sys->local_arena,
-              sys->config.local_storage,
-              sys->config.local_storage_size);
+    /* 2. Initialize the local slab.
+     *
+     * Bin sizing is derived from max_vms and spawn_data_kb. Each
+     * VM consumes one block from each of these bins on load:
+     *
+     *    VmCpu          - one  512 B block
+     *    Mailbox        - one    2 KB block (default mailbox shape)
+     *    Text           - one block at ceil-pow2(text filesz)
+     *    Rodata         - one block at ceil-pow2(rodata filesz)
+     *    Data region    - one  bin sized to ceil-pow2(spawn_data_kb)
+     *
+     * Text and rodata sizes vary wildly across guests:
+     *   - minimal hello.elf: ~10 B text, no rodata
+     *   - shell.elf: ~30 KB text, several KB rodata
+     *   - TUI guests: text 5-16 KB, rodata < 1 KB
+     *
+     * Rather than picking one text bin and rounding everything up,
+     * we populate several small-to-medium bins (256 B through the
+     * configured spawn_data bin) with max_vms+headroom slots each.
+     * The slab's per-block headers are 8 B so the overhead is fine
+     * even on small bins. This way any guest fits into some bin
+     * without manual tuning.
+     *
+     * Add a small headroom in each bin (one extra slot) so a brief
+     * over-by-one due to ELF variation or temp allocations during
+     * load doesn't hit the limit. */
+    SlabConfig local_cfg = (SlabConfig){0};
+    uint16_t headroom = (uint16_t)((sys->config.max_vms < 32)
+                                   ? 1 : (sys->config.max_vms / 16));
+    uint16_t per_bin_slots = sys->config.max_vms + headroom;
+
+    int bin_cpu  = slab_bin_for_size(sizeof(VmCpu));
+    int bin_mbox = slab_bin_for_size(2048);
+    int bin_data = slab_bin_for_size(
+                       (size_t)sys->config.spawn_data_kb * 1024);
+
+    /* The per-VM bins. */
+    local_cfg.bucket_counts[bin_cpu]  += per_bin_slots;
+    local_cfg.bucket_counts[bin_mbox] += per_bin_slots;
+    local_cfg.bucket_counts[bin_data] += per_bin_slots;
+
+    /* Variable-size guest segments (text, rodata) might land in
+     * any bin from 32 B (a near-empty .text in a minimal hello
+     * program) up to slightly below the data bin. Make sure each
+     * of those bins can hold at least one per-VM block — the
+     * loader picks whichever bin fits. */
+    int bin_segment_hi = bin_data > 0 ? bin_data - 1 : 0;
+    for (int b = 0; b <= bin_segment_hi; b++) {
+        local_cfg.bucket_counts[b] += per_bin_slots;
+    }
+
+    sr = slab_init(sys->local_slab,
+                   sys->config.local_storage,
+                   sys->config.local_storage_size,
+                   &local_cfg,
+                   slab_null_locker);
+    if (sr != SLAB_OK) {
+        return false;
+    }
 
     /* 3. Initialize the ECALL router and install standard handlers. */
     vm_ecall_router_init(sys->ecall_router);
@@ -733,79 +793,99 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
         return result;
     }
 
-    /* 1. Allocate the VmCpu struct from the bump arena. */
-    VmCpu *cpu = (VmCpu *)bump_alloc(sys->local_arena, sizeof(VmCpu));
+    /* Resources to clean up on failure. We track them as we go
+     * and unwind in reverse order in the error path. */
+    VmCpu *cpu = NULL;
+    void  *mbox_storage = NULL;
+    int    assigned = -1;
+
+    /* 1. Allocate the VmCpu struct from the local slab. */
+    cpu = (VmCpu *)slab_alloc(sys->local_slab, sizeof(VmCpu));
     if (!cpu) {
         result.code = VM_SYS_ERR_NO_ARENA_SPACE;
-        return result;
+        goto fail;
     }
 
-    /* 2. Find the slot we'll get, so we can stash a pointer.
-     *    The scheduler picks the actual id later. We don't have
-     *    a "peek next free id" API, so register first and patch
-     *    the slot afterward. But registering needs the cpu init'd,
-     *    so init first. We use a tentative vm_id of 0; the
-     *    scheduler will overwrite it. */
+    /* 2. Init it with a placeholder vm_id; the scheduler will
+     *    overwrite. */
     vm_init(cpu, 0);
 
     /* 3. Allocate mailbox storage and initialize the mailbox at
-     *    a known slot in sys->mailboxes[]. We need the vm_id for
-     *    indexing, so we register with the scheduler first to get
-     *    the id assigned, then set up the mailbox at that index. */
-    int assigned = vm_sched_register(sys->sched, cpu);
+     *    a known slot in sys->mailboxes[]. We register with the
+     *    scheduler first to get the id assigned. */
+    assigned = vm_sched_register(sys->sched, cpu);
     if (assigned < 0) {
         result.code = VM_SYS_ERR_FULL;
-        return result;
+        goto fail;
     }
     sys->vms[assigned] = cpu;
 
-    /* Mailbox storage. */
     size_t mbox_storage_bytes = vm_mailbox_required_storage_bytes(
         mailbox_slot_size, mailbox_depth);
     if (mbox_storage_bytes == 0) {
-        /* Invalid mailbox shape — undo the registration. */
-        vm_sched_unregister(sys->sched, (uint16_t)assigned);
-        sys->vms[assigned] = NULL;
         result.code = VM_SYS_ERR_INVALID_ARG;
-        return result;
+        goto fail;
     }
-    void *mbox_storage = bump_alloc(sys->local_arena, mbox_storage_bytes);
+    mbox_storage = slab_alloc(sys->local_slab, mbox_storage_bytes);
     if (!mbox_storage) {
-        vm_sched_unregister(sys->sched, (uint16_t)assigned);
-        sys->vms[assigned] = NULL;
         result.code = VM_SYS_ERR_NO_ARENA_SPACE;
-        return result;
+        goto fail;
     }
     VmMailboxResult mr = vm_mailbox_init(&sys->mailboxes[assigned],
                                           mbox_storage,
                                           mailbox_slot_size,
                                           mailbox_depth);
     if (mr != VM_MBOX_OK) {
-        vm_sched_unregister(sys->sched, (uint16_t)assigned);
-        sys->vms[assigned] = NULL;
         result.code = VM_SYS_ERR_INVALID_ARG;
-        return result;
+        goto fail;
     }
 
-    /* 4. Load the ELF. */
+    /* 4. Load the ELF. Any allocations vm_load made (text/rodata
+     *    in COPY_RAM mode + the data region) get freed in the
+     *    error path below via the CPU's region table. */
     VmLoaderConfig loader_cfg = {
         .code_backing      = code_backing,
         .rodata_backing    = rodata_backing,
-        .ram_arena         = sys->local_arena,
+        .ram_arena         = sys->local_slab,
         .region_data_size  = data_region_size,
         .shared_base       = sys->config.shared_storage,
         .shared_size       = (uint32_t)sys->config.shared_storage_size,
     };
     VmLoadResult lr = vm_load(cpu, elf_image, elf_size, &loader_cfg);
     if (lr != VM_LOAD_OK) {
-        vm_sched_unregister(sys->sched, (uint16_t)assigned);
-        sys->vms[assigned] = NULL;
         result.code = VM_SYS_ERR_LOAD_FAILED;
         result.load_result = lr;
-        return result;
+        goto fail;
     }
 
     result.assigned_vm_id = assigned;
+    return result;
+
+fail:
+    /* Unwind in reverse order of acquisition.
+     *
+     * vm_load doesn't clean up its own partial allocations on
+     * failure (it returns immediately when a PT_LOAD fails), so
+     * we walk the cpu's region table and free any RAM-backed
+     * regions ourselves. slab_free silently ignores NULL and
+     * non-slab pointers (XIP regions), so this is safe even when
+     * vm_load never ran. */
+    if (cpu) {
+        for (uint32_t i = 0; i < VM_REGION_COUNT; i++) {
+            VmRegion *r = &cpu->regions[i];
+            if (r->base) {
+                slab_free(sys->local_slab, r->base);
+                r->base = NULL;
+                r->length = 0;
+            }
+        }
+    }
+    if (assigned >= 0) {
+        vm_sched_unregister(sys->sched, (uint16_t)assigned);
+        sys->vms[assigned] = NULL;
+    }
+    if (mbox_storage) slab_free(sys->local_slab, mbox_storage);
+    if (cpu) slab_free(sys->local_slab, cpu);
     return result;
 }
 
@@ -826,6 +906,94 @@ VmMailbox *vm_system_get_mailbox(VmSystem *sys, uint16_t vm_id) {
     if (vm_id >= VM_SCHED_MAX_VMS) return NULL;
     if (sys->vms[vm_id] == NULL) return NULL;
     return &sys->mailboxes[vm_id];
+}
+
+/* ============================================================
+ *  vm_system_unload_vm — reclaim a VM's allocations
+ * ============================================================ */
+
+bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id) {
+    if (!sys) return false;
+    if (vm_id >= VM_SCHED_MAX_VMS) return false;
+
+    VmCpu *cpu = sys->vms[vm_id];
+    if (!cpu) return false;
+
+    /* Ensure the VM won't be stepped further (defensive — most
+     * callers will already have observed the halt). */
+    cpu->halted = true;
+
+    /* Walk regions and free any that came from the local slab.
+     * We try to free every region's base pointer; the slab's
+     * bounds check filters out XIP regions whose base points
+     * into the caller-provided ELF buffer rather than the slab.
+     *
+     * The slab also tolerates NULL via early-return (regions
+     * with length==0 still have base==NULL after init). */
+    for (uint32_t i = 0; i < VM_REGION_COUNT; i++) {
+        VmRegion *r = &cpu->regions[i];
+        if (!r->base) continue;
+        SlabResult sr = slab_free(sys->local_slab, r->base);
+        (void)sr;   /* SLAB_ERR_FOREIGN_POINTER and SLAB_ERR_INVALID_ARG
+                     * are acceptable here — they just mean this region
+                     * wasn't slab-allocated (XIP). */
+        r->base = NULL;
+        r->length = 0;
+    }
+
+    /* Free the mailbox storage. The mailbox wraps a FifoQueue
+     * which wraps a RingBuffer; the storage pointer lives at
+     * mailbox._fifo.rb.storage. slab_free silently ignores
+     * NULL or foreign pointers. */
+    {
+        void *mbox_storage = sys->mailboxes[vm_id]._fifo.rb.storage;
+        if (mbox_storage) {
+            slab_free(sys->local_slab, mbox_storage);
+        }
+    }
+
+    /* Free the VmCpu itself. After this, cpu is dangling — must
+     * NULL the slot before any caller observes the system. */
+    slab_free(sys->local_slab, cpu);
+
+    /* Unregister from scheduler and clear the slot. */
+    vm_sched_unregister(sys->sched, vm_id);
+    sys->vms[vm_id] = NULL;
+
+    /* Zero the mailbox so a future load gets a clean slot. */
+    memset(&sys->mailboxes[vm_id], 0, sizeof(sys->mailboxes[vm_id]));
+
+    return true;
+}
+
+/* ============================================================
+ *  vm_system_local_required — estimate slab region size
+ * ============================================================ */
+
+size_t vm_system_local_required(uint16_t max_vms, uint32_t spawn_data_kb) {
+    if (max_vms == 0) max_vms = 8;
+    if (spawn_data_kb == 0) spawn_data_kb = 16;
+
+    /* Mirror the bin selection logic from vm_system_init. */
+    uint16_t headroom = (max_vms < 32) ? 1 : (max_vms / 16);
+    uint16_t per_bin = max_vms + headroom;
+
+    SlabConfig cfg = (SlabConfig){0};
+
+    int bin_cpu  = slab_bin_for_size(sizeof(VmCpu));
+    int bin_mbox = slab_bin_for_size(2048);
+    int bin_data = slab_bin_for_size((size_t)spawn_data_kb * 1024);
+
+    cfg.bucket_counts[bin_cpu]  += per_bin;
+    cfg.bucket_counts[bin_mbox] += per_bin;
+    cfg.bucket_counts[bin_data] += per_bin;
+
+    int bin_segment_hi = bin_data > 0 ? bin_data - 1 : 0;
+    for (int b = 0; b <= bin_segment_hi; b++) {
+        cfg.bucket_counts[b] += per_bin;
+    }
+
+    return slab_required_bytes(&cfg);
 }
 
 /* ============================================================

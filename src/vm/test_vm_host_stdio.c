@@ -88,6 +88,8 @@ static int run_with_captured_stdout(const char *elf_path,
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+        .max_vms = 1,
+        .spawn_data_kb = 16,
         .baseline_quantum    = 200,
     };
     bool init_ok = vm_system_init(&sys, &cfg);
@@ -150,6 +152,8 @@ static void test_install_stdio_returns_true(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+        .max_vms = 1,
+        .spawn_data_kb = 16,
     };
     ASSERT(vm_system_init(&sys, &cfg));
     ASSERT(vm_host_install_stdio(&sys));
@@ -221,6 +225,8 @@ static int run_keydump_with_input(const char *input, size_t input_len,
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+        .max_vms = 1,
+        .spawn_data_kb = 16,
         .baseline_quantum    = 200,
     };
     bool init_ok = vm_system_init(&sys, &cfg);

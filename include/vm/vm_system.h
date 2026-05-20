@@ -107,7 +107,6 @@
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
 #include "memory/slab_stack.h"
-#include "memory/bump.h"
 
 /* ============================================================
  *  Configuration
@@ -164,6 +163,24 @@ typedef struct {
     uint16_t default_mailbox_slot_size;   /* default 32 bytes */
     uint16_t default_mailbox_depth;       /* default 8 slots  */
 
+    /* === Per-VM sizing (drives the local slab's bin sizes) ===
+     *
+     * These are surfaced because they correspond directly to the
+     * vm.cfg knobs the user thinks about: 'how many VMs can run
+     * concurrently' and 'how much data each gets.'
+     *
+     * max_vms is an upper bound on concurrent active VMs. Sets
+     * the slot count of every per-VM bin in the local slab. If
+     * you load more VMs than this, vm_system_load_vm returns
+     * VM_SYS_ERR_FULL.
+     *
+     * spawn_data_kb is the size in KB of the per-VM data region.
+     * Rounded up to a power of 2 internally to fit a slab bin.
+     * Zero = use a small default (currently 16 KB) suitable for
+     * non-TUI guests. */
+    uint16_t max_vms;            /* default 8 */
+    uint32_t spawn_data_kb;      /* default 16 */
+
 } VmSystemConfig;
 
 /* ============================================================
@@ -187,9 +204,16 @@ typedef struct {
     /* The shared-region slab. Use slab_* on this to inspect usage. */
     SlabAllocator *shared_slab;
 
-    /* The bump arena for VM-local storage. Use bump_used / _peak /
-     * _remaining to track headroom. */
-    BumpAllocator *local_arena;
+    /* The local-region slab. Per-VM allocations (VmCpu, mailbox
+     * storage, copy-to-RAM segments, data region) all come from
+     * here. Use slab_* to inspect usage.
+     *
+     * Replaces the previous bump_arena. Slabs support real
+     * per-allocation free, so spawned VMs can be unloaded
+     * independently and in any order without fragmenting the
+     * arena — essential for the multi-VM concurrent use case
+     * the window manager and program manager will exercise. */
+    SlabAllocator *local_slab;
 
     /* === Public read-only — config snapshot === */
     VmSystemConfig config;
@@ -202,14 +226,14 @@ typedef struct {
     VmEcallRouter _ecall_router;
     VmSched       _sched;
     SlabAllocator _shared_slab;
-    BumpAllocator _local_arena;
+    SlabAllocator _local_slab;
 
     /* === Per-VM state ===
      *
      * Indexed by vm_id. Slot is "in use" iff vms[i] is non-NULL
      * (mirrors the scheduler's registration state). */
 
-    /* CPU structs are allocated from the bump arena at load time
+    /* CPU structs are allocated from the local slab at load time
      * and the pointers stored here. */
     VmCpu *vms[VM_SCHED_MAX_VMS];
 
@@ -312,6 +336,38 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
  * unregistered. */
 VmMailbox *vm_system_get_mailbox(VmSystem *sys, uint16_t vm_id);
 
+/* Unload a previously-loaded VM. Releases all of its slab-arena
+ * allocations (data region, mailbox storage, copy-to-RAM code
+ * and rodata, VmCpu struct), unregisters it from the scheduler,
+ * and clears its entry in sys->vms[].
+ *
+ * The slab allocator's per-block free means each VM's resources
+ * are independently reclaimable — you can unload VMs in any
+ * order without fragmenting the arena. This is what makes the
+ * multi-VM concurrent use case (window manager, program manager)
+ * possible.
+ *
+ * Safe to call on a halted VM. Calling on a running VM marks it
+ * halted first, but doesn't gracefully shut it down — guests
+ * that need cleanup should handle SYS_EXIT themselves.
+ *
+ * Returns true on success, false if vm_id is invalid or the
+ * slot is empty. */
+bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id);
+
+/* Compute the local-region storage size needed to support the
+ * given config. Use this to size the caller-provided buffer:
+ *
+ *     size_t bytes = vm_system_local_required(max_vms, spawn_data_kb);
+ *     static uint8_t local_region[/ * bytes * /];
+ *
+ * Because the buffer must be statically allocated for embedded
+ * targets, this helper is primarily for understanding the math
+ * rather than runtime sizing. The returned value is an upper
+ * bound including slab overhead. */
+size_t vm_system_local_required(uint16_t max_vms,
+                                uint32_t spawn_data_kb);
+
 /* ============================================================
  *  Execution
  *
@@ -349,11 +405,15 @@ static inline size_t vm_system_shared_bytes_used(const VmSystem *sys) {
 }
 
 static inline size_t vm_system_local_bytes_used(const VmSystem *sys) {
-    return sys ? bump_used(sys->local_arena) : 0;
+    return sys ? slab_bytes_used(sys->local_slab) : 0;
 }
 
+/* No peak tracking on the slab; this returned the bump arena's
+ * high-water-mark previously. Slab returns current usage as
+ * peak for now — the slab allocator could grow a real peak
+ * field if it becomes useful. */
 static inline size_t vm_system_local_bytes_peak(const VmSystem *sys) {
-    return sys ? bump_peak(sys->local_arena) : 0;
+    return sys ? slab_bytes_used(sys->local_slab) : 0;
 }
 
 #endif /* VM_SYSTEM_H */

@@ -17,7 +17,10 @@
  * ============================================================ */
 
 #define SHARED_BYTES  (64 * 1024)
-#define LOCAL_BYTES   (256 * 1024)
+/* Sized for max_vms=2 spawn_data_kb=4 (the per-test config below).
+ * The slab allocator carves bins for each VM's allocations plus
+ * headroom; this comfortably covers it. */
+#define LOCAL_BYTES   (128 * 1024)
 
 static uint8_t g_shared_storage[SHARED_BYTES];
 static uint8_t g_local_storage[LOCAL_BYTES];
@@ -154,13 +157,15 @@ static void test_init_succeeds(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
     };
     ASSERT(vm_system_init(&sys, &cfg));
 
     ASSERT(sys.ecall_router != NULL);
     ASSERT(sys.sched != NULL);
     ASSERT(sys.shared_slab != NULL);
-    ASSERT(sys.local_arena != NULL);
+    ASSERT(sys.local_slab != NULL);
     /* Defaults filled in */
     ASSERT_EQ_INT(5000, (int)sys.config.baseline_quantum);
 
@@ -179,6 +184,8 @@ static void test_init_rejects_null_args(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
     };
     ASSERT(!vm_system_init(NULL, &cfg));
 
@@ -212,6 +219,8 @@ static void test_load_and_run_exit_vm(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -251,6 +260,8 @@ static void test_load_and_run_self_vm(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -310,6 +321,8 @@ static void test_alloc_and_free(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -352,6 +365,8 @@ static void test_alloc_zero_returns_einval(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -401,6 +416,8 @@ static void test_mailbox_info_on_self(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -438,6 +455,8 @@ static void test_mailbox_info_without_whitelist_returns_eperm(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -474,6 +493,8 @@ static void test_three_vms_all_exit(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -533,6 +554,8 @@ static void test_send_and_recv_direct(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -656,6 +679,8 @@ static void test_send_and_recv_blocking(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 200,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -708,6 +733,8 @@ static void test_local_bytes_used_grows(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .baseline_quantum = 100,
     };
     ASSERT(vm_system_init(&sys, &cfg));
@@ -760,6 +787,8 @@ static void test_tick_hz_zero_without_source(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
     };
     ASSERT(vm_system_init(&sys, &cfg));
 
@@ -780,6 +809,8 @@ static void test_tick_hz_returns_configured_value(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -802,6 +833,8 @@ static void test_ticks_now_reads_scheduler_tick(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -829,6 +862,8 @@ static void test_sleep_ticks_sets_block_sleep(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -856,6 +891,8 @@ static void test_sleep_ticks_zero_yields(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -883,6 +920,8 @@ static void test_sleep_until_future_blocks(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -909,6 +948,8 @@ static void test_sleep_until_past_yields(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -939,6 +980,8 @@ static void test_sleep_until_wraparound_safe(void) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };
@@ -970,6 +1013,8 @@ static void reload_setup(VmSystem *sys, VmCpu *cpu, uint32_t at_tick) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage = g_local_storage,
         .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 4,
         .tick_source = fake_tick_source,
         .ticks_per_second = 1000,
     };

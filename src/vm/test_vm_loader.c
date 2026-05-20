@@ -8,11 +8,79 @@
 #include "test_runner.h"
 #include "vm/vm_loader.h"
 #include "vm/vm_core.h"
-#include "memory/bump.h"
+#include "memory/slab_stack.h"
 
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+
+/* ============================================================
+ *  Slab helper for tests
+ *
+ *  These tests previously used a bump allocator. With the slab
+ *  migration, every test sets up a SlabAllocator over a local
+ *  byte buffer. We adapt the bin layout to the buffer size: small
+ *  buffers get a few small bins, larger buffers get a wider range.
+ * ============================================================ */
+
+static void test_slab_init(SlabAllocator *a, void *region, size_t bytes) {
+    SlabConfig cfg = {0};
+    /* Align the region pointer up to 8 bytes first; the slab needs
+     * 8-aligned bin block storage. */
+    uintptr_t base = (uintptr_t)region;
+    uintptr_t aligned = (base + 7) & ~(uintptr_t)7;
+    size_t adj = aligned - base;
+    if (adj >= bytes) {
+        /* Buffer too small even after alignment. Init a no-op slab
+         * (zero buckets) so the struct is valid but all alloc
+         * attempts return NULL. Tests that intentionally exercise
+         * out-of-memory paths rely on this. */
+        memset(a, 0, sizeof(*a));
+        slab_init(a, region, bytes < 8 ? 8 : bytes, &cfg, slab_null_locker);
+        return;
+    }
+    region = (void *)aligned;
+    bytes -= adj;
+
+    /* Choose a bin layout that fits in the available bytes. Real
+     * required-bytes for each branch (computed via
+     * slab_required_bytes):
+     *   bins 0-9 x 2:  ~65 KB
+     *   bins 0-8 x 2:  ~33 KB
+     *   bins 0-7 x 2:  ~17 KB
+     *   bins 0-4 x 2:  ~3.2 KB
+     *   bins 0-1 x 2:  ~250 B */
+    if (bytes >= 65536 + 1024) {
+        /* Largest — bins 0-9 (up to 16 KB blocks). */
+        for (int b = 0; b <= 9; b++) cfg.bucket_counts[b] = 2;
+    } else if (bytes >= 33000 + 1024) {
+        /* Large — bins 0-8 (up to 8 KB blocks). */
+        for (int b = 0; b <= 8; b++) cfg.bucket_counts[b] = 2;
+    } else if (bytes >= 17000 + 1024) {
+        /* Medium — bins 0-7 (up to 4 KB blocks). */
+        for (int b = 0; b <= 7; b++) cfg.bucket_counts[b] = 2;
+    } else if (bytes >= 3200 + 256) {
+        /* Small — up to 512 B blocks. */
+        for (int b = 0; b <= 4; b++) cfg.bucket_counts[b] = 2;
+    } else if (bytes >= 256) {
+        /* Tiny. */
+        cfg.bucket_counts[0] = 2;
+        cfg.bucket_counts[1] = 2;
+    } else {
+        /* Buffer too small for any meaningful config. Init with
+         * zero buckets — alloc attempts will fail with NULL.
+         * Used by intentional-OOM tests. */
+    }
+
+    SlabResult r = slab_init(a, region, bytes, &cfg, slab_null_locker);
+    if (r != SLAB_OK) {
+        /* Silently zero the struct so callers don't crash on
+         * the null locker. Tests that hit this path expect
+         * subsequent allocations to fail. */
+        memset(a, 0, sizeof(*a));
+        a->locker = slab_null_locker;
+    }
+}
 
 /* ============================================================
  *  ELF synthesizer
@@ -186,9 +254,9 @@ static void test_load_simple_copy_ram(void) {
     build_simple_elf(elf_buf, sizeof(elf_buf), &elf_size);
 
     /* Set up host RAM for the VM */
-    uint8_t vm_ram[8192];
-    BumpAllocator arena;
-    bump_init(&arena, vm_ram, sizeof(vm_ram));
+    uint8_t vm_ram[32768];
+    SlabAllocator arena;
+    test_slab_init(&arena, vm_ram, sizeof(vm_ram));
 
     uint8_t shared_storage[256] = {0};
 
@@ -249,9 +317,9 @@ static void test_load_simple_xip(void) {
     size_t elf_size;
     build_simple_elf(elf_buf, sizeof(elf_buf), &elf_size);
 
-    uint8_t vm_ram[4096];
-    BumpAllocator arena;
-    bump_init(&arena, vm_ram, sizeof(vm_ram));
+    uint8_t vm_ram[32768];
+    SlabAllocator arena;
+    test_slab_init(&arena, vm_ram, sizeof(vm_ram));
 
     VmCpu cpu;
     vm_init(&cpu, 1);
@@ -297,9 +365,9 @@ static void test_load_accepts_pt_note(void) {
     elf_add_other(&b, 0x6474e551);   /* PT_GNU_STACK */
     elf_finalize(&b);
 
-    uint8_t vm_ram[4096];
-    BumpAllocator arena;
-    bump_init(&arena, vm_ram, sizeof(vm_ram));
+    uint8_t vm_ram[32768];
+    SlabAllocator arena;
+    test_slab_init(&arena, vm_ram, sizeof(vm_ram));
 
     VmCpu cpu;
     vm_init(&cpu, 0);
@@ -319,9 +387,9 @@ static void test_load_accepts_pt_note(void) {
 
 static void test_reject_truncated(void) {
     uint8_t elf_buf[10] = {0};
-    BumpAllocator arena;
-    uint8_t ram[256];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -339,9 +407,9 @@ static void test_reject_bad_magic(void) {
     /* Corrupt the magic */
     elf_buf[0] = 'X';
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -360,9 +428,9 @@ static void test_reject_wrong_class(void) {
     build_simple_elf(elf_buf, sizeof(elf_buf), &elf_size);
     elf_buf[4] = 2;   /* ELFCLASS64 instead of ELFCLASS32 */
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -381,9 +449,9 @@ static void test_reject_wrong_endian(void) {
     build_simple_elf(elf_buf, sizeof(elf_buf), &elf_size);
     elf_buf[5] = 2;   /* ELFDATA2MSB */
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -405,9 +473,9 @@ static void test_reject_wrong_machine(void) {
                  sizeof(SIMPLE_CODE), sizeof(SIMPLE_CODE));
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -429,9 +497,9 @@ static void test_reject_not_executable(void) {
                  sizeof(SIMPLE_CODE), sizeof(SIMPLE_CODE));
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -453,9 +521,9 @@ static void test_reject_pt_dynamic(void) {
     elf_add_other(&b, 2);   /* PT_DYNAMIC */
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -477,9 +545,9 @@ static void test_reject_pt_interp(void) {
     elf_add_other(&b, 3);   /* PT_INTERP */
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -501,9 +569,9 @@ static void test_reject_writable_code(void) {
                  sizeof(SIMPLE_CODE), sizeof(SIMPLE_CODE));
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -526,9 +594,9 @@ static void test_reject_entry_not_in_code(void) {
                  sizeof(SIMPLE_CODE), sizeof(SIMPLE_CODE));
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -551,9 +619,9 @@ static void test_reject_entry_misaligned(void) {
                  sizeof(SIMPLE_CODE), sizeof(SIMPLE_CODE));
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -577,9 +645,9 @@ static void test_reject_bss_in_rodata(void) {
     elf_add_load(&b, 0x40000000, 0x4, SIMPLE_RODATA, 4, 8);
     elf_finalize(&b);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -599,9 +667,9 @@ static void test_reject_data_size_too_small(void) {
     /* simple ELF wants 4 bytes data + 32 bytes bss = 36; we'll
      * give it only 8. */
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -620,9 +688,9 @@ static void test_reject_arena_exhausted(void) {
     build_simple_elf(elf_buf, sizeof(elf_buf), &elf_size);
 
     /* Arena too small for the data region alone */
-    BumpAllocator arena;
+    SlabAllocator arena;
     uint8_t ram[16];
-    bump_init(&arena, ram, sizeof(ram));
+    test_slab_init(&arena, ram, sizeof(ram));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -640,9 +708,9 @@ static void test_reject_arena_exhausted(void) {
  * ============================================================ */
 
 static void test_reject_null_args(void) {
-    uint8_t buf[64];
-    BumpAllocator arena;
-    bump_init(&arena, buf, sizeof(buf));
+    uint8_t buf[4096];
+    SlabAllocator arena;
+    test_slab_init(&arena, buf, sizeof(buf));
     VmCpu cpu;
     vm_init(&cpu, 0);
 
@@ -665,16 +733,23 @@ static void test_result_strings_exist(void) {
 
 /* ============================================================
  *  Reload cycle — confirms the dynamic-loading workflow works
+ *
+ *  Previously this checked bump_used before/after bump_reset.
+ *  In the slab world, the equivalent is: load → free all the
+ *  cpu's regions explicitly → load again. The slab returns the
+ *  freed bins, so the second load uses the same memory. We
+ *  verify by checking total bytes_in_use returns to the same
+ *  level after the second load.
  * ============================================================ */
 
-static void test_reload_after_bump_reset(void) {
+static void test_reload_after_slab_free(void) {
     uint8_t elf_buf[1024];
     size_t elf_size;
     build_simple_elf(elf_buf, sizeof(elf_buf), &elf_size);
 
-    BumpAllocator arena;
-    uint8_t ram[4096];
-    bump_init(&arena, ram, sizeof(ram));
+    SlabAllocator arena;
+    uint8_t ram[32768];
+    test_slab_init(&arena, ram, sizeof(ram));
 
     /* First load */
     VmCpu cpu;
@@ -685,15 +760,26 @@ static void test_reload_after_bump_reset(void) {
         .rodata_backing = VM_BACKING_COPY_RAM,
     };
     ASSERT_EQ_INT(VM_LOAD_OK, vm_load(&cpu, elf_buf, elf_size, &cfg));
-    size_t used_after_first = bump_used(&arena);
+    size_t used_after_first = arena.total_bytes_in_use;
     ASSERT(used_after_first > 0);
 
-    /* Reset the arena and reload (simulating "unload, hot-swap
-     * a new ELF, load again"). */
-    bump_reset(&arena);
+    /* Free everything the loader allocated. slab_free handles
+     * NULL and foreign pointers gracefully, so the loop just
+     * walks each region. */
+    for (uint32_t i = 0; i < VM_REGION_COUNT; i++) {
+        if (cpu.regions[i].base) {
+            slab_free(&arena, cpu.regions[i].base);
+            cpu.regions[i].base = NULL;
+            cpu.regions[i].length = 0;
+        }
+    }
+
+    /* Re-init the cpu and reload. With the slab returning
+     * freed bins to their freelists, the second load should
+     * consume the same bytes. */
     vm_init(&cpu, 0);
     ASSERT_EQ_INT(VM_LOAD_OK, vm_load(&cpu, elf_buf, elf_size, &cfg));
-    ASSERT_EQ_INT((int)used_after_first, (int)bump_used(&arena));
+    ASSERT_EQ_INT((int)used_after_first, (int)arena.total_bytes_in_use);
 }
 
 /* ============================================================
@@ -733,7 +819,7 @@ int main(void) {
     RUN(test_result_strings_exist);
 
     /* Lifecycle */
-    RUN(test_reload_after_bump_reset);
+    RUN(test_reload_after_slab_free);
 
     return TEST_SUITE_RESULT();
 }

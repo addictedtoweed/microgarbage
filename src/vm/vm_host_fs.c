@@ -16,7 +16,6 @@
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
 #include "vm/vm_system.h"
-#include "memory/bump.h"
 
 #include "ff.h"
 
@@ -864,27 +863,31 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Save the bump-arena mark BEFORE the child's allocations
-     * happen. vm_system_load_vm pulls a VmCpu + mailbox storage
-     * + data region from sys->local_arena; on this child's halt
-     * we rewind back to this mark to reclaim all of it. Without
-     * this rewind, every spawn permanently consumes ~64+ KB of
-     * the local arena and the host runs out after a handful of
-     * runs. */
-    BumpMark pre_spawn_mark = bump_mark(sys->local_arena);
+    /* Determine the spawn data region size for the child.
+     * Prefer sys->config.spawn_data_kb (the new path); fall back
+     * to the deprecated global if the host didn't migrate. */
+    uint32_t spawn_data_bytes = (uint32_t)sys->config.spawn_data_kb * 1024u;
+    if (spawn_data_bytes == 0) {
+        spawn_data_bytes = g_spawn_data_size;
+    }
 
     /* Load as a new VM. VM_BACKING_COPY_RAM means the loader
      * copies the bytes it needs out of our buffer, so we can
-     * free the buffer after vm_system_load_vm returns. */
+     * free the buffer after vm_system_load_vm returns.
+     *
+     * Per-allocation freeing via the slab means we can unload
+     * the child cleanly on halt — see vm_system_unload_vm at
+     * the bottom of this handler. */
     VmLoadVmResult lr = vm_system_load_vm(sys, elf, elf_size,
-                                          g_spawn_data_size,
+                                          spawn_data_bytes,
                                           VM_BACKING_COPY_RAM,
                                           VM_BACKING_COPY_RAM);
     free(elf);
 
     if (lr.code != VM_SYS_OK) {
-        /* Load failure: nothing was committed, mark is still
-         * valid. Just report and return — no rewind needed. */
+        /* Load failure: nothing committed — vm_system_load_vm
+         * does its own cleanup on partial failure. Just report
+         * and return. */
         int32_t e;
         switch (lr.code) {
             case VM_SYS_ERR_FULL:             e = VM_EAGAIN;  break;
@@ -1020,23 +1023,15 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     }
 
 child_done:
-    /* Reclaim the child's resources:
+    /* Reclaim the child's resources by unloading the VM. This
+     * walks its region table and slab_frees each RAM-backed
+     * region, frees the mailbox storage and VmCpu, unregisters
+     * the scheduler slot, and NULLs sys->vms[].
      *
-     *   1. Unregister from the scheduler — frees the vm_id slot
-     *      so future spawns can use it.
-     *   2. NULL out the sys->vms[] slot so the system doesn't
-     *      keep a dangling pointer to about-to-be-overwritten
-     *      memory.
-     *   3. Rewind the bump arena to the mark we saved before
-     *      load — reclaims VmCpu + mailbox storage + the entire
-     *      data region (typically 64+ KB) so the next spawn
-     *      can use that space.
-     *
-     * After this returns, the child's allocations are gone and
-     * the parent can spawn again indefinitely. */
-    vm_sched_unregister(sys->sched, (uint16_t)lr.assigned_vm_id);
-    sys->vms[lr.assigned_vm_id] = NULL;
-    bump_rewind_to(sys->local_arena, pre_spawn_mark);
+     * Per-block freeing via the slab means the parent can spawn
+     * again immediately — the freed bytes go back to their bins
+     * and are picked up by the next allocation. */
+    vm_system_unload_vm(sys, (uint16_t)lr.assigned_vm_id);
 }
 
 

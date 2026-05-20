@@ -204,6 +204,30 @@ typedef struct SlabAllocator {
  * computes the value, then declaring a buffer based on it). */
 size_t slab_required_bytes(const SlabConfig *cfg);
 
+/* Compute the bin index that an allocation of `bytes` would land
+ * in. Bins are powers of 2 starting at 32 B: bin i has block
+ * size (32 << i). Sizes larger than the biggest bin return the
+ * last bin index — caller should check size against the bin's
+ * block_size before relying on the result.
+ *
+ * Accounts for the per-block header overhead (SLAB_HEADER_SIZE
+ * bytes) so a caller asking "where would a 64 KB block land?"
+ * gets the right answer (the 128 KB bin, since 64 KB + 8 header
+ * exceeds the 64 KB bin's capacity).
+ *
+ * Useful when laying out a SlabConfig: "I want N blocks of about
+ * 64 KB each → bucket_counts[slab_bin_for_size(64*1024)] = N". */
+static inline int slab_bin_for_size(size_t bytes) {
+    size_t total = bytes + SLAB_HEADER_SIZE;
+    int bin = 0;
+    size_t sz = 32;
+    while (sz < total && bin < SLAB_BIN_COUNT - 1) {
+        sz <<= 1;
+        bin++;
+    }
+    return bin;
+}
+
 /* Initialize a slab allocator in the caller-provided region.
  *
  *   a:        allocator handle (caller-owned)

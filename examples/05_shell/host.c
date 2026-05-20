@@ -64,11 +64,21 @@
  * --------------------------------------------------------------- */
 #define POOL_BYTES   (128 * 1024)
 #define SHARED_BYTES (64 * 1024)
-/* LOCAL_BYTES is the per-VM-data bump arena. Each loaded guest
- * (the shell itself + any spawned child) takes a slice of this.
- * Shell + a TUI-using snake/tetris-class guest fits comfortably
- * in 192 KB. Increase further if you spawn larger guests. */
-#define LOCAL_BYTES  (192 * 1024)
+/* LOCAL_BYTES is the local-slab region. The slab carves it into
+ * fixed-size bins; each per-VM allocation rounds up to the next
+ * bin size. With our config (4 VMs × 64 KB data), each VM consumes
+ * roughly:
+ *   - VmCpu (280 B)    → 512 B bin
+ *   - mailbox (272 B)  → 512 B bin
+ *   - text (≤ 30 KB)   → 32 KB bin
+ *   - rodata (≤ 4 KB)  → 8 KB bin
+ *   - data (64 KB)     → 128 KB bin  (+ slab's 8 B header per block
+ *                                       means a 64 KB request needs
+ *                                       65544 B of block storage)
+ * Plus the slab populates smaller bins (32 B..2 KB) for variable
+ * segment sizes — vm_system_local_required reports ~1.3 MB total.
+ * We round to 1.5 MB to leave a margin. */
+#define LOCAL_BYTES  (1536 * 1024)
 
 static uint8_t g_pool[POOL_BYTES];
 static uint8_t g_shared[SHARED_BYTES];
@@ -532,6 +542,12 @@ int main(int argc, char **argv) {
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
 
+        /* Per-VM sizing: the shell can spawn up to 3 child VMs
+         * (4 total slots = shell + 3 children) and each child can
+         * use up to 64 KB of data for TUI canvases etc. */
+        .max_vms             = 4,
+        .spawn_data_kb       = 64,
+
         /* Real-time tick source: 1 ms granularity from
          * CLOCK_MONOTONIC. Guests can use SYS_SLEEP_TICKS and
          * SYS_SLEEP_UNTIL to pace themselves at human timescales
@@ -569,13 +585,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Bump the per-spawn data region from the 16 KB default. Guests
-     * that use the TUI library carry a back-buffered canvas + front
-     * buffer in BSS (each canvas is rows × cols × 6 bytes; 30 × 80
-     * defaults give ~14 KB per buffer = 28 KB), plus tile arena and
-     * library state — about 44 KB for snake. 64 KB gives that and
-     * leaves headroom. */
-    vm_host_fs_set_spawn_data_size(64 * 1024);
+    /* The per-spawn data region size is now set in VmSystemConfig
+     * above (spawn_data_kb = 64). The legacy
+     * vm_host_fs_set_spawn_data_size global is still honored when
+     * the config doesn't set it, but we don't need it here. */
 
     /* 6b. Configure the /host mount. By default the shell can
      * read files under ./host_files/ as /host/<name>. Lets the

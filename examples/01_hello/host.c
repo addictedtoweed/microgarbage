@@ -68,14 +68,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 2. Initialize the system. Most defaults are fine; we only
-     *    need to point it at our memory pools. */
+    /* 2. Initialize the system. We size the per-VM bins for the
+     *    smallest case: 1 VM, 8 KB data region. With those config
+     *    values the local slab needs about 30 KB. */
     VmSystem sys;
     VmSystemConfig cfg = {
         .shared_storage      = g_shared,
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+        .max_vms             = 1,
+        .spawn_data_kb       = 8,
     };
     if (!vm_system_init(&sys, &cfg)) {
         fprintf(stderr, "host: vm_system_init failed\n");

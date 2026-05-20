@@ -127,7 +127,7 @@
 #include <stdbool.h>
 
 #include "vm/vm_core.h"
-#include "memory/bump.h"
+#include "memory/slab_stack.h"
 
 /* ============================================================
  *  Backing modes (per-region choice for code and rodata)
@@ -199,11 +199,18 @@ typedef struct {
 
     /* --- RAM source for COPY_RAM and the DATA region ---
      *
-     * If both backing modes are XIP, the bump arena is only used
-     * for the DATA region. Even so, region_data_size > 0 and a
-     * valid arena are required, because every VM must have a
-     * stack. */
-    BumpAllocator *ram_arena;
+     * Allocations come from this slab. Per-allocation freeing
+     * means vm_unload can fully reclaim a VM's bytes without
+     * fragmenting the arena. The slab must have bins large
+     * enough to hold:
+     *
+     *   - The text/rodata block(s) when COPY_RAM mode is in use.
+     *     For typical guests these are 4-16 KB; round up to a
+     *     reasonable bin size in the slab config.
+     *   - The DATA region (region_data_size bytes).
+     *
+     * If both backings are XIP, the slab is only used for DATA. */
+    SlabAllocator *ram_arena;
 
     /* --- DATA region sizing ---
      *
