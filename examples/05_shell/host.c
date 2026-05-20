@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------
  * Backing storage
@@ -57,6 +58,38 @@ static uint8_t g_local[LOCAL_BYTES];
 
 static TrashDrive g_drive;
 static FATFS g_fs;
+
+/* ---------------------------------------------------------------
+ * Tick source: milliseconds since first call.
+ *
+ * The scheduler calls this on each step to refresh global_tick.
+ * Guests see tick units of one millisecond, and SYS_TICK_HZ
+ * returns 1000. The tick wraps at 2^32 ms ≈ 49.7 days of
+ * continuous runtime.
+ *
+ * We anchor at the first call so global_tick starts at 0 (or
+ * close to it) — easier to reason about than raw monotonic time
+ * which can be a giant number. CLOCK_MONOTONIC is immune to
+ * wall-clock adjustments (NTP, manual set).
+ * --------------------------------------------------------------- */
+static struct timespec g_t0;
+static int             g_t0_set = 0;
+
+static uint32_t monotonic_ms_ticks(void *userdata) {
+    (void)userdata;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if (!g_t0_set) {
+        g_t0 = t;
+        g_t0_set = 1;
+    }
+    /* Difference in milliseconds. The cast truncates to uint32,
+     * which is the intended wraparound behavior. */
+    uint64_t ms =
+        ((uint64_t)(t.tv_sec  - g_t0.tv_sec )) * 1000ULL +
+        ((uint64_t)(t.tv_nsec - g_t0.tv_nsec)) / 1000000ULL;
+    return (uint32_t)ms;
+}
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int signo) { (void)signo; g_stop = 1; }
@@ -187,6 +220,13 @@ int main(int argc, char **argv) {
         .shared_storage_size = SHARED_BYTES,
         .local_storage       = g_local,
         .local_storage_size  = LOCAL_BYTES,
+
+        /* Real-time tick source: 1 ms granularity from
+         * CLOCK_MONOTONIC. Guests can use SYS_SLEEP_TICKS and
+         * SYS_SLEEP_UNTIL to pace themselves at human timescales
+         * (animations, polling, periodic loops). */
+        .tick_source         = monotonic_ms_ticks,
+        .ticks_per_second    = 1000,
     };
     if (!vm_system_init(&sys, &cfg)) {
         fprintf(stderr, "host: vm_system_init failed\n");
