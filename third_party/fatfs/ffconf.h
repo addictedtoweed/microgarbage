@@ -2,7 +2,7 @@
 /  Configurations of FatFs Module
 /---------------------------------------------------------------------------*/
 
-#define FFCONF_DEF	86631	/* Revision ID — MUST match FF_DEFINED in ff.h.
+#define FFCONF_DEF	80386	/* Revision ID — MUST match FF_DEFINED in ff.h.
                              * R0.15p3 used 86631. R0.16 (and any later
                              * release) will be different. When upgrading
                              * FatFs: open the new ff.h, look for
