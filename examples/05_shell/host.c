@@ -111,11 +111,21 @@ static uint32_t monotonic_ms_ticks(void *userdata) {
         g_t0 = t;
         g_t0_set = 1;
     }
-    /* Difference in milliseconds. The cast truncates to uint32,
-     * which is the intended wraparound behavior. */
-    uint64_t ms =
-        ((uint64_t)(t.tv_sec  - g_t0.tv_sec )) * 1000ULL +
-        ((uint64_t)(t.tv_nsec - g_t0.tv_nsec)) / 1000000ULL;
+    /* Difference in milliseconds. Borrow from seconds if nsec
+     * went backwards relative to the anchor — without that, a
+     * signed long subtraction (-500_000_000) cast to uint64
+     * blows up to a near-2^64 value and the millisecond math
+     * skews badly once per second of real time. */
+    long sec_delta  = (long)(t.tv_sec  - g_t0.tv_sec);
+    long nsec_delta = (long)(t.tv_nsec - g_t0.tv_nsec);
+    if (nsec_delta < 0) {
+        sec_delta  -= 1;
+        nsec_delta += 1000000000L;
+    }
+    uint64_t ms = (uint64_t)sec_delta * 1000ULL
+                + (uint64_t)nsec_delta / 1000000ULL;
+    /* The cast to uint32 truncates to 49.7-day wraparound, which
+     * is the documented intended behavior. */
     return (uint32_t)ms;
 }
 
