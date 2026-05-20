@@ -1,0 +1,53 @@
+# microgarbage shell — example configuration file
+#
+# This file is loaded automatically if present in the host's
+# working directory. To use it, rename or copy to 'vm.cfg' next
+# to the host binary. To skip it, run with --no-config. To point
+# at a different file, use --config=<path>.
+#
+# Every setting here is optional. Anything you don't set keeps
+# its built-in default. CLI flags (e.g., --max-vms=2) override
+# whatever's in this file.
+#
+# Lines starting with # or ; are comments. Section names go in
+# square brackets. Key-value pairs use 'key = value'. Trailing
+# comments on the same line work if there's whitespace before
+# the # or ; .
+
+
+[memory]
+# local-slab size in KB. The local slab holds per-VM allocations:
+# the VmCpu struct, mailboxes, and the text/rodata/data regions
+# of every loaded VM. Default: 1536 (matches the static array
+# size, which is the compile-time upper bound).
+#
+# Range: 32..1536. Going below ~256 KB only makes sense if you've
+# also lowered max_vms and spawn_data_kb.
+# local_kb = 1536
+
+# shared-slab size in KB. The shared slab serves SYS_ALLOC from
+# guests for cross-VM data (mailbox messages, shared buffers).
+# Default: 64. Range: 8..64.
+# shared_kb = 64
+
+# Maximum concurrent VMs (shell + spawned children). Default 4
+# means the shell can spawn up to 3 children at once.
+# Range: 1..16. Going above 4 needs local_kb bumped because each
+# VM consumes one VmCpu + one mailbox + text + rodata + data.
+# max_vms = 4
+
+# Per-spawn data region size in KB. Every spawned VM gets this
+# much for its writable data segment (stack + heap-like usage).
+# Default: 64. Range: 1..256.
+# spawn_data_kb = 64
+
+
+[stdio]
+# Enable raw mode on stdin if it's a TTY. Raw mode disables
+# line-buffering and echo, which is what TUI guests (snake, the
+# shell line editor) need. Default: true.
+#
+# Set to false only if you're piping commands into the host for
+# scripted testing — raw mode on a non-TTY pipe is a no-op anyway,
+# but it's surfaced here for completeness.
+# raw_mode = true

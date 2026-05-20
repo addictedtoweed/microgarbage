@@ -34,6 +34,7 @@
 #include "vm/vm_core.h"
 #include "storage/trashdrive.h"
 #include "storage/trashdrive_fatfs.h"
+#include "util/inicfg.h"
 #include "ff.h"
 
 #include <stdio.h>
@@ -86,6 +87,154 @@ static uint8_t g_local[LOCAL_BYTES];
 
 static TrashDrive g_drive;
 static FATFS g_fs;
+
+/* ---------------------------------------------------------------
+ * Host configuration (vm.cfg + CLI overrides).
+ *
+ * Defaults match the historical hardcoded values, so a host
+ * launched without any config or flags behaves identically to
+ * the M.1b version. Layering is:
+ *
+ *   1. Start with built-in defaults.
+ *   2. If a vm.cfg is found (or --config <path> given), apply it.
+ *   3. Apply CLI overrides on top.
+ *
+ * That way: CLI wins ties, config is just persistent defaults.
+ * --------------------------------------------------------------- */
+
+typedef struct {
+    /* Memory */
+    size_t   local_bytes;        /* local slab size */
+    size_t   shared_bytes;       /* shared slab size */
+    uint16_t max_vms;
+    uint16_t spawn_data_kb;
+
+    /* Stdio */
+    bool     raw_mode;           /* enable raw mode on stdin if tty */
+} HostConfig;
+
+static void host_config_set_defaults(HostConfig *hc) {
+    hc->local_bytes   = LOCAL_BYTES;
+    hc->shared_bytes  = SHARED_BYTES;
+    hc->max_vms       = 4;
+    hc->spawn_data_kb = 64;
+    hc->raw_mode      = true;
+}
+
+/* Apply an IniCfg's settings to *hc. Unknown keys produce a
+ * warning on stderr but don't fail the load — forward-compat
+ * matters more than strictness for a config file the user
+ * edits by hand. */
+static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
+    /* Per-key binders. Each one returns false on a value parse
+     * error so we can blame the line in stderr. */
+    long lv;
+    bool bv;
+
+    if (inicfg_get_int(cfg, "memory", "local_kb", &lv)) {
+        if (lv < 32 || lv > (long)(LOCAL_BYTES / 1024)) {
+            fprintf(stderr, "vm.cfg: [memory] local_kb=%ld out of range "
+                    "(32..%zu)\n", lv, (size_t)(LOCAL_BYTES / 1024));
+            return false;
+        }
+        hc->local_bytes = (size_t)lv * 1024;
+    }
+    if (inicfg_get_int(cfg, "memory", "shared_kb", &lv)) {
+        if (lv < 8 || lv > (long)(SHARED_BYTES / 1024)) {
+            fprintf(stderr, "vm.cfg: [memory] shared_kb=%ld out of range "
+                    "(8..%zu)\n", lv, (size_t)(SHARED_BYTES / 1024));
+            return false;
+        }
+        hc->shared_bytes = (size_t)lv * 1024;
+    }
+    if (inicfg_get_int(cfg, "memory", "max_vms", &lv)) {
+        if (lv < 1 || lv > 16) {
+            fprintf(stderr, "vm.cfg: [memory] max_vms=%ld out of range "
+                    "(1..16)\n", lv);
+            return false;
+        }
+        hc->max_vms = (uint16_t)lv;
+    }
+    if (inicfg_get_int(cfg, "memory", "spawn_data_kb", &lv)) {
+        if (lv < 1 || lv > 256) {
+            fprintf(stderr, "vm.cfg: [memory] spawn_data_kb=%ld out of "
+                    "range (1..256)\n", lv);
+            return false;
+        }
+        hc->spawn_data_kb = (uint16_t)lv;
+    }
+    if (inicfg_get_bool(cfg, "stdio", "raw_mode", &bv)) {
+        hc->raw_mode = bv;
+    }
+
+    /* Warn on unknown keys so typos surface. We allow unknown
+     * sections (e.g., a future [mount] from M.3) so older hosts
+     * don't reject newer configs. */
+    static const struct {
+        const char *section;
+        const char *keys[8];     /* NULL-terminated */
+    } known[] = {
+        { "memory", {"local_kb", "shared_kb", "max_vms",
+                     "spawn_data_kb", NULL} },
+        { "stdio",  {"raw_mode", NULL} },
+    };
+    for (size_t i = 0; i < cfg->count; i++) {
+        const char *s = cfg->entries[i].section;
+        const char *k = cfg->entries[i].key;
+        bool found_section = false;
+        bool found_key = false;
+        for (size_t j = 0; j < sizeof(known) / sizeof(known[0]); j++) {
+            if (strcmp(s, known[j].section) != 0) continue;
+            found_section = true;
+            for (size_t m = 0; known[j].keys[m]; m++) {
+                if (strcmp(k, known[j].keys[m]) == 0) {
+                    found_key = true;
+                    break;
+                }
+            }
+            break;
+        }
+        if (found_section && !found_key) {
+            fprintf(stderr, "vm.cfg: line %u: warning: unknown key "
+                    "'%s.%s'\n", cfg->entries[i].line, s, k);
+        }
+        /* Unknown section: silent, future-compat. */
+    }
+    return true;
+}
+
+/* Attempt to load vm.cfg from `path`. If `path` is NULL, tries
+ * "./vm.cfg" and silently does nothing if it's not there. If
+ * `path` is non-NULL, missing-or-unreadable IS an error (the
+ * user explicitly asked for that file). */
+static bool load_host_config(const char *path, HostConfig *hc) {
+    bool explicit = (path != NULL);
+    if (!path) path = "vm.cfg";
+
+    /* If the path isn't explicit, peek to see if the default
+     * config exists. Missing default is fine; we just keep
+     * built-in defaults. */
+    if (!explicit) {
+        FILE *probe = fopen(path, "rb");
+        if (!probe) return true;
+        fclose(probe);
+    }
+
+    IniCfg cfg;
+    IniCfgError err;
+    if (!inicfg_parse_file(path, &cfg, &err)) {
+        if (err.line == 0) {
+            fprintf(stderr, "host: %s\n", err.msg);
+        } else {
+            fprintf(stderr, "host: %s: line %u: %s\n",
+                    path, err.line, err.msg);
+        }
+        return false;
+    }
+    bool ok = apply_inicfg(&cfg, hc);
+    inicfg_destroy(&cfg);
+    return ok;
+}
 
 /* ---------------------------------------------------------------
  * Tick source: milliseconds since first call.
@@ -467,6 +616,17 @@ int main(int argc, char **argv) {
      * Usage: host [options] [shell.elf]
      *
      * Options:
+     *   --config=<path>     Load config from <path>. Default is
+     *                       ./vm.cfg if present (silently skipped
+     *                       if missing). Use this to point at a
+     *                       different config file.
+     *   --no-config         Skip even a present ./vm.cfg. Useful
+     *                       for testing CLI-only behavior.
+     *   --local-kb=<N>      Local-slab size in KB (overrides config).
+     *   --shared-kb=<N>     Shared-slab size in KB (overrides config).
+     *   --max-vms=<N>       Max concurrent VMs (overrides config).
+     *   --spawn-data-kb=<N> Per-spawn data region size in KB.
+     *   --raw=on|off        Toggle raw-mode stdin.
      *   --host-fs=<path>    Mount <path> as /host inside the shell.
      *                       The guest can then read/run files via
      *                       /host/<name>. Default: ./host_files
@@ -479,6 +639,8 @@ int main(int argc, char **argv) {
      *                       identifier ('microgarbage') or a full
      *                       \\.\\pipe\\<name> path.
      *
+     * Layering: built-in defaults < config file < CLI.
+     *
      * Positional: the path to shell.elf. Defaults to build/shell.elf.
      */
     const char *elf_path     = NULL;
@@ -486,9 +648,45 @@ int main(int argc, char **argv) {
     bool host_fs_writable    = false;
     bool host_fs_disabled    = false;
     const char *pipe_name    = NULL;
+    const char *cfg_path     = NULL;
+    bool        no_config    = false;
+
+    /* CLI overrides for HostConfig fields. These are "unset" until
+     * the user passes the flag, so they only fire after we've
+     * loaded the config file (which gets the chance to set them
+     * first). Sentinel values: -1 for ints, -1 for tri-state bool. */
+    long cli_local_kb       = -1;
+    long cli_shared_kb      = -1;
+    long cli_max_vms        = -1;
+    long cli_spawn_data_kb  = -1;
+    int  cli_raw_mode       = -1;   /* 0=off, 1=on, -1=unset */
 
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--host-fs=", 10) == 0) {
+        if (strncmp(argv[i], "--config=", 9) == 0) {
+            cfg_path = argv[i] + 9;
+        } else if (strcmp(argv[i], "--no-config") == 0) {
+            no_config = true;
+        } else if (strncmp(argv[i], "--local-kb=", 11) == 0) {
+            cli_local_kb = strtol(argv[i] + 11, NULL, 10);
+        } else if (strncmp(argv[i], "--shared-kb=", 12) == 0) {
+            cli_shared_kb = strtol(argv[i] + 12, NULL, 10);
+        } else if (strncmp(argv[i], "--max-vms=", 10) == 0) {
+            cli_max_vms = strtol(argv[i] + 10, NULL, 10);
+        } else if (strncmp(argv[i], "--spawn-data-kb=", 16) == 0) {
+            cli_spawn_data_kb = strtol(argv[i] + 16, NULL, 10);
+        } else if (strncmp(argv[i], "--raw=", 6) == 0) {
+            const char *v = argv[i] + 6;
+            if (strcmp(v, "on") == 0 || strcmp(v, "true") == 0 ||
+                strcmp(v, "yes") == 0 || strcmp(v, "1") == 0) {
+                cli_raw_mode = 1;
+            } else if (strcmp(v, "off") == 0 || strcmp(v, "false") == 0 ||
+                       strcmp(v, "no") == 0 || strcmp(v, "0") == 0) {
+                cli_raw_mode = 0;
+            } else {
+                fprintf(stderr, "host: --raw expects on|off (got '%s')\n", v);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--host-fs=", 10) == 0) {
             host_fs_root = argv[i] + 10;
         } else if (strcmp(argv[i], "--host-fs-rw") == 0) {
             host_fs_writable = true;
@@ -498,10 +696,17 @@ int main(int argc, char **argv) {
             pipe_name = argv[i] + 7;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "  --host-fs=<path>   mount path as /host (default: ./host_files)\n");
-            fprintf(stderr, "  --host-fs-rw       allow writes to /host (default: read-only)\n");
-            fprintf(stderr, "  --no-host-fs       disable /host mount\n");
-            fprintf(stderr, "  --pipe=<name>      route stdio through a named pipe (Windows)\n");
+            fprintf(stderr, "  --config=<path>     load config from <path>\n");
+            fprintf(stderr, "  --no-config         skip ./vm.cfg even if present\n");
+            fprintf(stderr, "  --local-kb=<N>      local-slab size in KB\n");
+            fprintf(stderr, "  --shared-kb=<N>     shared-slab size in KB\n");
+            fprintf(stderr, "  --max-vms=<N>       max concurrent VMs\n");
+            fprintf(stderr, "  --spawn-data-kb=<N> per-spawn data region in KB\n");
+            fprintf(stderr, "  --raw=on|off        toggle raw-mode stdin\n");
+            fprintf(stderr, "  --host-fs=<path>    mount path as /host (default: ./host_files)\n");
+            fprintf(stderr, "  --host-fs-rw        allow writes to /host (default: read-only)\n");
+            fprintf(stderr, "  --no-host-fs        disable /host mount\n");
+            fprintf(stderr, "  --pipe=<name>       route stdio through a named pipe (Windows)\n");
             return 1;
         } else if (!elf_path) {
             elf_path = argv[i];
@@ -511,6 +716,57 @@ int main(int argc, char **argv) {
         }
     }
     if (!elf_path) elf_path = "build/shell.elf";
+
+    /* ----- Load HostConfig: defaults -> vm.cfg -> CLI overrides -----
+     *
+     * If --no-config was passed, we skip even the implicit default
+     * file. If --config=<path> was passed, missing file is an error
+     * (user asked for that file explicitly). Without --config, a
+     * missing ./vm.cfg is fine. */
+    HostConfig hc;
+    host_config_set_defaults(&hc);
+    if (!no_config) {
+        if (!load_host_config(cfg_path, &hc)) return 1;
+    } else if (cfg_path) {
+        fprintf(stderr, "host: --no-config and --config are mutually exclusive\n");
+        return 1;
+    }
+    /* CLI overrides last. Each cli_* is range-checked here so
+     * an out-of-range value still fails cleanly (instead of being
+     * silently clamped or wrapping). */
+    if (cli_local_kb >= 0) {
+        if (cli_local_kb < 32 || cli_local_kb > (long)(LOCAL_BYTES / 1024)) {
+            fprintf(stderr, "host: --local-kb=%ld out of range (32..%zu)\n",
+                    cli_local_kb, (size_t)(LOCAL_BYTES / 1024));
+            return 1;
+        }
+        hc.local_bytes = (size_t)cli_local_kb * 1024;
+    }
+    if (cli_shared_kb >= 0) {
+        if (cli_shared_kb < 8 || cli_shared_kb > (long)(SHARED_BYTES / 1024)) {
+            fprintf(stderr, "host: --shared-kb=%ld out of range (8..%zu)\n",
+                    cli_shared_kb, (size_t)(SHARED_BYTES / 1024));
+            return 1;
+        }
+        hc.shared_bytes = (size_t)cli_shared_kb * 1024;
+    }
+    if (cli_max_vms >= 0) {
+        if (cli_max_vms < 1 || cli_max_vms > 16) {
+            fprintf(stderr, "host: --max-vms=%ld out of range (1..16)\n",
+                    cli_max_vms);
+            return 1;
+        }
+        hc.max_vms = (uint16_t)cli_max_vms;
+    }
+    if (cli_spawn_data_kb >= 0) {
+        if (cli_spawn_data_kb < 1 || cli_spawn_data_kb > 256) {
+            fprintf(stderr, "host: --spawn-data-kb=%ld out of range (1..256)\n",
+                    cli_spawn_data_kb);
+            return 1;
+        }
+        hc.spawn_data_kb = (uint16_t)cli_spawn_data_kb;
+    }
+    if (cli_raw_mode != -1) hc.raw_mode = (cli_raw_mode != 0);
 
 #ifndef PIPE_MODE_SUPPORTED
     if (pipe_name) {
@@ -581,19 +837,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 6. Build the VmSystem and install both bridges. */
+    /* 6. Build the VmSystem and install both bridges. Memory
+     * sizing and per-VM limits come from HostConfig (defaults +
+     * vm.cfg + CLI overrides). */
     VmSystem sys;
     VmSystemConfig cfg = {
         .shared_storage      = g_shared,
-        .shared_storage_size = SHARED_BYTES,
+        .shared_storage_size = hc.shared_bytes,
         .local_storage       = g_local,
-        .local_storage_size  = LOCAL_BYTES,
+        .local_storage_size  = hc.local_bytes,
 
-        /* Per-VM sizing: the shell can spawn up to 3 child VMs
-         * (4 total slots = shell + 3 children) and each child can
-         * use up to 64 KB of data for TUI canvases etc. */
-        .max_vms             = 4,
-        .spawn_data_kb       = 64,
+        .max_vms             = hc.max_vms,
+        .spawn_data_kb       = hc.spawn_data_kb,
 
         /* Real-time tick source: 1 ms granularity from
          * CLOCK_MONOTONIC. Guests can use SYS_SLEEP_TICKS and
@@ -603,7 +858,12 @@ int main(int argc, char **argv) {
         .ticks_per_second    = 1000,
     };
     if (!vm_system_init(&sys, &cfg)) {
-        fprintf(stderr, "host: vm_system_init failed\n");
+        fprintf(stderr, "host: vm_system_init failed "
+                "(local=%zu shared=%zu max_vms=%u spawn_data_kb=%u — "
+                "try smaller values in vm.cfg or via --max-vms / "
+                "--spawn-data-kb)\n",
+                hc.local_bytes, hc.shared_bytes,
+                (unsigned)hc.max_vms, (unsigned)hc.spawn_data_kb);
         return 1;
     }
 
@@ -622,7 +882,9 @@ int main(int argc, char **argv) {
         return 1;
 #endif
     } else {
-        if (!vm_host_install_stdio(&sys)) {
+        VmHostStdioConfig sio = {0};
+        sio.raw_mode = hc.raw_mode;
+        if (!vm_host_install_stdio_ex(&sys, &sio)) {
             fprintf(stderr, "host: vm_host_install_stdio failed\n");
             return 1;
         }
