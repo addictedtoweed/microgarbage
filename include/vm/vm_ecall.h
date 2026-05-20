@@ -167,6 +167,20 @@
 /* --- Identity / introspection (1024..1039) --- */
 #define SYS_SELF            1024   /* get this VM's ID */
 
+/* --- Process management (1104..1119) ---
+ *
+ * Spawning is host-mediated — the guest hands the host an
+ * ELF path, the host loads it as a new VM, runs it to
+ * completion, and returns the exit code. There's no fork,
+ * exec, or async-spawn here; just synchronous run-this-and-
+ * wait-for-it.
+ *
+ * Spawn syscalls are NOT installed by vm_system_init; the host
+ * application opts in by calling vm_host_install_fs() (the same
+ * module that owns file IO — see vm_host_fs.h).
+ */
+#define SYS_SPAWN_AND_WAIT  1104   /* spawn_and_wait(path) → exit_code or -errno */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

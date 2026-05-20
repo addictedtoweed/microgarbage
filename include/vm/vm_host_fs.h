@@ -193,6 +193,89 @@ void vm_host_fs_reset(void);
 bool vm_host_install_fs_atexit(VmSystem *sys);
 
 /* ============================================================
+ *  Host-filesystem passthrough mount
+ *
+ *  A second "filesystem" rooted at the virtual path "/host/" in
+ *  the guest's namespace, backed by a real directory on the
+ *  host's actual filesystem. Lets you put ELF files, data, or
+ *  scripts in a host directory and read them from the guest
+ *  without having to copy them into the FatFs volume.
+ *
+ *  Read-only by default for safety — a buggy guest shouldn't be
+ *  able to delete files off your real hard drive. Pass writable
+ *  = true to vm_host_set_host_fs_root to allow O_WRONLY/O_CREAT/
+ *  O_TRUNC against /host/... paths.
+ *
+ *  Path sandboxing: every guest path starting with "/host/" is
+ *  resolved relative to the configured root. ".." components
+ *  that would escape the root are rejected with -EPERM. So the
+ *  guest can read /host/foo and /host/sub/bar but never
+ *  /host/../../etc/passwd.
+ *
+ *  Call vm_host_set_host_fs_root BEFORE the guest tries to use
+ *  any /host/... path. If not called, /host/... paths return
+ *  -ENOENT (acts as if the mount doesn't exist).
+ * ============================================================ */
+
+/* Configure the host-filesystem passthrough mount.
+ *
+ *   root      Absolute host path to a directory. Files under this
+ *             directory become visible to the guest as
+ *             /host/<filename> etc. Pass NULL to disable the
+ *             mount entirely.
+ *   writable  If true, the guest can create/modify/delete files
+ *             under root. If false (recommended default), the
+ *             mount is read-only.
+ *
+ * Returns true on success, false if `root` doesn't exist or
+ * isn't a directory. The string is copied internally — you can
+ * free your buffer after this returns.
+ */
+bool vm_host_set_host_fs_root(const char *root, bool writable);
+
+/* ============================================================
+ *  Spawn (run another VM from inside the running shell)
+ *
+ *  SYS_SPAWN_AND_WAIT lets a guest load and run another ELF as
+ *  a new VM in the same system, then wait for it to halt.
+ *
+ *  The spawned VM is loaded with VM_BACKING_COPY_RAM — its code
+ *  and rodata segments are copied out of the source file into
+ *  fresh RAM from the host's bump arena. This means:
+ *
+ *    - The ELF file's storage doesn't need to be contiguous or
+ *      stable. FatFs-on-trashdrive (scattered sectors) and host-
+ *      filesystem-on-disk (entirely outside our address space)
+ *      both work fine — the bytes are copied as they're read.
+ *
+ *    - Each spawn consumes RAM from the bump arena. Plan for
+ *      ~20-30 KB per spawned VM (code + rodata + data region).
+ *      The arena is sized by vm_system's local_storage_size.
+ *
+ *  The parent VM is paused while the spawned VM runs — its
+ *  scheduler slot stays in place but its quantum doesn't tick.
+ *  When the spawned VM halts (SYS_EXIT), control returns to the
+ *  parent and the syscall returns the exit code.
+ *
+ *  The spawned VM shares the parent's stdio. Anything it writes
+ *  to fd 1 appears on the user's terminal. This matches the
+ *  "foreground process" model from a shell — the spawned VM is
+ *  conceptually the only thing running until it exits.
+ *
+ *  Configuration: vm_host_fs_set_spawn_data_size() controls how
+ *  much data-region RAM each spawned VM gets. Default is 16 KB.
+ * ============================================================ */
+
+/* Set the data-region size (in bytes) given to each spawned VM.
+ * Must be at least 4 KB and a multiple of 4 KB. Returns true on
+ * success. The new size applies to subsequent spawns; in-flight
+ * spawns are unaffected. */
+bool vm_host_fs_set_spawn_data_size(uint32_t bytes);
+
+/* Get the currently-configured spawn data-region size. */
+uint32_t vm_host_fs_get_spawn_data_size(void);
+
+/* ============================================================
  *  Diagnostics
  *
  *  Mostly useful for tests. May be removed/changed without

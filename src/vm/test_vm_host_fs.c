@@ -375,6 +375,87 @@ static void test_path_translation_strips_volume_prefix(void) {
     fixture_teardown();
 }
 
+/* Locate a pre-built guest_minimal.elf. Returns NULL if not
+ * found anywhere we know to look — the test that uses this
+ * will SKIP. The minimal ELF is a 3-instruction RV32IMC program
+ * that does sys_exit(0); it lives in examples/01_hello/. */
+static const char *locate_minimal_elf(void) {
+    /* 1. Environment override. Useful for CI where the test binary
+     *    might run from a build directory removed from the source. */
+    const char *env = getenv("VM_TEST_MINIMAL_ELF");
+    if (env) {
+        FILE *f = fopen(env, "rb");
+        if (f) { fclose(f); return env; }
+    }
+    /* 2. Standard checked-in path, run from repo root. */
+    static const char *candidates[] = {
+        "examples/01_hello/build/guest_minimal.elf",
+        "../examples/01_hello/build/guest_minimal.elf",
+        "../../examples/01_hello/build/guest_minimal.elf",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
+        FILE *f = fopen(candidates[i], "rb");
+        if (f) { fclose(f); return candidates[i]; }
+    }
+    return NULL;
+}
+
+/* Read a host file into a freshly malloc'd buffer. Caller frees. */
+static uint8_t *slurp(const char *path, size_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    rewind(f);
+    uint8_t *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return NULL;
+    }
+    fclose(f);
+    *out_size = (size_t)sz;
+    return buf;
+}
+
+/* SYS_SPAWN_AND_WAIT: write guest_minimal.elf into the FatFs
+ * volume, spawn it via the syscall, verify return value is 0
+ * (the minimal program is sys_exit(0)). */
+static void test_spawn_and_wait_minimal_elf(void) {
+    const char *elf_path = locate_minimal_elf();
+    if (!elf_path) {
+        printf("  SKIP  guest_minimal.elf not found "
+               "(set VM_TEST_MINIMAL_ELF or build examples/01_hello)\n");
+        return;
+    }
+
+    size_t elf_size;
+    uint8_t *elf = slurp(elf_path, &elf_size);
+    ASSERT(elf != NULL);
+
+    ASSERT(fixture_init());
+
+    /* Write the ELF into the FatFs volume at /spawn.elf. */
+    FIL ff;
+    ASSERT(f_open(&ff, "0:/spawn.elf", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK);
+    UINT bw;
+    ASSERT(f_write(&ff, elf, (UINT)elf_size, &bw) == FR_OK);
+    ASSERT(bw == elf_size);
+    ASSERT(f_close(&ff) == FR_OK);
+    free(elf);
+
+    /* Spawn it. The path "/spawn.elf" gets translated to
+     * "0:/spawn.elf" by our path resolver. */
+    uint32_t path = put_string("/spawn.elf", 0);
+    int32_t rc = invoke_syscall(SYS_SPAWN_AND_WAIT, path, 0, 0, 0);
+
+    /* guest_minimal calls sys_exit(0); exit code masked to 8 bits
+     * by our handler. */
+    ASSERT_EQ_INT(rc, 0);
+
+    fixture_teardown();
+}
+
 int main(void) {
     TEST_SUITE("vm_host_fs");
     RUN(test_openat_create_writes_and_reads_back);
@@ -385,6 +466,7 @@ int main(void) {
     RUN(test_lseek_set_cur_end);
     RUN(test_open_fd_limit);
     RUN(test_path_translation_strips_volume_prefix);
+    RUN(test_spawn_and_wait_minimal_elf);
     return TEST_SUITE_RESULT();
 }
 
