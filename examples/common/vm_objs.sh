@@ -112,45 +112,6 @@ GUEST_LD="${REPO_ROOT}/examples/common/guest.ld"
 # host compiler is Cygwin-native and speaks Cygwin paths.
 # ---------------------------------------------------------------
 
-# Detect once: is the guest compiler a native Windows binary
-# that we'll need to feed Windows-style paths to?
-#
-# This matters specifically for xPack's riscv-none-elf-gcc.exe
-# (and similar Windows-native cross compilers) when invoked from
-# Cygwin. Cygwin-native tools, including any RISC-V toolchain
-# installed via apt-cyg or built inside Cygwin, speak Cygwin
-# paths natively and do NOT need translation.
-#
-# Heuristic: under Cygwin (cygpath exists), the compiler needs
-# Windows-path translation IFF its installed path is OUTSIDE
-# Cygwin's rootfs — i.e., somewhere under /cygdrive/<letter>/
-# rather than /usr, /usr/local, /opt, /home, etc.
-_VM_OBJS_GUEST_NEEDS_WINPATH=0
-if command -v cygpath >/dev/null 2>&1; then
-    _vm_objs_guest_cc_path=$(command -v "$GUEST_CC" 2>/dev/null || true)
-    case "$_vm_objs_guest_cc_path" in
-        /cygdrive/*)
-            # Lives on a Windows drive — must be a native binary.
-            _VM_OBJS_GUEST_NEEDS_WINPATH=1
-            ;;
-        *)
-            # Inside Cygwin rootfs — treat as Cygwin-native.
-            # (Even if the file is named *.exe, Cygwin tools are
-            # typically built that way and still accept POSIX paths.)
-            ;;
-    esac
-    unset _vm_objs_guest_cc_path
-fi
-
-# Translate a path for the guest compiler (no-op outside Cygwin).
-guest_path() {
-    if [ "$_VM_OBJS_GUEST_NEEDS_WINPATH" = "1" ]; then
-        cygpath -w "$1"
-    else
-        printf '%s' "$1"
-    fi
-}
-
 # Pick the first available RISC-V cross-compiler. Common names:
 #   riscv64-unknown-elf-gcc   — upstream riscv-collab/riscv-gnu-toolchain
 #                               and most Linux distro packages
@@ -176,8 +137,49 @@ if [ -z "${GUEST_CC:-}" ]; then
     unset _candidate
 fi
 
-# GUEST_CFLAGS as an array (no paths inside currently, but
-# consistent style and supports future additions).
+# Detect once: is the guest compiler a native Windows binary
+# that we'll need to feed Windows-style paths to?
+#
+# This matters specifically for xPack's riscv-none-elf-gcc.exe
+# (and similar Windows-native cross compilers) when invoked from
+# Cygwin. Cygwin-native tools, including any RISC-V toolchain
+# installed via apt-cyg or built inside Cygwin, speak Cygwin
+# paths natively and do NOT need translation.
+#
+# Heuristic: under Cygwin (cygpath exists), the compiler needs
+# Windows-path translation IFF its installed path is OUTSIDE
+# Cygwin's rootfs — i.e., somewhere under /cygdrive/<letter>/
+# rather than /usr, /usr/local, /opt, /home, etc.
+#
+# NOTE: this block MUST come after GUEST_CC is selected, since
+# the detection resolves it via `command -v`. Moving it before
+# the auto-detect block above leaves GUEST_CC empty and the
+# detection silently fails.
+_VM_OBJS_GUEST_NEEDS_WINPATH=0
+if command -v cygpath >/dev/null 2>&1; then
+    _vm_objs_guest_cc_path=$(command -v "$GUEST_CC" 2>/dev/null || true)
+    case "$_vm_objs_guest_cc_path" in
+        /cygdrive/*)
+            # Lives on a Windows drive — must be a native binary.
+            _VM_OBJS_GUEST_NEEDS_WINPATH=1
+            ;;
+        *)
+            # Inside Cygwin rootfs — treat as Cygwin-native.
+            # (Even if the file is named *.exe, Cygwin tools are
+            # typically built that way and still accept POSIX paths.)
+            ;;
+    esac
+    unset _vm_objs_guest_cc_path
+fi
+
+# Translate a path for the guest compiler (no-op outside Cygwin).
+guest_path() {
+    if [ "$_VM_OBJS_GUEST_NEEDS_WINPATH" = "1" ]; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
 if [ -z "${GUEST_CFLAGS+x}" ]; then
     GUEST_CFLAGS=(
         -march=rv32imc -mabi=ilp32
