@@ -39,10 +39,12 @@
 #define SYS_LSEEK      62
 #define SYS_READ       63
 #define SYS_WRITE      64
+#define SYS_FFLUSH     82
 #define SYS_EXIT       93
 #define SYS_READDIR   120
 #define SYS_YIELD    1040
 #define SYS_SPAWN_AND_WAIT  1104
+#define SYS_TTY_SET_RAW     1105
 
 #define AT_FDCWD      (-100)
 
@@ -177,6 +179,20 @@ static inline void sys_exit(int code) {
 static inline int sys_spawn_and_wait(const char *path) {
     register int      a0 asm("a0") = (int)(unsigned long)path;
     register int      a7 asm("a7") = SYS_SPAWN_AND_WAIT;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return a0;
+}
+
+static inline int sys_fflush(int fd) {
+    register int a0 asm("a0") = fd;
+    register int a7 asm("a7") = SYS_FFLUSH;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return a0;
+}
+
+static inline int sys_tty_set_raw(int enable) {
+    register int a0 asm("a0") = enable;
+    register int a7 asm("a7") = SYS_TTY_SET_RAW;
     asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return a0;
 }
@@ -364,59 +380,140 @@ static void perror_(const char *prefix, int err) {
 
 #define LINE_CAP  256
 
-/* Read a line from stdin in cooked mode, filtering ESC sequences.
+/* ============================================================
+ *  Command history (ring buffer)
  *
- * In cooked mode the terminal does line editing for us — line
- * stays in the kernel buffer until Enter, then arrives whole.
- * BUT: the terminal also ECHOES bytes literally as they come in,
- * including ESC sequences from arrow keys / function keys.
+ *  Fixed-size in-memory log of the last HIST_N submitted
+ *  commands. Used by readline_raw for up/down recall.
  *
- * When the user presses Up Arrow at our prompt, mintty (and
- * other terminals) echoes ESC [ A — which the terminal itself
- * then interprets, moving the cursor up a line visually. From
- * the shell's perspective those three bytes ALSO land in the
- * line buffer when Enter is pressed.
- *
- * Real shells (bash, zsh) handle this by going into raw mode
- * and implementing their own line editor with history recall.
- * We're not there yet, so for now we strip ESC sequences from
- * the line as we read it. Cost: no history-via-arrows. Win:
- * arrows don't pollute commands with garbage.
- *
- * Filter state machine:
- *   ESC_NONE   ground state, byte is normal input
- *   ESC_INTRO  saw ESC; expecting the next byte to be either:
- *                '[' or 'O'   → enter CSI mode (collect until
- *                              a "final byte" in 0x40-0x7E)
- *                anything else → short escape, end now (drop
- *                              that byte too)
- *   ESC_CSI    in a CSI sequence; collect until a final byte
- *              in 0x40-0x7E, then return to ESC_NONE
- *
- * This handles arrow keys (ESC [ A/B/C/D), function keys
- * (ESC O P, ESC [ N ~), and the basic short escapes (ESC c,
- * ESC = etc.) — all the things a terminal might echo while
- * we're cooked-mode reading.
- */
+ *  Eviction is FIFO: when the buffer is full, adding a new
+ *  command overwrites the oldest entry. Empty commands aren't
+ *  added; consecutive duplicates are (matches sh, not bash with
+ *  HISTIGNORE=dups).
+ * ============================================================ */
 
+#define HIST_N      16
+
+static char     hist_buf[HIST_N][LINE_CAP];
+static unsigned hist_count;     /* number of valid entries, ≤ HIST_N */
+static unsigned hist_head;      /* index where the next entry lands */
+
+static void history_add(const char *line) {
+    if (!line || line[0] == '\0') return;
+    scpy(hist_buf[hist_head], line, LINE_CAP);
+    hist_head = (hist_head + 1) % HIST_N;
+    if (hist_count < HIST_N) hist_count++;
+}
+
+/* Return the i-th-most-recent entry (i=0 is newest, i=count-1
+ * is oldest), or NULL if i is out of range. */
+static const char *history_get(unsigned i) {
+    if (i >= hist_count) return 0;
+    /* Most recent entry is at (hist_head - 1) mod HIST_N. */
+    unsigned idx = (hist_head + HIST_N - 1 - i) % HIST_N;
+    return hist_buf[idx];
+}
+
+/* ============================================================
+ *  Raw-mode line editor
+ *
+ *  Replaces the cooked-mode readline. The shell puts the TTY
+ *  into raw mode before calling this; the editor is responsible
+ *  for echoing what the user types (the terminal doesn't auto-
+ *  echo in raw mode) and for handling line editing — backspace,
+ *  Ctrl-C, history recall via up/down.
+ *
+ *  Why raw mode at all: in cooked mode the terminal echoes every
+ *  byte the user types, including ESC sequences from arrow keys.
+ *  Echoing ESC [ A makes the terminal interpret it as 'cursor up'
+ *  and visibly move the cursor away from the prompt. Raw mode
+ *  disables echo so the editor can decide what's worth printing.
+ *
+ *  Supported keys (everything else is silently ignored):
+ *
+ *    Printable 0x20-0x7E    echo + append to buffer
+ *    Backspace 0x7F or 0x08 if buffer non-empty: pop, erase
+ *    Enter \n or \r         echo \r\n, return line
+ *    Ctrl-C 0x03            echo ^C\r\n, return empty line
+ *    Ctrl-D 0x04            if buffer empty: return EOF
+ *    Ctrl-L 0x0C            clear screen, redraw prompt + line
+ *    Ctrl-U 0x15            clear current line
+ *    Up arrow (ESC [ A)     history: previous command
+ *    Down arrow (ESC [ B)   history: next command (or restore draft)
+ *
+ *  Left/Right arrows are silently ignored — editing happens at
+ *  the end of the line only. Same with function keys and other
+ *  escape sequences.
+ *
+ *  Return value: line length (≥ 0) on Enter or Ctrl-C, -1 on
+ *  Ctrl-D-at-empty or stdin error (caller treats as EOF).
+ * ============================================================ */
+
+/* The prompt the editor redraws when the line content changes
+ * (e.g., on history recall, Ctrl-L, Ctrl-U). The outer loop
+ * still prints the [<cwd>] line above, and writes this prompt
+ * as the introductory text for the editor's row. */
+static const char *EDIT_PROMPT = "$ ";
+
+static void erase_line_and_redraw_prompt(void) {
+    /* \r return to col 0; \x1b[2K erase entire line; prompt */
+    puts_("\r\x1b[2K");
+    puts_(EDIT_PROMPT);
+}
+
+/* Replace the editor's working buffer with `src`, redraw the
+ * line to match. Used by history recall and Ctrl-U. */
+static unsigned set_line(char *buf, const char *src) {
+    erase_line_and_redraw_prompt();
+    unsigned n = 0;
+    if (src) {
+        while (src[n] && n < LINE_CAP - 1) {
+            buf[n] = src[n];
+            n++;
+        }
+        buf[n] = '\0';
+        sys_write(1, buf, n);
+    } else {
+        buf[0] = '\0';
+    }
+    sys_fflush(1);
+    return n;
+}
+
+/* ESC-sequence state during input. */
 typedef enum {
     ESC_NONE = 0,
-    ESC_INTRO,
-    ESC_CSI,
+    ESC_INTRO,         /* saw ESC, expecting [ or O */
+    ESC_CSI,           /* saw ESC[ or ESCO, expecting final byte */
 } EscState;
 
-static int readline(char *buf, unsigned cap) {
+/* Sentinel value for hist_pos meaning "I'm composing a fresh
+ * line, not viewing history." When the user presses Up from
+ * this state, we snapshot the working buffer into `draft` so
+ * Down can restore it. */
+#define HIST_AT_DRAFT  ((unsigned)-1)
+
+static int readline_raw(char *buf, unsigned cap) {
     unsigned pos = 0;
     EscState esc = ESC_NONE;
+    unsigned hist_pos = HIST_AT_DRAFT;
+    static char draft[LINE_CAP];
+    draft[0] = '\0';
+
+    buf[0] = '\0';
+    sys_fflush(1);
+
     for (;;) {
         if (pos >= cap - 1) {
+            /* Buffer full — treat next byte as Enter. */
             buf[cap - 1] = '\0';
+            puts_("\r\n");
+            sys_fflush(1);
             return (int)pos;
         }
         char c;
         int r = sys_read(0, &c, 1);
         if (r < 0) {
-            buf[pos] = '\0';
             return -1;
         }
         if (r == 0) {
@@ -424,22 +521,53 @@ static int readline(char *buf, unsigned cap) {
             continue;
         }
 
-        /* Filter state machine. */
+        /* ESC sequence dispatch. We resolve the sequence here
+         * before processing as a normal byte, so that arrow keys
+         * etc. are handled atomically. */
         if (esc == ESC_INTRO) {
             if (c == '[' || c == 'O') {
-                esc = ESC_CSI;     /* enter CSI; drop bytes until final */
+                esc = ESC_CSI;
             } else {
-                esc = ESC_NONE;    /* short escape; drop THIS byte too */
+                esc = ESC_NONE;   /* short escape, ignore both bytes */
             }
             continue;
         }
         if (esc == ESC_CSI) {
-            /* Final byte ends the sequence. Final bytes are in
-             * the range 0x40-0x7E. Anything else is a parameter
-             * or intermediate byte we discard. */
+            /* CSI final byte: 0x40-0x7E. Handle arrows; ignore
+             * everything else (function keys, mouse, etc.). */
             if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7E) {
+                if (c == 'A') {
+                    /* Up: previous history entry */
+                    if (hist_count > 0) {
+                        unsigned new_pos;
+                        if (hist_pos == HIST_AT_DRAFT) {
+                            /* Snapshot the in-progress draft. */
+                            scpy(draft, buf, LINE_CAP);
+                            new_pos = 0;
+                        } else if (hist_pos + 1 < hist_count) {
+                            new_pos = hist_pos + 1;
+                        } else {
+                            new_pos = hist_pos;   /* clamp at oldest */
+                        }
+                        hist_pos = new_pos;
+                        pos = set_line(buf, history_get(hist_pos));
+                    }
+                } else if (c == 'B') {
+                    /* Down: next history entry or restore draft */
+                    if (hist_pos != HIST_AT_DRAFT) {
+                        if (hist_pos == 0) {
+                            hist_pos = HIST_AT_DRAFT;
+                            pos = set_line(buf, draft);
+                        } else {
+                            hist_pos--;
+                            pos = set_line(buf, history_get(hist_pos));
+                        }
+                    }
+                }
+                /* C (right), D (left): ignore for now */
                 esc = ESC_NONE;
             }
+            /* Non-final byte: stay in ESC_CSI, keep collecting. */
             continue;
         }
         if (c == 0x1B) {
@@ -447,17 +575,60 @@ static int readline(char *buf, unsigned cap) {
             continue;
         }
 
-        /* Normal byte processing. */
-        if (c == '\n') {
+        /* Normal byte. */
+        unsigned char b = (unsigned char)c;
+
+        if (b == '\n' || b == '\r') {
             buf[pos] = '\0';
-            /* Strip trailing CR if present (some terminals send CRLF). */
-            if (pos > 0 && buf[pos - 1] == '\r') {
-                buf[pos - 1] = '\0';
-                pos--;
-            }
+            puts_("\r\n");
+            sys_fflush(1);
             return (int)pos;
         }
-        buf[pos++] = c;
+        if (b == 0x7F || b == 0x08) {     /* Backspace */
+            if (pos > 0) {
+                pos--;
+                buf[pos] = '\0';
+                /* Erase visually: back up one column, overwrite
+                 * with space, back up again. */
+                puts_("\b \b");
+                sys_fflush(1);
+            }
+            continue;
+        }
+        if (b == 0x03) {                  /* Ctrl-C */
+            puts_("^C\r\n");
+            sys_fflush(1);
+            buf[0] = '\0';
+            return 0;                     /* empty line, no history */
+        }
+        if (b == 0x04) {                  /* Ctrl-D */
+            if (pos == 0) {
+                return -1;                /* EOF on empty line */
+            }
+            continue;                     /* ignore on non-empty line */
+        }
+        if (b == 0x0C) {                  /* Ctrl-L: clear screen */
+            puts_("\x1b[2J\x1b[H");       /* clear + home */
+            erase_line_and_redraw_prompt();
+            if (pos > 0) sys_write(1, buf, pos);
+            sys_fflush(1);
+            continue;
+        }
+        if (b == 0x15) {                  /* Ctrl-U: clear line */
+            pos = 0;
+            buf[0] = '\0';
+            erase_line_and_redraw_prompt();
+            sys_fflush(1);
+            continue;
+        }
+        if (b >= 0x20 && b <= 0x7E) {     /* Printable */
+            buf[pos++] = (char)b;
+            buf[pos] = '\0';
+            sys_write(1, &c, 1);
+            sys_fflush(1);
+            continue;
+        }
+        /* Any other control byte: silently ignore. */
     }
 }
 
@@ -494,8 +665,35 @@ static void cmd_help(void) {
     putln("  cat <path>           print file contents");
     putln("  write <path> <text>  write text to file (truncating)");
     putln("  run <path>           load and execute an ELF as a child VM");
+    putln("  history              show recent commands");
     putln("  help                 this message");
     putln("  exit                 leave shell");
+    putln("");
+    putln("editor keys: backspace, up/down (history),");
+    putln("             Ctrl-L (clear screen), Ctrl-U (clear line),");
+    putln("             Ctrl-C (cancel line), Ctrl-D (exit on empty line)");
+}
+
+static void cmd_history(void) {
+    /* Print oldest to newest. history_get(i) gives the i-th-most-
+     * recent, so we walk i from count-1 down to 0. The displayed
+     * line number is i+1 from the top (1-indexed, oldest first). */
+    if (hist_count == 0) {
+        putln("(history is empty)");
+        return;
+    }
+    for (unsigned i = hist_count; i-- > 0; ) {
+        const char *line = history_get(i);
+        if (!line) continue;
+        char buf[12];
+        char *p = fmt_u32(hist_count - i, buf + sizeof(buf));
+        /* right-pad to 4 columns for tidy alignment */
+        unsigned w = (unsigned)((buf + sizeof(buf) - 1) - p);
+        for (unsigned k = w; k < 4; k++) puts_(" ");
+        puts_(p);
+        puts_("  ");
+        putln(line);
+    }
 }
 
 static void cmd_pwd(void) {
@@ -724,9 +922,11 @@ static void dispatch(char *line) {
     else if (scmp(argv[0], "cat")   == 0) cmd_cat(argc, argv);
     else if (scmp(argv[0], "write") == 0) cmd_write(argc, argv);
     else if (scmp(argv[0], "run")   == 0) cmd_run(argc, argv);
+    else if (scmp(argv[0], "history") == 0) cmd_history();
     else if (scmp(argv[0], "exit")  == 0 || scmp(argv[0], "quit") == 0) {
         putln("bye");
         cursor_reset_default();
+        sys_tty_set_raw(0);             /* leave terminal cooked */
         sys_exit(0);
     } else {
         puts_(argv[0]);
@@ -742,7 +942,14 @@ void _start(void) {
      * reset happens on every exit path. */
     cursor_steady_block();
 
-    putln("VM shell — type 'help' for commands");
+    /* Enter raw mode for the editor. From this point on we own
+     * line editing — backspace, echo, arrow keys, etc. The flag
+     * tells us whether the toggle actually engaged (it returns
+     * false when stdin isn't a TTY, e.g., during automated test
+     * runs that pipe input). */
+    int have_raw = (sys_tty_set_raw(1) == 0);
+
+    putln("VM shell -- type 'help' for commands");
 
     char line[LINE_CAP];
     int first = 1;
@@ -754,23 +961,35 @@ void _start(void) {
          *
          * The blank line before the path separates each command's
          * output from the next prompt. The path on its own line
-         * stays out of the way of long working directories. The
-         * `$ ` on the input line keeps the cursor at a predictable
-         * column regardless of cwd length.
+         * stays out of the way of long working directories.
          *
          * Skip the leading newline on the very first prompt — the
          * welcome banner already provides separation. */
-        if (!first) puts_("\n");
+        if (!first) puts_("\r\n");
         first = 0;
         puts_("[");
         puts_(g_cwd);
-        puts_("]\n$ ");
-        int n = readline(line, sizeof(line));
+        puts_("]\r\n");
+        /* The `$ ` prompt itself is printed by readline_raw, so
+         * that history recall and Ctrl-U redraws can rebuild the
+         * same prompt-then-line layout. */
+        puts_("$ ");
+        sys_fflush(1);
+
+        int n = readline_raw(line, sizeof(line));
         if (n < 0) {
-            putln("\n(stdin closed)");
+            puts_("\r\n");
+            putln("(stdin closed)");
             cursor_reset_default();
+            if (have_raw) sys_tty_set_raw(0);
             sys_exit(0);
         }
+        /* Re-enter raw mode after dispatch — if dispatch ran a
+         * spawn, the child may have toggled raw mode on its way
+         * out (snake does this politely). We want it on for our
+         * own prompt. */
+        history_add(line);
         dispatch(line);
+        if (have_raw) sys_tty_set_raw(1);
     }
 }
