@@ -36,11 +36,15 @@
 /* ---------------------------------------------------------------
  * Backing storage
  *
- * The trashdrive pool needs to be at least 16 KB (FatFs's
- * practical floor for FAT12) and a multiple of 512 bytes. 64 KB
- * gives us room for a handful of small files.
+ * The trashdrive pool needs to be large enough for FatFs R0.16 to
+ * lay out a valid FAT volume. Empirically the minimum on R0.16
+ * with our config (FM_FAT, n_fat=1) is around 96 KB; below that
+ * f_mkfs returns FR_MKFS_ABORTED. We use 128 KB to leave headroom
+ * for files plus FatFs's own bookkeeping.
+ *
+ * If you change this, keep it a multiple of TRASH_SECTOR_SIZE (512).
  * --------------------------------------------------------------- */
-#define POOL_BYTES   (64 * 1024)
+#define POOL_BYTES   (128 * 1024)
 #define SHARED_BYTES (64 * 1024)
 #define LOCAL_BYTES  (96 * 1024)
 

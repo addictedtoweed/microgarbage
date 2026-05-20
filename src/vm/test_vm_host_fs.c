@@ -78,7 +78,9 @@ int main(void) {
 
 #define SHARED_BYTES (32 * 1024)
 #define LOCAL_BYTES  (64 * 1024)
-#define POOL_BYTES   (64 * 1024)
+/* 128 KB — needs to be at least ~96 KB for FatFs R0.16 f_mkfs (see
+ * test_trashdrive_fatfs.c for the same rationale). */
+#define POOL_BYTES   (128 * 1024)
 #define DATA_BYTES   (4 * 1024)   /* fake guest "memory" for path strings etc. */
 
 static uint8_t g_shared[SHARED_BYTES];

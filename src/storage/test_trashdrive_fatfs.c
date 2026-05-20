@@ -54,7 +54,10 @@ int main(void) {
  * enough sectors for the boot record, FAT table, root directory,
  * and at least one data cluster; ~16 KB is the practical floor
  * for FAT12). 64 KB gives us room for a handful of small files. */
-#define POOL_BYTES (64 * 1024)
+/* 128 KB — needs to be at least ~96 KB for FatFs R0.16 f_mkfs to
+ * succeed with our config (FM_FAT, n_fat=1). 128 KB leaves headroom
+ * for files and FatFs's own bookkeeping. */
+#define POOL_BYTES (128 * 1024)
 static uint8_t g_pool[POOL_BYTES];
 static TrashDrive g_drive;
 static FATFS g_fs;
