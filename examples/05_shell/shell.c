@@ -364,15 +364,57 @@ static void perror_(const char *prefix, int err) {
 
 #define LINE_CAP  256
 
+/* Read a line from stdin in cooked mode, filtering ESC sequences.
+ *
+ * In cooked mode the terminal does line editing for us — line
+ * stays in the kernel buffer until Enter, then arrives whole.
+ * BUT: the terminal also ECHOES bytes literally as they come in,
+ * including ESC sequences from arrow keys / function keys.
+ *
+ * When the user presses Up Arrow at our prompt, mintty (and
+ * other terminals) echoes ESC [ A — which the terminal itself
+ * then interprets, moving the cursor up a line visually. From
+ * the shell's perspective those three bytes ALSO land in the
+ * line buffer when Enter is pressed.
+ *
+ * Real shells (bash, zsh) handle this by going into raw mode
+ * and implementing their own line editor with history recall.
+ * We're not there yet, so for now we strip ESC sequences from
+ * the line as we read it. Cost: no history-via-arrows. Win:
+ * arrows don't pollute commands with garbage.
+ *
+ * Filter state machine:
+ *   ESC_NONE   ground state, byte is normal input
+ *   ESC_INTRO  saw ESC; expecting the next byte to be either:
+ *                '[' or 'O'   → enter CSI mode (collect until
+ *                              a "final byte" in 0x40-0x7E)
+ *                anything else → short escape, end now (drop
+ *                              that byte too)
+ *   ESC_CSI    in a CSI sequence; collect until a final byte
+ *              in 0x40-0x7E, then return to ESC_NONE
+ *
+ * This handles arrow keys (ESC [ A/B/C/D), function keys
+ * (ESC O P, ESC [ N ~), and the basic short escapes (ESC c,
+ * ESC = etc.) — all the things a terminal might echo while
+ * we're cooked-mode reading.
+ */
+
+typedef enum {
+    ESC_NONE = 0,
+    ESC_INTRO,
+    ESC_CSI,
+} EscState;
+
 static int readline(char *buf, unsigned cap) {
     unsigned pos = 0;
+    EscState esc = ESC_NONE;
     for (;;) {
         if (pos >= cap - 1) {
-            /* Line too long; truncate and break. */
             buf[cap - 1] = '\0';
             return (int)pos;
         }
-        int r = sys_read(0, buf + pos, 1);
+        char c;
+        int r = sys_read(0, &c, 1);
         if (r < 0) {
             buf[pos] = '\0';
             return -1;
@@ -381,7 +423,32 @@ static int readline(char *buf, unsigned cap) {
             sys_yield();
             continue;
         }
-        if (buf[pos] == '\n') {
+
+        /* Filter state machine. */
+        if (esc == ESC_INTRO) {
+            if (c == '[' || c == 'O') {
+                esc = ESC_CSI;     /* enter CSI; drop bytes until final */
+            } else {
+                esc = ESC_NONE;    /* short escape; drop THIS byte too */
+            }
+            continue;
+        }
+        if (esc == ESC_CSI) {
+            /* Final byte ends the sequence. Final bytes are in
+             * the range 0x40-0x7E. Anything else is a parameter
+             * or intermediate byte we discard. */
+            if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7E) {
+                esc = ESC_NONE;
+            }
+            continue;
+        }
+        if (c == 0x1B) {
+            esc = ESC_INTRO;
+            continue;
+        }
+
+        /* Normal byte processing. */
+        if (c == '\n') {
             buf[pos] = '\0';
             /* Strip trailing CR if present (some terminals send CRLF). */
             if (pos > 0 && buf[pos - 1] == '\r') {
@@ -390,7 +457,7 @@ static int readline(char *buf, unsigned cap) {
             }
             return (int)pos;
         }
-        pos++;
+        buf[pos++] = c;
     }
 }
 
