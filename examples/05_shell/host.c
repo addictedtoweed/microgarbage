@@ -32,6 +32,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 /* ---------------------------------------------------------------
  * Backing storage
@@ -75,7 +78,46 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
 }
 
 int main(int argc, char **argv) {
-    const char *elf_path = (argc >= 2) ? argv[1] : "build/shell.elf";
+    /* ----- Parse args -----
+     *
+     * Usage: host [options] [shell.elf]
+     *
+     * Options:
+     *   --host-fs=<path>    Mount <path> as /host inside the shell.
+     *                       The guest can then read/run files via
+     *                       /host/<name>. Default: ./host_files
+     *   --host-fs-rw        Make the /host mount writable. Default
+     *                       is read-only for safety.
+     *   --no-host-fs        Disable the /host mount entirely.
+     *
+     * Positional: the path to shell.elf. Defaults to build/shell.elf.
+     */
+    const char *elf_path     = NULL;
+    const char *host_fs_root = "host_files";   /* default — created if missing */
+    bool host_fs_writable    = false;
+    bool host_fs_disabled    = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--host-fs=", 10) == 0) {
+            host_fs_root = argv[i] + 10;
+        } else if (strcmp(argv[i], "--host-fs-rw") == 0) {
+            host_fs_writable = true;
+        } else if (strcmp(argv[i], "--no-host-fs") == 0) {
+            host_fs_disabled = true;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
+            fprintf(stderr, "  --host-fs=<path>   mount path as /host (default: ./host_files)\n");
+            fprintf(stderr, "  --host-fs-rw       allow writes to /host (default: read-only)\n");
+            fprintf(stderr, "  --no-host-fs       disable /host mount\n");
+            return 1;
+        } else if (!elf_path) {
+            elf_path = argv[i];
+        } else {
+            fprintf(stderr, "host: extra positional argument '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+    if (!elf_path) elf_path = "build/shell.elf";
 
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
@@ -157,6 +199,38 @@ int main(int argc, char **argv) {
     if (!vm_host_install_fs(&sys)) {
         fprintf(stderr, "host: vm_host_install_fs failed\n");
         return 1;
+    }
+
+    /* 6b. Configure the /host mount. By default the shell can
+     * read files under ./host_files/ as /host/<name>. Lets the
+     * user drop ELFs there and run them via "run /host/foo.elf"
+     * inside the shell.
+     *
+     * If the path doesn't exist, try to create it. If we can't
+     * (permissions, parent missing), warn but don't fail — the
+     * shell still works without /host. */
+    if (!host_fs_disabled) {
+        struct stat st;
+        if (stat(host_fs_root, &st) != 0) {
+            /* Try to create. POSIX mkdir; succeeds in Cygwin too. */
+            if (mkdir(host_fs_root, 0755) != 0) {
+                fprintf(stderr, "host: warning — could not create '%s' for /host mount: %s\n",
+                        host_fs_root, strerror(errno));
+                fprintf(stderr, "host: /host will be disabled\n");
+                host_fs_disabled = true;
+            }
+        }
+        if (!host_fs_disabled) {
+            if (!vm_host_set_host_fs_root(host_fs_root, host_fs_writable)) {
+                fprintf(stderr, "host: warning — vm_host_set_host_fs_root('%s') failed\n",
+                        host_fs_root);
+                fprintf(stderr, "host: /host will be disabled\n");
+            } else {
+                fprintf(stderr, "host: /host mounted from '%s' (%s)\n",
+                        host_fs_root,
+                        host_fs_writable ? "read/write" : "read-only");
+            }
+        }
     }
 
     /* 7. Load the shell. */

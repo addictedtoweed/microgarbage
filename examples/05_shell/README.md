@@ -68,12 +68,79 @@ The host pre-creates `/home`, `/tmp`, and a `/readme.txt` so
 | `touch <path>`     | Create empty file                         |
 | `cat <path>`       | Print file contents                       |
 | `write <p> <text>` | Write text to file (truncating)           |
+| `run <path>`       | Load and execute an ELF as a child VM     |
 | `help`             | Show command list                         |
 | `exit`             | Leave the shell                           |
 
 Paths can be absolute (`/foo/bar`) or relative (`bar` ⇒
 `<cwd>/bar`). `cd ..` works (one level up). `cd .` is a no-op
 (stays in cwd).
+
+## The `/host` mount and `run`
+
+The host process exposes a real directory on the developer's
+machine to the shell as `/host/...`. By default this is
+`./host_files/` (auto-created if missing). You can drop any
+file in there and read it from inside the shell via `/host/foo`.
+
+The `run` command takes an ELF path and spawns it as a child
+VM. The child runs synchronously — the shell blocks until the
+child halts. Child output appears on the shell's terminal,
+interleaved with the prompts.
+
+Two sample spawnable ELFs are built into `./host_files/`:
+
+- `hello.elf` — prints `hi from spawned VM` and exits
+- `count.elf` — counts 1 to 10, one per line, and exits
+
+Example session:
+
+```
+[/]
+$ run /host/hello.elf
+hi from spawned VM
+
+[/]
+$ run /host/count.elf
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+[/]
+$
+```
+
+ELFs always load with `VM_BACKING_COPY_RAM` — code and rodata
+are copied into fresh RAM from the bump arena, not run XIP from
+the source file. This is required because the source storage
+(FatFs sectors, or host-fs bytes outside our address space) is
+not necessarily contiguous in memory. Plan for roughly 20–30 KB
+of RAM per spawned VM (code + rodata + 16 KB data region).
+
+### Host-fs CLI options
+
+```
+./build/host [--host-fs=PATH] [--host-fs-rw] [--no-host-fs] [shell.elf]
+
+  --host-fs=PATH     mount PATH as /host (default: ./host_files)
+  --host-fs-rw       allow writes to /host (default: read-only)
+  --no-host-fs       disable the /host mount entirely
+```
+
+The mount is **read-only by default** to keep a buggy or
+malicious guest from clobbering real files. Pass `--host-fs-rw`
+to opt into write access — useful if you want the shell to be
+able to `write` or `touch` files visible to the host.
+
+Path traversal escapes are rejected: `/host/../etc/passwd`
+returns `-EPERM`. The mount is sandboxed to its configured root.
 
 ## Example session
 
@@ -111,9 +178,12 @@ bye
   simplicity. To add history you'd switch to raw mode (like
   `04_keydump`) and implement an input-edit loop with
   cursor-movement and history buffers.
-- **No pipes / redirection**: this is a single-VM shell with no
-  subprocess concept. The `write` command exists as a
-  redirection substitute.
+- **No pipes / redirection**: the `write` command exists as a
+  redirection substitute. Real pipes would need a way to route
+  one VM's stdout into another's stdin.
+- **No background jobs**: `run` is always synchronous. A
+  hypothetical `run &` would need scheduler changes so the
+  parent VM keeps running while the child does too.
 - **No completion / globbing**: no `*` expansion.
 - **Volume persistence**: the trashdrive lives in host RAM; each
   run starts with a freshly-formatted volume. To persist across
@@ -123,6 +193,13 @@ bye
 ## Files
 
 - `host.c` — sets up trashdrive + FatFs + VmSystem + stdio/fs
-  bridges, loads `shell.elf`, runs scheduler
-- `shell.c` — the guest shell (~500 lines, no libc)
-- `build.sh` — builds both. Checks for FatFs presence first.
+  bridges, loads `shell.elf`, runs scheduler. Parses `--host-fs=`
+  CLI args and configures the `/host` mount.
+- `shell.c` — the guest shell (~600 lines, no libc)
+- `host_files_src/` — sources for the sample spawnable guests
+  (`hello.c`, `count.c`). `build.sh` compiles each into a
+  matching `.elf` under `host_files/`.
+- `host_files/` — auto-populated by `build.sh` with the sample
+  ELFs. This directory is what the shell sees as `/host`.
+- `build.sh` — builds the host, the shell guest, and each
+  spawnable. Checks for FatFs presence first.

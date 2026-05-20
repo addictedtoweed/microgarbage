@@ -42,6 +42,7 @@
 #define SYS_EXIT       93
 #define SYS_READDIR   120
 #define SYS_YIELD    1040
+#define SYS_SPAWN_AND_WAIT  1104
 
 #define AT_FDCWD      (-100)
 
@@ -166,6 +167,18 @@ static inline void sys_exit(int code) {
     register int a7 asm("a7") = SYS_EXIT;
     asm volatile ("ecall" :: "r"(a0), "r"(a7));
     __builtin_unreachable();
+}
+
+/* Spawn another ELF as a child VM and block until it exits.
+ * Returns its exit code (0..255) on success, or a negative
+ * errno on failure (e.g., -2 = ENOENT). The child shares this
+ * VM's stdin/stdout/stderr — anything it prints appears on
+ * the user's terminal interleaved with our own output. */
+static inline int sys_spawn_and_wait(const char *path) {
+    register int      a0 asm("a0") = (int)(unsigned long)path;
+    register int      a7 asm("a7") = SYS_SPAWN_AND_WAIT;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return a0;
 }
 
 /* ============================================================
@@ -413,6 +426,7 @@ static void cmd_help(void) {
     putln("  touch <path>         create empty file");
     putln("  cat <path>           print file contents");
     putln("  write <path> <text>  write text to file (truncating)");
+    putln("  run <path>           load and execute an ELF as a child VM");
     putln("  help                 this message");
     putln("  exit                 leave shell");
 }
@@ -563,6 +577,40 @@ static void cmd_write(int argc, char **argv) {
     sys_close(fd);
 }
 
+/* run <path>
+ *
+ * Spawn an ELF file as a child VM and wait for it to exit.
+ * The child shares our stdio, so anything it prints appears
+ * on the user's terminal interleaved with our own output.
+ *
+ * The path can be:
+ *   - On the FatFs RAM volume (any path that doesn't start with /host)
+ *   - On the host filesystem (under /host/, e.g., /host/calc.elf)
+ *
+ * Prints the child's exit code only if it's non-zero (so the
+ * common success case is quiet, like Unix shells). */
+static void cmd_run(int argc, char **argv) {
+    if (argc < 2) { putln("run: usage: run <path>"); return; }
+    char path[PATH_CAP];
+    if (resolve_path(argv[1], path) != 0) {
+        putln("run: path too long");
+        return;
+    }
+    int rc = sys_spawn_and_wait(path);
+    if (rc < 0) {
+        perror_("run", rc);
+        return;
+    }
+    if (rc != 0) {
+        /* Mimic bash: print exit code only when non-zero. */
+        char buf[16];
+        char *p = fmt_u32((unsigned)rc, buf + sizeof(buf));
+        puts_("run: exit ");
+        puts_(p);
+        putln("");
+    }
+}
+
 /* ============================================================
  *  Main loop
  * ============================================================ */
@@ -582,6 +630,7 @@ static void dispatch(char *line) {
     else if (scmp(argv[0], "touch") == 0) cmd_touch(argc, argv);
     else if (scmp(argv[0], "cat")   == 0) cmd_cat(argc, argv);
     else if (scmp(argv[0], "write") == 0) cmd_write(argc, argv);
+    else if (scmp(argv[0], "run")   == 0) cmd_run(argc, argv);
     else if (scmp(argv[0], "exit")  == 0 || scmp(argv[0], "quit") == 0) {
         putln("bye");
         sys_exit(0);

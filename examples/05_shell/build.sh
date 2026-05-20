@@ -17,6 +17,7 @@ BUILD_DIR="$EXAMPLE_DIR/build"
 case "${1:-build}" in
     clean)
         rm -rf "$BUILD_DIR"
+        rm -rf "$EXAMPLE_DIR/host_files"
         echo "05_shell: cleaned"
         exit 0
         ;;
@@ -65,6 +66,23 @@ if have_guest_cc; then
         -Wl,-T,"$(guest_path "$GUEST_LD")" \
         -o "$(guest_path "$BUILD_DIR/shell.elf")" \
         "$(guest_path "$EXAMPLE_DIR/shell.c")"
+
+    # Build the sample spawnable guests. These get dropped into
+    # ./host_files/ so they're accessible from inside the shell
+    # via "/host/<name>.elf". The shell's host process mounts
+    # ./host_files/ as /host by default, auto-creating the
+    # directory if it doesn't exist.
+    HOST_FILES_DIR="$EXAMPLE_DIR/host_files"
+    mkdir -p "$HOST_FILES_DIR"
+    for src in "$EXAMPLE_DIR"/host_files_src/*.c; do
+        [ -f "$src" ] || continue
+        name=$(basename "$src" .c)
+        echo "05_shell: compiling host_files/$name.elf (spawnable)..."
+        "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
+            -Wl,-T,"$(guest_path "$GUEST_LD")" \
+            -o "$(guest_path "$HOST_FILES_DIR/$name.elf")" \
+            "$(guest_path "$src")"
+    done
 else
     if [ -f "$BUILD_DIR/shell.elf" ]; then
         echo "05_shell: $GUEST_CC not found, using existing shell.elf"
