@@ -219,6 +219,12 @@ static signed char g_dy = 0;
 static Cell g_food;
 static unsigned g_score = 0;
 
+/* === temporary diagnostic === */
+#define DIAG_CAP 512
+static char g_diag_buf[DIAG_CAP];
+static unsigned g_diag_count = 0;
+/* === end temporary === */
+
 /* Cell access helpers */
 static Cell *snake_head(void) { return &g_snake[g_head_idx]; }
 
@@ -520,38 +526,35 @@ void _start(void) {
 
         /* === temporary diagnostic ===
          *
-         * Measure the actual elapsed ticks between consecutive
-         * frames and print a single character to stderr. The
-         * character encodes the elapsed time:
+         * Record per-frame elapsed-ticks into an in-memory buffer.
+         * Dumped to stderr after cleanup (i.e., after the screen
+         * is cleared and before the shell prompt returns), so the
+         * diagnostic doesn't smear characters into the playfield.
          *
-         *   '.'  delta < period (FAST — pacing broken)
-         *   '_'  delta == period exactly (ideal)
-         *   '+'  delta = period+1..2*period (one OS tick of slack)
-         *   '*'  delta > 2*period (very slow frame)
-         *
-         * stderr is unbuffered, so each frame's character appears
-         * immediately. After playing a few seconds, you should
-         * see a stream of '+'s (normal) potentially interrupted
-         * by '.'s (the bug). Send the resulting text and I can
-         * tell what's happening.
+         * Character legend:
+         *   '/'  first frame (no prior tick to compare)
+         *   '.'  delta < period           — FAST (bug)
+         *   '_'  delta == period          — ideal
+         *   '+'  period < delta < 2*period — normal Windows jitter
+         *   '*'  delta >= 2*period         — very slow frame
          *
          * Remove this block once the bug is identified. */
-        {
+        if (g_diag_count < DIAG_CAP) {
             static unsigned last_tick = 0;
             unsigned now = sys_ticks_now();
             char c;
             if (last_tick == 0) {
-                c = '/';                /* first frame, no delta */
+                c = '/';
             } else {
                 unsigned delta = now - last_tick;
                 unsigned p = hz / 8;
-                if (delta < p)            c = '.';   /* FAST */
-                else if (delta == p)      c = '_';   /* exact */
-                else if (delta < 2 * p)   c = '+';   /* a bit slow */
-                else                      c = '*';   /* very slow */
+                if (delta < p)            c = '.';
+                else if (delta == p)      c = '_';
+                else if (delta < 2 * p)   c = '+';
+                else                      c = '*';
             }
             last_tick = now;
-            sys_write(2, &c, 1);
+            g_diag_buf[g_diag_count++] = c;
         }
 
         sys_yield_until_reload();
@@ -588,5 +591,19 @@ void _start(void) {
     ansi_cursor_steady_block();
     sys_fflush(1);
     sys_tty_set_raw(0);
+
+    /* === temporary diagnostic ===
+     * Dump the per-frame pacing data captured during play.
+     * Goes to stdout (which is now cooked) so cygwin's terminal
+     * does the right CRLF translation. */
+    puts_("pacing: ");
+    if (g_diag_count > 0) {
+        sys_write(1, g_diag_buf, g_diag_count);
+    }
+    puts_("\n");
+    puts_("legend:  /=first  _=exact  +=normal-jitter  .=FAST(bug)  *=very-slow\n");
+    sys_fflush(1);
+    /* === end temporary === */
+
     sys_exit(0);
 }
