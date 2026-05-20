@@ -517,6 +517,43 @@ void _start(void) {
          * — without it, ANSI sequences would queue up in the
          * stdio buffer. */
         sys_fflush(1);
+
+        /* === temporary diagnostic ===
+         *
+         * Measure the actual elapsed ticks between consecutive
+         * frames and print a single character to stderr. The
+         * character encodes the elapsed time:
+         *
+         *   '.'  delta < period (FAST — pacing broken)
+         *   '_'  delta == period exactly (ideal)
+         *   '+'  delta = period+1..2*period (one OS tick of slack)
+         *   '*'  delta > 2*period (very slow frame)
+         *
+         * stderr is unbuffered, so each frame's character appears
+         * immediately. After playing a few seconds, you should
+         * see a stream of '+'s (normal) potentially interrupted
+         * by '.'s (the bug). Send the resulting text and I can
+         * tell what's happening.
+         *
+         * Remove this block once the bug is identified. */
+        {
+            static unsigned last_tick = 0;
+            unsigned now = sys_ticks_now();
+            char c;
+            if (last_tick == 0) {
+                c = '/';                /* first frame, no delta */
+            } else {
+                unsigned delta = now - last_tick;
+                unsigned p = hz / 8;
+                if (delta < p)            c = '.';   /* FAST */
+                else if (delta == p)      c = '_';   /* exact */
+                else if (delta < 2 * p)   c = '+';   /* a bit slow */
+                else                      c = '*';   /* very slow */
+            }
+            last_tick = now;
+            sys_write(2, &c, 1);
+        }
+
         sys_yield_until_reload();
     }
 
