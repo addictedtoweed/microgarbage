@@ -24,15 +24,18 @@
  *     $ run /host/snake.elf
  */
 
-#define SYS_READ            63
-#define SYS_WRITE           64
-#define SYS_EXIT            93
-#define SYS_YIELD         1040
-#define SYS_TICKS_NOW     1043
-#define SYS_TICK_HZ       1044
-#define SYS_SLEEP_TICKS   1045
-#define SYS_SLEEP_UNTIL   1046
-#define SYS_TTY_SET_RAW   1105
+#define SYS_READ                63
+#define SYS_WRITE               64
+#define SYS_FFLUSH              82
+#define SYS_EXIT                93
+#define SYS_YIELD             1040
+#define SYS_TICKS_NOW         1043
+#define SYS_TICK_HZ           1044
+#define SYS_SLEEP_TICKS       1045
+#define SYS_SLEEP_UNTIL       1046
+#define SYS_SET_RELOAD_PERIOD 1047
+#define SYS_YIELD_UNTIL_RELOAD 1048
+#define SYS_TTY_SET_RAW       1105
 
 /* ============================================================
  *  Syscall inline asm
@@ -53,6 +56,13 @@ static inline int sys_write(int fd, const void *buf, unsigned n) {
     register unsigned a2 asm("a2") = n;
     register int      a7 asm("a7") = SYS_WRITE;
     asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return a0;
+}
+
+static inline int sys_fflush(int fd) {
+    register int a0 asm("a0") = fd;
+    register int a7 asm("a7") = SYS_FFLUSH;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return a0;
 }
 
@@ -81,6 +91,18 @@ static inline void sys_sleep_until(unsigned deadline) {
     register unsigned a0 asm("a0") = deadline;
     register int      a7 asm("a7") = SYS_SLEEP_UNTIL;
     asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
+}
+
+static inline void sys_set_reload_period(unsigned period) {
+    register unsigned a0 asm("a0") = period;
+    register int      a7 asm("a7") = SYS_SET_RELOAD_PERIOD;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
+}
+
+static inline void sys_yield_until_reload(void) {
+    register int a0 asm("a0");
+    register int a7 asm("a7") = SYS_YIELD_UNTIL_RELOAD;
+    asm volatile ("ecall" : "=r"(a0) : "r"(a7) : "memory");
 }
 
 static inline int sys_tty_set_raw(int enable) {
@@ -428,9 +450,22 @@ void _start(void) {
     g_esc_state = 0;
 
     /* Game-loop pacing. tick_hz is 1000 on the PC host (1 ms).
-     * Period 125 ms gives a comfortable speed; tune to taste. */
-    unsigned period = hz / 8;           /* ~125 ms / frame */
-    unsigned next = sys_ticks_now() + period;
+     * Period 125 ms gives a comfortable ~8 fps.
+     *
+     * The kernel owns the deadline arithmetic — we don't carry a
+     * `next` variable. Each yield_until_reload wakes us at the
+     * next period boundary, FreeRTOS-style: if a frame runs over
+     * by more than a period, the kernel skips ahead to the next
+     * future boundary rather than firing missed events back-to-
+     * back. Phase stays locked to the original grid. */
+    sys_set_reload_period(hz / 8);
+
+    /* Flush all the startup drawing to the terminal before the
+     * first frame's sleep. Otherwise ANSI sequences sit in the
+     * host's FILE* buffer (block-buffered when stdout is a pipe,
+     * line-buffered on a TTY but no newline triggers it) and the
+     * player sees nothing until the next read. */
+    sys_fflush(1);
 
     int game_over = 0;
     const char *over_reason = "";
@@ -460,11 +495,6 @@ void _start(void) {
          * tail cell which is about to vacate — but only if we're
          * not eating, since eating means we don't pop the tail). */
         int eating = (ux == g_food.x && uy == g_food.y);
-        /* For simplicity we test against the current body
-         * including the tail. False positive only if the new
-         * head lands on the tail cell that's about to leave,
-         * which is a legal move in most snake variants. We
-         * tolerate the slight conservatism. */
         if (snake_body_contains(ux, uy)) {
             game_over = 1;
             over_reason = "bit yourself";
@@ -492,22 +522,34 @@ void _start(void) {
             place_food();
         }
 
-        /* 8. Pace the loop. Autoreload: bumping `next` by period
-         * means a slow frame doesn't accumulate drift. */
-        sys_sleep_until(next);
-        next += period;
+        /* 8. Flush this frame's writes to the terminal, then
+         * wait for the next period boundary. The flush is what
+         * makes the snake actually appear to move on the screen
+         * — without it, ANSI sequences would queue up in the
+         * stdio buffer. */
+        sys_fflush(1);
+        sys_yield_until_reload();
     }
 
     /* Game over: show a centered message for ~1 second, then
      * clean up. */
     if (game_over) {
         ansi_goto(4 + PLAY_H / 2, 2 + (PLAY_W / 2 - 8));
-        puts_("GAME OVER — ");
+        puts_("GAME OVER -- ");
         puts_(over_reason);
         ansi_goto(4 + PLAY_H / 2 + 1, 2 + (PLAY_W / 2 - 7));
         puts_("score: ");
         putd(g_score);
-        /* Sleep ~1.5 seconds so the player can read it */
+        /* Make sure the message reaches the screen BEFORE we
+         * sleep — otherwise the buffer holds it and the
+         * upcoming ansi_clear_screen wipes it without it ever
+         * being seen. */
+        sys_fflush(1);
+        /* Sleep ~1.5 seconds so the player can read the
+         * message. We use the reload mechanism's primitive here
+         * for one-shot purposes; clear the period first so
+         * yield_until_reload isn't lurking. */
+        sys_set_reload_period(0);
         sys_sleep_until(sys_ticks_now() + (hz + hz/2));
     }
 
@@ -516,6 +558,7 @@ void _start(void) {
     ansi_clear_screen();
     ansi_home();
     ansi_show_cursor();
+    sys_fflush(1);
     sys_tty_set_raw(0);
     sys_exit(0);
 }
