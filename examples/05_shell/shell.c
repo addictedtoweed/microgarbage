@@ -244,22 +244,33 @@ static int last_slash(const char *path) {
 
 static int join_paths(const char *base, const char *rest, char *out) {
     unsigned bl = slen(base);
-    /* Strip trailing '/' from base unless base is "/". */
-    if (bl > 1 && base[bl - 1] == '/') bl--;
+    /* Note whether base already ends with '/' (only legitimate for
+     * base == "/" — every other path is stored without trailing
+     * slash). If it does, we won't add our own separator. */
+    int base_ends_slash = (bl > 0 && base[bl - 1] == '/');
+
+    /* Strip a trailing '/' from base unless base is "/" (we still
+     * need to KEEP that one slash in the output). */
+    if (bl > 1 && base[bl - 1] == '/') {
+        bl--;
+        base_ends_slash = 0;   /* we just stripped it */
+    }
 
     unsigned rl = slen(rest);
-    /* Skip leading '/' in rest (we'll add our own). */
+    /* Skip leading '/' in rest (base already supplies the separator). */
     unsigned ri = 0;
     if (rl > 0 && rest[0] == '/') ri = 1;
 
-    /* Total: bl + 1 (slash) + (rl - ri) + 1 (null). */
-    unsigned total = bl + 1 + (rl - ri) + 1;
+    /* Total bytes: bl + (1 separator unless base already ends in /) +
+     * (rl - ri) bytes from rest + 1 for null. */
+    unsigned sep = base_ends_slash ? 0 : 1;
+    unsigned total = bl + sep + (rl - ri) + 1;
     if (total > PATH_CAP) return -1;
 
     unsigned o = 0;
     for (unsigned i = 0; i < bl; i++) out[o++] = base[i];
     if (rl > ri) {
-        out[o++] = '/';
+        if (!base_ends_slash) out[o++] = '/';
         for (unsigned i = ri; i < rl; i++) out[o++] = rest[i];
     } else if (bl == 0) {
         out[o++] = '/';
