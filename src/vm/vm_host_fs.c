@@ -50,6 +50,7 @@ typedef enum {
 
 typedef struct {
     SlotKind kind;
+    bool     writable;    /* HOST/FATFS: was the mount writable at open? */
     union {
         FIL   file;
         DIR   dir;
@@ -89,52 +90,126 @@ static void free_slot(FdSlot *s) {
 /* ============================================================
  *  Path handling
  *
- *  Guests use POSIX-ish paths starting with "/". FatFs uses
- *  volume-prefixed paths like "0:/foo". We rewrite leading "/"
- *  to "0:/" so the two conventions interoperate.
+ *  Every absolute guest path must look like "/drives/<name>/...".
+ *  The <name> is looked up in the mount table; <...> is the
+ *  path within that mount's backend. Paths that don't start with
+ *  "/drives/" return -ENOENT (the namespace is single-rooted on
+ *  the drive table).
  *
- *  If the guest path already starts with "<digit>:" or has no
- *  leading "/", we pass it through unchanged — letting advanced
- *  users address specific volumes if FF_VOLUMES > 1.
+ *  Mount kinds:
+ *    HOST  — passthrough to a directory on the host's OS fs.
+ *            Composes the resolved host path by appending the
+ *            <...> portion to the mount's host_root. ".." escapes
+ *            are rejected.
+ *    FATFS — passes the resolved path to FatFs in volume-prefixed
+ *            form ("N:/foo/bar"). The mount stores the FatFs
+ *            volume number.
  * ============================================================ */
 
 #define MAX_PATH 256
 
-/* Where /host/... maps to on the real host filesystem. NULL
- * means the mount is disabled — paths starting with /host/
- * return -ENOENT. */
-static char    *g_host_fs_root      = NULL;
-static size_t   g_host_fs_root_len  = 0;
-static bool     g_host_fs_writable  = false;
-
-/* Which backend a path is destined for after translation. */
+/* Mount table. M.3a supports up to VM_HOST_FS_MAX_MOUNTS entries
+ * (default 8). The order of entries doesn't matter; lookup is by
+ * name. */
 typedef enum {
-    PATH_BACKEND_FATFS = 0,   /* hand to f_open/f_mkdir/etc.        */
-    PATH_BACKEND_HOST  = 1,   /* hand to native fopen/mkdir/etc.   */
+    MOUNT_KIND_FREE  = 0,    /* slot is empty (memset state) */
+    MOUNT_KIND_HOST  = 1,
+    MOUNT_KIND_FATFS = 2,
+} MountKind;
+
+#define MOUNT_NAME_MAX 15    /* names fit in [A-Za-z0-9_-]{1,15} */
+
+typedef struct {
+    MountKind kind;
+    char      name[MOUNT_NAME_MAX + 1];
+
+    /* HOST fields */
+    char    *host_root;       /* malloc'd, no trailing slash */
+    size_t   host_root_len;
+    bool     writable;        /* only meaningful for HOST */
+
+    /* FATFS fields */
+    uint8_t  fatfs_volume;    /* FatFs pdrv number */
+    FATFS   *fatfs_struct;    /* host-owned, may be NULL */
+} Mount;
+
+static Mount    g_mounts[VM_HOST_FS_MAX_MOUNTS];
+static unsigned g_mount_count = 0;
+
+/* Which backend a path was routed to. */
+typedef enum {
+    PATH_BACKEND_FATFS = 0,
+    PATH_BACKEND_HOST  = 1,
 } PathBackend;
 
-/* Resolve a guest path into a host-usable absolute path.
+/* Lookup a mount by name. Returns NULL if not found. */
+static const Mount *find_mount(const char *name) {
+    for (unsigned i = 0; i < VM_HOST_FS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].kind != MOUNT_KIND_FREE &&
+            strcmp(g_mounts[i].name, name) == 0) {
+            return &g_mounts[i];
+        }
+    }
+    return NULL;
+}
+
+/* Find a free slot. Returns NULL if the table is full. */
+static Mount *find_free_mount_slot(void) {
+    for (unsigned i = 0; i < VM_HOST_FS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].kind == MOUNT_KIND_FREE) return &g_mounts[i];
+    }
+    return NULL;
+}
+
+/* Validate a mount name: 1..15 chars, [A-Za-z0-9_-]. The naming
+ * rule is restrictive on purpose — mount names appear in paths
+ * the guest can pass to syscalls, and we want unambiguous
+ * separator handling, no traversal trickery, and a name that
+ * fits in a fixed-size buffer without dynamic alloc. */
+static bool valid_mount_name(const char *name) {
+    if (!name) return false;
+    size_t n = strlen(name);
+    if (n == 0 || n > MOUNT_NAME_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (!((c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') ||
+              c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Resolve a guest path of the form "/drives/<name>/<rest>" into
+ * a host-usable absolute path, plus metadata about which backend
+ * to route to.
  *
- * Three classes:
+ * Inputs:
+ *   cpu, guest_addr   the guest-side null-terminated path
+ *   out, cap          buffer for the translated path
  *
- *   "/host/..."     -> PATH_BACKEND_HOST  ; resolved against g_host_fs_root
- *                                           with .. escapes rejected
- *   "<digit>:/..."  -> PATH_BACKEND_FATFS ; passes through unchanged
- *   "/..."          -> PATH_BACKEND_FATFS ; prefixed with "0:"
- *   else            -> PATH_BACKEND_FATFS ; pass-through (FatFs will reject
- *                                           if FF_FS_RPATH is off)
+ * Outputs (on success):
+ *   *out_backend      PATH_BACKEND_HOST or PATH_BACKEND_FATFS
+ *   *out_writable     true if the mount allows writes
  *
- * Returns 0 on success and sets *out_backend, or -errno on
- * failure. The translated path is written into `out` (cap bytes).
+ * Returns 0 on success, or -errno on failure:
+ *   -EFAULT          guest pointer not readable
+ *   -ENAMETOOLONG    guest path too long, or translated path
+ *                    overflows `out`
+ *   -ENOENT          path doesn't start with /drives/<name>/ or
+ *                    <name> isn't a registered mount
+ *   -EPERM           ".." escape attempt in a HOST mount path
+ *   -EINVAL          buffer too small to be usable
  */
 static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
                               char *out, size_t cap,
-                              PathBackend *out_backend) {
+                              PathBackend *out_backend,
+                              bool *out_writable) {
     if (cap < 16) return -VM_EINVAL;
 
-    /* Stage 1: copy the raw guest path into a scratch buffer.
-     * We do this without prefix-injection so we can inspect it
-     * cleanly. */
+    /* Stage 1: copy the raw guest path into a scratch buffer. */
     char raw[MAX_PATH];
     size_t raw_pos = 0;
     for (;;) {
@@ -146,76 +221,75 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
         raw_pos++;
     }
 
-    /* Stage 2: dispatch by prefix. */
+    /* Stage 2: every path must start with /drives/. */
+    const char prefix[] = "/drives/";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    if (strncmp(raw, prefix, prefix_len) != 0) {
+        return -VM_ENOENT;
+    }
 
-    /* (a) /host/... — host filesystem passthrough */
-    if (strncmp(raw, "/host/", 6) == 0 || strcmp(raw, "/host") == 0) {
-        if (!g_host_fs_root) return -VM_ENOENT;
+    /* Stage 3: extract the mount name — chars after /drives/ up
+     * to the next '/' or end of string. Then look it up. */
+    const char *mount_start = raw + prefix_len;
+    const char *mount_end = mount_start;
+    while (*mount_end != '\0' && *mount_end != '/') mount_end++;
+    size_t name_len = (size_t)(mount_end - mount_start);
+    if (name_len == 0 || name_len > MOUNT_NAME_MAX) return -VM_ENOENT;
 
-        /* Path under the mount: skip the "/host" prefix. The
-         * remainder (which starts with "/" or is empty) gets
-         * appended to g_host_fs_root. */
-        const char *rel = raw + 5;   /* skip "/host" */
-        if (*rel == '\0') rel = "/"; /* "/host" alone means the root dir */
+    char name[MOUNT_NAME_MAX + 1];
+    memcpy(name, mount_start, name_len);
+    name[name_len] = '\0';
 
-        /* Reject .. components anywhere in the remainder. Even
-         * a single "/.." attempt suggests an escape attempt; we
-         * don't try to normalize and verify in-bounds. */
+    const Mount *m = find_mount(name);
+    if (!m) return -VM_ENOENT;
+
+    /* `rel` is the path WITHIN the mount, starting with '/' or
+     * empty. "/drives/host" alone -> rel = "/" (mount root). */
+    const char *rel = mount_end;
+    if (*rel == '\0') rel = "/";   /* canonicalize "/drives/foo" */
+
+    /* Stage 4: backend-specific composition. */
+    if (m->kind == MOUNT_KIND_HOST) {
+        /* Reject .. components anywhere in rel. */
         if (strstr(rel, "/..") != NULL ||
-            (rel[0] == '.' && rel[1] == '.' && (rel[2] == '\0' || rel[2] == '/'))) {
+            (rel[0] == '.' && rel[1] == '.' &&
+             (rel[2] == '\0' || rel[2] == '/'))) {
             return -VM_EPERM;
         }
 
-        /* Compose: g_host_fs_root + rel. Both have a leading/trailing
-         * "/" arrangement we need to handle carefully. Root is
-         * guaranteed to NOT end in "/" (we strip it on configure);
-         * rel is guaranteed to START with "/". */
         size_t rel_len = strlen(rel);
-        if (g_host_fs_root_len + rel_len + 1 > cap) return -VM_ENAMETOOLONG;
-        memcpy(out, g_host_fs_root, g_host_fs_root_len);
-        memcpy(out + g_host_fs_root_len, rel, rel_len + 1);   /* +1 for null */
+        if (m->host_root_len + rel_len + 1 > cap) return -VM_ENAMETOOLONG;
+        memcpy(out, m->host_root, m->host_root_len);
+        memcpy(out + m->host_root_len, rel, rel_len + 1);   /* +null */
 
-        *out_backend = PATH_BACKEND_HOST;
+        *out_backend  = PATH_BACKEND_HOST;
+        *out_writable = m->writable;
         return 0;
     }
 
-    /* (b) FatFs: translate "/foo" -> "0:/foo", pass through
-     * "N:/foo" forms unchanged. */
-    bool has_volume_prefix = false;
-    if (raw[0] >= '0' && raw[0] <= '9' && raw[1] == ':') {
-        has_volume_prefix = true;
-    }
+    /* FATFS: emit "<volume>:<rel>". The volume number is one
+     * digit (FF_VOLUMES <= 10 in our build). */
+    size_t rel_len = strlen(rel);
+    /* '<digit>' + ':' + rel + null = 2 + rel_len + 1 */
+    if (rel_len + 3 > cap) return -VM_ENAMETOOLONG;
+    out[0] = (char)('0' + m->fatfs_volume);
+    out[1] = ':';
+    memcpy(out + 2, rel, rel_len + 1);     /* includes null */
 
-    size_t out_pos = 0;
-    if (!has_volume_prefix && raw[0] == '/') {
-        if (cap < raw_pos + 3) return -VM_ENAMETOOLONG;
-        out[out_pos++] = '0';
-        out[out_pos++] = ':';
-    }
-    if (out_pos + raw_pos + 1 > cap) return -VM_ENAMETOOLONG;
-    memcpy(out + out_pos, raw, raw_pos + 1);   /* includes null */
-
-    *out_backend = PATH_BACKEND_FATFS;
+    *out_backend  = PATH_BACKEND_FATFS;
+    *out_writable = true;     /* FatFs writability is per-mount-or-not;
+                                 * for now all FatFs mounts are r/w. */
     return 0;
 }
 
-/* Copy a guest path (zero-terminated string at guest_addr) into
- * `out` (size `cap`), rewriting "/..." -> "0:/...". Returns the
- * length of the copied path on success (not including the null
- * terminator), or -errno on failure.
- *
- * This is the FatFs-only variant — paths starting with "/host/"
- * are translated to FatFs form anyway, which will fail since no
- * "host" volume is mounted. Used by handlers that DON'T need to
- * support the host mount (e.g., mkdir/unlink — we can't create
- * directories on the real host fs, so why translate the path).
- *
- * NEW handlers should use resolve_guest_path() instead.
- */
+/* Copy a guest path for handlers that only support FatFs paths
+ * (mkdir, unlink, readdir). Returns the length on success, or
+ * -errno. */
 static int copy_path(VmCpu *cpu, uint32_t guest_addr,
                      char *out, size_t cap) {
     PathBackend backend;
-    int r = resolve_guest_path(cpu, guest_addr, out, cap, &backend);
+    bool writable;
+    int r = resolve_guest_path(cpu, guest_addr, out, cap, &backend, &writable);
     if (r < 0) return r;
     if (backend == PATH_BACKEND_HOST) {
         /* Caller doesn't support host paths. Tell them no. */
@@ -340,7 +414,7 @@ static int32_t fs_write_fd(int fd, const void *buf, uint32_t n) {
         return (int32_t)bw;
     }
     if (s->kind == SLOT_HOST_FILE) {
-        if (!g_host_fs_writable) return -VM_EROFS;
+        if (!s->writable) return -VM_EROFS;
         size_t bw = fwrite(buf, 1, n, s->u.host);
         if (bw < n) return -VM_EIO;
         return (int32_t)bw;
@@ -402,7 +476,9 @@ static void handle_openat(VmCpu *cpu, void *system) {
 
     char buf[MAX_PATH];
     PathBackend backend;
-    int rp = resolve_guest_path(cpu, path, buf, sizeof(buf), &backend);
+    bool writable;
+    int rp = resolve_guest_path(cpu, path, buf, sizeof(buf),
+                                 &backend, &writable);
     if (rp < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)rp;
         return;
@@ -414,7 +490,7 @@ static void handle_openat(VmCpu *cpu, void *system) {
             /* Directory enumeration on the host fs isn't implemented
              * in this round — would need opendir/readdir/closedir
              * wrappers and a new SLOT_HOST_DIR. Easy to add later
-             * if needed; for now /host is files-only. */
+             * if needed; for now host mounts are files-only. */
             cpu->regs[VM_REG_A0] = (uint32_t)-VM_ENOSYS;
             return;
         }
@@ -422,7 +498,7 @@ static void handle_openat(VmCpu *cpu, void *system) {
         uint32_t access = flags & VM_O_ACCMODE;
         bool wants_write = (access != VM_O_RDONLY) ||
                            (flags & (VM_O_CREAT | VM_O_TRUNC | VM_O_APPEND));
-        if (wants_write && !g_host_fs_writable) {
+        if (wants_write && !writable) {
             cpu->regs[VM_REG_A0] = (uint32_t)-VM_EROFS;
             return;
         }
@@ -442,6 +518,7 @@ static void handle_openat(VmCpu *cpu, void *system) {
             return;
         }
         FdSlot *s = &g_fds[fd - FD_BASE];
+        s->writable = writable;
         FILE *f = fopen(buf, mode_str);
         if (!f) {
             free_slot(s);
@@ -731,41 +808,106 @@ static void handle_readdir(VmCpu *cpu, void *system) {
 }
 
 /* ============================================================
- *  Host-filesystem mount configuration
+ *  Mount table API
  * ============================================================ */
 
-bool vm_host_set_host_fs_root(const char *root, bool writable) {
-    /* Tear down any previous configuration first. */
-    if (g_host_fs_root) {
-        free(g_host_fs_root);
-        g_host_fs_root = NULL;
-        g_host_fs_root_len = 0;
-        g_host_fs_writable = false;
-    }
+/* Strip trailing slashes (forward and back) from a path. Leaves
+ * at least one character; "/" stays "/". Returns the trimmed
+ * length. Operates on a fresh copy so the caller's buffer is
+ * untouched. */
+static size_t copy_and_strip_trailing_slashes(const char *src,
+                                              char *dst, size_t cap) {
+    size_t len = strlen(src);
+    if (len + 1 > cap) return 0;
+    memcpy(dst, src, len);
+    while (len > 1 && (dst[len - 1] == '/' || dst[len - 1] == '\\')) len--;
+    dst[len] = '\0';
+    return len;
+}
 
-    if (!root) return true;   /* NULL means "disable mount" */
+bool vm_host_fs_mount_host(const char *name, const char *root,
+                           bool writable) {
+    if (!valid_mount_name(name) || !root) return false;
+    if (find_mount(name)) return false;     /* duplicate */
 
-    /* Validate that the directory actually exists. We use stat()
-     * to check — this is portable across POSIX and works on Cygwin. */
+    /* Validate that the directory actually exists. */
     struct stat st;
     if (stat(root, &st) != 0) return false;
     if (!S_ISDIR(st.st_mode)) return false;
 
-    /* Copy the path, stripping any trailing slash. We always
-     * compose with rel paths that start with "/", so a trailing
-     * slash on root would cause "//"  in the result. */
-    size_t len = strlen(root);
-    while (len > 1 && (root[len - 1] == '/' || root[len - 1] == '\\')) len--;
+    Mount *m = find_free_mount_slot();
+    if (!m) return false;                   /* table full */
 
-    char *copy = malloc(len + 1);
-    if (!copy) return false;
-    memcpy(copy, root, len);
-    copy[len] = '\0';
+    /* Copy the root path with trailing slash stripped. */
+    char tmp[MAX_PATH];
+    size_t rlen = copy_and_strip_trailing_slashes(root, tmp, sizeof(tmp));
+    if (rlen == 0) return false;
 
-    g_host_fs_root = copy;
-    g_host_fs_root_len = len;
-    g_host_fs_writable = writable;
+    char *root_copy = malloc(rlen + 1);
+    if (!root_copy) return false;
+    memcpy(root_copy, tmp, rlen + 1);
+
+    /* Commit. Note: name length already validated in valid_mount_name. */
+    memset(m, 0, sizeof(*m));
+    m->kind = MOUNT_KIND_HOST;
+    memcpy(m->name, name, strlen(name) + 1);
+    m->host_root     = root_copy;
+    m->host_root_len = rlen;
+    m->writable      = writable;
+    g_mount_count++;
     return true;
+}
+
+bool vm_host_fs_mount_fatfs(const char *name, uint8_t pdrv,
+                            void *fatfs) {
+    if (!valid_mount_name(name)) return false;
+    if (find_mount(name)) return false;
+    /* FF_VOLUMES upper bound — we can't easily import that here
+     * without dragging ffconf into the header. Trust the caller
+     * for now; FatFs will refuse pdrv values out of range when
+     * we hand it the volume-prefixed path. */
+    if (pdrv > 9) return false;             /* keeps the prefix one digit */
+
+    Mount *m = find_free_mount_slot();
+    if (!m) return false;
+
+    memset(m, 0, sizeof(*m));
+    m->kind = MOUNT_KIND_FATFS;
+    memcpy(m->name, name, strlen(name) + 1);
+    m->fatfs_volume = pdrv;
+    m->fatfs_struct = (FATFS *)fatfs;
+    m->writable     = true;     /* FatFs mounts are always r/w for now */
+    g_mount_count++;
+    return true;
+}
+
+bool vm_host_fs_unmount(const char *name) {
+    for (unsigned i = 0; i < VM_HOST_FS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].kind != MOUNT_KIND_FREE &&
+            strcmp(g_mounts[i].name, name) == 0) {
+            if (g_mounts[i].kind == MOUNT_KIND_HOST) {
+                free(g_mounts[i].host_root);
+            }
+            memset(&g_mounts[i], 0, sizeof(g_mounts[i]));
+            g_mount_count--;
+            return true;
+        }
+    }
+    return false;
+}
+
+void vm_host_fs_unmount_all(void) {
+    for (unsigned i = 0; i < VM_HOST_FS_MAX_MOUNTS; i++) {
+        if (g_mounts[i].kind == MOUNT_KIND_HOST) {
+            free(g_mounts[i].host_root);
+        }
+        memset(&g_mounts[i], 0, sizeof(g_mounts[i]));
+    }
+    g_mount_count = 0;
+}
+
+unsigned vm_host_fs_mount_count(void) {
+    return g_mount_count;
 }
 
 /* ============================================================
@@ -849,7 +991,9 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
 
     char buf[MAX_PATH];
     PathBackend backend;
-    int rp = resolve_guest_path(cpu, path_addr, buf, sizeof(buf), &backend);
+    bool writable;
+    int rp = resolve_guest_path(cpu, path_addr, buf, sizeof(buf),
+                                 &backend, &writable);
     if (rp < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)rp;
         return;
@@ -1099,12 +1243,7 @@ static void vm_host_fs_close_all(void) {
 
 void vm_host_fs_reset(void) {
     vm_host_fs_close_all();
-    if (g_host_fs_root) {
-        free(g_host_fs_root);
-        g_host_fs_root = NULL;
-        g_host_fs_root_len = 0;
-        g_host_fs_writable = false;
-    }
+    vm_host_fs_unmount_all();
     vm_host_stdio_set_fs_hooks(NULL, NULL, NULL);
 }
 

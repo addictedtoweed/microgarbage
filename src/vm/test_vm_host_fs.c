@@ -133,6 +133,9 @@ static bool fixture_init(void) {
     if (!vm_host_install_stdio(&g_sys)) return false;
     if (!vm_host_install_fs(&g_sys)) return false;
 
+    /* Register the freshly-mounted FatFs as /drives/td0. */
+    if (!vm_host_fs_mount_fatfs("td0", 0, &g_fs)) return false;
+
     /* 5. Fake VmCpu with one writable data region so handlers
      * can translate guest pointers. We put it at region 2 (DATA),
      * which is the default writable region. */
@@ -181,7 +184,7 @@ static int32_t invoke_syscall(uint32_t sys_num,
 static void test_openat_create_writes_and_reads_back(void) {
     ASSERT(fixture_init());
 
-    uint32_t path = put_string("/test.txt", 0);
+    uint32_t path = put_string("/drives/td0/test.txt", 0);
     uint32_t data = put_string("hello, file!", 256);
     uint32_t buf  = 0x80000000 + 512;
 
@@ -213,7 +216,7 @@ static void test_openat_create_writes_and_reads_back(void) {
 static void test_openat_nonexistent_returns_enoent(void) {
     ASSERT(fixture_init());
 
-    uint32_t path = put_string("/nope.txt", 0);
+    uint32_t path = put_string("/drives/td0/nope.txt", 0);
     int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path, VM_O_RDONLY, 0);
     ASSERT_EQ_INT(-VM_ENOENT, fd);
 
@@ -223,7 +226,7 @@ static void test_openat_nonexistent_returns_enoent(void) {
 static void test_openat_wrong_dirfd_rejected(void) {
     ASSERT(fixture_init());
 
-    uint32_t path = put_string("/some.txt", 0);
+    uint32_t path = put_string("/drives/td0/some.txt", 0);
     /* Pass dirfd != AT_FDCWD; should be rejected with EINVAL. */
     int32_t r = invoke_syscall(SYS_OPENAT, 5, path,
                                 VM_O_RDONLY | VM_O_CREAT, 0);
@@ -236,13 +239,13 @@ static void test_mkdirat_and_readdir(void) {
     ASSERT(fixture_init());
 
     /* Create two directories. */
-    uint32_t p1 = put_string("/d1", 0);
-    uint32_t p2 = put_string("/d2", 64);
+    uint32_t p1 = put_string("/drives/td0/d1", 0);
+    uint32_t p2 = put_string("/drives/td0/d2", 64);
     ASSERT_EQ_INT(0, invoke_syscall(SYS_MKDIRAT, VM_AT_FDCWD, p1, 0, 0));
     ASSERT_EQ_INT(0, invoke_syscall(SYS_MKDIRAT, VM_AT_FDCWD, p2, 0, 0));
 
-    /* Open root for readdir. */
-    uint32_t root = put_string("/", 128);
+    /* Open root of the FatFs mount for readdir. */
+    uint32_t root = put_string("/drives/td0", 128);
     int32_t dfd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, root,
                                   VM_O_RDONLY | VM_O_DIRECTORY, 0);
     ASSERT(dfd >= 3);
@@ -269,7 +272,7 @@ static void test_unlinkat_removes_file(void) {
     ASSERT(fixture_init());
 
     /* Create then unlink. */
-    uint32_t path = put_string("/del.txt", 0);
+    uint32_t path = put_string("/drives/td0/del.txt", 0);
     int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
                                  VM_O_WRONLY | VM_O_CREAT, 0);
     ASSERT(fd >= 3);
@@ -288,7 +291,7 @@ static void test_unlinkat_removes_file(void) {
 static void test_lseek_set_cur_end(void) {
     ASSERT(fixture_init());
 
-    uint32_t path = put_string("/seek.dat", 0);
+    uint32_t path = put_string("/drives/td0/seek.dat", 0);
     int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
                                  VM_O_RDWR | VM_O_CREAT, 0);
     ASSERT(fd >= 3);
@@ -325,10 +328,10 @@ static void test_open_fd_limit(void) {
     /* Open up to the limit, then verify the next open fails. */
     int fds[VM_HOST_FS_MAX_FILES + 1];
     unsigned i;
-    char namebuf[16];
+    char namebuf[24];
     for (i = 0; i < VM_HOST_FS_MAX_FILES; i++) {
-        snprintf(namebuf, sizeof(namebuf), "/f%u", i);
-        uint32_t path = put_string(namebuf, i * 16);
+        snprintf(namebuf, sizeof(namebuf), "/drives/td0/f%u", i);
+        uint32_t path = put_string(namebuf, i * 24);
         int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
                                      VM_O_WRONLY | VM_O_CREAT, 0);
         if (fd < 0) {
@@ -340,8 +343,8 @@ static void test_open_fd_limit(void) {
         fds[i] = fd;
     }
     /* One more should fail with EMFILE. */
-    snprintf(namebuf, sizeof(namebuf), "/overflow");
-    uint32_t path = put_string(namebuf, i * 16);
+    snprintf(namebuf, sizeof(namebuf), "/drives/td0/overflow");
+    uint32_t path = put_string(namebuf, i * 24);
     int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
                                  VM_O_WRONLY | VM_O_CREAT, 0);
     ASSERT_EQ_INT(-VM_EMFILE, fd);
@@ -361,22 +364,42 @@ static void test_open_fd_limit(void) {
     fixture_teardown();
 }
 
-static void test_path_translation_strips_volume_prefix(void) {
-    /* If the guest passes "0:/foo", our path-handling should
-     * leave it as-is rather than mistakenly prefixing it. */
+/* After the M.3 refactor, the only valid absolute path shape is
+ * /drives/<name>/.... Bare paths like "/foo" and FatFs's native
+ * "0:/foo" form must be rejected. This test pins that down. */
+static void test_path_translation_rejects_bare_paths(void) {
     ASSERT(fixture_init());
 
-    uint32_t path = put_string("0:/explicit", 0);
-    int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
+    /* Bare absolute path */
+    uint32_t p1 = put_string("/explicit", 0);
+    int32_t r1 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p1,
                                  VM_O_WRONLY | VM_O_CREAT, 0);
-    ASSERT(fd >= 3);
-    invoke_syscall(SYS_CLOSE, (uint32_t)fd, 0, 0, 0);
+    ASSERT_EQ_INT(-(int)VM_ENOENT, (int)r1);
 
-    /* Re-open as "/explicit" — should find the same file. */
-    uint32_t path2 = put_string("/explicit", 64);
-    fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path2, VM_O_RDONLY, 0);
-    ASSERT(fd >= 3);
-    invoke_syscall(SYS_CLOSE, (uint32_t)fd, 0, 0, 0);
+    /* FatFs-native volume prefix — also rejected now */
+    uint32_t p2 = put_string("0:/explicit", 64);
+    int32_t r2 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p2,
+                                 VM_O_WRONLY | VM_O_CREAT, 0);
+    ASSERT_EQ_INT(-(int)VM_ENOENT, (int)r2);
+
+    /* The legacy /host/ prefix is also gone */
+    uint32_t p3 = put_string("/host/foo.txt", 128);
+    int32_t r3 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p3,
+                                 VM_O_RDONLY, 0);
+    ASSERT_EQ_INT(-(int)VM_ENOENT, (int)r3);
+
+    /* Unknown mount name — also ENOENT */
+    uint32_t p4 = put_string("/drives/nope/foo.txt", 192);
+    int32_t r4 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p4,
+                                 VM_O_RDONLY, 0);
+    ASSERT_EQ_INT(-(int)VM_ENOENT, (int)r4);
+
+    /* And one positive control — /drives/td0/ DOES work */
+    uint32_t p5 = put_string("/drives/td0/works.txt", 256);
+    int32_t r5 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p5,
+                                 VM_O_WRONLY | VM_O_CREAT, 0);
+    ASSERT(r5 >= 3);
+    invoke_syscall(SYS_CLOSE, (uint32_t)r5, 0, 0, 0);
 
     fixture_teardown();
 }
@@ -452,7 +475,7 @@ static void test_spawn_and_wait_minimal_elf(void) {
 
     /* Spawn it. The path "/spawn.elf" gets translated to
      * "0:/spawn.elf" by our path resolver. */
-    uint32_t path = put_string("/spawn.elf", 0);
+    uint32_t path = put_string("/drives/td0/spawn.elf", 0);
     int32_t rc = invoke_syscall(SYS_SPAWN_AND_WAIT, path, 0, 0, 0);
 
     /* guest_minimal calls sys_exit(0); exit code masked to 8 bits
@@ -476,7 +499,7 @@ static void test_route_functions_handle_file_fds(void) {
     ASSERT(fixture_init());
 
     /* Create a file and write some content via the syscall path. */
-    uint32_t path = put_string("/routed.txt", 0);
+    uint32_t path = put_string("/drives/td0/routed.txt", 0);
     uint32_t data = put_string("from the guest", 256);
 
     int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
@@ -540,6 +563,155 @@ static void test_route_functions_reject_stdio_fds(void) {
     fixture_teardown();
 }
 
+/* ---------------------------------------------------------------
+ *  Mount table API tests (M.3)
+ * --------------------------------------------------------------- */
+
+static void test_mount_host_basic(void) {
+    ASSERT(fixture_init());
+
+    /* Create a host directory and a file in it. */
+    const char *root = "/tmp/microgarbage_mount_test";
+    mkdir(root, 0755);
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/hello.txt", root);
+        FILE *f = fopen(path, "wb");
+        ASSERT_NOT_NULL(f);
+        fputs("hi from host", f);
+        fclose(f);
+    }
+
+    /* Register as /drives/h0 (read-only). */
+    ASSERT(vm_host_fs_mount_host("h0", root, false));
+
+    /* Open and read back via the syscall. */
+    uint32_t path = put_string("/drives/h0/hello.txt", 0);
+    int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
+                                 VM_O_RDONLY, 0);
+    ASSERT(fd >= 3);
+    uint32_t buf = 0x80000000 + 256;
+    int32_t n = invoke_syscall(SYS_READ, (uint32_t)fd, buf, 64, 0);
+    ASSERT_EQ_INT(12, n);
+    ASSERT_EQ_INT(0, memcmp(g_data + 256, "hi from host", 12));
+    invoke_syscall(SYS_CLOSE, (uint32_t)fd, 0, 0, 0);
+
+    /* Writes are rejected on a read-only mount. */
+    uint32_t wpath = put_string("/drives/h0/new.txt", 64);
+    int32_t r = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, wpath,
+                                VM_O_WRONLY | VM_O_CREAT, 0);
+    ASSERT_EQ_INT(-(int)VM_EROFS, (int)r);
+
+    fixture_teardown();
+    /* Cleanup the temp dir. */
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/hello.txt", root);
+        remove(path);
+        rmdir(root);
+    }
+}
+
+static void test_mount_host_writable(void) {
+    ASSERT(fixture_init());
+
+    const char *root = "/tmp/microgarbage_mount_test_rw";
+    mkdir(root, 0755);
+    ASSERT(vm_host_fs_mount_host("h0", root, true));
+
+    /* Write a file. */
+    uint32_t path = put_string("/drives/h0/new.txt", 0);
+    int32_t fd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, path,
+                                 VM_O_WRONLY | VM_O_CREAT, 0);
+    ASSERT(fd >= 3);
+    uint32_t data = put_string("payload", 64);
+    int32_t w = invoke_syscall(SYS_WRITE, (uint32_t)fd, data, 7, 0);
+    ASSERT_EQ_INT(7, w);
+    invoke_syscall(SYS_CLOSE, (uint32_t)fd, 0, 0, 0);
+
+    /* Verify via the host fs that the file actually appeared. */
+    {
+        char p[256];
+        snprintf(p, sizeof(p), "%s/new.txt", root);
+        FILE *f = fopen(p, "rb");
+        ASSERT_NOT_NULL(f);
+        char buf[16] = {0};
+        size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        ASSERT_EQ_INT(7, (int)r);
+        ASSERT_EQ_INT(0, memcmp(buf, "payload", 7));
+        remove(p);
+    }
+    rmdir(root);
+    fixture_teardown();
+}
+
+static void test_mount_dotdot_rejected(void) {
+    ASSERT(fixture_init());
+
+    const char *root = "/tmp/microgarbage_mount_test_esc";
+    mkdir(root, 0755);
+    ASSERT(vm_host_fs_mount_host("h0", root, false));
+
+    /* Try to escape with ../. Always EPERM, regardless of whether
+     * the target exists. */
+    uint32_t p1 = put_string("/drives/h0/../etc/passwd", 0);
+    int32_t r1 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p1,
+                                 VM_O_RDONLY, 0);
+    ASSERT_EQ_INT(-(int)VM_EPERM, (int)r1);
+
+    /* Even .. at the very top. */
+    uint32_t p2 = put_string("/drives/h0/..", 64);
+    int32_t r2 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p2,
+                                 VM_O_RDONLY, 0);
+    ASSERT_EQ_INT(-(int)VM_EPERM, (int)r2);
+
+    rmdir(root);
+    fixture_teardown();
+}
+
+static void test_mount_invalid_names(void) {
+    ASSERT(fixture_init());
+
+    /* Empty, too long, and bad characters all rejected. */
+    ASSERT(!vm_host_fs_mount_fatfs("",                     1, &g_fs));
+    ASSERT(!vm_host_fs_mount_fatfs("toolongnameisawful_x", 1, &g_fs));
+    ASSERT(!vm_host_fs_mount_fatfs("bad/slash",            1, &g_fs));
+    ASSERT(!vm_host_fs_mount_fatfs("bad.dot",              1, &g_fs));
+    ASSERT(!vm_host_fs_mount_fatfs("bad space",            1, &g_fs));
+    /* Good ones. */
+    ASSERT(vm_host_fs_mount_fatfs("a",        1, &g_fs));
+    ASSERT(vm_host_fs_mount_fatfs("td-1",     2, &g_fs));
+    ASSERT(vm_host_fs_mount_fatfs("UPPER_OK", 3, &g_fs));
+    /* Duplicate name rejected. */
+    ASSERT(!vm_host_fs_mount_fatfs("a", 4, &g_fs));
+
+    fixture_teardown();
+}
+
+static void test_mount_count_and_unmount(void) {
+    ASSERT(fixture_init());
+
+    /* fixture_init already added one (td0). */
+    ASSERT_EQ_INT(1, (int)vm_host_fs_mount_count());
+
+    ASSERT(vm_host_fs_mount_fatfs("td1", 1, &g_fs));
+    ASSERT_EQ_INT(2, (int)vm_host_fs_mount_count());
+
+    ASSERT(vm_host_fs_mount_fatfs("td2", 2, &g_fs));
+    ASSERT_EQ_INT(3, (int)vm_host_fs_mount_count());
+
+    /* Unmount the middle one. The count drops; td0 and td2 still
+     * resolvable. */
+    ASSERT(vm_host_fs_unmount("td1"));
+    ASSERT_EQ_INT(2, (int)vm_host_fs_mount_count());
+
+    /* Unmount a non-existent one fails cleanly. */
+    ASSERT(!vm_host_fs_unmount("nope"));
+
+    fixture_teardown();
+}
+
 int main(void) {
     TEST_SUITE("vm_host_fs");
     RUN(test_openat_create_writes_and_reads_back);
@@ -549,10 +721,15 @@ int main(void) {
     RUN(test_unlinkat_removes_file);
     RUN(test_lseek_set_cur_end);
     RUN(test_open_fd_limit);
-    RUN(test_path_translation_strips_volume_prefix);
+    RUN(test_path_translation_rejects_bare_paths);
     RUN(test_spawn_and_wait_minimal_elf);
     RUN(test_route_functions_handle_file_fds);
     RUN(test_route_functions_reject_stdio_fds);
+    RUN(test_mount_host_basic);
+    RUN(test_mount_host_writable);
+    RUN(test_mount_dotdot_rejected);
+    RUN(test_mount_invalid_names);
+    RUN(test_mount_count_and_unmount);
     return TEST_SUITE_RESULT();
 }
 

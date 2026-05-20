@@ -51,3 +51,48 @@
 # scripted testing — raw mode on a non-TTY pipe is a no-op anyway,
 # but it's surfaced here for completeness.
 # raw_mode = true
+
+
+# Filesystem mounts.
+#
+# Every absolute path the shell sees must start with /drives/<name>/.
+# Each [mount.<name>] section here defines one such mount. If no
+# [mount.*] sections are present at all, the host falls back to
+# built-in defaults equivalent to:
+#
+#   [mount.td0]
+#   type = td
+#
+#   [mount.host]
+#   type = host
+#   path = ./host_files
+#   writable = false
+#
+# As soon as you add ONE [mount.*] section, the defaults are skipped
+# entirely — list everything you want explicitly.
+#
+# Two backend kinds in M.3a:
+#
+#   type = td     RAM-backed FatFs volume. Persists for the lifetime
+#                 of the host process. Multiple td mounts aren't
+#                 supported yet (the static FatFs backing has one
+#                 volume). size_kb is parsed but ignored — the pool
+#                 size is compile-time.
+#
+#   type = host   Passthrough to a host-side directory. Files in the
+#                 directory become visible at /drives/<name>/<file>.
+#                 Read-only by default (a buggy guest can't delete
+#                 your hard drive). Set writable = true to allow
+#                 create/modify/delete.
+#                 Note: ".." escapes are always rejected, even with
+#                 writable = true.
+
+# [mount.td0]
+# type    = td
+# size_kb = 128
+
+# [mount.host]
+# type     = host
+# path     = ./host_files
+# writable = false
+

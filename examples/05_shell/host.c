@@ -102,6 +102,24 @@ static FATFS g_fs;
  * That way: CLI wins ties, config is just persistent defaults.
  * --------------------------------------------------------------- */
 
+/* Mount entry parsed from [mount.<name>] sections. */
+typedef enum {
+    HOST_MOUNT_TD   = 0,
+    HOST_MOUNT_HOST = 1,
+} HostMountKind;
+
+#define HOST_MOUNT_MAX 8
+
+typedef struct {
+    HostMountKind kind;
+    char          name[16];
+    /* TD: size in KB.
+     * HOST: path string. */
+    uint32_t      size_kb;
+    char          path[128];
+    bool          writable;
+} HostMount;
+
 typedef struct {
     /* Memory */
     size_t   local_bytes;        /* local slab size */
@@ -111,6 +129,12 @@ typedef struct {
 
     /* Stdio */
     bool     raw_mode;           /* enable raw mode on stdin if tty */
+
+    /* Mounts. If mount_count==0, the host uses built-in defaults
+     * (td0 + host). Non-zero means the config explicitly listed
+     * mounts; defaults are skipped entirely. */
+    HostMount mounts[HOST_MOUNT_MAX];
+    unsigned  mount_count;
 } HostConfig;
 
 static void host_config_set_defaults(HostConfig *hc) {
@@ -119,6 +143,25 @@ static void host_config_set_defaults(HostConfig *hc) {
     hc->max_vms       = 4;
     hc->spawn_data_kb = 64;
     hc->raw_mode      = true;
+    hc->mount_count   = 0;
+}
+
+/* Find or create a mount entry by name in hc. Returns NULL on
+ * cap-exceeded. */
+static HostMount *host_config_mount_get_or_create(HostConfig *hc,
+                                                   const char *name) {
+    for (unsigned i = 0; i < hc->mount_count; i++) {
+        if (strcmp(hc->mounts[i].name, name) == 0) return &hc->mounts[i];
+    }
+    if (hc->mount_count >= HOST_MOUNT_MAX) return NULL;
+    HostMount *m = &hc->mounts[hc->mount_count++];
+    memset(m, 0, sizeof(*m));
+    /* Copy name with truncation. */
+    size_t n = strlen(name);
+    if (n >= sizeof(m->name)) n = sizeof(m->name) - 1;
+    memcpy(m->name, name, n);
+    m->name[n] = '\0';
+    return m;
 }
 
 /* Apply an IniCfg's settings to *hc. Unknown keys produce a
@@ -167,9 +210,83 @@ static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
         hc->raw_mode = bv;
     }
 
+    /* Walk all entries looking for [mount.<name>] sections. Each
+     * such section defines one mount. Key bindings within the
+     * section:
+     *
+     *   type     = host | td
+     *   path     = <dir>    (host only; absolute or relative)
+     *   writable = bool     (host only; default false)
+     *   size_kb  = <int>    (td only; default 128)
+     */
+    for (size_t i = 0; i < cfg->count; i++) {
+        const char *s = cfg->entries[i].section;
+        if (strncmp(s, "mount.", 6) != 0) continue;
+        const char *name = s + 6;
+        if (*name == '\0') {
+            fprintf(stderr, "vm.cfg: line %u: empty mount name in [mount.]\n",
+                    cfg->entries[i].line);
+            return false;
+        }
+        HostMount *m = host_config_mount_get_or_create(hc, name);
+        if (!m) {
+            fprintf(stderr, "vm.cfg: line %u: too many [mount.*] sections "
+                    "(max %d)\n", cfg->entries[i].line, HOST_MOUNT_MAX);
+            return false;
+        }
+        const char *k = cfg->entries[i].key;
+        const char *v = cfg->entries[i].value;
+        if (strcmp(k, "type") == 0) {
+            if (strcmp(v, "host") == 0)      m->kind = HOST_MOUNT_HOST;
+            else if (strcmp(v, "td") == 0)   m->kind = HOST_MOUNT_TD;
+            else {
+                fprintf(stderr, "vm.cfg: line %u: [mount.%s] unknown type "
+                        "'%s' (expected 'host' or 'td')\n",
+                        cfg->entries[i].line, name, v);
+                return false;
+            }
+        } else if (strcmp(k, "path") == 0) {
+            size_t pn = strlen(v);
+            if (pn >= sizeof(m->path)) {
+                fprintf(stderr, "vm.cfg: line %u: [mount.%s] path too long\n",
+                        cfg->entries[i].line, name);
+                return false;
+            }
+            memcpy(m->path, v, pn + 1);
+        } else if (strcmp(k, "writable") == 0) {
+            if (inicfg_get_bool(cfg, s, k, &bv)) {
+                m->writable = bv;
+            } else {
+                fprintf(stderr, "vm.cfg: line %u: [mount.%s] writable: "
+                        "unparseable bool '%s'\n",
+                        cfg->entries[i].line, name, v);
+                return false;
+            }
+        } else if (strcmp(k, "size_kb") == 0) {
+            if (inicfg_get_int(cfg, s, k, &lv)) {
+                if (lv < 8 || lv > 4096) {
+                    fprintf(stderr, "vm.cfg: line %u: [mount.%s] "
+                            "size_kb=%ld out of range (8..4096)\n",
+                            cfg->entries[i].line, name, lv);
+                    return false;
+                }
+                m->size_kb = (uint32_t)lv;
+            } else {
+                fprintf(stderr, "vm.cfg: line %u: [mount.%s] size_kb: "
+                        "unparseable integer '%s'\n",
+                        cfg->entries[i].line, name, v);
+                return false;
+            }
+        } else {
+            fprintf(stderr, "vm.cfg: line %u: warning: unknown key "
+                    "'%s.%s'\n", cfg->entries[i].line, s, k);
+        }
+    }
+
     /* Warn on unknown keys so typos surface. We allow unknown
-     * sections (e.g., a future [mount] from M.3) so older hosts
-     * don't reject newer configs. */
+     * sections (e.g., a future [scheduler]) so older hosts
+     * don't reject newer configs. [mount.<name>] sections are
+     * already handled above, so skip those here. */
     static const struct {
         const char *section;
         const char *keys[8];     /* NULL-terminated */
@@ -181,6 +298,8 @@ static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
     for (size_t i = 0; i < cfg->count; i++) {
         const char *s = cfg->entries[i].section;
         const char *k = cfg->entries[i].key;
+        /* [mount.<name>] handled in the loop above. */
+        if (strncmp(s, "mount.", 6) == 0) continue;
         bool found_section = false;
         bool found_key = false;
         for (size_t j = 0; j < sizeof(known) / sizeof(known[0]); j++) {
@@ -824,7 +943,14 @@ int main(int argc, char **argv) {
         if (f_open(&f, "0:/readme.txt", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
             const char *msg =
                 "Welcome to the VM shell.\n"
-                "Try: ls, cd /home, mkdir foo, touch bar.txt, cat readme.txt\n";
+                "Try: ls, cd home, mkdir foo, touch bar.txt, cat readme.txt\n"
+                "\n"
+                "Filesystem layout:\n"
+                "  /drives/td0/    this RAM-backed FatFs volume (default cwd)\n"
+                "  /drives/host/   host directory passthrough (read-only)\n"
+                "\n"
+                "Absolute paths must start with /drives/<name>/. Relative\n"
+                "paths are resolved against the current directory.\n";
             f_write(&f, msg, (UINT)strlen(msg), &bw);
             f_close(&f);
         }
@@ -894,39 +1020,103 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* The per-spawn data region size is now set in VmSystemConfig
-     * above (spawn_data_kb = 64). The legacy
-     * vm_host_fs_set_spawn_data_size global is still honored when
-     * the config doesn't set it, but we don't need it here. */
-
-    /* 6b. Configure the /host mount. By default the shell can
-     * read files under ./host_files/ as /host/<name>. Lets the
-     * user drop ELFs there and run them via "run /host/foo.elf"
-     * inside the shell.
+    /* 6b. Mounts.
      *
-     * If the path doesn't exist, try to create it. If we can't
-     * (permissions, parent missing), warn but don't fail — the
-     * shell still works without /host. */
-    if (!host_fs_disabled) {
-        struct stat st;
-        if (stat(host_fs_root, &st) != 0) {
-            /* Try to create. POSIX mkdir; succeeds in Cygwin too. */
-            if (mkdir(host_fs_root, 0755) != 0) {
-                fprintf(stderr, "host: warning — could not create '%s' for /host mount: %s\n",
-                        host_fs_root, strerror(errno));
-                fprintf(stderr, "host: /host will be disabled\n");
-                host_fs_disabled = true;
+     * If vm.cfg's [mount.<name>] sections were used, hc.mount_count
+     * is non-zero and those become the mounts. Otherwise we set up
+     * the built-in defaults: /drives/td0 (the RAM-backed FatFs)
+     * and /drives/host (a passthrough to host_fs_root, unless
+     * --no-host-fs was passed).
+     *
+     * The shell defaults its cwd to /drives/td0. If a custom config
+     * doesn't include a td0, the shell's first `pwd` will show a
+     * non-resolvable cwd — but that's the user's choice.
+     *
+     * Multiple TD mounts aren't supported in M.3a: there's only one
+     * static FatFs volume backing. A configured td<N> reuses it,
+     * but the size_kb override is ignored (the backing pool size
+     * is compile-time). M.3b adds image-file backends and proper
+     * per-mount backing pools. */
+
+    if (hc.mount_count == 0) {
+        /* No mount section in vm.cfg — use built-in defaults. */
+        if (!vm_host_fs_mount_fatfs("td0", 0, &g_fs)) {
+            fprintf(stderr, "host: vm_host_fs_mount_fatfs('td0') failed\n");
+            return 1;
+        }
+
+        if (!host_fs_disabled) {
+            struct stat st;
+            if (stat(host_fs_root, &st) != 0) {
+                if (mkdir(host_fs_root, 0755) != 0) {
+                    fprintf(stderr, "host: warning — could not create '%s' "
+                            "for /drives/host mount: %s\n",
+                            host_fs_root, strerror(errno));
+                    fprintf(stderr, "host: /drives/host will be disabled\n");
+                    host_fs_disabled = true;
+                }
+            }
+            if (!host_fs_disabled) {
+                if (!vm_host_fs_mount_host("host", host_fs_root,
+                                           host_fs_writable)) {
+                    fprintf(stderr, "host: warning — "
+                            "vm_host_fs_mount_host('%s') failed\n",
+                            host_fs_root);
+                    fprintf(stderr, "host: /drives/host will be disabled\n");
+                } else {
+                    fprintf(stderr, "host: /drives/host mounted from '%s' "
+                            "(%s)\n",
+                            host_fs_root,
+                            host_fs_writable ? "read/write" : "read-only");
+                }
             }
         }
-        if (!host_fs_disabled) {
-            if (!vm_host_set_host_fs_root(host_fs_root, host_fs_writable)) {
-                fprintf(stderr, "host: warning — vm_host_set_host_fs_root('%s') failed\n",
-                        host_fs_root);
-                fprintf(stderr, "host: /host will be disabled\n");
+    } else {
+        /* Config-driven mount setup. */
+        bool any_td_mounted = false;
+        for (unsigned i = 0; i < hc.mount_count; i++) {
+            const HostMount *m = &hc.mounts[i];
+            if (m->kind == HOST_MOUNT_TD) {
+                if (any_td_mounted) {
+                    fprintf(stderr, "host: vm.cfg: multiple [mount.*] of "
+                            "type=td not supported in M.3a (ignoring "
+                            "mount.%s)\n", m->name);
+                    continue;
+                }
+                if (!vm_host_fs_mount_fatfs(m->name, 0, &g_fs)) {
+                    fprintf(stderr, "host: vm_host_fs_mount_fatfs('%s') "
+                            "failed\n", m->name);
+                    return 1;
+                }
+                fprintf(stderr, "host: /drives/%s mounted (FatFs, %u KB pool"
+                        "%s)\n", m->name, (unsigned)(POOL_BYTES / 1024),
+                        m->size_kb ? "; size_kb override ignored" : "");
+                any_td_mounted = true;
             } else {
-                fprintf(stderr, "host: /host mounted from '%s' (%s)\n",
-                        host_fs_root,
-                        host_fs_writable ? "read/write" : "read-only");
+                /* HOST. Path is required. */
+                if (m->path[0] == '\0') {
+                    fprintf(stderr, "host: vm.cfg: [mount.%s] type=host "
+                            "needs a 'path' setting\n", m->name);
+                    return 1;
+                }
+                struct stat st;
+                if (stat(m->path, &st) != 0) {
+                    if (mkdir(m->path, 0755) != 0) {
+                        fprintf(stderr, "host: vm.cfg: [mount.%s] "
+                                "cannot create '%s': %s\n",
+                                m->name, m->path, strerror(errno));
+                        return 1;
+                    }
+                }
+                if (!vm_host_fs_mount_host(m->name, m->path, m->writable)) {
+                    fprintf(stderr, "host: vm.cfg: [mount.%s] "
+                            "vm_host_fs_mount_host('%s') failed\n",
+                            m->name, m->path);
+                    return 1;
+                }
+                fprintf(stderr, "host: /drives/%s mounted from '%s' (%s)\n",
+                        m->name, m->path,
+                        m->writable ? "read/write" : "read-only");
             }
         }
     }
