@@ -48,7 +48,7 @@
 #  define PIPE_MODE_SUPPORTED 1
 #  include <windows.h>
 #  include <io.h>          /* _open_osfhandle */
-#  include <fcntl.h>       /* _O_RDWR */
+#  include <fcntl.h>       /* O_RDWR */
 #endif
 
 /* ---------------------------------------------------------------
@@ -203,10 +203,14 @@ static FILE *open_named_pipe_for_stdio(const char *name) {
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Wrap the HANDLE in a POSIX fd, then in a FILE*. _O_RDWR
+    /* Wrap the HANDLE in a POSIX fd, then in a FILE*. O_RDWR
      * matches PIPE_ACCESS_DUPLEX. From this point the FILE* can
-     * be passed wherever the bridge expects stdin/stdout/stderr. */
-    int fd = _open_osfhandle((intptr_t)g_pipe_handle, _O_RDWR);
+     * be passed wherever the bridge expects stdin/stdout/stderr.
+     *
+     * Cygwin uses the POSIX-spelled O_RDWR (no underscore); the
+     * MSVC spelling _O_RDWR is unavailable here. _open_osfhandle
+     * itself keeps its Microsoft-namespaced name on Cygwin. */
+    int fd = _open_osfhandle((intptr_t)g_pipe_handle, O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "host: _open_osfhandle failed: %s\n",
                 strerror(errno));
