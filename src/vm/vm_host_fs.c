@@ -146,7 +146,12 @@ static int32_t fres_to_errno(FRESULT r) {
         case FR_NOT_READY:           return -VM_EIO;
         case FR_NO_FILE:             return -VM_ENOENT;
         case FR_NO_PATH:             return -VM_ENOENT;
-        case FR_INVALID_NAME:        return -VM_EINVAL;
+        case FR_INVALID_NAME:        return -VM_ENAMETOOLONG;
+        /* FatFs returns FR_INVALID_NAME both for syntactically bad
+         * names and (more often, with LFN off) for names that don't
+         * fit the 8.3 limit. EINVAL would be more accurate for the
+         * former but ENAMETOOLONG is more useful for the latter,
+         * which is what users actually hit. */
         case FR_DENIED:              return -VM_EPERM;
         case FR_EXIST:               return -VM_EEXIST;
         case FR_INVALID_OBJECT:      return -VM_EBADF;
