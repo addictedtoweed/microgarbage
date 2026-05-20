@@ -1,23 +1,38 @@
 # Common build settings for VM examples.
 #
-# Sourced by each example's build.sh. Sets these variables:
+# Sourced by each example's build.sh. Requires bash; uses arrays
+# to support paths with spaces.
+#
+# Sets these variables (arrays where it matters for spaces):
 #
 #   REPO_ROOT        Absolute path to repo root (auto-detected
 #                    relative to this file's location).
 #   CC               C compiler (override via env to use a
 #                    different one).
-#   CFLAGS           Standard flags (warnings + C11 + -Iinclude).
-#   VM_CORE_SRCS     Space-separated list of VM library .c files
-#                    that any example host must link. Always includes
-#                    the full VM core; we don't try to slice it
-#                    finer because the linker drops unused objects.
+#   CFLAGS           Array of flags (warnings + C11 + -Iinclude).
+#                    Use with "${CFLAGS[@]}" — never $CFLAGS.
+#   VM_CORE_SRCS     Array of VM library .c files that any example
+#                    host must link. Always includes the full VM
+#                    core; we don't try to slice it finer because
+#                    the linker drops unused objects.
+#                    Use with "${VM_CORE_SRCS[@]}".
 #   GUEST_LD         Path to the shared guest linker script.
 #   GUEST_CC         RISC-V cross-compiler for guest ELFs.
-#   GUEST_CFLAGS     Standard flags for guest compilation
-#                    (rv32imc, no libc, freestanding).
+#   GUEST_CFLAGS     Array of guest compilation flags (rv32imc,
+#                    no libc, freestanding).
+#                    Use with "${GUEST_CFLAGS[@]}".
 #
 # All paths are absolute so example scripts can be run from
-# anywhere.
+# anywhere. Arrays preserve the spaces in REPO_ROOT correctly;
+# the old space-separated-string approach silently broke when
+# any path contained whitespace.
+
+# Refuse to run under a non-bash shell. Arrays and BASH_SOURCE
+# are bash-isms; sourcing from dash/ash/sh will silently misbehave.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "vm_objs.sh: this file requires bash (was sourced from $0)" >&2
+    return 1 2>/dev/null || exit 1
+fi
 
 # ---------------------------------------------------------------
 # Locate the repo root.
@@ -34,24 +49,42 @@ unset _VM_OBJS_DIR
 # ---------------------------------------------------------------
 
 CC=${CC:-cc}
-CFLAGS=${CFLAGS:--Wall -Wextra -Wpedantic -std=c11 -O2 -I${REPO_ROOT}/include}
 
-# Every VM-library .c file the host needs. We include all of them;
-# the linker drops what's unused. Order doesn't matter for ELF
-# linking but we keep it organized for readability.
-VM_CORE_SRCS="\
-    ${REPO_ROOT}/src/vm/vm_core.c \
-    ${REPO_ROOT}/src/vm/vm_loader.c \
-    ${REPO_ROOT}/src/vm/vm_ecall.c \
-    ${REPO_ROOT}/src/vm/vm_ecall_handlers.c \
-    ${REPO_ROOT}/src/vm/vm_mailbox.c \
-    ${REPO_ROOT}/src/vm/vm_sched.c \
-    ${REPO_ROOT}/src/vm/vm_system.c \
-    ${REPO_ROOT}/src/vm/vm_host_stdio.c \
-    ${REPO_ROOT}/src/memory/bump.c \
-    ${REPO_ROOT}/src/memory/slab_stack.c \
-    ${REPO_ROOT}/src/containers/fifo_queue.c \
-    ${REPO_ROOT}/src/containers/ring_buffer.c"
+# CFLAGS as an array. Each token is a separate element so spaces
+# inside REPO_ROOT don't get word-split when expanded. If the
+# caller already set CFLAGS as a string, respect it (note: that
+# string still won't survive spaces in $REPO_ROOT — but the
+# caller has chosen to override our handling).
+if [ -z "${CFLAGS+x}" ]; then
+    CFLAGS=(
+        -Wall -Wextra -Wpedantic -std=c11 -O2
+        -I"${REPO_ROOT}/include"
+    )
+else
+    # Caller-supplied string; convert to a single-element array
+    # so "${CFLAGS[@]}" still works in build.sh. This means
+    # CFLAGS="..." overrides DO get word-split on spaces in
+    # the user's value, which is the historical behavior.
+    # shellcheck disable=SC2206
+    CFLAGS=($CFLAGS)
+fi
+
+# Every VM-library .c file the host needs. Array form survives
+# spaces in $REPO_ROOT.
+VM_CORE_SRCS=(
+    "${REPO_ROOT}/src/vm/vm_core.c"
+    "${REPO_ROOT}/src/vm/vm_loader.c"
+    "${REPO_ROOT}/src/vm/vm_ecall.c"
+    "${REPO_ROOT}/src/vm/vm_ecall_handlers.c"
+    "${REPO_ROOT}/src/vm/vm_mailbox.c"
+    "${REPO_ROOT}/src/vm/vm_sched.c"
+    "${REPO_ROOT}/src/vm/vm_system.c"
+    "${REPO_ROOT}/src/vm/vm_host_stdio.c"
+    "${REPO_ROOT}/src/memory/bump.c"
+    "${REPO_ROOT}/src/memory/slab_stack.c"
+    "${REPO_ROOT}/src/containers/fifo_queue.c"
+    "${REPO_ROOT}/src/containers/ring_buffer.c"
+)
 
 # ---------------------------------------------------------------
 # Guest compilation.
@@ -84,7 +117,18 @@ if [ -z "${GUEST_CC:-}" ]; then
     unset _candidate
 fi
 
-GUEST_CFLAGS=${GUEST_CFLAGS:--march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -O2}
+# GUEST_CFLAGS as an array (no paths inside currently, but
+# consistent style and supports future additions).
+if [ -z "${GUEST_CFLAGS+x}" ]; then
+    GUEST_CFLAGS=(
+        -march=rv32imc -mabi=ilp32
+        -nostdlib -nostartfiles
+        -ffreestanding -O2
+    )
+else
+    # shellcheck disable=SC2206
+    GUEST_CFLAGS=($GUEST_CFLAGS)
+fi
 
 # Whether the cross-compiler exists. Examples that need to
 # rebuild the .elf will check this and skip rebuild if missing

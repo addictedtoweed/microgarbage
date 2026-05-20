@@ -46,12 +46,12 @@ mkdir -p "$BUILD_DIR"
 #   - trashdrive.c and trashdrive_fatfs.c
 #   - FatFs's ff.c and ffsystem.c
 echo "05_shell: compiling host (with FatFs)..."
-$CC $CFLAGS \
+"$CC" "${CFLAGS[@]}" \
     -DHAVE_FATFS \
     -I"$FATFS_DIR" -I"$FATFS_SOURCE" \
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
-    $VM_CORE_SRCS \
+    "${VM_CORE_SRCS[@]}" \
     "$REPO_ROOT/src/vm/vm_host_fs.c" \
     "$REPO_ROOT/src/storage/trashdrive.c" \
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \
@@ -61,7 +61,7 @@ $CC $CFLAGS \
 # Build the guest.
 if have_guest_cc; then
     echo "05_shell: compiling guest (RV32IMC)..."
-    $GUEST_CC $GUEST_CFLAGS \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
         -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/shell.elf" \
         "$EXAMPLE_DIR/shell.c"

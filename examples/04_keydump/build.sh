@@ -42,17 +42,17 @@ mkdir -p "$BUILD_DIR"
 # Build the host application.
 # ---------------------------------------------------------------
 echo "04_keydump: compiling host..."
-$CC $CFLAGS \
+"$CC" "${CFLAGS[@]}" \
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
-    $VM_CORE_SRCS
+    "${VM_CORE_SRCS[@]}"
 
 # ---------------------------------------------------------------
 # Build the guest ELF (if the cross-compiler is available).
 # ---------------------------------------------------------------
 if have_guest_cc; then
     echo "04_keydump: compiling guest (RV32IMC)..."
-    $GUEST_CC $GUEST_CFLAGS \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
         -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/guest.elf" \
         "$EXAMPLE_DIR/guest.c"

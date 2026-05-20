@@ -25,18 +25,18 @@ esac
 mkdir -p "$BUILD_DIR"
 
 echo "03_mailbox: compiling host..."
-$CC $CFLAGS \
+"$CC" "${CFLAGS[@]}" \
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
-    $VM_CORE_SRCS
+    "${VM_CORE_SRCS[@]}"
 
 if have_guest_cc; then
     echo "03_mailbox: compiling producer (RV32IMC)..."
-    $GUEST_CC $GUEST_CFLAGS -Wl,-T,"$GUEST_LD" \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/producer.elf" "$EXAMPLE_DIR/producer.c"
 
     echo "03_mailbox: compiling consumer (RV32IMC)..."
-    $GUEST_CC $GUEST_CFLAGS -Wl,-T,"$GUEST_LD" \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/consumer.elf" "$EXAMPLE_DIR/consumer.c"
 else
     if [ -f "$BUILD_DIR/producer.elf" ] && [ -f "$BUILD_DIR/consumer.elf" ]; then

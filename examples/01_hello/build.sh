@@ -42,10 +42,10 @@ mkdir -p "$BUILD_DIR"
 # Build the host application.
 # ---------------------------------------------------------------
 echo "01_hello: compiling host..."
-$CC $CFLAGS \
+"$CC" "${CFLAGS[@]}" \
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
-    $VM_CORE_SRCS
+    "${VM_CORE_SRCS[@]}"
 
 # ---------------------------------------------------------------
 # Build the guest ELFs (if the cross-compiler is available).
@@ -60,25 +60,25 @@ $CC $CFLAGS \
 # ---------------------------------------------------------------
 if have_guest_cc; then
     echo "01_hello: compiling guest (RV32IMC)..."
-    $GUEST_CC $GUEST_CFLAGS \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
         -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/guest.elf" \
         "$EXAMPLE_DIR/guest.c"
 
     echo "01_hello: compiling guest_factorial..."
-    $GUEST_CC $GUEST_CFLAGS \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
         -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/guest_factorial.elf" \
         "$EXAMPLE_DIR/guest_factorial.c"
 
     echo "01_hello: compiling guest_squares..."
-    $GUEST_CC $GUEST_CFLAGS \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
         -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/guest_squares.elf" \
         "$EXAMPLE_DIR/guest_squares.c"
 
     echo "01_hello: compiling guest_minimal (test fixture)..."
-    $GUEST_CC $GUEST_CFLAGS \
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
         -Wl,-T,"$GUEST_LD" \
         -o "$BUILD_DIR/guest_minimal.elf" \
         "$EXAMPLE_DIR/guest_minimal.c"
