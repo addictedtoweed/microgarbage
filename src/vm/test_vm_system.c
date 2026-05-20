@@ -1086,11 +1086,18 @@ static void test_yield_until_reload_subsequent_cycles(void) {
 }
 
 static void test_yield_until_reload_catchup_skips_to_future(void) {
-    /* The crux of the FreeRTOS-style catch-up policy: if a slow
-     * frame leaves us multiple periods past the planned deadline,
-     * skip forward to the next FUTURE boundary rather than
-     * firing back-to-back. Phase preserved, missed frames
-     * dropped. */
+    /* If the guest is multiple periods past the deadline, the
+     * kernel skips ahead to the next FUTURE boundary and blocks
+     * until it. Phase preserved on the original tick grid;
+     * missed frames dropped cleanly (no rapid-fire catch-up).
+     *
+     * Earlier versions of this handler issued BLOCK_YIELDED in
+     * the "already past" case, which let the guest fire one
+     * catch-up frame back-to-back. That produced visible stutter
+     * on hosts where the OS scheduler is jittery: every late
+     * frame was followed by a too-fast one. The current
+     * implementation always BLOCK_SLEEPs until the next future
+     * boundary — same phase preservation, no visible burst. */
     VmSystem sys;
     VmCpu cpu;
     reload_setup(&sys, &cpu, 0);
@@ -1107,13 +1114,44 @@ static void test_yield_until_reload_catchup_skips_to_future(void) {
     cpu.regs[REG_A7] = 1048;
     vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
 
-    /* The current deadline (100) is past, so wake immediately
-     * via YIELDED. But reload_next_deadline should have been
-     * advanced past now: 100, 200, 300, 400 — first future is
-     * 400. */
-    ASSERT_EQ_INT((int)BLOCK_YIELDED, (int)cpu.block_reason);
-    ASSERT_EQ_INT(400, (int)cpu.reload_next_deadline);
-    ASSERT_EQ_INT(0, (int)cpu.regs[REG_A0]);
+    /* Sleep until the next future boundary: 100, 200, 300, 400
+     * — first future is 400. reload_next_deadline advances by
+     * one more period (500) so the call AFTER this targets it. */
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(400, (int)cpu.block_deadline);
+    ASSERT_EQ_INT(500, (int)cpu.reload_next_deadline);
+
+    vm_system_destroy(&sys);
+}
+
+static void test_yield_until_reload_small_overshoot_still_sleeps(void) {
+    /* Regression test for the 'goes fast' bug: when the host
+     * oversleeps by even a small amount (here 5 ticks past the
+     * 100-tick period), the kernel must still BLOCK_SLEEP until
+     * the next future boundary — NOT BLOCK_YIELDED, which would
+     * cause the guest to rapid-fire one extra frame and the
+     * user to perceive a stutter. */
+    VmSystem sys;
+    VmCpu cpu;
+    reload_setup(&sys, &cpu, 0);
+
+    cpu.regs[REG_A0] = 100;              /* period = 100 */
+    cpu.regs[REG_A7] = 1047;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+    /* reload_next_deadline = 100 */
+
+    /* Host slept 105 ticks instead of 100 — 5 ticks of slack. */
+    sys.sched->global_tick = 105;
+
+    cpu.regs[REG_A7] = 1048;
+    vm_ecall_dispatch(sys.ecall_router, &cpu, &sys);
+
+    /* Should sleep until 200, NOT yield. The 5-tick slack is
+     * absorbed into the next frame's deadline, which lands at
+     * the original-grid 200. */
+    ASSERT_EQ_INT((int)BLOCK_SLEEP, (int)cpu.block_reason);
+    ASSERT_EQ_INT(200, (int)cpu.block_deadline);
+    ASSERT_EQ_INT(300, (int)cpu.reload_next_deadline);
 
     vm_system_destroy(&sys);
 }
@@ -1220,6 +1258,7 @@ int main(void) {
     RUN(test_yield_until_reload_blocks_until_first_deadline);
     RUN(test_yield_until_reload_subsequent_cycles);
     RUN(test_yield_until_reload_catchup_skips_to_future);
+    RUN(test_yield_until_reload_small_overshoot_still_sleeps);
     RUN(test_yield_until_reload_without_period_yields);
     RUN(test_yield_until_reload_independent_of_sleep_until);
 

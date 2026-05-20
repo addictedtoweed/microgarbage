@@ -546,34 +546,36 @@ static void handle_yield_until_reload(VmCpu *cpu, void *system_p) {
     uint32_t deadline = cpu->reload_next_deadline;
     uint32_t period   = cpu->reload_period;
 
-    /* Compute the deadline AFTER this wake.
+    /* Find the next deadline that's STRICTLY in the future.
      *
-     * Start at deadline + period (the natural next boundary).
-     * If now is already past that — guest ran long — advance
-     * by full periods until the next deadline is in the
-     * future. Bounded loop: at a sane period (>= 1 tick) this
-     * iterates at most a handful of times even in a serious
-     * overrun. The 1024 cap is purely defensive against
-     * pathological inputs (host clock jump, period set to 1
-     * after sleeping a long time, etc.). */
-    uint32_t next = deadline + period;
+     * Why "in the future" rather than "advance by exactly one
+     * period": on real systems the host scheduler is jittery
+     * — Cygwin/Windows in particular can preempt the host
+     * process for hundreds of ms at a time. By the time we get
+     * here, `now` may already be well past `deadline`. We want
+     * the guest's next wake-up to land on a future tick boundary,
+     * which preserves phase but cleanly drops missed frames.
+     *
+     * Earlier versions of this handler had a separate "wake
+     * immediately if already past" branch (BLOCK_YIELDED). That
+     * caused visible stutter: any time the host overslept by
+     * even a few ms, the guest would rapid-fire ONE catch-up
+     * frame and then resume. From the user's POV, the snake
+     * would jump two cells back-to-back. The fix is to just
+     * always BLOCK_SLEEP until the next future boundary — no
+     * rapid-fire, no catch-up bursts. */
+    uint32_t next = deadline;
     int safety = 1024;
+    /* Advance while `next` is NOT strictly in the future. The
+     * <= comparison (via signed-subtract) catches both "already
+     * past" and "exactly at now". */
     while ((int32_t)(now - next) >= 0 && safety-- > 0) {
         next += period;
     }
-    cpu->reload_next_deadline = next;
+    cpu->reload_next_deadline = next + period;
 
-    /* If the CURRENT deadline (the one we were aiming at) is
-     * already in the past, the guest is late — wake right
-     * away on the next scheduler pass via BLOCK_YIELDED.
-     * Otherwise block until the deadline. */
-    if ((int32_t)(now - deadline) >= 0) {
-        cpu->regs[VM_REG_A0] = 0;
-        cpu->block_reason = BLOCK_YIELDED;
-    } else {
-        cpu->block_reason = BLOCK_SLEEP;
-        cpu->block_deadline = deadline;
-    }
+    cpu->block_reason = BLOCK_SLEEP;
+    cpu->block_deadline = next;
 }
 
 /* ============================================================
