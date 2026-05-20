@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 /* ============================================================
  *  File descriptor table
@@ -885,23 +886,70 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
 
     /* Pump the new VM until it halts. We step ONLY the spawned
      * VM — other VMs in the scheduler don't tick during this
-     * time, which keeps the model simple. */
+     * time, which keeps the model simple.
+     *
+     * We have to do a few things the main scheduler normally
+     * does on our behalf, because we're not going through
+     * vm_sched_step here:
+     *
+     *   - Refresh sys->sched->global_tick from the host tick
+     *     source each iteration, so the child's SYS_TICKS_NOW
+     *     sees forward progress and SYS_SLEEP_* deadlines can
+     *     actually be reached.
+     *   - Honor BLOCK_SLEEP / BLOCK_YIELDED: a child that calls
+     *     sys_sleep_until needs us to wait until its deadline
+     *     before stepping it again, otherwise the loop becomes
+     *     a busy-wait that never makes timing progress.
+     */
     VmCpu *child = sys->vms[lr.assigned_vm_id];
     if (!child) {
-        /* Shouldn't happen; load returned OK but slot is null. */
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
         return;
     }
 
+    VmSched *sched = sys->sched;
+
     while (!child->halted) {
+        /* Refresh global_tick from the host's tick source. */
+        if (sched->config.tick_source) {
+            sched->global_tick =
+                sched->config.tick_source(sched->config.tick_source_userdata);
+        }
+
+        /* If the child is blocked on a sleep, decide whether
+         * its deadline has been reached. We use the same
+         * wraparound-safe comparison the scheduler does. */
+        if (child->block_reason == BLOCK_SLEEP) {
+            uint32_t now = sched->global_tick;
+            uint32_t deadline = child->block_deadline;
+            if ((int32_t)(now - deadline) >= 0) {
+                /* Wake. */
+                child->block_reason = BLOCK_NONE;
+                child->block_deadline = 0;
+                child->regs[VM_REG_A0] = 0;
+            } else {
+                /* Still asleep. Yield briefly to the host (so
+                 * we don't pin a CPU) and re-check. With a
+                 * ms-granularity tick source, a nanosleep of
+                 * ~1 ms is the natural granularity. We use a
+                 * single 1 ms sleep regardless of how far the
+                 * deadline is — keeps the host responsive to
+                 * Ctrl-C without overshooting the deadline. */
+                struct timespec ts = { 0, 1000000L };   /* 1 ms */
+                nanosleep(&ts, NULL);
+                continue;
+            }
+        } else if (child->block_reason == BLOCK_YIELDED) {
+            /* YIELD is "wake on next pass" — just clear it
+             * and step. */
+            child->block_reason = BLOCK_NONE;
+            child->regs[VM_REG_A0] = 0;
+        }
+
         VmStepResult r = vm_step(child, 4096, NULL);
         if (r == VM_STEP_ECALL) {
-            vm_ecall_dispatch(sys->ecall_router, child, sys);
+            vm_ecall_dispatch(sched->config.ecall_router, child, sys);
         } else if (r == VM_STEP_TRAPPED) {
-            /* Treat any unhandled trap as a fatal exit. The
-             * child's halted flag isn't set automatically on
-             * trap (the host decides what to do); we choose to
-             * halt it. */
             child->halted = true;
             cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
             return;

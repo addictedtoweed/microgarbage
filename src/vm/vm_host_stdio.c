@@ -312,8 +312,20 @@ static void handle_read(VmCpu *cpu, void *system) {
     if (r > 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)r;
     } else if (r == 0) {
-        /* read() returning 0 means EOF (the other end closed). */
-        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO);
+        /* In cooked mode, read() == 0 means EOF (stdin closed).
+         * In raw mode with VMIN=0, read() == 0 means "no data
+         * ready right now" — NOT EOF. Same physical syscall,
+         * different semantics, distinguished only by the termios
+         * state we set up at install/toggle time.
+         *
+         * g_termios_saved tracks whether we're currently in raw
+         * mode (set true by enable_raw_mode, cleared by
+         * disable_raw_mode). Use it to disambiguate. */
+        if (g_termios_saved) {
+            cpu->regs[VM_REG_A0] = 0;            /* no data ready */
+        } else {
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO); /* EOF */
+        }
     } else {
         /* r < 0: errno tells us what happened. */
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {

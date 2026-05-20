@@ -381,10 +381,32 @@ void _start(void) {
     }
     place_food();
 
-    /* Game-loop pacing. tick_hz is 1000 on the PC host (1 ms).
-     * Period 120 ms gives a comfortable speed; tune to taste. */
+    /* Drain any stale input that was sitting in stdin before we
+     * entered raw mode (e.g., the Enter that submitted the 'run'
+     * command, or any keystrokes the user happened to type while
+     * the shell was launching us). Without this, a stray byte
+     * could be interpreted as 'q' and we'd exit immediately.
+     *
+     * Read for ~150 ms, discarding everything. The user's
+     * intended input starts after this grace window. */
     unsigned hz = sys_tick_hz();
     if (hz == 0) hz = 1000;            /* fallback: assume ms */
+    {
+        unsigned drain_until = sys_ticks_now() + (hz / 7);  /* ~150 ms */
+        char junk;
+        while ((int)(sys_ticks_now() - drain_until) < 0) {
+            while (sys_read(0, &junk, 1) > 0) { /* discard */ }
+            /* Small yield so we're not spinning at full speed */
+            register int a7 asm("a7") = SYS_YIELD;
+            asm volatile ("ecall" :: "r"(a7) : "memory");
+        }
+    }
+    /* Reset the escape state machine in case we partially drained
+     * a sequence. */
+    g_esc_state = 0;
+
+    /* Game-loop pacing. tick_hz is 1000 on the PC host (1 ms).
+     * Period 125 ms gives a comfortable speed; tune to taste. */
     unsigned period = hz / 8;           /* ~125 ms / frame */
     unsigned next = sys_ticks_now() + period;
 
