@@ -47,8 +47,13 @@
 #if defined(__CYGWIN__) || defined(_WIN32)
 #  define PIPE_MODE_SUPPORTED 1
 #  include <windows.h>
-#  include <io.h>          /* _open_osfhandle */
 #  include <fcntl.h>       /* O_RDWR */
+#  include <unistd.h>      /* close */
+#  if defined(__CYGWIN__)
+#    include <sys/cygwin.h>   /* cygwin_attach_handle_to_fd */
+#  else
+#    include <io.h>           /* _open_osfhandle on MSVC/MinGW */
+#  endif
 #endif
 
 /* ---------------------------------------------------------------
@@ -203,16 +208,35 @@ static FILE *open_named_pipe_for_stdio(const char *name) {
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Wrap the HANDLE in a POSIX fd, then in a FILE*. O_RDWR
-     * matches PIPE_ACCESS_DUPLEX. From this point the FILE* can
-     * be passed wherever the bridge expects stdin/stdout/stderr.
+    /* Wrap the HANDLE in a POSIX fd, then in a FILE*. From this
+     * point the FILE* can be passed wherever the bridge expects
+     * stdin/stdout/stderr.
      *
-     * Cygwin uses the POSIX-spelled O_RDWR (no underscore); the
-     * MSVC spelling _O_RDWR is unavailable here. _open_osfhandle
-     * itself keeps its Microsoft-namespaced name on Cygwin. */
+     * Two different APIs depending on the toolchain:
+     *
+     *   - Cygwin: cygwin_attach_handle_to_fd is the canonical
+     *     way to turn a Win32 HANDLE into a POSIX fd. The 'name'
+     *     argument is a label Cygwin will use in /proc/self/fd
+     *     listings — useful for debugging, ignored otherwise.
+     *     bin=1 means "binary mode" (no CRLF translation, which
+     *     is exactly right for a serial-style stream).
+     *
+     *   - MSVC / native MinGW: _open_osfhandle from <io.h> does
+     *     the same thing using Microsoft's CRT fd table.
+     *
+     * Both return -1 on error. */
+#if defined(__CYGWIN__)
+    int fd = cygwin_attach_handle_to_fd(
+        (char *)"/dev/pipe-microgarbage",   /* descriptive label */
+        -1,                                  /* let Cygwin pick fd */
+        g_pipe_handle,
+        1,                                   /* binary mode */
+        GENERIC_READ | GENERIC_WRITE);
+#else
     int fd = _open_osfhandle((intptr_t)g_pipe_handle, O_RDWR);
+#endif
     if (fd < 0) {
-        fprintf(stderr, "host: _open_osfhandle failed: %s\n",
+        fprintf(stderr, "host: handle-to-fd failed: %s\n",
                 strerror(errno));
         CloseHandle(g_pipe_handle);
         g_pipe_handle = INVALID_HANDLE_VALUE;
