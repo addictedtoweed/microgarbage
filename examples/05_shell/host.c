@@ -173,19 +173,40 @@ static HANDLE g_pipe_handle = INVALID_HANDLE_VALUE;
 
 static ssize_t pipe_cookie_read(void *cookie, char *buf, size_t size) {
     HANDLE h = (HANDLE)cookie;
-    /* The pipe is in PIPE_NOWAIT mode (see open_named_pipe_for_stdio
-     * below). In nonblocking mode ReadFile returns FALSE with
-     * GetLastError()==ERROR_NO_DATA when no bytes are available,
-     * which we translate to read-returned-zero — same semantics
-     * the bridge expects for a non-blocking stdin. */
-    DWORD got = 0;
-    if (!ReadFile(h, buf, (DWORD)size, &got, NULL)) {
+
+    /* Non-blocking read via PeekNamedPipe.
+     *
+     * We CAN'T put the pipe into PIPE_NOWAIT mode, because that
+     * affects the client side too — PuTTY's ReadFile would then
+     * also return immediately when no data is queued, which
+     * PuTTY interprets as EOF, causing it to disconnect. So we
+     * keep the pipe in blocking mode and use PeekNamedPipe to
+     * check the queue before each ReadFile.
+     *
+     * PeekNamedPipe returns the number of bytes currently in the
+     * pipe's read buffer without removing them. If that's zero,
+     * we report read-returned-0 (no data) without calling
+     * ReadFile (which would block). If it's nonzero, we
+     * ReadFile up to that many bytes — guaranteed not to block. */
+    DWORD avail = 0;
+    if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
         DWORD err = GetLastError();
-        if (err == ERROR_NO_DATA || err == ERROR_PIPE_LISTENING) {
-            return 0;
-        }
         if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
-            /* PuTTY closed the connection. Return 0 = EOF. */
+            return 0;          /* PuTTY closed → EOF */
+        }
+        errno = EIO;
+        return -1;
+    }
+    if (avail == 0) {
+        return 0;              /* No data available right now */
+    }
+
+    DWORD want = (DWORD)size;
+    if (want > avail) want = avail;
+    DWORD got = 0;
+    if (!ReadFile(h, buf, want, &got, NULL)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED) {
             return 0;
         }
         errno = EIO;
@@ -267,20 +288,12 @@ static FILE *open_named_pipe_for_stdio(const char *name) {
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Switch to non-blocking mode. The VM's SYS_READ is non-blocking
-     * (returns 0 if no data ready) and we want ReadFile to honor
-     * that. PIPE_NOWAIT makes ReadFile/WriteFile return immediately
-     * with ERROR_NO_DATA / written-0 if they'd otherwise have to
-     * wait. MSDN deprecates this for "real" async I/O but it's
-     * exactly right for our polled-I/O case. */
-    DWORD nowait = PIPE_NOWAIT | PIPE_READMODE_BYTE;
-    if (!SetNamedPipeHandleState(g_pipe_handle, &nowait, NULL, NULL)) {
-        fprintf(stderr, "host: SetNamedPipeHandleState failed (error %lu)\n",
-                (unsigned long)GetLastError());
-        CloseHandle(g_pipe_handle);
-        g_pipe_handle = INVALID_HANDLE_VALUE;
-        return NULL;
-    }
+    /* Note: pipe stays in blocking mode. We don't use PIPE_NOWAIT
+     * because that affects the CLIENT side too — PuTTY's ReadFile
+     * would return 0 bytes immediately when nothing's queued,
+     * which PuTTY interprets as EOF and disconnects. We do non-
+     * blocking reads on our side via PeekNamedPipe inside the
+     * read cookie. */
 
     /* Build a FILE* over the HANDLE.
      *
