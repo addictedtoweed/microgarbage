@@ -317,8 +317,14 @@ void _start(void) {
 
     /* TUI startup. Alt screen keeps the user's shell scrollback
      * pristine; raw mode disables echo and lets us see keypresses
-     * one at a time; hidden cursor cleans up the display. */
-    tui_init(TUI_USE_ALT_SCREEN | TUI_USE_RAW | TUI_HIDE_CURSOR);
+     * one at a time; hidden cursor cleans up the display.
+     *
+     * Canvas dimensions: 24 rows × 80 cols is the classic
+     * minimum. We use 22 rows × 50 cols to give the playfield
+     * border (16 rows × 42 cols) + chrome a comfortable home
+     * without spending bytes on terminal area we won't draw to. */
+    tui_init(TUI_USE_ALT_SCREEN | TUI_USE_RAW | TUI_HIDE_CURSOR,
+             22, 50);
 
     /* Initial snake: 4 cells, centered, heading right. */
     g_head_idx = 3;

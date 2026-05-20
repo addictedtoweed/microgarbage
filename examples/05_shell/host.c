@@ -64,7 +64,11 @@
  * --------------------------------------------------------------- */
 #define POOL_BYTES   (128 * 1024)
 #define SHARED_BYTES (64 * 1024)
-#define LOCAL_BYTES  (96 * 1024)
+/* LOCAL_BYTES is the per-VM-data bump arena. Each loaded guest
+ * (the shell itself + any spawned child) takes a slice of this.
+ * Shell + a TUI-using snake/tetris-class guest fits comfortably
+ * in 192 KB. Increase further if you spawn larger guests. */
+#define LOCAL_BYTES  (192 * 1024)
 
 static uint8_t g_pool[POOL_BYTES];
 static uint8_t g_shared[SHARED_BYTES];
@@ -564,6 +568,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "host: vm_host_install_fs failed\n");
         return 1;
     }
+
+    /* Bump the per-spawn data region from the 16 KB default. Guests
+     * that use the TUI library carry a back-buffered canvas + front
+     * buffer in BSS (each canvas is rows × cols × 6 bytes; 30 × 80
+     * defaults give ~14 KB per buffer = 28 KB), plus tile arena and
+     * library state — about 44 KB for snake. 64 KB gives that and
+     * leaves headroom. */
+    vm_host_fs_set_spawn_data_size(64 * 1024);
 
     /* 6b. Configure the /host mount. By default the shell can
      * read files under ./host_files/ as /host/<name>. Lets the
