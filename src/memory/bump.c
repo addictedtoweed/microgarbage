@@ -70,6 +70,16 @@ void bump_reset(BumpAllocator *b) {
     b->peak_offset = 0;
 }
 
+void bump_rewind_to(BumpAllocator *b, BumpMark mark) {
+    if (!b) return;
+    /* Guard against pathological inputs: never extend forward. */
+    if (mark > b->offset) return;
+    b->offset = mark;
+    /* peak_offset is preserved deliberately — diagnostics value
+     * for "what was the highest watermark we ever saw" survives
+     * rewinds, only bump_reset clears it. */
+}
+
 void *bump_alloc(BumpAllocator *b, size_t n) {
     return bump_alloc_aligned(b, n, BUMP_DEFAULT_ALIGNMENT);
 }

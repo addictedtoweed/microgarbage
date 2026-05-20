@@ -229,6 +229,99 @@ static void test_reset_clears_peak(void) {
 }
 
 /* ============================================================
+ *  Mark / rewind
+ *
+ *  Mark/rewind lets callers carve out a "transaction" — allocate
+ *  some stuff, then later either commit (do nothing) or roll
+ *  back (rewind to the saved mark). The spawn handler uses this
+ *  to reclaim a child VM's allocations on its halt.
+ * ============================================================ */
+
+static void test_mark_returns_current_offset(void) {
+    BumpAllocator b;
+    bump_init(&b, g_buf, sizeof(g_buf));
+    ASSERT_EQ_INT(0, (int)bump_mark(&b));
+    bump_alloc(&b, 100);
+    /* After a 100-byte alloc the offset has advanced by AT LEAST
+     * 100 (might be more due to alignment of subsequent allocs,
+     * but here we're the only allocator). */
+    BumpMark m = bump_mark(&b);
+    ASSERT(m >= 100);
+}
+
+static void test_rewind_drops_recent_allocs(void) {
+    BumpAllocator b;
+    bump_init(&b, g_buf, sizeof(g_buf));
+    bump_alloc(&b, 200);
+    BumpMark m = bump_mark(&b);
+    bump_alloc(&b, 500);
+    ASSERT(bump_used(&b) >= 700);
+    bump_rewind_to(&b, m);
+    ASSERT_EQ_INT((int)m, (int)bump_used(&b));
+}
+
+static void test_rewind_allows_reuse_of_freed_space(void) {
+    BumpAllocator b;
+    bump_init(&b, g_buf, sizeof(g_buf) /* 4 KB */);
+    BumpMark m = bump_mark(&b);
+    /* Allocate something large, then rewind, then allocate again. */
+    void *p1 = bump_alloc(&b, 2000);
+    ASSERT(p1 != NULL);
+    bump_rewind_to(&b, m);
+    void *p2 = bump_alloc(&b, 2000);
+    ASSERT(p2 != NULL);
+    /* The second allocation should reuse the same region. */
+    ASSERT(p1 == p2);
+}
+
+static void test_rewind_preserves_peak(void) {
+    BumpAllocator b;
+    bump_init(&b, g_buf, sizeof(g_buf));
+    BumpMark m = bump_mark(&b);
+    bump_alloc(&b, 1500);
+    size_t peak_before = bump_peak(&b);
+    ASSERT(peak_before >= 1500);
+    bump_rewind_to(&b, m);
+    /* Peak should NOT have rewound — diagnostics value of "what
+     * was the high-water mark we ever saw" survives rewinds. */
+    ASSERT_EQ_INT((int)peak_before, (int)bump_peak(&b));
+}
+
+static void test_rewind_to_future_offset_is_noop(void) {
+    BumpAllocator b;
+    bump_init(&b, g_buf, sizeof(g_buf));
+    bump_alloc(&b, 100);
+    BumpMark cur = bump_mark(&b);
+    /* Try to rewind to a position FORWARD of current — should
+     * never extend forward. */
+    bump_rewind_to(&b, cur + 1000);
+    ASSERT_EQ_INT((int)cur, (int)bump_used(&b));
+}
+
+static void test_rewind_nested_marks(void) {
+    /* Pattern that matches the spawn handler: a parent transaction
+     * containing a child transaction. Rewinding the child mark
+     * should not affect parent allocations. */
+    BumpAllocator b;
+    bump_init(&b, g_buf, sizeof(g_buf));
+
+    BumpMark outer = bump_mark(&b);
+    bump_alloc(&b, 100);     /* parent allocation */
+
+    BumpMark inner = bump_mark(&b);
+    bump_alloc(&b, 500);     /* child allocation */
+    ASSERT(bump_used(&b) >= 600);
+
+    bump_rewind_to(&b, inner);
+    /* Parent allocation still survives. */
+    ASSERT(bump_used(&b) >= 100);
+    ASSERT(bump_used(&b) < 600);
+
+    bump_rewind_to(&b, outer);
+    ASSERT_EQ_INT(0, (int)bump_used(&b));
+}
+
+/* ============================================================
  *  Peak tracking
  * ============================================================ */
 
@@ -377,6 +470,14 @@ int main(void) {
     RUN(test_reset_returns_position_to_zero);
     RUN(test_reset_allows_full_reuse);
     RUN(test_reset_clears_peak);
+
+    /* Mark / rewind */
+    RUN(test_mark_returns_current_offset);
+    RUN(test_rewind_drops_recent_allocs);
+    RUN(test_rewind_allows_reuse_of_freed_space);
+    RUN(test_rewind_preserves_peak);
+    RUN(test_rewind_to_future_offset_is_noop);
+    RUN(test_rewind_nested_marks);
 
     /* Peak tracking */
     RUN(test_peak_tracks_high_water_mark);

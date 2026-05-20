@@ -140,6 +140,21 @@ void bump_destroy(BumpAllocator *b);
  * lifetime peak, read it before reset. */
 void bump_reset(BumpAllocator *b);
 
+/* Save the current bump position as a mark. Returns the offset
+ * that can later be passed to bump_rewind_to() to discard all
+ * allocations made after this mark. */
+typedef size_t BumpMark;
+static inline BumpMark bump_mark(const BumpAllocator *b) {
+    return b ? b->offset : 0;
+}
+
+/* Rewind the bump position to a previously-saved mark. All
+ * pointers issued by bump_alloc after the mark are invalidated.
+ * If `mark` exceeds the current offset, behaves as a no-op
+ * (we never extend forward via this function). The peak_offset
+ * is preserved (not rewound) for diagnostics. */
+void bump_rewind_to(BumpAllocator *b, BumpMark mark);
+
 /* ============================================================
  *  Allocation
  *
