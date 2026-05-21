@@ -164,4 +164,49 @@ bool vm_host_stdio_set_raw_mode(bool enable);
  * future awareness. */
 int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap);
 
+/* ============================================================
+ *  Windows-specific hooks (implemented in vm_host_stdio_win32.c).
+ *
+ *  On non-Windows builds these are unused — vm_host_stdio.c
+ *  follows the POSIX path unconditionally. On Windows builds
+ *  vm_host_stdio.c calls into these helpers from the relevant
+ *  termios entry points; if they succeed, we have a Windows
+ *  console and the termios path is skipped. If they fail, we
+ *  fall back to termios (which works for Cygwin pty handles).
+ *
+ *  Host applications should call attach_console_if_native very
+ *  early in main() — before any printf — so output goes to a
+ *  visible console when the binary was launched from Explorer
+ *  or from a GUI shortcut without a parent console.
+ * ============================================================ */
+
+#ifdef _WIN32
+
+/* Attach to parent process console, or allocate a new one if
+ * there isn't a parent console. Rebinds stdin/stdout/stderr to
+ * the resulting console. Returns:
+ *    1 = attached or allocated
+ *    0 = a console was already attached, nothing done
+ *   -1 = no parent console AND AllocConsole failed */
+int  vm_host_stdio_win32_attach_console_if_native(void);
+
+/* Probe whether fd is a Windows console (as opposed to a Cygwin
+ * pty, pipe, file, etc.). */
+bool vm_host_stdio_win32_is_console(int fd);
+
+/* Switch the console attached to fd into raw VT-input mode.
+ * Returns false if fd isn't a Windows console — caller falls
+ * back to termios. */
+bool vm_host_stdio_win32_enable_raw_mode(int fd);
+
+/* Restore saved console mode from the most recent
+ * enable_raw_mode call. */
+bool vm_host_stdio_win32_disable_raw_mode(void);
+
+/* Non-blocking read from a Windows console handle. Returns
+ * bytes read (>= 0), or -1 on error. Returns 0 if no data ready. */
+int  vm_host_stdio_win32_read_bytes_nonblock(int fd, void *buf, unsigned cap);
+
+#endif /* _WIN32 */
+
 #endif /* VM_HOST_STDIO_H */

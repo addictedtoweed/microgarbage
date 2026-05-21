@@ -16,6 +16,7 @@
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
 #include "vm/vm_system.h"
+#include "vm/host_compat.h"
 
 #include "ff.h"
 
@@ -106,7 +107,7 @@ static void free_slot(FdSlot *s) {
  *            volume number.
  * ============================================================ */
 
-#define MAX_PATH 256
+#define VM_HOST_FS_MAX_PATH 256
 
 /* Mount table. M.3a supports up to VM_HOST_FS_MAX_MOUNTS entries
  * (default 8). The order of entries doesn't matter; lookup is by
@@ -210,7 +211,7 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
     if (cap < 16) return -VM_EINVAL;
 
     /* Stage 1: copy the raw guest path into a scratch buffer. */
-    char raw[MAX_PATH];
+    char raw[VM_HOST_FS_MAX_PATH];
     size_t raw_pos = 0;
     for (;;) {
         if (raw_pos >= sizeof(raw) - 1) return -VM_ENAMETOOLONG;
@@ -474,7 +475,7 @@ static void handle_openat(VmCpu *cpu, void *system) {
         return;
     }
 
-    char buf[MAX_PATH];
+    char buf[VM_HOST_FS_MAX_PATH];
     PathBackend backend;
     bool writable;
     int rp = resolve_guest_path(cpu, path, buf, sizeof(buf),
@@ -710,7 +711,7 @@ static void handle_mkdirat(VmCpu *cpu, void *system) {
         return;
     }
 
-    char buf[MAX_PATH];
+    char buf[VM_HOST_FS_MAX_PATH];
     int p = copy_path(cpu, path, buf, sizeof(buf));
     if (p < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)p;
@@ -738,7 +739,7 @@ static void handle_unlinkat(VmCpu *cpu, void *system) {
         return;
     }
 
-    char buf[MAX_PATH];
+    char buf[VM_HOST_FS_MAX_PATH];
     int p = copy_path(cpu, path, buf, sizeof(buf));
     if (p < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)p;
@@ -839,7 +840,7 @@ bool vm_host_fs_mount_host(const char *name, const char *root,
     if (!m) return false;                   /* table full */
 
     /* Copy the root path with trailing slash stripped. */
-    char tmp[MAX_PATH];
+    char tmp[VM_HOST_FS_MAX_PATH];
     size_t rlen = copy_and_strip_trailing_slashes(root, tmp, sizeof(tmp));
     if (rlen == 0) return false;
 
@@ -989,7 +990,7 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     VmSystem *sys = (VmSystem *)system;
     uint32_t path_addr = cpu->regs[VM_REG_A0];
 
-    char buf[MAX_PATH];
+    char buf[VM_HOST_FS_MAX_PATH];
     PathBackend backend;
     bool writable;
     int rp = resolve_guest_path(cpu, path_addr, buf, sizeof(buf),

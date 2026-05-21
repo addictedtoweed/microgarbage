@@ -17,9 +17,47 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <termios.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* POSIX termios is the raw-mode API on Linux/macOS/Cygwin. On
+ * mingw (native Windows) the header doesn't exist and raw mode
+ * goes through vm_host_stdio_win32_enable_raw_mode instead. */
+#ifndef _WIN32
+#include <termios.h>
+#else
+/* Stub the termios bits enough that the rest of the file can
+ * stay structurally the same. The fields we use are
+ *   tcflag_t, struct termios, tcsetattr, tcgetattr, etc.
+ * — none of these are ever called on _WIN32 builds because
+ * enable_raw_mode short-circuits to the Win32 path before
+ * reaching them. We provide minimal stand-ins for declarations
+ * only so the file compiles. */
+typedef unsigned int tcflag_t;
+struct termios {
+    tcflag_t c_iflag;
+    tcflag_t c_oflag;
+    tcflag_t c_cflag;
+    tcflag_t c_lflag;
+    char     c_cc[32];
+};
+#define ICRNL 0
+#define IXON 0
+#define BRKINT 0
+#define INPCK 0
+#define ISTRIP 0
+#define ECHO 0
+#define ICANON 0
+#define ISIG 0
+#define IEXTEN 0
+#define VMIN 0
+#define VTIME 1
+#define TCSAFLUSH 0
+static inline int tcgetattr(int fd, struct termios *t) { (void)fd; (void)t; return -1; }
+static inline int tcsetattr(int fd, int act, const struct termios *t) {
+    (void)fd; (void)act; (void)t; return -1;
+}
+#endif
 
 /* ============================================================
  *  Module state
@@ -85,19 +123,51 @@ static bool          g_termios_saved = false;
 static struct termios g_termios_orig;
 static int           g_termios_fd = -1;
 
+/* On Windows builds, true if we successfully enabled raw mode
+ * via the Win32 console API path. Mutually exclusive with
+ * g_termios_saved — only one of the two paths is in effect at
+ * a time. */
+#ifdef _WIN32
+static bool g_win32_raw_active = false;
+#endif
+
 /* atexit hook: restore the saved termios so the user's shell
- * isn't left in raw mode after we exit. */
+ * isn't left in raw mode after we exit. Also restores the
+ * Windows console mode if that path was used. */
 static void restore_termios_atexit(void) {
     if (g_termios_saved && g_termios_fd >= 0) {
         tcsetattr(g_termios_fd, TCSAFLUSH, &g_termios_orig);
         g_termios_saved = false;
     }
+#ifdef _WIN32
+    if (g_win32_raw_active) {
+        vm_host_stdio_win32_disable_raw_mode();
+        g_win32_raw_active = false;
+    }
+#endif
 }
 
 /* Put the given fd into raw mode, saving its current termios for
  * later restore. Returns true if anything was changed (so the
- * atexit hook should run), false if the fd is not a tty. */
+ * atexit hook should run), false if the fd is not a tty.
+ *
+ * On Windows builds, this first tries the Win32 console API
+ * (via vm_host_stdio_win32_enable_raw_mode). If the fd is a real
+ * Windows console handle, that takes care of things. Otherwise
+ * (Cygwin pty, Linux tty), we fall through to the termios path
+ * below. */
 static bool enable_raw_mode(int fd) {
+#ifdef _WIN32
+    if (vm_host_stdio_win32_enable_raw_mode(fd)) {
+        /* Mark as if we set raw mode so disable_raw_mode runs
+         * the Win32 restore path. g_termios_saved stays false
+         * so we don't try to tcsetattr a non-tty. We use a
+         * dedicated flag to disambiguate. */
+        g_win32_raw_active = true;
+        atexit(restore_termios_atexit);
+        return true;
+    }
+#endif
     if (!isatty(fd)) return false;
 
     struct termios raw;
@@ -130,10 +200,17 @@ static bool enable_raw_mode(int fd) {
     return true;
 }
 
-/* Restore the saved termios. Returns true if anything changed
- * (i.e., we were previously in raw mode), false if there was
- * no saved state to restore. */
+/* Restore the saved termios (or Win32 console state). Returns
+ * true if anything changed (i.e., we were previously in raw
+ * mode via either path), false if there was no saved state. */
 static bool disable_raw_mode(void) {
+#ifdef _WIN32
+    if (g_win32_raw_active) {
+        vm_host_stdio_win32_disable_raw_mode();
+        g_win32_raw_active = false;
+        return true;
+    }
+#endif
     if (!g_termios_saved || g_termios_fd < 0) return false;
     tcsetattr(g_termios_fd, TCSAFLUSH, &g_termios_orig);
     g_termios_saved = false;
@@ -145,14 +222,28 @@ static bool disable_raw_mode(void) {
 
 /* Public: toggle raw mode on the previously-installed stdin
  * fd. Used by SYS_TTY_SET_RAW. Returns true on success, false
- * if the fd is not a tty or no stdio was installed. */
+ * if the fd is not a tty / Windows console or no stdio was
+ * installed. */
 bool vm_host_stdio_set_raw_mode(bool enable) {
     if (!g_in_file) return false;
     int fd = fileno(g_in_file);
-    if (fd < 0 || !isatty(fd)) return false;
+    if (fd < 0) return false;
+
+#ifdef _WIN32
+    /* On Windows we accept the fd if either isatty() says yes
+     * (Cygwin pty) OR it's a real Windows console. */
+    bool ok = isatty(fd) || vm_host_stdio_win32_is_console(fd);
+    if (!ok) return false;
+#else
+    if (!isatty(fd)) return false;
+#endif
 
     if (enable) {
-        if (g_termios_saved) return true;   /* already raw */
+        if (g_termios_saved
+#ifdef _WIN32
+            || g_win32_raw_active
+#endif
+            ) return true;   /* already raw */
         return enable_raw_mode(fd);
     } else {
         return disable_raw_mode();
@@ -163,6 +254,17 @@ int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap) {
     if (!g_in_file || cap == 0) return 0;
     int src_fd = (g_in_fd >= 0) ? g_in_fd : fileno(g_in_file);
     if (src_fd < 0) return -1;
+
+#ifdef _WIN32
+    /* On Windows console handles, the POSIX read() / O_NONBLOCK
+     * combo doesn't always behave; use the Win32 console reader
+     * for those, fall through to POSIX read for Cygwin ptys and
+     * pipes. */
+    if (g_win32_raw_active) {
+        return vm_host_stdio_win32_read_bytes_nonblock(src_fd, buf, cap);
+    }
+#endif
+
     ssize_t r = read(src_fd, buf, cap);
     if (r > 0) return (int)r;
     if (r == 0) return 0;        /* no data / EOF — caller doesn't care which */
@@ -171,12 +273,23 @@ int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap) {
     return -1;
 }
 
-/* Set O_NONBLOCK on a fd. Returns 0 on success, -1 on failure. */
+/* Set O_NONBLOCK on a fd. Returns 0 on success, -1 on failure.
+ *
+ * On _WIN32 builds, fcntl/F_GETFL/O_NONBLOCK don't exist. The
+ * Win32 path doesn't need this — Windows console reads are
+ * gated by WaitForSingleObject in vm_host_stdio_win32_read_*
+ * rather than by non-blocking file flags. So we make this a
+ * no-op on Windows. */
 static int set_nonblock(int fd) {
+#ifdef _WIN32
+    (void)fd;
+    return 0;
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
     return 0;
+#endif
 }
 
 /* ============================================================
@@ -473,22 +586,31 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
         set_nonblock(in_fd);
     }
 
-    /* Raw mode (tty only). enable_raw_mode is a no-op for non-tty
-     * fds, returning false silently. We DO want to know when raw
-     * was requested but couldn't be set — that's the most common
-     * Cygwin/Windows-console headache. Print one diagnostic line
-     * so the user understands why their game's mouse events are
-     * echoing into the shell. */
+    /* Raw mode. enable_raw_mode tries Win32 console mode first
+     * (on _WIN32 builds), then falls back to termios for Cygwin
+     * pty / Linux tty handles. If neither works the fd isn't a
+     * usable terminal at all. */
     if (raw && in_fd >= 0) {
         if (!enable_raw_mode(in_fd)) {
-            const char *why = isatty(in_fd) ? "tcgetattr failed" : "not a tty";
+            const char *why;
+#ifdef _WIN32
+            if (vm_host_stdio_win32_is_console(in_fd)) {
+                why = "Windows SetConsoleMode failed";
+            } else if (isatty(in_fd)) {
+                why = "tcgetattr failed";
+            } else {
+                why = "not a tty or console";
+            }
+#else
+            why = isatty(in_fd) ? "tcgetattr failed" : "not a tty";
+#endif
             fprintf(stderr,
                 "host: raw mode requested but unavailable on stdin "
                 "(fd=%d, %s).\n"
                 "      Interactive features may behave oddly. Try "
                 "launching\n"
-                "      from mintty (cygwin terminal) or use "
-                "'set raw-mode false' in vm.cfg.\n",
+                "      from a real terminal (mintty / Windows Terminal /\n"
+                "      cmd) or use 'set raw-mode false' in vm.cfg.\n",
                 in_fd, why);
         }
     }

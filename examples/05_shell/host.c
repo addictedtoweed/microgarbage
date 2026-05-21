@@ -49,9 +49,25 @@
 #include <sys/types.h>
 #include <time.h>
 
+#include "vm/host_compat.h"
+
 #if defined(__CYGWIN__) || defined(_WIN32)
 #  define PIPE_MODE_SUPPORTED 1
 #  include <windows.h>
+#endif
+
+/* mkdir is single-arg on mingw (Windows doesn't have a permissions
+ * concept that maps to a Unix mode). Wrapper to keep the call sites
+ * portable. */
+#ifdef _WIN32
+static int host_mkdir(const char *path, int mode) {
+    (void)mode;
+    return mkdir(path);
+}
+#else
+static int host_mkdir(const char *path, int mode) {
+    return mkdir(path, (mode_t)mode);
+}
 #endif
 
 /* ---------------------------------------------------------------
@@ -752,6 +768,15 @@ static bool setup_pipe_transport(VmSystem *sys, const char *name) {
 #endif  /* PIPE_MODE_SUPPORTED */
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* If we were launched without a console attached (e.g. as
+     * a GUI-subsystem binary from Explorer, or as a mingw
+     * console binary with stdin/out somehow detached), attach
+     * to the parent's console or allocate a fresh one. This
+     * keeps double-click usable and means a native Windows
+     * binary launched from cmd doesn't pop an extra window. */
+    vm_host_stdio_win32_attach_console_if_native();
+#endif
     /* ----- Parse args -----
      *
      * Usage: host [options] [shell.elf]
@@ -917,9 +942,15 @@ int main(int argc, char **argv) {
     }
 #endif
 
+#ifdef _WIN32
+    /* mingw doesn't have struct sigaction. Use the simpler
+     * signal() ANSI API; SIGINT is what we care about (Ctrl-C). */
+    signal(SIGINT, on_sigint);
+#else
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
     sigaction(SIGINT, &sa, NULL);
+#endif
 
     /* 1. Initialize the block device. */
     if (trash_init(&g_drive, g_pool, sizeof(g_pool)) != TRASH_OK) {
@@ -1099,7 +1130,7 @@ int main(int argc, char **argv) {
         if (!host_fs_disabled) {
             struct stat st;
             if (stat(host_fs_root, &st) != 0) {
-                if (mkdir(host_fs_root, 0755) != 0) {
+                if (host_mkdir(host_fs_root, 0755) != 0) {
                     fprintf(stderr, "host: warning — could not create '%s' "
                             "for /drives/host mount: %s\n",
                             host_fs_root, strerror(errno));
@@ -1152,7 +1183,7 @@ int main(int argc, char **argv) {
                 }
                 struct stat st;
                 if (stat(m->path, &st) != 0) {
-                    if (mkdir(m->path, 0755) != 0) {
+                    if (host_mkdir(m->path, 0755) != 0) {
                         fprintf(stderr, "host: vm.cfg: [mount.%s] "
                                 "cannot create '%s': %s\n",
                                 m->name, m->path, strerror(errno));
