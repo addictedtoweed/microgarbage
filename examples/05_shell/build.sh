@@ -46,7 +46,14 @@ mkdir -p "$BUILD_DIR"
 #     vm_host_fs is added below)
 #   - trashdrive.c and trashdrive_fatfs.c
 #   - FatFs's ff.c and ffsystem.c
+#   - On native Windows: -lws2_32 for the TCP transport's WinSock
+#     calls. Linux/Cygwin pull BSD sockets from libc; no extra
+#     library needed.
 echo "05_shell: compiling host (with FatFs)..."
+HOST_LIBS=()
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*) HOST_LIBS+=(-lws2_32) ;;
+esac
 "$CC" "${CFLAGS[@]}" \
     -DHAVE_FATFS \
     -I"$FATFS_DIR" -I"$FATFS_SOURCE" \
@@ -58,7 +65,8 @@ echo "05_shell: compiling host (with FatFs)..."
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \
     "$REPO_ROOT/src/util/inicfg.c" \
     "$FATFS_DIR/ff_wrapped.c" \
-    "$FATFS_SOURCE/ffsystem.c"
+    "$FATFS_SOURCE/ffsystem.c" \
+    "${HOST_LIBS[@]}"
 
 # Build the guest.
 if have_guest_cc; then

@@ -33,6 +33,24 @@
 #  define _DEFAULT_SOURCE
 #endif
 
+/* On native Windows: winsock2.h MUST be included before windows.h
+ * (windows.h pulls in winsock.h v1 which conflicts with v2). We
+ * pre-include winsock2 unconditionally on _WIN32 — before any
+ * project header that might transitively pull in <windows.h> —
+ * so the v2 API wins. Cygwin is exempt: it uses BSD sockets
+ * (in the POSIX block further down). */
+#if defined(_WIN32) && !defined(__CYGWIN__)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+typedef SOCKET tcp_sock_t;
+#  define TCP_SOCK_INVALID INVALID_SOCKET
+#  define TCP_SOCK_ERROR   SOCKET_ERROR
+#  define tcp_close(s)     closesocket(s)
+#  define tcp_last_errno() WSAGetLastError()
+#  define TCP_WOULDBLOCK   WSAEWOULDBLOCK
+#  define TCP_MODE_SUPPORTED 1
+#endif
+
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_transport.h"
@@ -74,6 +92,22 @@
 #  include <fcntl.h>
 #  include <termios.h>
 #  include <sys/ioctl.h>
+#endif
+
+/* TCP transport on POSIX systems (already configured above on
+ * native Windows). */
+#if !defined(_WIN32) || defined(__CYGWIN__)
+#  define TCP_MODE_SUPPORTED 1
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
+typedef int tcp_sock_t;
+#  define TCP_SOCK_INVALID (-1)
+#  define TCP_SOCK_ERROR   (-1)
+#  define tcp_close(s)     close(s)
+#  define tcp_last_errno() errno
+#  define TCP_WOULDBLOCK   EAGAIN
 #endif
 
 /* mkdir is single-arg on mingw (Windows doesn't have a permissions
@@ -912,6 +946,239 @@ static bool setup_pty_transport(VmSystem *sys) {
 }
 #endif  /* PTY_MODE_SUPPORTED */
 
+#ifdef TCP_MODE_SUPPORTED
+/* ============================================================
+ *  TCP transport (round U.4)
+ *
+ *  Listens on a TCP port; on the first connection, that socket
+ *  becomes the transport's read/write target. Single-session
+ *  for now (U.6 extends to N parallel sessions).
+ *
+ *  Useful for:
+ *    - PC/Pi demo hosts: connect via `nc localhost 5678` or
+ *      `telnet localhost 5678` from any machine on the LAN.
+ *    - Headless servers: launch the host, connect remotely.
+ *    - Future Ethernet on STM32: same transport, just compiled
+ *      against lwIP's BSD-sockets layer instead of libc's.
+ *
+ *  Compared to pipe / pty:
+ *    - Network-addressable (not just same-machine).
+ *    - No TTY semantics: the client provides its own line
+ *      discipline. set_raw is a no-op.
+ *    - Cross-platform: native Linux and native Windows.
+ *
+ *  Same LF→CRLF write policy as the other transports: lone
+ *  '\\n' gets a '\\r' inserted, explicit '\\r\\n' passes through.
+ *  Telnet clients expect CRLF; raw nc clients don't care
+ *  either way.
+ * ============================================================ */
+
+static tcp_sock_t g_tcp_listen_fd = TCP_SOCK_INVALID;
+static tcp_sock_t g_tcp_client_fd = TCP_SOCK_INVALID;
+
+static int tcp_t_read(VmHostTransport *t, void *buf, unsigned cap) {
+    (void)t;
+    if (g_tcp_client_fd == TCP_SOCK_INVALID) return -5;
+    if (cap == 0) return 0;
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    int r = recv(g_tcp_client_fd, (char *)buf, (int)cap, 0);
+#else
+    ssize_t r = recv(g_tcp_client_fd, buf, cap, 0);
+#endif
+    if (r > 0) return (int)r;
+    if (r == 0) return 0;   /* client closed (or 0-byte send) */
+    int err = tcp_last_errno();
+    if (err == TCP_WOULDBLOCK) return 0;
+#if !defined(_WIN32) || defined(__CYGWIN__)
+    if (err == EINTR) return 0;
+#endif
+    return -5;
+}
+
+static int tcp_t_write(VmHostTransport *t, const void *buf, unsigned n) {
+    (void)t;
+    if (g_tcp_client_fd == TCP_SOCK_INVALID) return -5;
+    static int prev_was_cr = 0;
+    const char *p = (const char *)buf;
+    unsigned total_in = 0;
+    size_t run_start = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = p[i];
+        if (c == '\n' && !prev_was_cr) {
+            if (i > run_start) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+                int w = send(g_tcp_client_fd, p + run_start,
+                             (int)(i - run_start), 0);
+#else
+                ssize_t w = send(g_tcp_client_fd, p + run_start,
+                                 i - run_start, 0);
+#endif
+                if (w < 0 && tcp_last_errno() != TCP_WOULDBLOCK) return -5;
+            }
+#if defined(_WIN32) && !defined(__CYGWIN__)
+            int w2 = send(g_tcp_client_fd, "\r\n", 2, 0);
+#else
+            ssize_t w2 = send(g_tcp_client_fd, "\r\n", 2, 0);
+#endif
+            if (w2 < 0 && tcp_last_errno() != TCP_WOULDBLOCK) return -5;
+            total_in += 1;
+            run_start = i + 1;
+            prev_was_cr = 0;
+            continue;
+        }
+        prev_was_cr = (c == '\r');
+    }
+    if (run_start < n) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+        int w = send(g_tcp_client_fd, p + run_start,
+                     (int)(n - run_start), 0);
+#else
+        ssize_t w = send(g_tcp_client_fd, p + run_start,
+                         n - run_start, 0);
+#endif
+        if (w < 0 && tcp_last_errno() != TCP_WOULDBLOCK) return -5;
+        total_in += (unsigned)(n - run_start);
+    }
+    return (int)total_in;
+}
+
+static int tcp_t_flush(VmHostTransport *t) {
+    (void)t;
+    /* send() goes straight to the kernel socket buffer; no app-
+     * level buffering to flush. Nagle is controlled separately
+     * via TCP_NODELAY (set at connect time). */
+    return 0;
+}
+
+static int tcp_t_set_raw(VmHostTransport *t, bool enable) {
+    (void)t; (void)enable;
+    /* TCP has no line discipline. The client decides what to do
+     * with bytes; we just pass them through. */
+    return 0;
+}
+
+static void tcp_t_close(VmHostTransport *t) {
+    (void)t;
+    if (g_tcp_client_fd != TCP_SOCK_INVALID) {
+        tcp_close(g_tcp_client_fd);
+        g_tcp_client_fd = TCP_SOCK_INVALID;
+    }
+    if (g_tcp_listen_fd != TCP_SOCK_INVALID) {
+        tcp_close(g_tcp_listen_fd);
+        g_tcp_listen_fd = TCP_SOCK_INVALID;
+    }
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    WSACleanup();
+#endif
+}
+
+static VmHostTransport g_tcp_transport = {
+    .read_nonblock = tcp_t_read,
+    .write         = tcp_t_write,
+    .flush         = tcp_t_flush,
+    .set_raw       = tcp_t_set_raw,
+    .close         = tcp_t_close,
+    .is_terminal   = true,
+    .ctx           = NULL,
+};
+
+/* Set the given socket to non-blocking mode. Returns 0 on
+ * success, -1 on failure. */
+static int tcp_set_nonblock(tcp_sock_t s) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    u_long mode = 1;
+    return (ioctlsocket(s, FIONBIO, &mode) == 0) ? 0 : -1;
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return (fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0) ? 0 : -1;
+#endif
+}
+
+/* Listen on TCP port, wait for the first connection, install
+ * stdio + transport. */
+static bool setup_tcp_transport(VmSystem *sys, int port) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "host: WSAStartup failed\n");
+        return false;
+    }
+#endif
+
+    tcp_sock_t lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd == TCP_SOCK_INVALID) {
+        fprintf(stderr, "host: socket() failed\n");
+        return false;
+    }
+    /* SO_REUSEADDR so quick restarts don't hit TIME_WAIT. */
+    int yes = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == TCP_SOCK_ERROR) {
+        fprintf(stderr, "host: bind(port=%d) failed\n", port);
+        tcp_close(lfd);
+        return false;
+    }
+    if (listen(lfd, 1) == TCP_SOCK_ERROR) {
+        fprintf(stderr, "host: listen() failed\n");
+        tcp_close(lfd);
+        return false;
+    }
+    g_tcp_listen_fd = lfd;
+
+    fprintf(stderr, "host: listening on TCP port %d\n", port);
+    fprintf(stderr, "host: connect with: nc localhost %d   "
+                    "(or telnet/PuTTY raw)\n", port);
+    fprintf(stderr, "host: waiting for client ...\n");
+    fflush(stderr);
+
+    /* Blocking accept — we want the first connection before the
+     * shell starts. */
+    struct sockaddr_in cli;
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    int cli_len = sizeof(cli);
+#else
+    socklen_t cli_len = sizeof(cli);
+#endif
+    tcp_sock_t cfd = accept(lfd, (struct sockaddr *)&cli, &cli_len);
+    if (cfd == TCP_SOCK_INVALID) {
+        fprintf(stderr, "host: accept() failed\n");
+        tcp_close(lfd);
+        g_tcp_listen_fd = TCP_SOCK_INVALID;
+        return false;
+    }
+
+    /* Disable Nagle for low-latency interactive use. */
+    int nodelay = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
+               (const char *)&nodelay, sizeof(nodelay));
+    /* Non-blocking so read_nonblock works. */
+    tcp_set_nonblock(cfd);
+
+    g_tcp_client_fd = cfd;
+    fprintf(stderr, "host: client connected from %s:%d\n",
+            inet_ntoa(cli.sin_addr),
+            (int)ntohs(cli.sin_port));
+    fflush(stderr);
+
+    VmHostStdioConfig sio = {0};
+    sio.raw_mode = false;
+    if (!vm_host_install_stdio_ex(sys, &sio)) {
+        fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
+        return false;
+    }
+    vm_host_set_transport(&g_tcp_transport);
+
+    return true;
+}
+#endif  /* TCP_MODE_SUPPORTED */
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     /* If we were launched without a console attached (e.g. as
@@ -960,6 +1227,7 @@ int main(int argc, char **argv) {
     bool host_fs_disabled    = false;
     const char *pipe_name    = NULL;
     bool        want_pty     = false;
+    int         tcp_port     = -1;
     const char *cfg_path     = NULL;
     bool        no_config    = false;
 
@@ -1008,6 +1276,13 @@ int main(int argc, char **argv) {
             pipe_name = argv[i] + 7;
         } else if (strcmp(argv[i], "--pty") == 0) {
             want_pty = true;
+        } else if (strncmp(argv[i], "--tcp=", 6) == 0) {
+            long p = strtol(argv[i] + 6, NULL, 10);
+            if (p < 1 || p > 65535) {
+                fprintf(stderr, "host: --tcp port out of range (1..65535)\n");
+                return 1;
+            }
+            tcp_port = (int)p;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
             fprintf(stderr, "  --config=<path>     load config from <path>\n");
@@ -1022,6 +1297,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  --no-host-fs        disable /host mount\n");
             fprintf(stderr, "  --pipe=<name>       route stdio through a named pipe (Windows)\n");
             fprintf(stderr, "  --pty               route stdio through a POSIX pty (Linux/Cygwin)\n");
+            fprintf(stderr, "  --tcp=<port>        listen on TCP port; first client gets the shell\n");
             return 1;
         } else if (!elf_path) {
             elf_path = argv[i];
@@ -1100,6 +1376,17 @@ int main(int argc, char **argv) {
     if (pipe_name && want_pty) {
         fprintf(stderr, "host: --pipe and --pty are mutually exclusive\n");
         return 1;
+    }
+    {
+        int transports_chosen = 0;
+        if (pipe_name) transports_chosen++;
+        if (want_pty)  transports_chosen++;
+        if (tcp_port >= 0) transports_chosen++;
+        if (transports_chosen > 1) {
+            fprintf(stderr, "host: only one of --pipe / --pty / --tcp "
+                            "can be used at a time (for now)\n");
+            return 1;
+        }
     }
 
 #ifdef _WIN32
@@ -1229,6 +1516,10 @@ int main(int argc, char **argv) {
         /* unreachable — we checked above */
         return 1;
 #endif
+    } else if (tcp_port >= 0) {
+        if (!setup_tcp_transport(&sys, tcp_port)) {
+            return 1;
+        }
     } else {
         VmHostStdioConfig sio = {0};
         sio.raw_mode = hc.raw_mode;
