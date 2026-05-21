@@ -308,6 +308,127 @@ static void test_release_for_vm(void) {
     fixture_teardown();
 }
 
+/* ============================================================
+ *  Input parser tests
+ *
+ *  Use the test-only injection hook to feed bytes into the
+ *  input ring without going through real stdin.
+ * ============================================================ */
+
+extern unsigned vm_host_tui_test_inject_input_(const void *bytes, unsigned n);
+
+static void test_poll_event_printable_ascii(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+
+    vm_host_tui_test_inject_input_("q", 1);
+    uint32_t evp = 0x80000000u;
+    int32_t r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    VmTuiEventRecord *ev = (VmTuiEventRecord *)g_data;
+    ASSERT_EQ_INT(VM_TUI_EVK_KEY, ev->kind);
+    ASSERT_EQ_INT('q', ev->key);
+
+    /* Second poll: no event */
+    r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(0, r);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_poll_event_enter(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+
+    vm_host_tui_test_inject_input_("\r", 1);
+    uint32_t evp = 0x80000000u;
+    int32_t r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    VmTuiEventRecord *ev = (VmTuiEventRecord *)g_data;
+    ASSERT_EQ_INT(VM_TUI_KEY_ENTER, ev->key);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_poll_event_arrow_keys(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+
+    /* CSI A = up arrow. Send "\x1b[A". */
+    vm_host_tui_test_inject_input_("\x1b[A", 3);
+    uint32_t evp = 0x80000000u;
+    int32_t r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    VmTuiEventRecord *ev = (VmTuiEventRecord *)g_data;
+    ASSERT_EQ_INT(VM_TUI_KEY_UP, ev->key);
+
+    /* CSI B = down. */
+    vm_host_tui_test_inject_input_("\x1b[B", 3);
+    r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    ASSERT_EQ_INT(VM_TUI_KEY_DOWN, ev->key);
+
+    /* CSI C = right. */
+    vm_host_tui_test_inject_input_("\x1b[C", 3);
+    r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    ASSERT_EQ_INT(VM_TUI_KEY_RIGHT, ev->key);
+
+    /* CSI D = left. */
+    vm_host_tui_test_inject_input_("\x1b[D", 3);
+    r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    ASSERT_EQ_INT(VM_TUI_KEY_LEFT, ev->key);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_poll_event_sgr_mouse(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 20, 80, 0);
+
+    /* SGR mouse press: CSI < 0 ; 5 ; 10 M
+     * button=0 (left), col=5, row=10, final 'M' = press */
+    vm_host_tui_test_inject_input_("\x1b[<0;5;10M", 10);
+    uint32_t evp = 0x80000000u;
+    int32_t r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    VmTuiEventRecord *ev = (VmTuiEventRecord *)g_data;
+    ASSERT_EQ_INT(VM_TUI_EVK_MOUSE, ev->kind);
+    ASSERT_EQ_INT(VM_TUI_MB_LEFT, ev->button);
+    ASSERT_EQ_INT(10, ev->row);
+    ASSERT_EQ_INT(5,  ev->col);
+    ASSERT(ev->flags & VM_TUI_EVF_PRESS);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_poll_event_function_keys(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 20, 80, 0);
+
+    /* F1 via SS3: ESC O P */
+    vm_host_tui_test_inject_input_("\x1bOP", 3);
+    uint32_t evp = 0x80000000u;
+    int32_t r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    VmTuiEventRecord *ev = (VmTuiEventRecord *)g_data;
+    ASSERT_EQ_INT(VM_TUI_KEY_F1, ev->key);
+
+    /* F5 via CSI ~: ESC [ 1 5 ~ */
+    vm_host_tui_test_inject_input_("\x1b[15~", 5);
+    r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    ASSERT_EQ_INT(VM_TUI_KEY_F1 + 4, ev->key);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
 int main(void) {
     TEST_SUITE("vm_host_tui");
     RUN(test_init_shutdown);
@@ -319,5 +440,10 @@ int main(void) {
     RUN(test_flush_draw_rejects_oversize);
     RUN(test_present_without_init_returns_ebusy);
     RUN(test_release_for_vm);
+    RUN(test_poll_event_printable_ascii);
+    RUN(test_poll_event_enter);
+    RUN(test_poll_event_arrow_keys);
+    RUN(test_poll_event_sgr_mouse);
+    RUN(test_poll_event_function_keys);
     return TEST_SUITE_RESULT();
 }

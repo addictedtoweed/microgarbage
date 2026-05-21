@@ -150,4 +150,18 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
  * toggles, so a guest can flip raw on/off many times. */
 bool vm_host_stdio_set_raw_mode(bool enable);
 
+/* Read up to `cap` bytes from the installed stdin fd into `buf`,
+ * non-blocking. Returns the number of bytes read, 0 if nothing
+ * is available, or -1 on error / no stdio installed.
+ *
+ * Used by the TUI input parser (vm_host_tui) to consume bytes
+ * without going through the SYS_READ guest path. This shares
+ * the same stdin fd that SYS_READ uses, so a guest that calls
+ * SYS_READ while another VM holds the canvas could race — but
+ * the canvas-owner-only rule for SYS_TUI_POLL_EVENT plus the
+ * fact that snake-style guests don't mix SYS_READ with TUI
+ * input mean this isn't a practical concern. Documented for
+ * future awareness. */
+int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap);
+
 #endif /* VM_HOST_STDIO_H */

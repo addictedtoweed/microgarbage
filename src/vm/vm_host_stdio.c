@@ -159,6 +159,18 @@ bool vm_host_stdio_set_raw_mode(bool enable) {
     }
 }
 
+int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap) {
+    if (!g_in_file || cap == 0) return 0;
+    int src_fd = (g_in_fd >= 0) ? g_in_fd : fileno(g_in_file);
+    if (src_fd < 0) return -1;
+    ssize_t r = read(src_fd, buf, cap);
+    if (r > 0) return (int)r;
+    if (r == 0) return 0;        /* no data / EOF — caller doesn't care which */
+    /* errno EAGAIN/EWOULDBLOCK = no data ready */
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    return -1;
+}
+
 /* Set O_NONBLOCK on a fd. Returns 0 on success, -1 on failure. */
 static int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
