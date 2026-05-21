@@ -606,6 +606,78 @@ static const char *g_builtins[] = {
     (const char *)0
 };
 
+/* ============================================================
+ *  /builtin/ synthetic mount (round T.7)
+ *
+ *  Builtins are also discoverable via /builtin/<name>. Useful
+ *  for `ls /builtin/` to see what's available, and for explicit
+ *  invocation like `/builtin/ls /host`.
+ *
+ *  This is a guest-side synthesis: the host knows nothing about
+ *  /builtin/. The shell intercepts:
+ *    - Tab completion (when prefix starts with /builtin/)
+ *    - `ls` (when arg path matches /builtin)
+ *    - path-first dispatch (paths starting with /builtin/)
+ *    - `ls /` (synthetic root listing adds 'builtin/' entry)
+ *
+ *  On hardware, this could be replaced with a real flash-XIP
+ *  mount where each builtin is an ELF pinned at a known address.
+ *  The user-facing API stays identical; only the implementation
+ *  swaps.
+ * ============================================================ */
+
+#define BUILTIN_PREFIX "/builtin"
+
+/* True if `path` is exactly "/builtin" or "/builtin/" (the
+ * directory itself). */
+static int is_builtin_dir(const char *path) {
+    if (path[0] != '/' || path[1] != 'b') return 0;
+    /* match "/builtin" */
+    static const char want[] = "/builtin";
+    for (int i = 0; want[i]; i++) {
+        if (path[i] != want[i]) return 0;
+    }
+    /* Followed by NUL or '/' (optionally with NUL after the slash). */
+    char c = path[8];
+    if (c == '\0') return 1;
+    if (c == '/' && path[9] == '\0') return 1;
+    return 0;
+}
+
+/* True if `path` begins with "/builtin/" and has at least one
+ * char after the slash (i.e. names a specific builtin). If so,
+ * writes the name (NUL-terminated) into name_out and returns 1. */
+static int is_builtin_file(const char *path, char *name_out, unsigned cap) {
+    static const char want[] = "/builtin/";
+    int i;
+    for (i = 0; want[i]; i++) {
+        if (path[i] != want[i]) return 0;
+    }
+    /* path[i] is the start of the name. */
+    if (path[i] == '\0') return 0;
+    /* Reject anything with a '/' inside the name — /builtin/foo/bar
+     * isn't a builtin reference, it's a deeper path that doesn't
+     * exist. */
+    unsigned n = 0;
+    while (path[i + n] != '\0') {
+        if (path[i + n] == '/') return 0;
+        if (n + 1 >= cap) return 0;
+        name_out[n] = path[i + n];
+        n++;
+    }
+    name_out[n] = '\0';
+    return n > 0;
+}
+
+/* Look up `name` in g_builtins. Returns non-zero if it's a real
+ * builtin. */
+static int is_known_builtin(const char *name) {
+    for (unsigned i = 0; g_builtins[i]; i++) {
+        if (scmp(name, g_builtins[i]) == 0) return 1;
+    }
+    return 0;
+}
+
 static void comp_init(CompList *cl) {
     cl->count = 0;
     cl->pool_used = 0;
@@ -640,22 +712,6 @@ static void comp_add(CompList *cl, const char *name, unsigned n,
     cl->is_dir[cl->count] = is_dir;
     cl->count++;
     cl->pool_used += n + 1;
-}
-
-/* Add every builtin whose name starts with `prefix`. */
-static void comp_collect_builtins(CompList *cl, const char *prefix,
-                                  unsigned plen) {
-    for (unsigned i = 0; g_builtins[i]; i++) {
-        const char *bn = g_builtins[i];
-        unsigned match = 1;
-        for (unsigned j = 0; j < plen; j++) {
-            if (bn[j] != prefix[j]) { match = 0; break; }
-        }
-        if (match) {
-            unsigned n = 0; while (bn[n]) n++;
-            comp_add(cl, bn, n, 0);
-        }
-    }
 }
 
 /* Open `dir`, iterate entries, add ones starting with prefix. */
@@ -844,8 +900,10 @@ static CompResult try_complete(char *buf, unsigned cap, unsigned *pos_io,
     comp_init(&cl);
 
     if (tok_idx == 0 && !sfind_char(prefix, '/')) {
-        /* First token, no '/' in it → builtins + cwd entries. */
-        comp_collect_builtins(&cl, prefix, plen);
+        /* First token, no '/' in it → cwd entries only. Builtins
+         * are now only surfaced through /builtin/ (T.7). Bare
+         * builtin names still dispatch from the table at command
+         * time, but they don't pollute Tab completion. */
         comp_collect_dir(&cl, g_cwd, prefix, plen, 1);
     } else {
         /* Path completion. Split partial path into dir + leaf. */
@@ -854,7 +912,34 @@ static CompResult try_complete(char *buf, unsigned cap, unsigned *pos_io,
         split_partial_path(prefix, dir, sizeof(dir), leaf, sizeof(leaf));
         unsigned leaf_len = 0;
         while (leaf[leaf_len]) leaf_len++;
-        comp_collect_dir(&cl, dir, leaf, leaf_len, 1);
+        /* Special case: if we're completing inside /builtin/, the
+         * candidate set is the builtin table, not a directory read. */
+        if (is_builtin_dir(dir)) {
+            for (unsigned i = 0; g_builtins[i]; i++) {
+                const char *bn = g_builtins[i];
+                int match = 1;
+                for (unsigned j = 0; j < leaf_len; j++) {
+                    if (bn[j] != leaf[j]) { match = 0; break; }
+                }
+                if (match) {
+                    unsigned n = 0; while (bn[n]) n++;
+                    comp_add(&cl, bn, n, 0);
+                }
+            }
+        } else {
+            comp_collect_dir(&cl, dir, leaf, leaf_len, 1);
+            /* If dir is the root, also surface the synthetic
+             * /builtin/ entry. The host doesn't know about it,
+             * so it won't appear via readdir; we add it here. */
+            if (dir[0] == '/' && dir[1] == '\0') {
+                const char *bn = "builtin";
+                int match = 1;
+                for (unsigned j = 0; j < leaf_len; j++) {
+                    if (bn[j] != leaf[j]) { match = 0; break; }
+                }
+                if (match) comp_add(&cl, bn, 7, 1);  /* is_dir = 1 */
+            }
+        }
         /* Override plen: only the leaf portion is the prefix
          * the candidate list matched against, but we want to
          * extend from where the leaf began in buf. The leaf
@@ -1108,6 +1193,7 @@ static void cmd_help(void) {
     putln("  mv <src> <dst>       move/rename file");
     putln("  run <path>           explicitly load and execute an ELF");
     putln("  <path>               same as run; e.g. /host/snake.elf");
+    putln("  /builtin/<name>      explicit builtin form; ls /builtin lists them");
     putln("  history              show recent commands");
     putln("  meminfo              show slab allocator + per-VM stats");
     putln("  help                 this message");
@@ -1263,6 +1349,16 @@ static void cmd_ls(int argc, char **argv) {
         putln("ls: path too long");
         return;
     }
+    /* /builtin/ is a synthetic directory served from the in-process
+     * builtin table. It doesn't exist on the host filesystem. */
+    if (is_builtin_dir(path)) {
+        for (unsigned i = 0; g_builtins[i]; i++) {
+            puts_("  ");
+            puts_(g_builtins[i]);
+            puts_("\n");
+        }
+        return;
+    }
     int fd = sys_openat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0);
     if (fd < 0) { perror_("ls", fd); return; }
 
@@ -1290,6 +1386,13 @@ static void cmd_ls(int argc, char **argv) {
         count++;
     }
     sys_close(fd);
+    /* On the root, also surface the synthetic /builtin/ directory.
+     * It's a shell-side concept, not an actual mount, so the host's
+     * SLOT_ROOT enumeration doesn't include it. */
+    if (path[0] == '/' && path[1] == '\0') {
+        puts_("  builtin/\n");
+        count++;
+    }
     if (count == 0) putln("  (empty)");
 }
 
@@ -1599,6 +1702,21 @@ static void dispatch(char *line) {
     char *argv[16];
     int argc = tokenize(line, argv, 16);
     if (argc == 0) return;       /* empty input */
+
+    /* /builtin/<name> form: route to the in-process builtin
+     * table. The name is substituted into argv[0] for the
+     * if-chain below; if it isn't a known builtin we print
+     * a clear error rather than letting the path-first dispatch
+     * fall through to an ENOENT spawn (which would be confusing). */
+    char builtin_name[32];
+    if (is_builtin_file(argv[0], builtin_name, sizeof(builtin_name))) {
+        if (!is_known_builtin(builtin_name)) {
+            puts_(argv[0]);
+            putln(": no such builtin");
+            return;
+        }
+        argv[0] = builtin_name;
+    }
 
     /* Builtins win on name conflicts (Unix-like predictability). */
     if      (scmp(argv[0], "help")  == 0) cmd_help();
