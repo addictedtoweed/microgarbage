@@ -323,7 +323,7 @@ static char *fmt_u32(unsigned v, char *buf_end) {
 #define CWD_CAP   192
 #define PATH_CAP  256
 
-static char g_cwd[CWD_CAP] = "/drives/td0";
+static char g_cwd[CWD_CAP] = "/td0";
 
 /* Find the last '/' in `path` and return its index, or -1 if
  * none. (Used to compute the parent directory for cd ..) */

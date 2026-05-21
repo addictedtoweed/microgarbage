@@ -999,10 +999,10 @@ int main(int argc, char **argv) {
                 "Try: ls, cd home, mkdir foo, touch bar.txt, cat readme.txt\n"
                 "\n"
                 "Filesystem layout:\n"
-                "  /drives/td0/    this RAM-backed FatFs volume (default cwd)\n"
-                "  /drives/host/   host directory passthrough (read-only)\n"
+                "  /td0/    this RAM-backed FatFs volume (default cwd)\n"
+                "  /host/   host directory passthrough (read-only)\n"
                 "\n"
-                "Absolute paths must start with /drives/<name>/. Relative\n"
+                "Absolute paths must start with /<name>/. Relative\n"
                 "paths are resolved against the current directory.\n";
             f_write(&f, msg, (UINT)strlen(msg), &bw);
             f_close(&f);
@@ -1106,11 +1106,11 @@ int main(int argc, char **argv) {
      *
      * If vm.cfg's [mount.<name>] sections were used, hc.mount_count
      * is non-zero and those become the mounts. Otherwise we set up
-     * the built-in defaults: /drives/td0 (the RAM-backed FatFs)
-     * and /drives/host (a passthrough to host_fs_root, unless
+     * the built-in defaults: /td0 (the RAM-backed FatFs)
+     * and /host (a passthrough to host_fs_root, unless
      * --no-host-fs was passed).
      *
-     * The shell defaults its cwd to /drives/td0. If a custom config
+     * The shell defaults its cwd to /td0. If a custom config
      * doesn't include a td0, the shell's first `pwd` will show a
      * non-resolvable cwd — but that's the user's choice.
      *
@@ -1132,9 +1132,9 @@ int main(int argc, char **argv) {
             if (stat(host_fs_root, &st) != 0) {
                 if (host_mkdir(host_fs_root, 0755) != 0) {
                     fprintf(stderr, "host: warning — could not create '%s' "
-                            "for /drives/host mount: %s\n",
+                            "for /host mount: %s\n",
                             host_fs_root, strerror(errno));
-                    fprintf(stderr, "host: /drives/host will be disabled\n");
+                    fprintf(stderr, "host: /host will be disabled\n");
                     host_fs_disabled = true;
                 }
             }
@@ -1144,9 +1144,9 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "host: warning — "
                             "vm_host_fs_mount_host('%s') failed\n",
                             host_fs_root);
-                    fprintf(stderr, "host: /drives/host will be disabled\n");
+                    fprintf(stderr, "host: /host will be disabled\n");
                 } else {
-                    fprintf(stderr, "host: /drives/host mounted from '%s' "
+                    fprintf(stderr, "host: /host mounted from '%s' "
                             "(%s)\n",
                             host_fs_root,
                             host_fs_writable ? "read/write" : "read-only");
@@ -1170,7 +1170,7 @@ int main(int argc, char **argv) {
                             "failed\n", m->name);
                     return 1;
                 }
-                fprintf(stderr, "host: /drives/%s mounted (FatFs, %u KB pool"
+                fprintf(stderr, "host: /%s mounted (FatFs, %u KB pool"
                         "%s)\n", m->name, (unsigned)(POOL_BYTES / 1024),
                         m->size_kb ? "; size_kb override ignored" : "");
                 any_td_mounted = true;
@@ -1196,7 +1196,7 @@ int main(int argc, char **argv) {
                             m->name, m->path);
                     return 1;
                 }
-                fprintf(stderr, "host: /drives/%s mounted from '%s' (%s)\n",
+                fprintf(stderr, "host: /%s mounted from '%s' (%s)\n",
                         m->name, m->path,
                         m->writable ? "read/write" : "read-only");
             }

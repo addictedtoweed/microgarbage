@@ -28,13 +28,13 @@
  *  ---------------------------------------------------------------
  *
  *  Every path the guest passes to a file syscall MUST start with
- *  "/drives/<name>/". The "<name>" segment selects a registered
+ *  "/<name>/". The "<name>" segment selects a registered
  *  mount; the rest is the path within that mount's backend.
  *
  *  Bare absolute paths like "/foo.txt" are REJECTED with -ENOENT.
  *  This is deliberate: with a single anonymous root, a script
  *  written for one host can land on a different volume on another
- *  host without warning. Strict /drives/<name>/ paths force the
+ *  host without warning. Strict /<name>/ paths force the
  *  call site to commit to a backend.
  *
  *  Relative paths are passed to FatFs (when the cwd is on a FatFs
@@ -42,7 +42,7 @@
  *  guest controls cwd via its own logic; this module just resolves
  *  whatever absolute path the syscall is given. (For HOST mounts,
  *  relative cwds are not currently supported — the shell rewrites
- *  relative paths into /drives/<name>/<rel> before passing them.)
+ *  relative paths into /<name>/<rel> before passing them.)
  *
  *  ---------------------------------------------------------------
  *  Backends
@@ -60,7 +60,7 @@
  *           struct that the caller has already mounted.
  *
  *  Future rounds add IMG (file-backed FatFs) without touching the
- *  /drives/<name>/ namespace.
+ *  /<name>/ namespace.
  *
  *  ---------------------------------------------------------------
  *  Installation
@@ -72,8 +72,8 @@
  *      vm_host_install_fs(&sys);        // for fds 3+
  *
  *      // Set up at least one mount before guests run.
- *      // Example: a RAM-backed FatFs as /drives/td0 and a
- *      // read-only host-directory passthrough at /drives/host:
+ *      // Example: a RAM-backed FatFs as /td0 and a
+ *      // read-only host-directory passthrough at /host:
  *      vm_host_fs_mount_fatfs("td0", 0, &g_fatfs0);
  *      vm_host_fs_mount_host ("host", "./host_files", false);
  *
@@ -236,7 +236,7 @@ bool vm_host_install_fs_atexit(VmSystem *sys);
  *  Mount table
  *
  *  Every path the guest passes to a file syscall must start with
- *  "/drives/<name>/". The <name> looks up an entry in this
+ *  "/<name>/". The <name> looks up an entry in this
  *  table; the rest of the path is the location within the
  *  mount's backend. Two backend kinds are supported:
  *
@@ -266,7 +266,7 @@ bool vm_host_install_fs_atexit(VmSystem *sys);
 
 /* Register a host-directory passthrough mount.
  *
- *   name      Mount point — guest sees this as /drives/<name>/.
+ *   name      Mount point — guest sees this as /<name>/.
  *             Limited to [A-Za-z0-9_-]{1,15}.
  *   root      Absolute host path to a directory. The string is
  *             copied internally; caller can free after.

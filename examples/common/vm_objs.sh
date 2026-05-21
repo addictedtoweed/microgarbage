@@ -94,6 +94,7 @@ unset _HOST_MACHINE
 if [ -z "${CFLAGS+x}" ]; then
     CFLAGS=(
         -Wall -Wextra -Wpedantic -std=c11 -O2
+        -D_POSIX_C_SOURCE=200809L
         -I"${REPO_ROOT}/include"
     )
 else

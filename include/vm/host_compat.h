@@ -23,6 +23,18 @@
 #ifndef MICROGARBAGE_VM_HOST_COMPAT_H
 #define MICROGARBAGE_VM_HOST_COMPAT_H
 
+#ifndef _WIN32
+/* On Linux/macOS/Cygwin, ensure POSIX prototypes for
+ * nanosleep, clock_gettime, etc. are visible. Without this
+ * the default <time.h> may only expose ANSI C symbols. Must
+ * be defined before any system header is pulled in by the
+ * including translation unit. */
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#  include <time.h>
+#endif
+
 #ifdef _WIN32
 
 #include <time.h>      /* struct timespec lives here on mingw too */

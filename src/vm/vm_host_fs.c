@@ -18,7 +18,15 @@
 #include "vm/vm_system.h"
 #include "vm/host_compat.h"
 
+/* FatFs and POSIX <dirent.h> both define a type named DIR. We
+ * include dirent.h here for host-mount directory listing; remap
+ * FatFs's name to FFDIR via a tiny preprocessor dance so both
+ * coexist. The remap only affects this translation unit. */
+#define DIR FFDIR
 #include "ff.h"
+#undef DIR
+
+#include <dirent.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -42,20 +50,38 @@
 #define FD_BASE    3
 #define FD_LIMIT   (FD_BASE + VM_HOST_FS_MAX_FILES)
 
+/* Maximum length of a resolved host path. Referenced both by the
+ * FdSlot union (for SLOT_HOST_DIR's cached dir path) and by the
+ * path-resolution code further down. */
+#define VM_HOST_FS_MAX_PATH 256
+
 typedef enum {
     SLOT_FREE = 0,
     SLOT_FILE,        /* FatFs file (u.file) */
     SLOT_DIR,         /* FatFs directory (u.dir) */
     SLOT_HOST_FILE,   /* Host-filesystem file (u.host) */
+    SLOT_ROOT,        /* Synthetic root listing — yields mount names */
+    SLOT_HOST_DIR,    /* Host-filesystem directory (u.host_dir) */
 } SlotKind;
 
 typedef struct {
     SlotKind kind;
     bool     writable;    /* HOST/FATFS: was the mount writable at open? */
     union {
-        FIL   file;
-        DIR   dir;
-        FILE *host;     /* stdio FILE* for SLOT_HOST_FILE */
+        FIL    file;
+        FFDIR  dir;
+        FILE  *host;       /* stdio FILE* for SLOT_HOST_FILE */
+        struct {
+            unsigned cursor;   /* index into the mount table */
+        } root;
+        struct {
+            DIR *dir;          /* POSIX opendir handle */
+            /* Cached resolved host path of the directory, used to
+             * build per-entry full paths for stat lookups. Includes
+             * a trailing '/'. */
+            char path[VM_HOST_FS_MAX_PATH];
+            size_t path_len;
+        } host_dir;
     } u;
 } FdSlot;
 
@@ -91,11 +117,13 @@ static void free_slot(FdSlot *s) {
 /* ============================================================
  *  Path handling
  *
- *  Every absolute guest path must look like "/drives/<name>/...".
- *  The <name> is looked up in the mount table; <...> is the
- *  path within that mount's backend. Paths that don't start with
- *  "/drives/" return -ENOENT (the namespace is single-rooted on
- *  the drive table).
+ *  Every absolute guest path must look like "/<name>/...".
+ *  The <name> is the mount name and is looked up in the mount
+ *  table; <...> is the path within that mount's backend. Paths
+ *  that don't start with a registered mount name return -ENOENT.
+ *
+ *  Listing "/" returns a synthetic directory containing one
+ *  entry per registered mount.
  *
  *  Mount kinds:
  *    HOST  — passthrough to a directory on the host's OS fs.
@@ -104,10 +132,11 @@ static void free_slot(FdSlot *s) {
  *            are rejected.
  *    FATFS — passes the resolved path to FatFs in volume-prefixed
  *            form ("N:/foo/bar"). The mount stores the FatFs
- *            volume number.
+ *            volume number. Today's `tmpfs` and `sd` config types
+ *            both map to FATFS internally; they differ in intent
+ *            (volatile RAM vs. persistent block device on
+ *            hardware), not in implementation on the dev host.
  * ============================================================ */
-
-#define VM_HOST_FS_MAX_PATH 256
 
 /* Mount table. M.3a supports up to VM_HOST_FS_MAX_MOUNTS entries
  * (default 8). The order of entries doesn't matter; lookup is by
@@ -183,7 +212,34 @@ static bool valid_mount_name(const char *name) {
     return true;
 }
 
-/* Resolve a guest path of the form "/drives/<name>/<rest>" into
+/* Copy a null-terminated guest path into `out`. Returns 0 on
+ * success, -errno on failure. Used by resolve_guest_path and
+ * by the root-path detection in handle_openat. */
+static int copy_guest_path(VmCpu *cpu, uint32_t guest_addr,
+                           char *out, size_t cap) {
+    size_t pos = 0;
+    for (;;) {
+        if (pos >= cap - 1) return -VM_ENAMETOOLONG;
+        const char *b = vm_translate_read(cpu, guest_addr + (uint32_t)pos, 1);
+        if (!b) return -VM_EFAULT;
+        out[pos] = *b;
+        if (*b == '\0') break;
+        pos++;
+    }
+    return 0;
+}
+
+/* Returns true if `path` refers to the synthetic root listing.
+ * Accepts "/", "/.", or empty (so guests written by humans
+ * don't trip over edge cases). */
+static bool is_root_path(const char *path) {
+    if (path[0] == '\0') return true;
+    if (path[0] == '/' && path[1] == '\0') return true;
+    if (path[0] == '/' && path[1] == '.' && path[2] == '\0') return true;
+    return false;
+}
+
+/* Resolve a guest path of the form "/<name>/<rest>" into
  * a host-usable absolute path, plus metadata about which backend
  * to route to.
  *
@@ -199,7 +255,7 @@ static bool valid_mount_name(const char *name) {
  *   -EFAULT          guest pointer not readable
  *   -ENAMETOOLONG    guest path too long, or translated path
  *                    overflows `out`
- *   -ENOENT          path doesn't start with /drives/<name>/ or
+ *   -ENOENT          path doesn't start with /<name>/ or
  *                    <name> isn't a registered mount
  *   -EPERM           ".." escape attempt in a HOST mount path
  *   -EINVAL          buffer too small to be usable
@@ -212,26 +268,17 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
 
     /* Stage 1: copy the raw guest path into a scratch buffer. */
     char raw[VM_HOST_FS_MAX_PATH];
-    size_t raw_pos = 0;
-    for (;;) {
-        if (raw_pos >= sizeof(raw) - 1) return -VM_ENAMETOOLONG;
-        const char *b = vm_translate_read(cpu, guest_addr + (uint32_t)raw_pos, 1);
-        if (!b) return -VM_EFAULT;
-        raw[raw_pos] = *b;
-        if (*b == '\0') break;
-        raw_pos++;
-    }
+    int cgr = copy_guest_path(cpu, guest_addr, raw, sizeof(raw));
+    if (cgr < 0) return cgr;
 
-    /* Stage 2: every path must start with /drives/. */
-    const char prefix[] = "/drives/";
-    const size_t prefix_len = sizeof(prefix) - 1;
-    if (strncmp(raw, prefix, prefix_len) != 0) {
+    /* Stage 2: every path must start with '/'. */
+    if (raw[0] != '/') {
         return -VM_ENOENT;
     }
 
-    /* Stage 3: extract the mount name — chars after /drives/ up
-     * to the next '/' or end of string. Then look it up. */
-    const char *mount_start = raw + prefix_len;
+    /* Stage 3: extract the mount name — chars after the leading
+     * '/' up to the next '/' or end of string. Then look it up. */
+    const char *mount_start = raw + 1;
     const char *mount_end = mount_start;
     while (*mount_end != '\0' && *mount_end != '/') mount_end++;
     size_t name_len = (size_t)(mount_end - mount_start);
@@ -245,9 +292,9 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
     if (!m) return -VM_ENOENT;
 
     /* `rel` is the path WITHIN the mount, starting with '/' or
-     * empty. "/drives/host" alone -> rel = "/" (mount root). */
+     * empty. "/foo" alone -> rel = "/" (mount root). */
     const char *rel = mount_end;
-    if (*rel == '\0') rel = "/";   /* canonicalize "/drives/foo" */
+    if (*rel == '\0') rel = "/";   /* canonicalize "/foo" */
 
     /* Stage 4: backend-specific composition. */
     if (m->kind == MOUNT_KIND_HOST) {
@@ -438,6 +485,10 @@ static int32_t fs_close_fd(int fd) {
         if (r != FR_OK) result = fres_to_errno(r);
     } else if (s->kind == SLOT_HOST_FILE) {
         if (fclose(s->u.host) != 0) result = -VM_EIO;
+    } else if (s->kind == SLOT_HOST_DIR) {
+        if (closedir(s->u.host_dir.dir) != 0) result = -VM_EIO;
+    } else if (s->kind == SLOT_ROOT) {
+        /* No underlying resource; nothing to free beyond the slot. */
     }
     free_slot(s);
     return result;
@@ -475,6 +526,36 @@ static void handle_openat(VmCpu *cpu, void *system) {
         return;
     }
 
+    /* Special case: opening "/" (or "/." or "") as a directory
+     * returns a synthetic SLOT_ROOT fd whose readdir yields one
+     * entry per registered mount. Required so `ls /` works.
+     * Opening "/" as a file is -EISDIR. */
+    char raw_path[VM_HOST_FS_MAX_PATH];
+    int cgr = copy_guest_path(cpu, path, raw_path, sizeof(raw_path));
+    if (cgr < 0) {
+        cpu->regs[VM_REG_A0] = (uint32_t)cgr;
+        return;
+    }
+    if (is_root_path(raw_path)) {
+        if (!(flags & VM_O_DIRECTORY)) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EISDIR;
+            return;
+        }
+        if ((flags & VM_O_ACCMODE) != VM_O_RDONLY) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EISDIR;
+            return;
+        }
+        int fd = alloc_fd(SLOT_ROOT);
+        if (fd < 0) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE;
+            return;
+        }
+        FdSlot *s = &g_fds[fd - FD_BASE];
+        s->u.root.cursor = 0;
+        cpu->regs[VM_REG_A0] = (uint32_t)fd;
+        return;
+    }
+
     char buf[VM_HOST_FS_MAX_PATH];
     PathBackend backend;
     bool writable;
@@ -488,11 +569,49 @@ static void handle_openat(VmCpu *cpu, void *system) {
     /* ---- Host-filesystem path ---- */
     if (backend == PATH_BACKEND_HOST) {
         if (flags & VM_O_DIRECTORY) {
-            /* Directory enumeration on the host fs isn't implemented
-             * in this round — would need opendir/readdir/closedir
-             * wrappers and a new SLOT_HOST_DIR. Easy to add later
-             * if needed; for now host mounts are files-only. */
-            cpu->regs[VM_REG_A0] = (uint32_t)-VM_ENOSYS;
+            /* Open directory on host fs via POSIX opendir. */
+            if ((flags & VM_O_ACCMODE) != VM_O_RDONLY) {
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EISDIR;
+                return;
+            }
+            DIR *d = opendir(buf);
+            if (!d) {
+                switch (errno) {
+                    case ENOENT:  cpu->regs[VM_REG_A0] = (uint32_t)-VM_ENOENT;  break;
+                    case ENOTDIR: cpu->regs[VM_REG_A0] = (uint32_t)-VM_ENOTDIR; break;
+                    case EACCES:  cpu->regs[VM_REG_A0] = (uint32_t)-VM_EPERM;   break;
+                    default:      cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;     break;
+                }
+                return;
+            }
+            int fd = alloc_fd(SLOT_HOST_DIR);
+            if (fd < 0) {
+                closedir(d);
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE;
+                return;
+            }
+            FdSlot *s = &g_fds[fd - FD_BASE];
+            s->writable = writable;
+            s->u.host_dir.dir = d;
+            /* Cache the resolved host path so readdir can stat
+             * each entry for size. Include a trailing '/' so we
+             * can just append d_name. If the resolved path
+             * already ends with '/', don't double up. */
+            size_t pl = strlen(buf);
+            if (pl >= sizeof(s->u.host_dir.path) - 2) {
+                closedir(d);
+                free_slot(s);
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_ENAMETOOLONG;
+                return;
+            }
+            memcpy(s->u.host_dir.path, buf, pl);
+            if (pl > 0 && s->u.host_dir.path[pl - 1] != '/' &&
+                          s->u.host_dir.path[pl - 1] != '\\') {
+                s->u.host_dir.path[pl++] = '/';
+            }
+            s->u.host_dir.path[pl] = '\0';
+            s->u.host_dir.path_len = pl;
+            cpu->regs[VM_REG_A0] = (uint32_t)fd;
             return;
         }
         /* Reject write-class opens against a read-only mount. */
@@ -765,7 +884,8 @@ static void handle_readdir(VmCpu *cpu, void *system) {
     int fd            = (int)cpu->regs[VM_REG_A0];
     uint32_t dirent_p = cpu->regs[VM_REG_A1];
 
-    FdSlot *s = slot_for(fd, SLOT_DIR);
+    /* slot_for with SLOT_FREE means "any kind"; we then branch. */
+    FdSlot *s = slot_for(fd, SLOT_FREE);
     if (!s) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
         return;
@@ -774,6 +894,95 @@ static void handle_readdir(VmCpu *cpu, void *system) {
     VmDirent *out = vm_translate_write(cpu, dirent_p, sizeof(VmDirent));
     if (!out) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EFAULT;
+        return;
+    }
+
+    if (s->kind == SLOT_ROOT) {
+        /* Walk forward through the mount table, returning one
+         * entry per registered (non-free) mount. */
+        while (s->u.root.cursor < VM_HOST_FS_MAX_MOUNTS) {
+            unsigned i = s->u.root.cursor++;
+            if (g_mounts[i].kind == MOUNT_KIND_FREE) continue;
+            memset(out, 0, sizeof(VmDirent));
+            out->type = VM_DT_DIR;
+            out->size = 0;
+            size_t name_max = sizeof(out->name) - 1;
+            strncpy(out->name, g_mounts[i].name, name_max);
+            out->name[name_max] = '\0';
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        cpu->regs[VM_REG_A0] = 1;   /* end of directory */
+        return;
+    }
+
+    if (s->kind == SLOT_HOST_DIR) {
+        errno = 0;
+        struct dirent *de = readdir(s->u.host_dir.dir);
+        if (!de) {
+            if (errno == 0) {
+                cpu->regs[VM_REG_A0] = 1;   /* end */
+            } else {
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
+            }
+            return;
+        }
+        /* Skip "." and ".." for the guest's view of the mount —
+         * neither is meaningful in a sandbox. */
+        while (de && (strcmp(de->d_name, ".") == 0 ||
+                       strcmp(de->d_name, "..") == 0)) {
+            errno = 0;
+            de = readdir(s->u.host_dir.dir);
+        }
+        if (!de) {
+            if (errno == 0) cpu->regs[VM_REG_A0] = 1;
+            else            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
+            return;
+        }
+        memset(out, 0, sizeof(VmDirent));
+        /* Determine type. d_type is available on Linux but not
+         * always reliable; fall back to noting "unknown" as REG. */
+#ifdef DT_DIR
+        if (de->d_type == DT_DIR)      out->type = VM_DT_DIR;
+        else if (de->d_type == DT_REG) out->type = VM_DT_REG;
+        else                           out->type = VM_DT_REG;
+#else
+        out->type = VM_DT_REG;
+#endif
+        /* Stat the entry to fill in size. Build the full path
+         * via the cached dir prefix + d_name. Truncated paths
+         * just leave size at 0. */
+        size_t dn_len = strlen(de->d_name);
+        if (s->u.host_dir.path_len + dn_len + 1 <=
+            sizeof(s->u.host_dir.path)) {
+            char tmp[VM_HOST_FS_MAX_PATH];
+            memcpy(tmp, s->u.host_dir.path, s->u.host_dir.path_len);
+            memcpy(tmp + s->u.host_dir.path_len, de->d_name, dn_len);
+            tmp[s->u.host_dir.path_len + dn_len] = '\0';
+            struct stat st;
+            if (stat(tmp, &st) == 0) {
+                if (S_ISDIR(st.st_mode)) {
+                    out->type = VM_DT_DIR;
+                    out->size = 0;
+                } else if (S_ISREG(st.st_mode)) {
+                    out->type = VM_DT_REG;
+                    out->size = (uint32_t)st.st_size;
+                }
+            }
+        }
+        /* Bounded copy: filenames > 63 chars get truncated, but
+         * the destination is always null-terminated. */
+        size_t name_max = sizeof(out->name) - 1;
+        size_t n = strlen(de->d_name);
+        if (n > name_max) n = name_max;
+        memcpy(out->name, de->d_name, n);
+        out->name[n] = '\0';
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+
+    if (s->kind != SLOT_DIR) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
         return;
     }
 
