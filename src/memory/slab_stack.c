@@ -389,3 +389,40 @@ SlabResult slab_free(SlabAllocator *a, void *p) {
     a->locker.unlock(a->locker.ctx, saved);
     return SLAB_OK;
 }
+
+/* ============================================================
+ *  slab_block_size — introspect an allocation
+ *
+ *  Returns the bin's block size (the "rounded up" allocation
+ *  size, which is the usable payload size) for `p`, or 0 if
+ *  `p` isn't a live block from this allocator. Used by the
+ *  guest-visible SYS_ALLOC_SIZE syscall to support realloc()
+ *  with correct copy bounds.
+ * ============================================================ */
+
+size_t slab_block_size(const SlabAllocator *a, const void *p) {
+    if (!a || !p) return 0;
+
+    BlockHeader *h = header_of((void *)p);
+
+    /* Region-bounds check. */
+    const uint8_t *block_addr = (const uint8_t *)h;
+    if (block_addr < a->region ||
+        block_addr >= a->region + a->region_bytes) {
+        return 0;
+    }
+
+#ifndef SLAB_NO_MAGIC
+    /* Only ALLOCATED blocks have valid bin_index. A freed block
+     * has the magic set but its bin_index is undefined (we never
+     * clear it but we also can't trust it). */
+    if (h->magic != SLAB_MAGIC_ALLOCATED) {
+        return 0;
+    }
+#endif
+
+    uint32_t bin = h->bin_index;
+    if (bin >= SLAB_BIN_COUNT) return 0;
+    return a->bins[bin].block_size;
+}
+

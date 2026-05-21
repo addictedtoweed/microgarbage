@@ -264,6 +264,15 @@ void *slab_alloc(SlabAllocator *a, size_t n);
  * via the header magic (unless SLAB_NO_MAGIC was defined). */
 SlabResult slab_free(SlabAllocator *a, void *p);
 
+/* Return the block size (the usable payload size, which is the
+ * bin's block_size — slab allocations are bucket-rounded) for
+ * a pointer previously returned by slab_alloc. Returns 0 if
+ * `p` is NULL, isn't from this allocator, or has been freed.
+ *
+ * Used by the SYS_ALLOC_SIZE syscall so guest realloc() can
+ * copy the right number of bytes from old to new. */
+size_t slab_block_size(const SlabAllocator *a, const void *p);
+
 /* ============================================================
  *  Introspection
  *

@@ -30,6 +30,7 @@
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_fs.h"
+#include "vm/vm_host_platform.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
 #include "storage/trashdrive.h"
@@ -395,6 +396,26 @@ static uint32_t monotonic_ms_ticks(void *userdata) {
     /* The cast to uint32 truncates to 49.7-day wraparound, which
      * is the documented intended behavior. */
     return (uint32_t)ms;
+}
+
+/* ---------------------------------------------------------------
+ * Realtime (wall-clock) source for SYS_REALTIME_NOW.
+ * Uses CLOCK_REALTIME — subject to NTP/manual adjustments, unlike
+ * the monotonic source above. Embedded hosts without an RTC would
+ * leave this NULL and SYS_REALTIME_NOW returns -ENOSYS.
+ * --------------------------------------------------------------- */
+static bool realtime_clock_source(void *userdata,
+                                   uint32_t *seconds_out,
+                                   uint32_t *nanos_out) {
+    (void)userdata;
+    struct timespec t;
+    if (clock_gettime(CLOCK_REALTIME, &t) != 0) return false;
+    /* Truncate to 32-bit Unix epoch seconds. This wraps in 2106;
+     * for a microcontroller that's not really an issue in any
+     * scenario I can imagine. */
+    *seconds_out = (uint32_t)t.tv_sec;
+    *nanos_out   = (uint32_t)t.tv_nsec;
+    return true;
 }
 
 static volatile sig_atomic_t g_stop = 0;
@@ -1018,6 +1039,28 @@ int main(int argc, char **argv) {
     if (!vm_host_install_fs(&sys)) {
         fprintf(stderr, "host: vm_host_install_fs failed\n");
         return 1;
+    }
+
+    /* 6c. Platform services (printf machinery, realtime clock,
+     * PRNG, alloc-introspection, frame-budget helper). Seed the
+     * PRNG from the realtime clock so guests get a different
+     * sequence on each host run. */
+    {
+        VmHostPlatformConfig pcfg = {0};
+        pcfg.realtime_source   = realtime_clock_source;
+        pcfg.realtime_userdata = NULL;
+        struct timespec t;
+        if (clock_gettime(CLOCK_REALTIME, &t) == 0) {
+            /* Mix sec and nsec into the seed so two runs in the
+             * same second still differ. SplitMix64 will diffuse. */
+            pcfg.rand_seed = ((uint64_t)t.tv_sec << 32) ^
+                             (uint64_t)t.tv_nsec ^
+                             0x9E3779B97F4A7C15ULL;
+        }
+        if (!vm_host_install_platform(&sys, &pcfg)) {
+            fprintf(stderr, "host: vm_host_install_platform failed\n");
+            return 1;
+        }
     }
 
     /* 6b. Mounts.

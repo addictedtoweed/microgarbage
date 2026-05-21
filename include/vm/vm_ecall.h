@@ -234,6 +234,18 @@
 #define SYS_SLAB_STATS      1106
 #define SYS_VM_STATS        1107
 
+/* Platform services (1108-1119): small primitives that are
+ * libc-shaped but live in the host so guests don't have to
+ * carry implementations. Each one is small in code AND state;
+ * see vm/vm_host_platform.h for the full contract. */
+#define SYS_FORMAT_AND_WRITE          1108  /* (fd, fmt, args, nargs) → bytes_written */
+#define SYS_FORMAT_TO_BUF             1109  /* (buf, cap, fmt, args, nargs) → bytes_written */
+#define SYS_REALTIME_NOW              1110  /* (out_struct_ptr) → 0 or -ENOSYS */
+#define SYS_ALLOC_SIZE                1111  /* (ptr) → block size, or -EINVAL */
+#define SYS_RAND                      1112  /* () → next u32 of PRNG output */
+#define SYS_TIMING_DEADLINE_REMAINING 1113  /* () → ticks until reload deadline, or 0 */
+/* 1114-1119 reserved for future small platform services */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */
@@ -373,6 +385,31 @@
 #define SYS_FIX_TO_FLOAT    1129   /* q16_16 in a0 → IEEE single */
 #define SYS_DOUBLE_TO_FIX   1130   /* IEEE double (a0:a1) → q16_16 */
 #define SYS_FIX_TO_DOUBLE   1131   /* q16_16 → IEEE double (a0:a1) */
+
+/* ============================================================
+ *  Reserved syscall ranges for plugins
+ *
+ *  These ranges are reserved in the ABI but unimplemented in
+ *  the public-domain build. Plugin code (vendor or third-party)
+ *  can register handlers for these numbers via the standard
+ *  vm_ecall_register mechanism. A guest that calls one of these
+ *  without a plugin registered gets the default "unhandled
+ *  syscall" path (-ENOSYS).
+ *
+ *  Ranges:
+ *    1200-1219   Cryptography (hash, encrypt, sign, verify, etc.)
+ *                  Vendor-supplied. Public-domain build ships no
+ *                  primitives in this range.
+ *    1220-1239   Open-source plugin space. Reserved for community
+ *                  plugins to avoid clashing with vendor namespace.
+ *    1240-1259   Vendor-specific extensions. Each vendor can
+ *                  define their own conventions within this range.
+ *
+ *  See include/vm/vm_plugin.h for the plugin-registration API.
+ * ============================================================ */
+/* (No #defines for the reserved ranges — leave the names to
+ * the plugin author so the public ABI doesn't accidentally
+ * commit to specific semantics.) */
 
 /* ============================================================
  *  Per-syscall ABI documentation
