@@ -43,6 +43,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Forward decl — defined below. */
 struct VmHostTransport;
@@ -108,18 +109,30 @@ typedef struct VmHostTransport {
 } VmHostTransport;
 
 /* ============================================================
- *  Active transport (process-global today; per-session later)
+ *  Active transport
  *
- *  vm_host_set_transport replaces the active transport with the
- *  given one. Pass NULL to restore the default behavior (which
- *  the stdio module installs at vm_host_install_stdio time).
+ *  The default (process-global) transport is set via
+ *  vm_host_set_transport. Most single-session demos use only this.
  *
- *  The returned old transport (if non-NULL) is the caller's
- *  responsibility to dispose of (via its close() callback).
- *  Most hosts set the transport once at startup and never
- *  change it.
+ *  Round U.6 added per-VM bindings so multi-session hosts can give
+ *  each shell VM its own transport. Lookup precedence at every I/O
+ *  site is:
+ *
+ *      1. per-VM binding (vm_host_set_transport_for_vm)
+ *      2. process default (vm_host_set_transport)
+ *      3. NULL — handler falls through to legacy stdio path
+ *
+ *  Returns the previous value when setting (NULL if none was
+ *  installed). The caller owns the transport struct's lifetime —
+ *  setting a new one doesn't free the old one.
  * ============================================================ */
 VmHostTransport *vm_host_set_transport(VmHostTransport *t);
 VmHostTransport *vm_host_get_transport(void);
+
+/* Per-VM transport binding (round U.6). Pass NULL for `t` to
+ * unbind a VM so it falls back to the process default. */
+VmHostTransport *vm_host_set_transport_for_vm(uint16_t vm_id,
+                                              VmHostTransport *t);
+VmHostTransport *vm_host_get_transport_for_vm(uint16_t vm_id);
 
 #endif  /* VM_HOST_TRANSPORT_H */

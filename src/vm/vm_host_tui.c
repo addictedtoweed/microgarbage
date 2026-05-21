@@ -45,34 +45,14 @@ void vm_host_tui_set_output(VmTuiOutputFn fn, void *ctx) {
     g_out_ctx = ctx;
 }
 
-/* Flush stdout only when we're using it. When a transport (or
- * the U.1 hook) is in play, stdout isn't on the output path at
- * all — fflushing it would be a no-op at best and could mix
- * unrelated stdio writes into our canvas frame at worst. */
-static void hflush_stdout_if_default(void) {
-    if (vm_host_get_transport()) return;
-    if (g_out_fn) return;
-    fflush(stdout);
-}
-
-/* Suppress -Wunused-result on write(). We're best-effort here:
- * a closed terminal means nothing reaches the user anyway. The
- * `fd` argument is the no-transport fallback target (always 1
- * in practice). When a transport is installed, output routes
- * through transport->write regardless of `fd`. */
-static void hwrite(int fd, const void *p, size_t n) {
-    VmHostTransport *t = vm_host_get_transport();
-    if (t && t->write) {
-        (void)t->write(t, p, (unsigned)n);
-        return;
-    }
-    if (g_out_fn) {
-        (void)g_out_fn(p, n, g_out_ctx);
-        return;
-    }
-    ssize_t r = write(fd, p, n);
-    (void)r;
-}
+/* hresolve_transport, hflush_stdout_if_default, and hwrite are
+ * defined AFTER the VmTuiSession declaration further down — they
+ * reference g_session.owner_vm and so need that struct in scope.
+ * Forward declarations let the rest of this header-level code
+ * compile in any order. */
+static VmHostTransport *hresolve_transport(void);
+static void             hflush_stdout_if_default(void);
+static void             hwrite(int fd, const void *p, size_t n);
 
 /* ============================================================
  *  Round U.5: per-VM TUI session state
@@ -206,6 +186,54 @@ static VmTuiSession g_session = {
  * accessor so the U.6 migration is local to one function. */
 static inline VmTuiSession *cur_session(void) {
     return &g_session;
+}
+
+/* ============================================================
+ *  Transport-routing helpers (used by every hwrite-callsite
+ *  in this file). Defined here, after g_session, so the
+ *  forward decls at the top can resolve.
+ * ============================================================ */
+
+/* Resolve the transport for the currently-active session.
+ * In U.5 single-session this returns the default. In U.6 it
+ * looks up per-VM via the session's owner_vm. When no session
+ * has an owner yet (TUI never initialized), falls back to the
+ * default transport so init-time output still works. */
+static VmHostTransport *hresolve_transport(void) {
+    if (g_session.owner_vm != UINT16_MAX) {
+        VmHostTransport *t = vm_host_get_transport_for_vm(g_session.owner_vm);
+        if (t) return t;
+    }
+    return vm_host_get_transport();
+}
+
+/* Flush stdout only when we're using it. When a transport (or
+ * the U.1 hook) is in play, stdout isn't on the output path at
+ * all — fflushing it would be a no-op at best and could mix
+ * unrelated stdio writes into our canvas frame at worst. */
+static void hflush_stdout_if_default(void) {
+    if (hresolve_transport()) return;
+    if (g_out_fn) return;
+    fflush(stdout);
+}
+
+/* Suppress -Wunused-result on write(). We're best-effort here:
+ * a closed terminal means nothing reaches the user anyway. The
+ * `fd` argument is the no-transport fallback target (always 1
+ * in practice). When a transport is installed, output routes
+ * through transport->write regardless of `fd`. */
+static void hwrite(int fd, const void *p, size_t n) {
+    VmHostTransport *t = hresolve_transport();
+    if (t && t->write) {
+        (void)t->write(t, p, (unsigned)n);
+        return;
+    }
+    if (g_out_fn) {
+        (void)g_out_fn(p, n, g_out_ctx);
+        return;
+    }
+    ssize_t r = write(fd, p, n);
+    (void)r;
 }
 
 /* Forward decl for atexit hook + raw mode reset. */
@@ -368,13 +396,18 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
      * mode, the user's keypresses would echo onto the screen
      * over our rendering.
      *
-     * vm_host_stdio_set_raw_mode silently returns false if the
-     * fd isn't a TTY or termios isn't available (Cygwin
-     * native-Windows binaries on a non-pty handle, e.g.); in
-     * those cases the user's terminal handles things on its
-     * own and we just live with whatever cooking it applies. */
+     * Round U.6: prefer this SESSION's transport->set_raw so that
+     * two simultaneous TUI sessions on different transports each
+     * manipulate their own line discipline independently. Falls
+     * back to the legacy global stdio raw-mode toggle when no
+     * session-bound transport supports set_raw. */
     if (flags & VM_TUI_USE_RAW) {
-        g_raw_mode_we_set = vm_host_stdio_set_raw_mode(true);
+        VmHostTransport *t = hresolve_transport();
+        if (t && t->set_raw) {
+            g_raw_mode_we_set = (t->set_raw(t, true) >= 0);
+        } else {
+            g_raw_mode_we_set = vm_host_stdio_set_raw_mode(true);
+        }
     } else {
         g_raw_mode_we_set = false;
     }
@@ -406,9 +439,18 @@ static void do_shutdown(void) {
 
     /* If we put the tty into raw mode, take it out so the user's
      * shell gets a normal cooked-mode terminal back when we
-     * exit. If the caller already had it raw, leave it. */
+     * exit. If the caller already had it raw, leave it.
+     *
+     * U.6: like do_init, prefer the session's transport->set_raw
+     * if available so we toggle the same line discipline we
+     * toggled on at init. */
     if (g_raw_mode_we_set) {
-        vm_host_stdio_set_raw_mode(false);
+        VmHostTransport *t = hresolve_transport();
+        if (t && t->set_raw) {
+            (void)t->set_raw(t, false);
+        } else {
+            vm_host_stdio_set_raw_mode(false);
+        }
         g_raw_mode_we_set = false;
     }
 
@@ -940,7 +982,17 @@ static void in_buf_refill(void) {
     if (g_in_head == g_in_tail) g_in_head = g_in_tail = 0;
     unsigned avail = IN_BUF_CAP - g_in_tail;
     if (avail == 0) return;
-    int r = vm_host_stdio_read_bytes_nonblock(g_in_buf + g_in_tail, avail);
+    /* Round U.6: pull bytes from THIS session's transport, not
+     * whatever the process default is. Falls back to the legacy
+     * stdio helper if no transport is bound to this session
+     * (which then itself consults the default). */
+    VmHostTransport *t = hresolve_transport();
+    int r;
+    if (t && t->read_nonblock) {
+        r = t->read_nonblock(t, g_in_buf + g_in_tail, avail);
+    } else {
+        r = vm_host_stdio_read_bytes_nonblock(g_in_buf + g_in_tail, avail);
+    }
     if (r > 0) g_in_tail += (unsigned)r;
 }
 

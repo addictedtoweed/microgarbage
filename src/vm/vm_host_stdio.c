@@ -13,6 +13,7 @@
 #include "vm/vm_host_transport.h"
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
+#include "vm/vm_sched.h"   /* VM_SCHED_MAX_VMS for per-VM transport table */
 
 #include <stdio.h>
 #include <errno.h>
@@ -87,31 +88,50 @@ static int   g_out_fd = -1;
 static int   g_err_fd = -1;
 
 /* ============================================================
- *  Active transport (round U.2)
+ *  Active transport (round U.2; per-VM in round U.6)
  *
- *  Lives here in stdio.c because that's the natural owner of
- *  the SYS_READ/SYS_WRITE/SYS_FFLUSH handlers; the transport
- *  is what those handlers ultimately consult.
+ *  U.2 introduced a single process-global transport pointer. U.6
+ *  extends this to a per-VM table so multiple shells, each bound
+ *  to a different transport, can coexist in one host process.
  *
- *  NULL = use the legacy stdio path (g_in_file/g_out_file via
- *  FILE* or fd overrides). When set, the handlers route to the
- *  transport's vtable instead.
+ *  Lookup precedence (highest first):
+ *    1. g_transport_by_vm[vm_id]  — set via set_transport_for_vm
+ *    2. g_default_transport       — set via vm_host_set_transport
+ *    3. NULL                      — falls through to legacy stdio
+ *                                   path (g_in_file/g_out_file)
  *
- *  Future Round U work moves this from process-global to
- *  per-session, but the lookup site (and the vtable shape)
- *  stays identical.
+ *  The single-arg `vm_host_set_transport(t)` API still works and
+ *  sets the default. Single-session demos (no per-VM bindings) see
+ *  identical behavior to U.5. Multi-session hosts call
+ *  `vm_host_set_transport_for_vm(vm_id, t)` for each session.
  * ============================================================ */
 
-static VmHostTransport *g_active_transport = NULL;
+static VmHostTransport *g_default_transport = NULL;
+static VmHostTransport *g_transport_by_vm[VM_SCHED_MAX_VMS];
 
 VmHostTransport *vm_host_set_transport(VmHostTransport *t) {
-    VmHostTransport *prev = g_active_transport;
-    g_active_transport = t;
+    VmHostTransport *prev = g_default_transport;
+    g_default_transport = t;
     return prev;
 }
 
 VmHostTransport *vm_host_get_transport(void) {
-    return g_active_transport;
+    return g_default_transport;
+}
+
+VmHostTransport *vm_host_set_transport_for_vm(uint16_t vm_id,
+                                              VmHostTransport *t) {
+    if (vm_id >= VM_SCHED_MAX_VMS) return NULL;
+    VmHostTransport *prev = g_transport_by_vm[vm_id];
+    g_transport_by_vm[vm_id] = t;
+    return prev;
+}
+
+VmHostTransport *vm_host_get_transport_for_vm(uint16_t vm_id) {
+    if (vm_id < VM_SCHED_MAX_VMS && g_transport_by_vm[vm_id]) {
+        return g_transport_by_vm[vm_id];
+    }
+    return g_default_transport;
 }
 
 /* ============================================================
@@ -254,14 +274,15 @@ static bool disable_raw_mode(void) {
  * if the fd is not a tty / Windows console or no stdio was
  * installed. */
 bool vm_host_stdio_set_raw_mode(bool enable) {
-    /* Round U.2: prefer the transport if it supplies a set_raw
-     * implementation. Transports that don't (NULL fn pointer)
-     * fall through to the legacy path; transports for non-terminal
-     * sinks (e.g. files) typically supply a no-op set_raw that
-     * returns 0. */
-    if (g_active_transport && g_active_transport->set_raw) {
-        return g_active_transport->set_raw(g_active_transport,
-                                           enable) >= 0;
+    /* Round U.2/U.6: this helper still operates on the DEFAULT
+     * transport. Per-VM raw-mode toggles are done by the TUI
+     * module reading its session's transport directly; this
+     * fallback path handles non-TUI callers (legacy code).
+     * Transports that don't supply set_raw fall through to the
+     * termios path on g_in_file. */
+    VmHostTransport *t = g_default_transport;
+    if (t && t->set_raw) {
+        return t->set_raw(t, enable) >= 0;
     }
 
     if (!g_in_file) return false;
@@ -294,9 +315,11 @@ int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap) {
      * is the path the TUI host service uses for input — when a
      * pipe or TCP transport is active, this is how mouse/keyboard
      * bytes reach the input parser. */
-    if (g_active_transport && g_active_transport->read_nonblock) {
-        return g_active_transport->read_nonblock(g_active_transport,
-                                                 buf, cap);
+    {
+        VmHostTransport *t = g_default_transport;
+        if (t && t->read_nonblock) {
+            return t->read_nonblock(t, buf, cap);
+        }
     }
 
     if (!g_in_file || cap == 0) return 0;
@@ -391,12 +414,14 @@ static void handle_write(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Round U.2: if a transport is installed, it owns stdout AND
+    /* Round U.2/U.6: if a transport is bound to this VM (or a
+     * process-default transport is set), it owns stdout AND
      * stderr (they're the same byte sink as far as the user is
      * concerned). Route through it before the FILE/fd fallback.
      * The transport's `write` is best-effort and may write less
      * than `n`; we propagate the count to the guest. */
-    if (g_active_transport && g_active_transport->write) {
+    VmHostTransport *vt = vm_host_get_transport_for_vm(cpu->vm_id);
+    if (vt && vt->write) {
         if (n == 0) {
             cpu->regs[VM_REG_A0] = 0;
             return;
@@ -407,13 +432,8 @@ static void handle_write(VmCpu *cpu, void *system) {
             cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
             return;
         }
-        int w = g_active_transport->write(g_active_transport,
-                                          host_buf, n);
-        if (w < 0) {
-            cpu->regs[VM_REG_A0] = (uint32_t)w;   /* already negative errno */
-        } else {
-            cpu->regs[VM_REG_A0] = (uint32_t)w;
-        }
+        int w = vt->write(vt, host_buf, n);
+        cpu->regs[VM_REG_A0] = (uint32_t)w;   /* >=0 bytes or -errno */
         return;
     }
 
@@ -486,11 +506,13 @@ static void handle_fflush(VmCpu *cpu, void *system) {
     if (!cpu) return;
     uint32_t fd = cpu->regs[VM_REG_A0];
 
-    /* Round U.2: defer to transport if installed. fd 0/1/2 are
-     * all the same byte sink as far as the transport's concerned. */
-    if (g_active_transport && g_active_transport->flush) {
+    /* Round U.2/U.6: defer to per-VM transport if installed.
+     * fd 0/1/2 are all the same byte sink as far as the transport's
+     * concerned. */
+    VmHostTransport *vt = vm_host_get_transport_for_vm(cpu->vm_id);
+    if (vt && vt->flush) {
         if (fd <= 2) {
-            int r = g_active_transport->flush(g_active_transport);
+            int r = vt->flush(vt);
             cpu->regs[VM_REG_A0] = (r >= 0) ? 0 : (uint32_t)r;
             return;
         }
@@ -547,9 +569,10 @@ static void handle_read(VmCpu *cpu, void *system) {
      * if the program has hung. This mirrors what real terminals
      * and most libcs do — flush-before-blocking-read is the rule
      * that makes interactive prompts work. */
+    VmHostTransport *vt = vm_host_get_transport_for_vm(cpu->vm_id);
     if (fd == 0) {
-        if (g_active_transport && g_active_transport->flush) {
-            (void)g_active_transport->flush(g_active_transport);
+        if (vt && vt->flush) {
+            (void)vt->flush(vt);
         } else {
             if (g_out_file) fflush(g_out_file);
             if (g_err_file && g_err_file != g_out_file) fflush(g_err_file);
@@ -577,9 +600,9 @@ static void handle_read(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Round U.2: if a transport is installed, it owns stdin.
-     * Same routing pattern as handle_write. */
-    if (fd == 0 && g_active_transport && g_active_transport->read_nonblock) {
+    /* Round U.2/U.6: if a transport is bound to this VM, it owns
+     * stdin. Same routing pattern as handle_write. */
+    if (fd == 0 && vt && vt->read_nonblock) {
         if (n == 0) {
             cpu->regs[VM_REG_A0] = 0;
             return;
@@ -590,8 +613,7 @@ static void handle_read(VmCpu *cpu, void *system) {
             cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
             return;
         }
-        int r = g_active_transport->read_nonblock(g_active_transport,
-                                                  host_buf, n);
+        int r = vt->read_nonblock(vt, host_buf, n);
         cpu->regs[VM_REG_A0] = (uint32_t)r;   /* >=0 or -errno */
         return;
     }
