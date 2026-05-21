@@ -120,10 +120,18 @@ static FATFS g_fs;
  * That way: CLI wins ties, config is just persistent defaults.
  * --------------------------------------------------------------- */
 
-/* Mount entry parsed from [mount.<name>] sections. */
+/* Mount entry parsed from [mount.<name>] sections.
+ *
+ * `tmpfs` and `sd` are separate config type names that both map
+ * to FatFs internally on the dev host today. They diverge when
+ * the platform moves to hardware:
+ *   tmpfs → FatFs over a RAM-backed block device (volatile)
+ *   sd    → FatFs over an SD card driver (persistent)
+ * On the dev host both look the same; the distinction is intent. */
 typedef enum {
-    HOST_MOUNT_TD   = 0,
-    HOST_MOUNT_HOST = 1,
+    HOST_MOUNT_TMPFS = 0,
+    HOST_MOUNT_SD    = 1,
+    HOST_MOUNT_HOST  = 2,
 } HostMountKind;
 
 #define HOST_MOUNT_MAX 8
@@ -232,10 +240,10 @@ static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
      * such section defines one mount. Key bindings within the
      * section:
      *
-     *   type     = host | td
+     *   type     = host | tmpfs | sd
      *   path     = <dir>    (host only; absolute or relative)
      *   writable = bool     (host only; default false)
-     *   size_kb  = <int>    (td only; default 128)
+     *   size_kb  = <int>    (tmpfs / sd only; default 128)
      */
     for (size_t i = 0; i < cfg->count; i++) {
         const char *s = cfg->entries[i].section;
@@ -255,11 +263,12 @@ static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
         const char *k = cfg->entries[i].key;
         const char *v = cfg->entries[i].value;
         if (strcmp(k, "type") == 0) {
-            if (strcmp(v, "host") == 0)      m->kind = HOST_MOUNT_HOST;
-            else if (strcmp(v, "td") == 0)   m->kind = HOST_MOUNT_TD;
+            if (strcmp(v, "host") == 0)       m->kind = HOST_MOUNT_HOST;
+            else if (strcmp(v, "tmpfs") == 0) m->kind = HOST_MOUNT_TMPFS;
+            else if (strcmp(v, "sd") == 0)    m->kind = HOST_MOUNT_SD;
             else {
                 fprintf(stderr, "vm.cfg: line %u: [mount.%s] unknown type "
-                        "'%s' (expected 'host' or 'td')\n",
+                        "'%s' (expected 'host', 'tmpfs', or 'sd')\n",
                         cfg->entries[i].line, name, v);
                 return false;
             }
@@ -1155,13 +1164,18 @@ int main(int argc, char **argv) {
         }
     } else {
         /* Config-driven mount setup. */
-        bool any_td_mounted = false;
+        bool any_fatfs_mounted = false;
         for (unsigned i = 0; i < hc.mount_count; i++) {
             const HostMount *m = &hc.mounts[i];
-            if (m->kind == HOST_MOUNT_TD) {
-                if (any_td_mounted) {
-                    fprintf(stderr, "host: vm.cfg: multiple [mount.*] of "
-                            "type=td not supported in M.3a (ignoring "
+            if (m->kind == HOST_MOUNT_TMPFS || m->kind == HOST_MOUNT_SD) {
+                /* tmpfs and sd both map to FatFs over the single
+                 * host-side trashdrive pool today. On hardware
+                 * they'll diverge (tmpfs stays in RAM; sd uses
+                 * the SD card driver). For now: just enforce one
+                 * FatFs mount until we add multi-volume support. */
+                if (any_fatfs_mounted) {
+                    fprintf(stderr, "host: vm.cfg: multiple FatFs mounts "
+                            "(tmpfs/sd) not supported in M.3a (ignoring "
                             "mount.%s)\n", m->name);
                     continue;
                 }
@@ -1170,10 +1184,13 @@ int main(int argc, char **argv) {
                             "failed\n", m->name);
                     return 1;
                 }
-                fprintf(stderr, "host: /%s mounted (FatFs, %u KB pool"
-                        "%s)\n", m->name, (unsigned)(POOL_BYTES / 1024),
+                const char *kind_str =
+                    (m->kind == HOST_MOUNT_TMPFS) ? "tmpfs" : "sd";
+                fprintf(stderr, "host: /%s mounted (%s via FatFs, %u KB pool"
+                        "%s)\n", m->name, kind_str,
+                        (unsigned)(POOL_BYTES / 1024),
                         m->size_kb ? "; size_kb override ignored" : "");
-                any_td_mounted = true;
+                any_fatfs_mounted = true;
             } else {
                 /* HOST. Path is required. */
                 if (m->path[0] == '\0') {
