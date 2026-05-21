@@ -231,6 +231,36 @@ void vm_host_tui_release_for_vm(uint16_t vm_id);
 
 #define VM_TUI_CELL_TRANSPARENT (1u << 0)
 
+/* ============================================================
+ *  Unicode glyph indices (0x80..0xBF)
+ *
+ *  Cells whose `c` byte is in this range get rendered as the
+ *  corresponding UTF-8 glyph by the host's emit path. Cells
+ *  with c < 0x80 emit as plain ASCII. This keeps cells 1 byte
+ *  wide while letting games use block characters, half-blocks,
+ *  bullets, and triangles without breaking the wire format.
+ * ============================================================ */
+
+#define VM_TUI_GLYPH_BLOCK_FULL        0x80  /* █ */
+#define VM_TUI_GLYPH_BLOCK_UPPER_HALF  0x81  /* ▀ */
+#define VM_TUI_GLYPH_BLOCK_LOWER_HALF  0x82  /* ▄ */
+#define VM_TUI_GLYPH_BLOCK_LEFT_HALF   0x83  /* ▌ */
+#define VM_TUI_GLYPH_BLOCK_RIGHT_HALF  0x84  /* ▐ */
+#define VM_TUI_GLYPH_SHADE_LIGHT       0x85  /* ░ */
+#define VM_TUI_GLYPH_SHADE_MEDIUM      0x86  /* ▒ */
+#define VM_TUI_GLYPH_SHADE_DARK        0x87  /* ▓ */
+#define VM_TUI_GLYPH_BULLET            0x88  /* ● */
+#define VM_TUI_GLYPH_TRIANGLE_UP       0x89  /* ▲ */
+#define VM_TUI_GLYPH_TRIANGLE_DOWN     0x8A  /* ▼ */
+#define VM_TUI_GLYPH_DIAMOND           0x8B  /* ◆ */
+#define VM_TUI_GLYPH_DOUBLE_HORIZ      0x90  /* ═ */
+#define VM_TUI_GLYPH_DOUBLE_VERT       0x91  /* ║ */
+#define VM_TUI_GLYPH_BULLET_OPEN       0x92  /* ○ */
+#define VM_TUI_GLYPH_SQUARE_FILLED     0x93  /* ■ */
+#define VM_TUI_GLYPH_SQUARE_EMPTY      0x94  /* □ */
+#define VM_TUI_GLYPH_TRIANGLE_LEFT     0x95  /* ◀ */
+#define VM_TUI_GLYPH_TRIANGLE_RIGHT    0x96  /* ▶ */
+
 #ifdef __cplusplus
 }
 #endif

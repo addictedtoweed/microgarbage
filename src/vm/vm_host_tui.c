@@ -530,6 +530,73 @@ static int32_t parse_draw_commands(const uint8_t *buf, uint32_t len) {
  *  Present + present_diff
  * ============================================================ */
 
+/* Unicode glyph table.
+ *
+ * Cell `c` values in 0x00..0x7F are emitted as plain ASCII.
+ * Values in 0x80..0xBF are indexed into this table and emitted
+ * as their UTF-8 byte sequences. 0xC0..0xFF are reserved for
+ * future expansion; today they emit as '?' fallback.
+ *
+ * This lets guests render box-drawing, half-blocks, and
+ * geometric shapes without expanding the cell beyond 1 byte. */
+
+typedef struct {
+    const char *utf8;
+    uint8_t     len;
+} GlyphEntry;
+
+static const GlyphEntry g_glyphs[64] = {
+    /* 0x80 */ { "\xe2\x96\x88", 3 },  /* █  full block */
+    /* 0x81 */ { "\xe2\x96\x80", 3 },  /* ▀  upper half block */
+    /* 0x82 */ { "\xe2\x96\x84", 3 },  /* ▄  lower half block */
+    /* 0x83 */ { "\xe2\x96\x8c", 3 },  /* ▌  left half block */
+    /* 0x84 */ { "\xe2\x96\x90", 3 },  /* ▐  right half block */
+    /* 0x85 */ { "\xe2\x96\x91", 3 },  /* ░  light shade */
+    /* 0x86 */ { "\xe2\x96\x92", 3 },  /* ▒  medium shade */
+    /* 0x87 */ { "\xe2\x96\x93", 3 },  /* ▓  dark shade */
+    /* 0x88 */ { "\xe2\x97\x8f", 3 },  /* ●  bullet */
+    /* 0x89 */ { "\xe2\x96\xb2", 3 },  /* ▲  up triangle */
+    /* 0x8a */ { "\xe2\x96\xbc", 3 },  /* ▼  down triangle */
+    /* 0x8b */ { "\xe2\x97\x86", 3 },  /* ◆  diamond */
+    /* 0x8c */ { "\xe2\x97\x86", 3 },  /* (reserved, fallback to diamond) */
+    /* 0x8d */ { "\xe2\x97\x86", 3 },
+    /* 0x8e */ { "\xe2\x97\x86", 3 },
+    /* 0x8f */ { "\xe2\x97\x86", 3 },
+    /* 0x90 */ { "\xe2\x95\x90", 3 },  /* ═  double horizontal */
+    /* 0x91 */ { "\xe2\x95\x91", 3 },  /* ║  double vertical */
+    /* 0x92 */ { "\xe2\x97\x8b", 3 },  /* ○  open bullet */
+    /* 0x93 */ { "\xe2\x96\xa0", 3 },  /* ■  filled square */
+    /* 0x94 */ { "\xe2\x96\xa1", 3 },  /* □  empty square */
+    /* 0x95 */ { "\xe2\x97\x80", 3 },  /* ◀  left triangle */
+    /* 0x96 */ { "\xe2\x96\xb6", 3 },  /* ▶  right triangle */
+    /* 0x97..0xbf: reserved, emit as '?' */
+    { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
+    { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
+    { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
+    { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
+    { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
+};
+
+/* Emit one cell's character: plain byte if < 0x80, glyph
+ * lookup if in 0x80..0xBF, '?' fallback otherwise. */
+static void emit_cell_char(char c) {
+    unsigned char uc = (unsigned char)c;
+    if (uc < 0x80) {
+        out_bytes(&c, 1);
+        return;
+    }
+    if (uc >= 0x80 && uc < 0xC0) {
+        const GlyphEntry *g = &g_glyphs[uc - 0x80];
+        if (g->utf8 && g->len) {
+            out_bytes(g->utf8, g->len);
+            return;
+        }
+    }
+    /* Fallback. */
+    const char qmark = '?';
+    out_bytes(&qmark, 1);
+}
+
 static bool cells_equal(HostCell a, HostCell b) {
     return a.c == b.c && a.fg == b.fg && a.bg == b.bg && a.attrs == b.attrs;
 }
@@ -544,7 +611,7 @@ static void emit_full_row(int r) {
             emit_sgr(tc.fg, tc.bg, tc.attrs);
             cur_fg = tc.fg; cur_bg = tc.bg; cur_attrs = tc.attrs;
         }
-        out_bytes(&tc.c, 1);
+        emit_cell_char(tc.c);
     }
 }
 
@@ -566,7 +633,7 @@ static void emit_diff_row(int r) {
             emit_sgr(back.fg, back.bg, back.attrs);
             cur_fg = back.fg; cur_bg = back.bg; cur_attrs = back.attrs;
         }
-        out_bytes(&back.c, 1);
+        emit_cell_char(back.c);
         last_col_emitted = c;
     }
 }
