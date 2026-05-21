@@ -74,47 +74,41 @@ static void hwrite(int fd, const void *p, size_t n) {
     (void)r;
 }
 
-/* Canvas owner. UINT16_MAX = no owner; SYS_TUI_INIT records the
- * caller's vm_id, SYS_TUI_SHUTDOWN clears it. Non-owners get
- * -EBUSY from any TUI syscall (except POLL_EVENT, which returns
- * 0 for non-owners — they just see no events). */
-static uint16_t g_owner_vm    = UINT16_MAX;
-static bool     g_initialized = false;
-static unsigned g_flags       = 0;
-
-/* Active canvas dimensions (1..VM_TUI_MAX_*). Set at init. */
-static int g_rows = VM_TUI_MAX_ROWS;
-static int g_cols = VM_TUI_MAX_COLS;
-
-/* Did we (the TUI module) toggle raw mode on at init? If so we
- * undo it at shutdown. If the caller's tty was already raw and
- * we didn't change it, we leave it alone. */
-static bool g_raw_mode_we_set = false;
-
-/* Forward decls for atexit hook + raw mode reset. */
-static void do_shutdown(void);
-
-/* Pen — current fg/bg/attr for OP_PUTC / OP_PUTS. */
-static uint16_t g_pen_fg    = VM_TUI_DEFAULT_COLOR;
-static uint16_t g_pen_bg    = VM_TUI_DEFAULT_COLOR;
-static uint8_t  g_pen_attrs = VM_TUI_ATTR_NONE;
-
-/* Notional cursor (1-indexed). */
-static int g_cur_row = 1;
-static int g_cur_col = 1;
-
-/* Clip rect (1-indexed). h/w default to full canvas. */
-static int g_clip_r = 1, g_clip_c = 1;
-static int g_clip_h = VM_TUI_MAX_ROWS, g_clip_w = VM_TUI_MAX_COLS;
-
-/* The TuiCell layout matches the guest's: 6 bytes packed.
+/* ============================================================
+ *  Round U.5: per-VM TUI session state
  *
- *   c       1 byte    char
- *   fg      2 bytes   color (0..15, 256=default)
- *   bg      2 bytes   color
- *   attrs   1 byte    bitmask
- *   flags   1 byte    cell flags (unused on canvas cells)
- */
+ *  All TUI state that USED to be process-global lives here in
+ *  VmTuiSession. For U.5 there is exactly one instance (g_session),
+ *  so behavior is bit-identical to pre-U.5. U.6 will make this an
+ *  array keyed by (vm_id, transport) so multiple shells can each
+ *  drive their own independent canvas + input parser.
+ *
+ *  Why this layout:
+ *    - Each session owns a back+front buffer pair (~42 KB each).
+ *      Two simultaneous sessions = two canvases on different
+ *      terminals; they never interfere.
+ *    - Each session owns its own input-parser state machine so
+ *      CSI/mouse sequences interleaved across transports stay
+ *      coherent.
+ *    - Each session owns its raw-mode flag because each transport
+ *      may need raw mode independently (one pty may be raw, one
+ *      TCP socket is irrelevant, etc.).
+ *
+ *  What stays global (intentionally):
+ *    - g_out_fn / g_out_ctx           — legacy U.1 hook fallback
+ *    - g_out_buf / g_out_pos          — write cache (just a buffer
+ *                                        between hwrite calls)
+ *    - g_tile_arena / g_tile_slots    — already vm-keyed via the
+ *                                        slot table; arena bytes
+ *                                        are pooled across all VMs
+ *
+ *  The forward decl `cur_session()` returns the current session
+ *  for the calling context. In U.5 it always returns &g_session;
+ *  in U.6 it does a (vm_id → session) lookup. ECALL handlers will
+ *  migrate to using it instead of touching g_session directly.
+ * ============================================================ */
+
+/* The TuiCell layout matches the guest's: 6 bytes packed. */
 typedef struct {
     char     c;
     uint16_t fg;
@@ -123,10 +117,140 @@ typedef struct {
     uint8_t  flags;
 } __attribute__((packed)) HostCell;
 
-/* Back and front buffers. */
-static HostCell g_canvas[VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
-static HostCell g_front [VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
-static bool     g_front_valid = false;
+#define VM_TUI_IN_BUF_CAP   256
+#define VM_TUI_MAX_CSI_PARAMS 6
+
+typedef struct VmTuiSession {
+    /* Canvas owner. UINT16_MAX = no owner; SYS_TUI_INIT records
+     * the caller's vm_id, SYS_TUI_SHUTDOWN clears it. Non-owners
+     * get -EBUSY from TUI syscalls (POLL_EVENT excepted — non-
+     * owners see an empty event queue, no error). */
+    uint16_t owner_vm;
+    bool     initialized;
+    unsigned flags;
+
+    /* Active canvas dimensions (1..VM_TUI_MAX_*). Set at init. */
+    int rows;
+    int cols;
+
+    /* Back + front buffer pair. The back buffer is what guests
+     * draw into; the front buffer holds what's currently on the
+     * terminal. present_diff compares them to compute the minimal
+     * output. */
+    HostCell canvas[VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
+    HostCell front [VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
+    bool     front_valid;
+
+    /* Did THIS session toggle raw mode on at init? If so, we
+     * un-toggle on shutdown. If the caller's tty was already raw
+     * before init, we don't un-toggle. */
+    bool raw_mode_we_set;
+
+    /* Pen — current fg/bg/attr for OP_PUTC / OP_PUTS / OP_FILL. */
+    uint16_t pen_fg;
+    uint16_t pen_bg;
+    uint8_t  pen_attrs;
+
+    /* Notional cursor (1-indexed). Doesn't drive the terminal
+     * cursor directly; it's what OP_MOVE / OP_PUTC operate on. */
+    int cur_row;
+    int cur_col;
+
+    /* Clip rect (1-indexed). h/w default to full canvas. */
+    int clip_r, clip_c, clip_h, clip_w;
+
+    /* Input buffer (ring; head <= tail, wraps at IN_BUF_CAP). */
+    uint8_t  in_buf[VM_TUI_IN_BUF_CAP];
+    unsigned in_head;
+    unsigned in_tail;
+
+    /* Input parser state machine. */
+    int  in_state;
+    int  csi_params[VM_TUI_MAX_CSI_PARAMS];
+    int  csi_n_params;
+    int  csi_curr;
+    bool csi_has_curr;
+    char csi_intermediate;
+    int  esc_idle_polls;
+} VmTuiSession;
+
+static VmTuiSession g_session = {
+    .owner_vm        = UINT16_MAX,
+    .initialized     = false,
+    .flags           = 0,
+    .rows            = VM_TUI_MAX_ROWS,
+    .cols            = VM_TUI_MAX_COLS,
+    .front_valid     = false,
+    .raw_mode_we_set = false,
+    .pen_fg          = VM_TUI_DEFAULT_COLOR,
+    .pen_bg          = VM_TUI_DEFAULT_COLOR,
+    .pen_attrs       = VM_TUI_ATTR_NONE,
+    .cur_row         = 1,
+    .cur_col         = 1,
+    .clip_r          = 1,
+    .clip_c          = 1,
+    .clip_h          = VM_TUI_MAX_ROWS,
+    .clip_w          = VM_TUI_MAX_COLS,
+    .in_head         = 0,
+    .in_tail         = 0,
+    .in_state        = 0,   /* IN_STATE_GROUND — defined below */
+    .csi_n_params    = 0,
+    .csi_curr        = 0,
+    .csi_has_curr    = false,
+    .csi_intermediate= 0,
+    .esc_idle_polls  = 0,
+};
+
+/* In U.5, the "current session" is always &g_session. U.6 will
+ * make this a (vm_id → session) lookup. ECALL handlers use this
+ * accessor so the U.6 migration is local to one function. */
+static inline VmTuiSession *cur_session(void) {
+    return &g_session;
+}
+
+/* Forward decl for atexit hook + raw mode reset. */
+static void do_shutdown(void);
+
+/* Compatibility shims: the existing code below uses the old
+ * global names extensively (~160 references). Rather than churn
+ * every reference at the same time as introducing the struct,
+ * we keep the old names working via #define indirection. U.6
+ * will remove these in favor of explicit cur_session()->field
+ * accesses; for now they keep the diff focused on STATE LAYOUT,
+ * not access syntax.
+ *
+ * Care: any local variable in this file named after a shim macro
+ * will silently rewrite — check before adding locals like `flags`,
+ * `rows`, `cols`, `cur_row`, `cur_col`. We grepped at the time of
+ * the refactor; no collisions today. */
+#define g_owner_vm           (g_session.owner_vm)
+#define g_initialized        (g_session.initialized)
+#define g_flags              (g_session.flags)
+#define g_rows               (g_session.rows)
+#define g_cols               (g_session.cols)
+#define g_raw_mode_we_set    (g_session.raw_mode_we_set)
+#define g_pen_fg             (g_session.pen_fg)
+#define g_pen_bg             (g_session.pen_bg)
+#define g_pen_attrs          (g_session.pen_attrs)
+#define g_cur_row            (g_session.cur_row)
+#define g_cur_col            (g_session.cur_col)
+#define g_clip_r             (g_session.clip_r)
+#define g_clip_c             (g_session.clip_c)
+#define g_clip_h             (g_session.clip_h)
+#define g_clip_w             (g_session.clip_w)
+#define g_canvas             (g_session.canvas)
+#define g_front              (g_session.front)
+#define g_front_valid        (g_session.front_valid)
+#define g_in_buf             (g_session.in_buf)
+#define g_in_head            (g_session.in_head)
+#define g_in_tail            (g_session.in_tail)
+#define g_in_state           (g_session.in_state)
+#define g_csi_params         (g_session.csi_params)
+#define g_csi_n_params       (g_session.csi_n_params)
+#define g_csi_curr           (g_session.csi_curr)
+#define g_csi_has_curr       (g_session.csi_has_curr)
+#define g_csi_intermediate   (g_session.csi_intermediate)
+#define g_esc_idle_polls     (g_session.esc_idle_polls)
 
 /* ============================================================
  *  Internal: bounds + drawable check
@@ -783,11 +907,10 @@ typedef struct {
 #define MOD_ALT   (1u << 1)
 #define MOD_CTRL  (1u << 2)
 
-#define IN_BUF_CAP 256
-
-static uint8_t  g_in_buf[IN_BUF_CAP];
-static unsigned g_in_head = 0;
-static unsigned g_in_tail = 0;
+/* IN_BUF_CAP is referenced by the session struct definition above
+ * (as VM_TUI_IN_BUF_CAP). We keep this alias for the in-buf
+ * helpers below, which use IN_BUF_CAP throughout. */
+#define IN_BUF_CAP VM_TUI_IN_BUF_CAP
 
 enum {
     IN_STATE_GROUND = 0,
@@ -795,15 +918,9 @@ enum {
     IN_STATE_CSI,
     IN_STATE_CSI_O,
 };
-static int g_in_state = IN_STATE_GROUND;
 
-#define MAX_CSI_PARAMS 6
-static int  g_csi_params[MAX_CSI_PARAMS];
-static int  g_csi_n_params = 0;
-static int  g_csi_curr = 0;
-static bool g_csi_has_curr = false;
-static char g_csi_intermediate = 0;
-static int  g_esc_idle_polls = 0;
+/* MAX_CSI_PARAMS aliases the session-struct constant. */
+#define MAX_CSI_PARAMS VM_TUI_MAX_CSI_PARAMS
 
 static int in_buf_used(void) { return (int)(g_in_tail - g_in_head); }
 
