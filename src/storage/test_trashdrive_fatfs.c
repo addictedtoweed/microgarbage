@@ -9,7 +9,7 @@
  *      src/storage/test_trashdrive_fatfs.c \
  *      src/storage/trashdrive_fatfs.c \
  *      src/storage/trashdrive.c \
- *      third_party/fatfs/source/ff.c \
+ *      third_party/fatfs/ff_wrapped.c \
  *      third_party/fatfs/source/ffsystem.c
  *
  * If FatFs hasn't been extracted yet, omit the `-DHAVE_FATFS` and

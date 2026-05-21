@@ -57,7 +57,7 @@ echo "05_shell: compiling host (with FatFs)..."
     "$REPO_ROOT/src/storage/trashdrive.c" \
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \
     "$REPO_ROOT/src/util/inicfg.c" \
-    "$FATFS_SOURCE/ff.c" \
+    "$FATFS_DIR/ff_wrapped.c" \
     "$FATFS_SOURCE/ffsystem.c"
 
 # Build the guest.

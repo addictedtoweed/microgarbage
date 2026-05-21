@@ -27,7 +27,7 @@
  *      src/vm/vm_mailbox.c src/vm/vm_loader.c src/vm/vm_core.c \
  *      src/memory/slab_stack.c src/memory/bump.c \
  *      src/containers/fifo_queue.c src/containers/ring_buffer.c \
- *      third_party/fatfs/source/ff.c third_party/fatfs/source/ffsystem.c
+ *      third_party/fatfs/ff_wrapped.c third_party/fatfs/source/ffsystem.c
  *
  * Public domain (CC0). No warranty.
  */
@@ -65,6 +65,8 @@ int main(void) {
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>     /* mkdir */
+#include <unistd.h>       /* rmdir */
 
 /* ============================================================
  *  Test fixture
