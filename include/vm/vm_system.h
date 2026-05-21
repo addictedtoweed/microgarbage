@@ -265,6 +265,15 @@ typedef struct {
      * entries the guest didn't free explicitly. */
     VmAllocTracking alloc_tracking[VM_SCHED_MAX_VMS];
 
+    /* Unload hooks. Each registered hook is called by
+     * vm_system_unload_vm before the VM's CPU and regions are
+     * torn down — useful for host services that hold per-VM
+     * state (like the TUI canvas owner). Up to 8 hooks; in
+     * practice we use only one (vm_host_tui). */
+    void (*unload_hooks[8])(uint16_t vm_id, void *userdata);
+    void  *unload_hook_userdata[8];
+    uint8_t unload_hook_count;
+
 } VmSystem;
 
 /* ============================================================
@@ -291,6 +300,21 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg);
  * state. Does NOT free any of the storage pools — caller owns
  * those. Safe to call on a zero-initialized struct. */
 void vm_system_destroy(VmSystem *sys);
+
+/* Register a callback to be invoked from vm_system_unload_vm
+ * before per-VM state is freed. Used by host services that
+ * hold per-VM resources (e.g., vm_host_tui's canvas owner).
+ *
+ *   hook        called with the unloading VM's vm_id and the
+ *               opaque userdata. Must be safe to call even if
+ *               the VM never used the service.
+ *   userdata    forwarded to the hook each call.
+ *
+ * Returns false if the hook table is full (max 8 hooks). */
+bool vm_system_register_unload_hook(
+    VmSystem *sys,
+    void (*hook)(uint16_t vm_id, void *userdata),
+    void *userdata);
 
 /* ============================================================
  *  VM management

@@ -982,6 +982,19 @@ void vm_system_destroy(VmSystem *sys) {
     memset(sys, 0, sizeof(*sys));
 }
 
+bool vm_system_register_unload_hook(
+    VmSystem *sys,
+    void (*hook)(uint16_t vm_id, void *userdata),
+    void *userdata)
+{
+    if (!sys || !hook) return false;
+    if (sys->unload_hook_count >= 8) return false;
+    sys->unload_hooks[sys->unload_hook_count] = hook;
+    sys->unload_hook_userdata[sys->unload_hook_count] = userdata;
+    sys->unload_hook_count++;
+    return true;
+}
+
 /* ============================================================
  *  VM loading
  * ============================================================ */
@@ -1140,6 +1153,15 @@ bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id) {
     /* Ensure the VM won't be stepped further (defensive — most
      * callers will already have observed the halt). */
     cpu->halted = true;
+
+    /* Invoke registered unload hooks. They run BEFORE region/slab
+     * teardown so a hook that needs to peek at the VM's regions
+     * can still do so. */
+    for (uint8_t hi = 0; hi < sys->unload_hook_count; hi++) {
+        if (sys->unload_hooks[hi]) {
+            sys->unload_hooks[hi](vm_id, sys->unload_hook_userdata[hi]);
+        }
+    }
 
     /* Walk regions and free any that came from the local slab.
      * We try to free every region's base pointer; the slab's

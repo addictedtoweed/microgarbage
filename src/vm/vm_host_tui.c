@@ -1081,6 +1081,13 @@ static void handle_tui_flush_draw(VmCpu *cpu, void *system) {
  *  Installation
  * ============================================================ */
 
+/* Adapter: VmSystem unload hooks take (vm_id, userdata). The
+ * TUI release function takes only vm_id, so we wrap it. */
+static void tui_unload_adapter(uint16_t vm_id, void *userdata) {
+    (void)userdata;
+    vm_host_tui_release_for_vm(vm_id);
+}
+
 bool vm_host_install_tui(VmSystem *sys) {
     if (!sys || !sys->ecall_router) return false;
 
@@ -1098,6 +1105,11 @@ bool vm_host_install_tui(VmSystem *sys) {
                            handle_tui_poll_event)) goto fail_diff;
     if (!vm_ecall_register(sys->ecall_router, SYS_TUI_FLUSH_DRAW,
                            handle_tui_flush_draw)) goto fail_poll;
+
+    /* Register the auto-release hook so a guest that exits without
+     * calling SYS_TUI_SHUTDOWN doesn't permanently lock the canvas. */
+    vm_system_register_unload_hook(sys, tui_unload_adapter, NULL);
+
     return true;
 
 fail_poll:     vm_ecall_unregister(sys->ecall_router, SYS_TUI_POLL_EVENT);
