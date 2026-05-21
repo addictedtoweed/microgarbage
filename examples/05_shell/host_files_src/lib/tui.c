@@ -490,3 +490,108 @@ bool tui_poll_event(TuiEvent *out) {
     out->kind = TUI_EV_NONE;
     return false;
 }
+
+/* ============================================================
+ *  Button widget (round D.2)
+ * ============================================================ */
+
+bool tui_button_hit(const TuiButton *b, int row, int col) {
+    return row >= b->row && row < b->row + b->h &&
+           col >= b->col && col < b->col + b->w;
+}
+
+void tui_button_draw(const TuiButton *b) {
+    TuiColor fg = b->pressed ? b->pressed_fg : b->fg;
+    TuiColor bg = b->pressed ? b->pressed_bg : b->bg;
+
+    /* Draw the button body as a filled rectangle. */
+    tui_set_fg(fg);
+    tui_set_bg(bg);
+    tui_fill_rect(b->row, b->col, b->h, b->w, ' ');
+
+    /* A subtle drop-shadow / border via reverse-video corners,
+     * but only on idle — when pressed we drop the border to give
+     * a "sunken" feel without needing separate drawing. */
+    if (!b->pressed) {
+        /* Light top-edge using upper half block */
+        for (int c = 0; c < b->w; c++) {
+            tui_set_cell(b->row, b->col + c,
+                         TUI_BLOCK_LOWER_HALF, bg, TUI_DEFAULT_COLOR, 0);
+        }
+        /* Dark bottom-edge using lower half block */
+        for (int c = 0; c < b->w; c++) {
+            tui_set_cell(b->row + b->h - 1, b->col + c,
+                         TUI_BLOCK_UPPER_HALF, bg, TUI_DEFAULT_COLOR, 0);
+        }
+    }
+
+    /* Label centered in the bounding box. */
+    if (b->label) {
+        int lbl_len = 0;
+        for (const char *p = b->label; *p; p++) lbl_len++;
+        if (lbl_len > b->w - 2) lbl_len = b->w - 2;
+        int label_col = b->col + (b->w - lbl_len) / 2;
+        int label_row = b->row + (b->h - 1) / 2;
+        /* When pressed, nudge the label down one row to simulate
+         * "the button moved." If h==1 we skip the nudge. */
+        if (b->pressed && b->h > 2) label_row++;
+        tui_set_fg(fg);
+        tui_set_bg(bg);
+        tui_set_attr(TUI_ATTR_BOLD);
+        tui_move(label_row, label_col);
+        for (int i = 0; i < lbl_len; i++) tui_putc(b->label[i]);
+        tui_set_attr(0);
+    }
+    tui_reset();
+}
+
+TuiButtonResult tui_button_handle(TuiButton *b, const TuiEvent *ev) {
+    if (!b || !ev || ev->kind != TUI_EV_MOUSE) return TUI_BTN_NONE;
+
+    int hit = tui_button_hit(b, ev->mouse.row, ev->mouse.col);
+
+    /* Press: arm the button if pressed inside its bounds. */
+    if (ev->mouse.press && !ev->mouse.drag) {
+        if (hit) {
+            if (!b->pressed) {
+                b->armed = 1;
+                b->pressed = 1;
+                return TUI_BTN_REDRAW;
+            }
+        }
+        return TUI_BTN_NONE;
+    }
+
+    /* Drag: update pressed visual to reflect current hover state
+     * while armed. If the user drags off the button while armed,
+     * we un-press (still armed, just unpressed visually). Drag
+     * back onto the button re-presses. Standard desktop UX. */
+    if (ev->mouse.drag) {
+        if (b->armed) {
+            int want = hit;
+            if (want != b->pressed) {
+                b->pressed = want;
+                return TUI_BTN_REDRAW;
+            }
+        }
+        return TUI_BTN_NONE;
+    }
+
+    /* Release: if armed and released over the button, that's a
+     * click. Otherwise just clear armed state. */
+    if (!ev->mouse.press) {
+        if (b->armed) {
+            int was_pressed = b->pressed;
+            b->armed = 0;
+            b->pressed = 0;
+            if (hit) {
+                /* Caller will likely teardown the menu so don't
+                 * worry about returning REDRAW too — CLICKED is
+                 * the strongest signal. */
+                return TUI_BTN_CLICKED;
+            }
+            if (was_pressed) return TUI_BTN_REDRAW;
+        }
+    }
+    return TUI_BTN_NONE;
+}

@@ -318,13 +318,17 @@ static void emit_sgr(uint16_t fg, uint16_t bg, uint8_t attrs) {
     if (attrs & VM_TUI_ATTR_UNDERLINE) out_str(";4");
     if (attrs & VM_TUI_ATTR_REVERSE)   out_str(";7");
     if (fg != VM_TUI_DEFAULT_COLOR) {
-        /* 16-color palette: 30-37 standard, 90-97 bright. */
-        if (fg < 8)        { out_str(";3"); out_dec(fg); }
-        else if (fg < 16)  { out_str(";9"); out_dec(fg - 8); }
+        /* 0..7   standard palette (SGR 30..37)
+         * 8..15  bright palette   (SGR 90..97)
+         * 16..255 xterm 256-color (SGR 38;5;N) */
+        if (fg < 8)         { out_str(";3"); out_dec(fg); }
+        else if (fg < 16)   { out_str(";9"); out_dec(fg - 8); }
+        else if (fg < 256)  { out_str(";38;5;"); out_dec(fg); }
     }
     if (bg != VM_TUI_DEFAULT_COLOR) {
-        if (bg < 8)        { out_str(";4"); out_dec(bg); }
-        else if (bg < 16)  { out_str(";10"); out_dec(bg - 8); }
+        if (bg < 8)         { out_str(";4"); out_dec(bg); }
+        else if (bg < 16)   { out_str(";10"); out_dec(bg - 8); }
+        else if (bg < 256)  { out_str(";48;5;"); out_dec(bg); }
     }
     out_str("m");
 }

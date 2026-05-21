@@ -452,4 +452,71 @@ void tui_present_diff(void);
 /* Poll for one input event. Non-blocking. */
 bool tui_poll_event(TuiEvent *out);
 
+/* ============================================================
+ *  Button widget (round D.2)
+ *
+ *  A clickable rectangular region with idle and pressed visual
+ *  states. The caller owns the struct and is responsible for
+ *  re-drawing when the state changes (signaled via the REDRAW
+ *  return code from tui_button_handle).
+ *
+ *  Typical use in a menu loop:
+ *
+ *      TuiButton ok = {
+ *          .row = 10, .col = 20, .h = 3, .w = 12,
+ *          .label = "OK",
+ *          .fg = 15, .bg = 4,
+ *          .pressed_fg = 15, .pressed_bg = 1,
+ *      };
+ *      tui_button_draw(&ok);
+ *      ...
+ *      while (running) {
+ *          TuiEvent ev;
+ *          while (tui_poll_event(&ev)) {
+ *              TuiButtonResult r = tui_button_handle(&ok, &ev);
+ *              if (r == TUI_BTN_CLICKED) { on_ok(); }
+ *              else if (r == TUI_BTN_REDRAW) { tui_button_draw(&ok); }
+ *          }
+ *          tui_present_diff();
+ *          sleep(33);
+ *      }
+ *
+ *  A button is "clicked" when the user presses the mouse on it
+ *  AND releases the mouse still on it. Pressing on the button
+ *  then dragging off cancels the click — same as standard
+ *  desktop button semantics.
+ *
+ *  Buttons don't process keyboard events directly. To support
+ *  "Enter activates the default button," the caller checks the
+ *  key event itself and calls the same action.
+ * ============================================================ */
+
+typedef struct {
+    int row, col;        /* top-left, 1-indexed */
+    int h, w;            /* bounding box (h >= 3, w >= label_len + 2) */
+    const char *label;
+    /* Idle-state colors. */
+    TuiColor fg, bg;
+    /* Pressed-state colors. */
+    TuiColor pressed_fg, pressed_bg;
+    /* Internal state — read-only from the caller's POV. */
+    int armed;           /* mouse went down on this button, still held */
+    int pressed;         /* visual state == pressed (mouse held over us) */
+} TuiButton;
+
+typedef enum {
+    TUI_BTN_NONE = 0,    /* no change, caller does nothing */
+    TUI_BTN_REDRAW,      /* visual state changed; caller should redraw */
+    TUI_BTN_CLICKED,     /* full press+release; trigger the action */
+} TuiButtonResult;
+
+/* Draw the button at its current state. */
+void tui_button_draw(const TuiButton *b);
+
+/* Process one event against this button. */
+TuiButtonResult tui_button_handle(TuiButton *b, const TuiEvent *ev);
+
+/* True if (row, col) falls inside the button's bounds. */
+bool tui_button_hit(const TuiButton *b, int row, int col);
+
 #endif  /* MICROGARBAGE_TUI_H */
