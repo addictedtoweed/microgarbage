@@ -474,9 +474,23 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
     }
 
     /* Raw mode (tty only). enable_raw_mode is a no-op for non-tty
-     * fds, returning false silently. */
+     * fds, returning false silently. We DO want to know when raw
+     * was requested but couldn't be set — that's the most common
+     * Cygwin/Windows-console headache. Print one diagnostic line
+     * so the user understands why their game's mouse events are
+     * echoing into the shell. */
     if (raw && in_fd >= 0) {
-        enable_raw_mode(in_fd);
+        if (!enable_raw_mode(in_fd)) {
+            const char *why = isatty(in_fd) ? "tcgetattr failed" : "not a tty";
+            fprintf(stderr,
+                "host: raw mode requested but unavailable on stdin "
+                "(fd=%d, %s).\n"
+                "      Interactive features may behave oddly. Try "
+                "launching\n"
+                "      from mintty (cygwin terminal) or use "
+                "'set raw-mode false' in vm.cfg.\n",
+                in_fd, why);
+        }
     }
 
     /* Register handlers. If either registration fails (e.g.,

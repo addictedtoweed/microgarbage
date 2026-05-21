@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ============================================================
  *  Module state
@@ -48,6 +49,14 @@ static unsigned g_flags       = 0;
 /* Active canvas dimensions (1..VM_TUI_MAX_*). Set at init. */
 static int g_rows = VM_TUI_MAX_ROWS;
 static int g_cols = VM_TUI_MAX_COLS;
+
+/* Did we (the TUI module) toggle raw mode on at init? If so we
+ * undo it at shutdown. If the caller's tty was already raw and
+ * we didn't change it, we leave it alone. */
+static bool g_raw_mode_we_set = false;
+
+/* Forward decls for atexit hook + raw mode reset. */
+static void do_shutdown(void);
 
 /* Pen — current fg/bg/attr for OP_PUTC / OP_PUTS. */
 static uint16_t g_pen_fg    = VM_TUI_DEFAULT_COLOR;
@@ -141,6 +150,17 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
         return -VM_EBUSY;
     }
 
+    /* Register an atexit hook on the FIRST init we ever do.
+     * If the host process exits while a guest still owns the
+     * canvas (Ctrl-C, fatal error, etc.), this restores the
+     * terminal so the parent shell doesn't inherit alt-screen,
+     * raw mode, mouse reporting, or hidden cursor. */
+    static bool atexit_registered = false;
+    if (!atexit_registered) {
+        atexit(do_shutdown);
+        atexit_registered = true;
+    }
+
     if (rows <= 0 || rows > VM_TUI_MAX_ROWS) rows = VM_TUI_MAX_ROWS;
     if (cols <= 0 || cols > VM_TUI_MAX_COLS) cols = VM_TUI_MAX_COLS;
 
@@ -180,9 +200,24 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
         const char *s = "\x1b[?1002h\x1b[?1006h";
         hwrite(1, s, 16);
     }
-    /* TUI_USE_RAW: we don't manipulate termios here — the host
-     * already has raw mode on if it was launched with raw_mode=true
-     * in vm.cfg. A future round may add a per-syscall raw toggle. */
+    /* TUI_USE_RAW: switch the controlling tty into raw mode so
+     * keystrokes and mouse events reach us byte-by-byte instead
+     * of being line-buffered and echoed back. The shell host
+     * usually already has raw mode on, but a spawned game can't
+     * count on that — and if we entered alt-screen with cooked
+     * mode, the user's keypresses would echo onto the screen
+     * over our rendering.
+     *
+     * vm_host_stdio_set_raw_mode silently returns false if the
+     * fd isn't a TTY or termios isn't available (Cygwin
+     * native-Windows binaries on a non-pty handle, e.g.); in
+     * those cases the user's terminal handles things on its
+     * own and we just live with whatever cooking it applies. */
+    if (flags & VM_TUI_USE_RAW) {
+        g_raw_mode_we_set = vm_host_stdio_set_raw_mode(true);
+    } else {
+        g_raw_mode_we_set = false;
+    }
 
     return 0;
 }
@@ -208,6 +243,14 @@ static void do_shutdown(void) {
         hwrite(1, s, 6);
     }
     fflush(stdout);
+
+    /* If we put the tty into raw mode, take it out so the user's
+     * shell gets a normal cooked-mode terminal back when we
+     * exit. If the caller already had it raw, leave it. */
+    if (g_raw_mode_we_set) {
+        vm_host_stdio_set_raw_mode(false);
+        g_raw_mode_we_set = false;
+    }
 
     g_initialized = false;
     g_owner_vm    = UINT16_MAX;
