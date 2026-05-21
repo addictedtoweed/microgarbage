@@ -31,9 +31,39 @@
  *  Module state
  * ============================================================ */
 
+/* Output transport hook (round U.1). If set, ALL canvas output
+ * goes through this function; otherwise we fall back to a raw
+ * write() to fd=1. Set via vm_host_tui_set_output(), normally
+ * by host.c when a non-stdout transport (named pipe, socket,
+ * serial) is in use. */
+static VmTuiOutputFn g_out_fn  = NULL;
+static void         *g_out_ctx = NULL;
+
+void vm_host_tui_set_output(VmTuiOutputFn fn, void *ctx) {
+    g_out_fn  = fn;
+    g_out_ctx = ctx;
+}
+
+/* Flush stdout only when we're using it. When a transport hook
+ * is registered, stdout isn't on the output path at all — the
+ * hook is — so fflushing it would be a no-op at best and could
+ * mix unrelated stdio writes into our canvas frame at worst. */
+static void hflush_stdout_if_default(void) {
+    if (!g_out_fn) fflush(stdout);
+}
+
 /* Suppress -Wunused-result on write(). We're best-effort here:
- * a closed terminal means nothing reaches the user anyway. */
+ * a closed terminal means nothing reaches the user anyway. The
+ * `fd` argument exists only for the no-hook fallback (always 1
+ * in practice); when a hook is registered it routes through the
+ * hook regardless of fd. */
 static void hwrite(int fd, const void *p, size_t n) {
+    if (g_out_fn) {
+        /* Best-effort: drop short writes (matches the old behavior
+         * for raw write() which we also weren't retrying on). */
+        (void)g_out_fn(p, n, g_out_ctx);
+        return;
+    }
     ssize_t r = write(fd, p, n);
     (void)r;
 }
@@ -242,7 +272,7 @@ static void do_shutdown(void) {
         const char *s = "\x1b[0m\r\n";
         hwrite(1, s, 6);
     }
-    fflush(stdout);
+    hflush_stdout_if_default();
 
     /* If we put the tty into raw mode, take it out so the user's
      * shell gets a normal cooked-mode terminal back when we
@@ -697,7 +727,7 @@ static void do_present(void) {
     out_str("\x1b[0m");
     if (g_flags & VM_TUI_USE_SYNC_OUTPUT) out_str("\x1b[?2026l");
     out_flush();
-    fflush(stdout);
+    hflush_stdout_if_default();
     copy_back_to_front();
 }
 
@@ -708,7 +738,7 @@ static void do_present_diff(void) {
     out_str("\x1b[0m");
     if (g_flags & VM_TUI_USE_SYNC_OUTPUT) out_str("\x1b[?2026l");
     out_flush();
-    fflush(stdout);
+    hflush_stdout_if_default();
     copy_back_to_front();
 }
 

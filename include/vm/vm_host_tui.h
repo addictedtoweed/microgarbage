@@ -36,6 +36,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -199,6 +200,32 @@ bool vm_host_install_tui(VmSystem *sys);
  * the VM didn't own the canvas. Also frees any tiles the
  * VM allocated. */
 void vm_host_tui_release_for_vm(uint16_t vm_id);
+
+/* ============================================================
+ *  Output transport hook (round U.1)
+ *
+ *  By default the TUI writes its canvas output (escape sequences
+ *  + cells) to file descriptor 1 via the POSIX write() syscall.
+ *  That works when the host process's stdout is the user's
+ *  terminal — which is the common case but not the only one.
+ *
+ *  When the host is exposing its shell over a different
+ *  transport (a named pipe, a TCP socket, a serial port, an
+ *  attached MCU UART), TUI output should follow the same path
+ *  as the shell's normal stdout, not punch through to fd=1.
+ *
+ *  Callers register an output function and an opaque context;
+ *  TUI calls it for every byte the canvas emits. The function
+ *  returns the number of bytes written (best-effort, like
+ *  POSIX write — partial writes are allowed but we don't
+ *  currently retry on them).
+ *
+ *  Pass (NULL, NULL) to restore the default fd=1 behavior.
+ * ============================================================ */
+
+typedef int (*VmTuiOutputFn)(const void *buf, size_t n, void *ctx);
+
+void vm_host_tui_set_output(VmTuiOutputFn fn, void *ctx);
 
 /* ============================================================
  *  Tile subsystem (round T.3b)

@@ -699,6 +699,29 @@ static void pipe_sys_fflush(VmCpu *cpu, void *system) {
     cpu->regs[VM_REG_A0] = 0;
 }
 
+/* === TUI output hook (round U.1) ===
+ *
+ * The TUI host service emits canvas escape sequences directly
+ * via write(1, ...). When the shell is running over a named
+ * pipe the user's terminal is on the OTHER end of the pipe,
+ * not on fd=1. Without this hook the TUI output would go to
+ * whatever fd=1 still points at (the Cygwin terminal that
+ * launched host.exe), and PuTTY-connected-to-pipe would see
+ * the shell prompt but no game.
+ *
+ * Unlike pipe_sys_write, this hook does NOT translate '\n' to
+ * '\r\n'. The TUI emits explicit '\r\n' where it wants line
+ * breaks; injecting extra '\r' would corrupt cursor positioning. */
+static int pipe_tui_write(const void *buf, size_t n, void *ctx) {
+    (void)ctx;
+    if (g_pipe_handle == INVALID_HANDLE_VALUE) return 0;
+    DWORD wr = 0;
+    if (!WriteFile(g_pipe_handle, buf, (DWORD)n, &wr, NULL)) {
+        return -1;
+    }
+    return (int)wr;
+}
+
 /* Create the named pipe, wait for the client to connect, and
  * register our SYS_READ/SYS_WRITE/SYS_FFLUSH handlers on the
  * given VmSystem.
@@ -771,6 +794,13 @@ static bool setup_pipe_transport(VmSystem *sys, const char *name) {
         fprintf(stderr, "host: register SYS_FFLUSH failed\n");
         return false;
     }
+
+    /* Route TUI canvas output through the pipe. Without this,
+     * the TUI host service would write directly to fd=1 (which
+     * in pipe mode is still the launching terminal, not the
+     * pipe client). The shell would appear in PuTTY but games
+     * would appear in the Cygwin terminal that ran host.exe. */
+    vm_host_tui_set_output(pipe_tui_write, NULL);
 
     return true;
 }
