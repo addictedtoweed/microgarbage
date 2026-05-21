@@ -69,6 +69,8 @@
 #define DT_DIR    1
 
 /* Errno values negated by the host on error returns. */
+#define E_PERM       1
+#define E_IO         5
 #define E_NOENT      2
 #define E_BADF       9
 #define E_EXIST     17
@@ -77,6 +79,7 @@
 #define E_INVAL     22
 #define E_MFILE     24
 #define E_NOSPC     28
+#define E_ROFS      30
 #define E_NAMETOOLONG 36
 
 /* Dirent layout — matches VmDirent in include/vm/vm_host_fs.h. */
@@ -405,6 +408,8 @@ static int resolve_path(const char *in, char *out) {
 static const char *errno_name(int err) {
     /* err is positive here (we negate the syscall return). */
     switch (err) {
+        case E_PERM:        return "permission denied";
+        case E_IO:          return "i/o error";
         case E_NOENT:       return "no such file or directory";
         case E_BADF:        return "bad file descriptor";
         case E_EXIST:       return "file exists";
@@ -413,6 +418,7 @@ static const char *errno_name(int err) {
         case E_INVAL:       return "invalid argument";
         case E_MFILE:       return "too many open files";
         case E_NOSPC:       return "no space left on device";
+        case E_ROFS:        return "read-only filesystem";
         case E_NAMETOOLONG: return "name too long";
         default:            return "unknown error";
     }
@@ -726,6 +732,8 @@ static void cmd_help(void) {
     putln("  touch <path>         create empty file");
     putln("  cat <path>           print file contents");
     putln("  write <path> <text>  write text to file (truncating)");
+    putln("  cp <src> <dst>       copy file");
+    putln("  mv <src> <dst>       move/rename file");
     putln("  run <path>           explicitly load and execute an ELF");
     putln("  <path>               same as run; e.g. /host/snake.elf");
     putln("  history              show recent commands");
@@ -1018,6 +1026,99 @@ static void cmd_write(int argc, char **argv) {
     sys_close(fd);
 }
 
+/* Copy bytes from one open fd to another. Returns 0 on success
+ * or a negative errno from the failing read/write. */
+static int copy_fd_to_fd(int src_fd, int dst_fd) {
+    char buf[512];
+    for (;;) {
+        int n = sys_read(src_fd, buf, sizeof(buf));
+        if (n < 0) return n;
+        if (n == 0) return 0;        /* EOF */
+        int written = 0;
+        while (written < n) {
+            int w = sys_write(dst_fd, buf + written, (unsigned)(n - written));
+            if (w < 0) return w;
+            if (w == 0) return -5;     /* EIO — shouldn't happen on files */
+            written += w;
+        }
+    }
+}
+
+/* cp src dst
+ *
+ * Copies one file to another. Truncates dst if it exists.
+ * Works across mounts (e.g., cp /host/foo.elf /td0/foo.elf)
+ * since the read/write loop is backend-agnostic. */
+static void cmd_cp(int argc, char **argv) {
+    if (argc < 3) { putln("cp: usage: cp <src> <dst>"); return; }
+    char src[PATH_CAP], dst[PATH_CAP];
+    if (resolve_path(argv[1], src) != 0) {
+        putln("cp: src path too long");
+        return;
+    }
+    if (resolve_path(argv[2], dst) != 0) {
+        putln("cp: dst path too long");
+        return;
+    }
+
+    int sfd = sys_openat(AT_FDCWD, src, O_RDONLY, 0);
+    if (sfd < 0) { perror_("cp", sfd); return; }
+
+    int dfd = sys_openat(AT_FDCWD, dst, O_WRONLY | O_CREAT | O_TRUNC, 0);
+    if (dfd < 0) { perror_("cp", dfd); sys_close(sfd); return; }
+
+    int r = copy_fd_to_fd(sfd, dfd);
+    sys_close(sfd);
+    sys_close(dfd);
+    if (r < 0) perror_("cp", r);
+}
+
+/* mv src dst
+ *
+ * Moves (renames) a file. Implementation: copy src to dst,
+ * then unlink src. If the unlink fails after a successful
+ * copy, the file ends up duplicated rather than moved, and
+ * we print a warning so the user knows to clean up.
+ *
+ * A future commit could add a SYS_RENAME for the same-mount
+ * case (which FatFs can do via f_rename and the host fs via
+ * rename(2)), but cp+unlink works as a portable fallback
+ * for all our cases today. */
+static void cmd_mv(int argc, char **argv) {
+    if (argc < 3) { putln("mv: usage: mv <src> <dst>"); return; }
+    char src[PATH_CAP], dst[PATH_CAP];
+    if (resolve_path(argv[1], src) != 0) {
+        putln("mv: src path too long");
+        return;
+    }
+    if (resolve_path(argv[2], dst) != 0) {
+        putln("mv: dst path too long");
+        return;
+    }
+
+    int sfd = sys_openat(AT_FDCWD, src, O_RDONLY, 0);
+    if (sfd < 0) { perror_("mv", sfd); return; }
+
+    int dfd = sys_openat(AT_FDCWD, dst, O_WRONLY | O_CREAT | O_TRUNC, 0);
+    if (dfd < 0) { perror_("mv", dfd); sys_close(sfd); return; }
+
+    int r = copy_fd_to_fd(sfd, dfd);
+    sys_close(sfd);
+    sys_close(dfd);
+    if (r < 0) {
+        perror_("mv", r);
+        /* Don't unlink src on failed copy — caller may still
+         * have the original. */
+        return;
+    }
+
+    int u = sys_unlinkat(AT_FDCWD, src, 0);
+    if (u < 0) {
+        puts_("mv: warning — copied to dst but failed to remove src: ");
+        perror_("mv", u);
+    }
+}
+
 /* run <path>
  *
  * Spawn an ELF file as a child VM and wait for it to exit.
@@ -1132,6 +1233,8 @@ static void dispatch(char *line) {
     else if (scmp(argv[0], "touch") == 0) cmd_touch(argc, argv);
     else if (scmp(argv[0], "cat")   == 0) cmd_cat(argc, argv);
     else if (scmp(argv[0], "write") == 0) cmd_write(argc, argv);
+    else if (scmp(argv[0], "cp")    == 0) cmd_cp(argc, argv);
+    else if (scmp(argv[0], "mv")    == 0) cmd_mv(argc, argv);
     else if (scmp(argv[0], "run")   == 0) cmd_run(argc, argv);
     else if (scmp(argv[0], "history") == 0) cmd_history();
     else if (scmp(argv[0], "meminfo") == 0) cmd_meminfo();
