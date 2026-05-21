@@ -283,6 +283,12 @@ static int scmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+/* Return non-zero if `s` contains `c`. */
+static int sfind_char(const char *s, char c) {
+    for (; *s; s++) if (*s == c) return 1;
+    return 0;
+}
+
 static void puts_(const char *s) {
     sys_write(1, s, slen(s));
 }
@@ -561,10 +567,346 @@ typedef enum {
  * Down can restore it. */
 #define HIST_AT_DRAFT  ((unsigned)-1)
 
+/* ============================================================
+ *  Tab completion (round T.6)
+ *
+ *  When Tab is pressed mid-line, we figure out what kind of
+ *  token the cursor is in (first token vs. an argument), build
+ *  a candidate list, and either complete or list-on-double-Tab.
+ *
+ *  First-token candidates  = builtins + executable files in cwd
+ *                            (path-first dispatch finds anything
+ *                            in cwd, so completing cwd files
+ *                            matches that semantics).
+ *  Argument candidates     = filesystem entries that match the
+ *                            partial path.
+ *
+ *  We use fixed-size buffers — no malloc, no dynamic allocation.
+ *  64 candidate slots, each pointing into a 2 KB pool. If the
+ *  directory has more entries than that, we truncate and print
+ *  "(more...)" on list.
+ * ============================================================ */
+
+#define COMP_MAX_CAND       64
+#define COMP_POOL_BYTES   2048
+
+typedef struct {
+    char  *names[COMP_MAX_CAND];
+    int    is_dir[COMP_MAX_CAND];   /* 1 if this candidate is a directory */
+    unsigned count;
+    char   pool[COMP_POOL_BYTES];
+    unsigned pool_used;
+} CompList;
+
+static const char *g_builtins[] = {
+    "help", "pwd", "ls", "cd", "mkdir", "rmdir", "rm", "touch",
+    "cat", "write", "cp", "mv", "run", "history", "meminfo",
+    "exit", "quit",
+    /* NULL terminator */
+    (const char *)0
+};
+
+static void comp_init(CompList *cl) {
+    cl->count = 0;
+    cl->pool_used = 0;
+}
+
+/* Add `name` (length n; n == 0 means strlen) to the candidate
+ * list if there's room and it isn't a duplicate. */
+static void comp_add(CompList *cl, const char *name, unsigned n,
+                     int is_dir) {
+    if (n == 0) {
+        for (const char *p = name; *p; p++) n++;
+    }
+    if (cl->count >= COMP_MAX_CAND) return;
+    if (cl->pool_used + n + 1 > COMP_POOL_BYTES) return;
+    /* Dup-check */
+    for (unsigned i = 0; i < cl->count; i++) {
+        const char *p = cl->names[i];
+        unsigned m = 0;
+        while (p[m]) m++;
+        if (m == n) {
+            int match = 1;
+            for (unsigned j = 0; j < n; j++) {
+                if (p[j] != name[j]) { match = 0; break; }
+            }
+            if (match) return;
+        }
+    }
+    char *dst = cl->pool + cl->pool_used;
+    for (unsigned i = 0; i < n; i++) dst[i] = name[i];
+    dst[n] = '\0';
+    cl->names[cl->count] = dst;
+    cl->is_dir[cl->count] = is_dir;
+    cl->count++;
+    cl->pool_used += n + 1;
+}
+
+/* Add every builtin whose name starts with `prefix`. */
+static void comp_collect_builtins(CompList *cl, const char *prefix,
+                                  unsigned plen) {
+    for (unsigned i = 0; g_builtins[i]; i++) {
+        const char *bn = g_builtins[i];
+        unsigned match = 1;
+        for (unsigned j = 0; j < plen; j++) {
+            if (bn[j] != prefix[j]) { match = 0; break; }
+        }
+        if (match) {
+            unsigned n = 0; while (bn[n]) n++;
+            comp_add(cl, bn, n, 0);
+        }
+    }
+}
+
+/* Open `dir`, iterate entries, add ones starting with prefix. */
+static void comp_collect_dir(CompList *cl, const char *dir,
+                             const char *prefix, unsigned plen,
+                             int hide_dotfiles) {
+    int fd = sys_openat(AT_FDCWD, dir, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return;
+    Dirent de;
+    for (;;) {
+        int r = sys_readdir(fd, &de);
+        if (r == 1) break;          /* end of directory (sys_readdir convention) */
+        if (r < 0)  break;          /* error */
+        /* Skip dotfiles when hide_dotfiles is on and the user's
+         * prefix didn't begin with a dot. */
+        if (hide_dotfiles && de.name[0] == '.' && prefix[0] != '.') continue;
+        /* Prefix match */
+        unsigned match = 1;
+        for (unsigned j = 0; j < plen; j++) {
+            if (de.name[j] != prefix[j]) { match = 0; break; }
+            if (de.name[j] == '\0')      { match = 0; break; }
+        }
+        if (!match) continue;
+        unsigned n = 0; while (de.name[n]) n++;
+        comp_add(cl, de.name, n, de.type == DT_DIR);
+    }
+    sys_close(fd);
+}
+
+/* Find longest common prefix length across all candidates. */
+static unsigned comp_common_prefix_len(const CompList *cl) {
+    if (cl->count == 0) return 0;
+    if (cl->count == 1) {
+        unsigned n = 0;
+        while (cl->names[0][n]) n++;
+        return n;
+    }
+    unsigned k = 0;
+    for (;;) {
+        char ch = cl->names[0][k];
+        if (ch == '\0') return k;
+        for (unsigned i = 1; i < cl->count; i++) {
+            if (cl->names[i][k] != ch) return k;
+        }
+        k++;
+    }
+}
+
+/* Print the candidate list. Called on double-Tab when no progress
+ * could be made. Wraps to terminal width naïvely (assumes 80). */
+static void comp_print_list(const CompList *cl) {
+    puts_("\r\n");
+    unsigned col = 0;
+    for (unsigned i = 0; i < cl->count; i++) {
+        const char *p = cl->names[i];
+        unsigned n = 0; while (p[n]) n++;
+        unsigned cell = n + (cl->is_dir[i] ? 1 : 0) + 2;  /* + "/  " or "  " */
+        if (col + cell > 76 && col > 0) {
+            puts_("\r\n");
+            col = 0;
+        }
+        sys_write(1, p, n);
+        if (cl->is_dir[i]) sys_write(1, "/", 1);
+        sys_write(1, "  ", 2);
+        col += cell;
+    }
+    puts_("\r\n");
+    sys_fflush(1);
+}
+
+/* Split a partial path into "directory portion" and "leaf
+ * prefix" relative to the shell's cwd. If `partial` is "foo/bar"
+ * then dir_out = "foo" (resolved against cwd), prefix_out = "bar".
+ * If "/foo/bar" then dir_out = "/foo". If "foo" then dir_out is
+ * cwd and prefix_out is "foo". */
+static void split_partial_path(const char *partial,
+                               char *dir_out, unsigned dir_cap,
+                               char *prefix_out, unsigned prefix_cap) {
+    /* Find last '/'. */
+    int last = -1;
+    for (int i = 0; partial[i]; i++) {
+        if (partial[i] == '/') last = i;
+    }
+    if (last < 0) {
+        /* No slash: entire token is the leaf prefix, dir is cwd. */
+        scpy(dir_out, g_cwd, dir_cap);
+        scpy(prefix_out, partial, prefix_cap);
+        return;
+    }
+    /* Copy the directory portion. Special case: "/" alone. */
+    char dpart[PATH_CAP];
+    if (last == 0) {
+        dpart[0] = '/';
+        dpart[1] = '\0';
+    } else {
+        int n = last;
+        if (n >= (int)sizeof(dpart) - 1) n = sizeof(dpart) - 2;
+        for (int i = 0; i < n; i++) dpart[i] = partial[i];
+        dpart[n] = '\0';
+    }
+    /* Resolve to absolute path. */
+    if (resolve_path(dpart, dir_out) != 0) {
+        scpy(dir_out, g_cwd, dir_cap);
+    }
+    /* Leaf prefix is everything after the last slash. */
+    scpy(prefix_out, partial + last + 1, prefix_cap);
+}
+
+/* Find the start of the token containing the cursor. Returns
+ * an offset into buf. If we're past whitespace, returns the
+ * cursor position itself (token is empty). */
+static unsigned find_token_start(const char *buf, unsigned pos) {
+    unsigned s = pos;
+    while (s > 0 && buf[s - 1] != ' ' && buf[s - 1] != '\t') s--;
+    return s;
+}
+
+/* Find which token index the cursor is in (0 = first token). */
+static unsigned find_token_index(const char *buf, unsigned pos) {
+    unsigned idx = 0;
+    int in_tok = 0;
+    for (unsigned i = 0; i < pos; i++) {
+        char c = buf[i];
+        if (c == ' ' || c == '\t') {
+            if (in_tok) idx++;
+            in_tok = 0;
+        } else {
+            in_tok = 1;
+        }
+    }
+    return idx;
+}
+
+/* Apply a completion to the buffer at position pos, replacing
+ * the token-prefix from tok_start..pos with the full candidate
+ * (just the bytes after the prefix). Returns the new pos. */
+static unsigned apply_completion(char *buf, unsigned cap, unsigned pos,
+                                 unsigned tok_start, unsigned prefix_len,
+                                 const char *ext, unsigned ext_len) {
+    if (pos + ext_len + 1 >= cap) return pos;     /* would overflow */
+    /* `ext` is the bytes beyond what the user already typed —
+     * i.e. the candidate name with the first `prefix_len` bytes
+     * skipped. The bytes from tok_start to pos already match the
+     * candidate up to prefix_len, so we just append ext. */
+    (void)tok_start;
+    (void)prefix_len;
+    for (unsigned i = 0; i < ext_len; i++) {
+        buf[pos++] = ext[i];
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* Result of one Tab keystroke. */
+typedef enum {
+    COMP_NONE       = 0,   /* nothing happened (no candidates) */
+    COMP_EXTENDED,         /* buffer was extended; redraw */
+    COMP_AMBIGUOUS,        /* multiple candidates; no progress */
+} CompResult;
+
+/* Try to complete the token under the cursor.
+ *
+ * On COMP_EXTENDED, `pos` has been updated, buf is null-terminated,
+ * and the caller should redraw the line.
+ * On COMP_AMBIGUOUS, the caller should remember "last was tab"; a
+ * second Tab will call comp_print_list_for(buf, pos) to show the
+ * list. We return without printing on first ambiguous Tab.
+ * On COMP_NONE, do nothing.
+ *
+ * If `list_now` is true (i.e., this is the second Tab in a row),
+ * we print the candidate list instead. */
+static CompResult try_complete(char *buf, unsigned cap, unsigned *pos_io,
+                               int list_now) {
+    unsigned pos = *pos_io;
+    unsigned tok_start = find_token_start(buf, pos);
+    unsigned tok_idx = find_token_index(buf, pos);
+    unsigned plen = pos - tok_start;
+
+    /* Build a temporary null-terminated copy of the token prefix. */
+    char prefix[PATH_CAP];
+    if (plen >= sizeof(prefix)) plen = sizeof(prefix) - 1;
+    for (unsigned i = 0; i < plen; i++) prefix[i] = buf[tok_start + i];
+    prefix[plen] = '\0';
+
+    CompList cl;
+    comp_init(&cl);
+
+    if (tok_idx == 0 && !sfind_char(prefix, '/')) {
+        /* First token, no '/' in it → builtins + cwd entries. */
+        comp_collect_builtins(&cl, prefix, plen);
+        comp_collect_dir(&cl, g_cwd, prefix, plen, 1);
+    } else {
+        /* Path completion. Split partial path into dir + leaf. */
+        char dir[PATH_CAP];
+        char leaf[PATH_CAP];
+        split_partial_path(prefix, dir, sizeof(dir), leaf, sizeof(leaf));
+        unsigned leaf_len = 0;
+        while (leaf[leaf_len]) leaf_len++;
+        comp_collect_dir(&cl, dir, leaf, leaf_len, 1);
+        /* Override plen: only the leaf portion is the prefix
+         * the candidate list matched against, but we want to
+         * extend from where the leaf began in buf. The leaf
+         * began plen - leaf_len bytes into the token. */
+        plen = leaf_len;
+        tok_start = pos - leaf_len;
+    }
+
+    if (cl.count == 0) return COMP_NONE;
+
+    if (cl.count == 1) {
+        /* Unambiguous. Extend with rest of name. Add '/' if it's
+         * a directory, else ' '. */
+        const char *name = cl.names[0];
+        unsigned name_len = 0; while (name[name_len]) name_len++;
+        if (name_len < plen) return COMP_NONE;  /* shouldn't happen */
+        unsigned ext_len = name_len - plen;
+        pos = apply_completion(buf, cap, pos, tok_start, plen,
+                                name + plen, ext_len);
+        /* Trailing space (file) or slash (dir) — bash-style. */
+        if (pos + 1 < cap) {
+            buf[pos++] = cl.is_dir[0] ? '/' : ' ';
+            buf[pos] = '\0';
+        }
+        *pos_io = pos;
+        return COMP_EXTENDED;
+    }
+
+    /* Multiple candidates. Find common prefix; if longer than
+     * current input, extend. Otherwise it's ambiguous and we
+     * either show list (double Tab) or do nothing. */
+    unsigned cplen = comp_common_prefix_len(&cl);
+    if (cplen > plen) {
+        unsigned ext_len = cplen - plen;
+        pos = apply_completion(buf, cap, pos, tok_start, plen,
+                                cl.names[0] + plen, ext_len);
+        *pos_io = pos;
+        return COMP_EXTENDED;
+    }
+
+    if (list_now) {
+        comp_print_list(&cl);
+        return COMP_AMBIGUOUS;
+    }
+    return COMP_AMBIGUOUS;
+}
+
 static int readline_raw(char *buf, unsigned cap) {
     unsigned pos = 0;
     EscState esc = ESC_NONE;
     unsigned hist_pos = HIST_AT_DRAFT;
+    int last_was_tab = 0;
     static char draft[LINE_CAP];
     draft[0] = '\0';
 
@@ -634,6 +976,7 @@ static int readline_raw(char *buf, unsigned cap) {
                 }
                 /* C (right), D (left): ignore for now */
                 esc = ESC_NONE;
+                last_was_tab = 0;
             }
             /* Non-final byte: stay in ESC_CSI, keep collecting. */
             continue;
@@ -661,6 +1004,7 @@ static int readline_raw(char *buf, unsigned cap) {
                 puts_("\b \b");
                 sys_fflush(1);
             }
+            last_was_tab = 0;
             continue;
         }
         if (b == 0x03) {                  /* Ctrl-C */
@@ -673,6 +1017,7 @@ static int readline_raw(char *buf, unsigned cap) {
             if (pos == 0) {
                 return -1;                /* EOF on empty line */
             }
+            last_was_tab = 0;
             continue;                     /* ignore on non-empty line */
         }
         if (b == 0x0C) {                  /* Ctrl-L: clear screen */
@@ -680,6 +1025,7 @@ static int readline_raw(char *buf, unsigned cap) {
             erase_line_and_redraw_prompt();
             if (pos > 0) sys_write(1, buf, pos);
             sys_fflush(1);
+            last_was_tab = 0;
             continue;
         }
         if (b == 0x15) {                  /* Ctrl-U: clear line */
@@ -687,6 +1033,30 @@ static int readline_raw(char *buf, unsigned cap) {
             buf[0] = '\0';
             erase_line_and_redraw_prompt();
             sys_fflush(1);
+            last_was_tab = 0;
+            continue;
+        }
+        if (b == '\t') {                  /* Tab: completion */
+            int was_tab = last_was_tab;
+            /* Reset preemptively; the Tab branch will set this
+             * back to 1 only if appropriate (single ambiguous). */
+            last_was_tab = 0;
+            CompResult cr = try_complete(buf, cap, &pos, was_tab);
+            if (cr == COMP_EXTENDED) {
+                erase_line_and_redraw_prompt();
+                if (pos > 0) sys_write(1, buf, pos);
+                sys_fflush(1);
+            } else if (cr == COMP_AMBIGUOUS) {
+                if (was_tab) {
+                    /* List was already printed by try_complete;
+                     * redraw the prompt + buffer below it. */
+                    erase_line_and_redraw_prompt();
+                    if (pos > 0) sys_write(1, buf, pos);
+                    sys_fflush(1);
+                } else {
+                    last_was_tab = 1;
+                }
+            }
             continue;
         }
         if (b >= 0x20 && b <= 0x7E) {     /* Printable */
@@ -694,9 +1064,11 @@ static int readline_raw(char *buf, unsigned cap) {
             buf[pos] = '\0';
             sys_write(1, &c, 1);
             sys_fflush(1);
+            last_was_tab = 0;
             continue;
         }
         /* Any other control byte: silently ignore. */
+        last_was_tab = 0;
     }
 }
 
@@ -932,6 +1304,12 @@ static void cmd_cd(int argc, char **argv) {
     int fd = sys_openat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0);
     if (fd < 0) { perror_("cd", fd); return; }
     sys_close(fd);
+    /* Strip a trailing '/' unless the path IS "/". Keeps the
+     * prompt and pwd output normalized regardless of whether the
+     * user typed `cd /host` or `cd /host/` (or got there via tab
+     * completion appending a trailing slash for directories). */
+    unsigned pl = slen(path);
+    if (pl > 1 && path[pl - 1] == '/') path[pl - 1] = '\0';
     /* Update cwd. */
     scpy(g_cwd, path, CWD_CAP);
 }
