@@ -108,6 +108,7 @@ if have_guest_cc; then
         echo "05_shell: compiling host_files/$name.elf (spawnable)..."
         "$GUEST_CC" "${GUEST_CFLAGS[@]}" "${GUEST_GC_CFLAGS[@]}" \
             -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
+            -I"$(guest_path "$EXAMPLE_DIR/host_files_src/lib/include")" \
             -Wl,-T,"$(guest_path "$GUEST_LD")" \
             "${GUEST_GC_LDFLAGS[@]}" \
             -o "$(guest_path "$HOST_FILES_DIR/$name.elf")" \

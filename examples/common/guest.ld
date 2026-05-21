@@ -29,5 +29,9 @@ SECTIONS {
     .text   : { *(.text*) }   > code
     .rodata : { *(.rodata*) } > rodata
     .data   : { *(.data*) }   > data
-    .bss    : { *(.bss*) *(COMMON) } > data
+    .bss    : {
+        __bss_start = .;
+        *(.bss*) *(COMMON)
+        __bss_end = .;
+    } > data
 }
