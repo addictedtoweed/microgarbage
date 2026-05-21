@@ -163,6 +163,35 @@ typedef enum {
 
 #define TUI_CELL_TRANSPARENT  (1u << 0)
 
+/* ============================================================
+ *  Unicode glyph indices
+ *
+ *  Pass these as the `c` argument to tui_set_cell, tui_tile_set,
+ *  tui_putc, etc. The host renders them as the corresponding
+ *  UTF-8 glyph at present time. Cells with c < 0x80 are emitted
+ *  as plain ASCII as before.
+ * ============================================================ */
+
+#define TUI_BLOCK_FULL        0x80  /* █ */
+#define TUI_BLOCK_UPPER_HALF  0x81  /* ▀ */
+#define TUI_BLOCK_LOWER_HALF  0x82  /* ▄ */
+#define TUI_BLOCK_LEFT_HALF   0x83  /* ▌ */
+#define TUI_BLOCK_RIGHT_HALF  0x84  /* ▐ */
+#define TUI_SHADE_LIGHT       0x85  /* ░ */
+#define TUI_SHADE_MEDIUM      0x86  /* ▒ */
+#define TUI_SHADE_DARK        0x87  /* ▓ */
+#define TUI_BULLET            0x88  /* ● */
+#define TUI_TRI_UP            0x89  /* ▲ */
+#define TUI_TRI_DOWN          0x8A  /* ▼ */
+#define TUI_DIAMOND           0x8B  /* ◆ */
+#define TUI_DBL_HORIZ         0x90  /* ═ */
+#define TUI_DBL_VERT          0x91  /* ║ */
+#define TUI_BULLET_OPEN       0x92  /* ○ */
+#define TUI_SQUARE_FILLED     0x93  /* ■ */
+#define TUI_SQUARE_EMPTY      0x94  /* □ */
+#define TUI_TRI_LEFT          0x95  /* ◀ */
+#define TUI_TRI_RIGHT         0x96  /* ▶ */
+
 typedef struct {
     char     c;        /* ASCII or first byte of UTF-8. Multi-byte
                         * support is via packing the codepoint
