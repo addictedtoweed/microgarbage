@@ -26,6 +26,12 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+/* For posix_openpt, grantpt, unlockpt, ptsname (XSI ext). */
+#define _XOPEN_SOURCE   600
+/* For cfmakeraw on glibc. */
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE
+#endif
 
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
@@ -49,12 +55,25 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "vm/host_compat.h"
 
 #if defined(__CYGWIN__) || defined(_WIN32)
 #  define PIPE_MODE_SUPPORTED 1
 #  include <windows.h>
+#endif
+
+/* PTY transport requires posix_openpt + grantpt + unlockpt + ptsname.
+ * Available on Linux, BSD, macOS, and Cygwin (POSIX-compliant). Not
+ * available on mingw / native Windows builds — those have ConPTY
+ * instead, which is a completely different API and is not in scope
+ * for this round. */
+#if !defined(_WIN32) || defined(__CYGWIN__)
+#  define PTY_MODE_SUPPORTED 1
+#  include <fcntl.h>
+#  include <termios.h>
+#  include <sys/ioctl.h>
 #endif
 
 /* mkdir is single-arg on mingw (Windows doesn't have a permissions
@@ -684,6 +703,215 @@ static bool setup_pipe_transport(VmSystem *sys, const char *name) {
 }
 #endif  /* PIPE_MODE_SUPPORTED */
 
+#ifdef PTY_MODE_SUPPORTED
+/* ============================================================
+ *  PTY transport (round U.3)
+ *
+ *  Allocates a POSIX pseudoterminal pair. The master fd lives
+ *  in this process; the slave path (typically /dev/pts/N on
+ *  Linux) is printed to stderr so the user can connect a
+ *  terminal emulator to it:
+ *
+ *      $ ./host --pty
+ *      host: pty created at /dev/pts/7
+ *      host: connect with: screen /dev/pts/7
+ *      host: ready
+ *
+ *  Then in another window:
+ *
+ *      $ screen /dev/pts/7
+ *
+ *  The shell prompt appears in screen; TUI demos appear there
+ *  too because the active transport routes every byte through
+ *  the master fd.
+ *
+ *  Compared to the pipe transport:
+ *    - Cross-platform: works on Linux, BSD, macOS, and Cygwin.
+ *      Does NOT work on native Windows (no posix_openpt).
+ *    - Has a real line discipline. set_raw() actually does
+ *      something — it flips the slave's termios into cbreak.
+ *    - Same LF→CRLF policy on writes: lone '\\n' gets the '\\r',
+ *      explicit '\\r\\n' passes through.
+ *    - read_nonblock uses O_NONBLOCK and reports EAGAIN as 0.
+ *    - When no slave is connected yet, reads return 0
+ *      ("no data"). Once the user attaches their terminal,
+ *      bytes start flowing. When the slave disconnects, reads
+ *      eventually return 0 or EIO; the host process keeps
+ *      running (U.6 will add proper session lifecycle).
+ * ============================================================ */
+
+static int g_pty_master_fd = -1;
+
+static int pty_t_read(VmHostTransport *t, void *buf, unsigned cap) {
+    (void)t;
+    if (g_pty_master_fd < 0) return -5;       /* -EIO */
+    if (cap == 0) return 0;
+    ssize_t r = read(g_pty_master_fd, buf, cap);
+    if (r > 0) return (int)r;
+    if (r == 0) {
+        /* On Linux, read() == 0 on a pty master can mean
+         * "slave not yet open" OR "slave has closed." In
+         * non-blocking mode with no slave attached, some kernels
+         * report this as EAGAIN instead. Either way we report
+         * "no data" — distinguishing transient-not-connected
+         * from real-disconnect requires the U.6 lifecycle work. */
+        return 0;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    if (errno == EIO)    return 0;   /* common 'no slave attached' code */
+    return -5;
+}
+
+static int pty_t_write(VmHostTransport *t, const void *buf, unsigned n) {
+    (void)t;
+    if (g_pty_master_fd < 0) return -5;
+    /* Same LF→CRLF policy as the pipe transport. */
+    static int prev_was_cr = 0;
+    const char *p = (const char *)buf;
+    unsigned total_in = 0;
+    size_t run_start = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = p[i];
+        if (c == '\n' && !prev_was_cr) {
+            if (i > run_start) {
+                ssize_t w = write(g_pty_master_fd, p + run_start,
+                                  i - run_start);
+                if (w < 0 && errno != EAGAIN) return -5;
+            }
+            ssize_t w = write(g_pty_master_fd, "\r\n", 2);
+            if (w < 0 && errno != EAGAIN) return -5;
+            total_in += 1;
+            run_start = i + 1;
+            prev_was_cr = 0;
+            continue;
+        }
+        prev_was_cr = (c == '\r');
+    }
+    if (run_start < n) {
+        ssize_t w = write(g_pty_master_fd, p + run_start,
+                          n - run_start);
+        if (w < 0 && errno != EAGAIN) return -5;
+        total_in += (unsigned)(n - run_start);
+    }
+    return (int)total_in;
+}
+
+static int pty_t_flush(VmHostTransport *t) {
+    (void)t;
+    /* POSIX write to a pty master is unbuffered at the
+     * application layer. The kernel may buffer in the pty
+     * driver but tcdrain() would block — not what we want.
+     * No-op. */
+    return 0;
+}
+
+static int pty_t_set_raw(VmHostTransport *t, bool enable) {
+    (void)t;
+    if (g_pty_master_fd < 0) return -5;
+    /* Manipulate the slave's line discipline via the master fd.
+     * POSIX defines tcgetattr/tcsetattr on a pty master as
+     * affecting the slave-side termios. */
+    struct termios ts;
+    if (tcgetattr(g_pty_master_fd, &ts) != 0) return -5;
+    if (enable) {
+        cfmakeraw(&ts);
+    } else {
+        /* Restore cooked-ish defaults. We don't preserve the
+         * EXACT termios across toggles (that would need a
+         * saved copy); approximate cooked is good enough for
+         * a transport that's typically used in raw mode. */
+        ts.c_iflag |= (ICRNL | BRKINT);
+        ts.c_oflag |= (OPOST | ONLCR);
+        ts.c_lflag |= (ICANON | ECHO | ISIG);
+    }
+    if (tcsetattr(g_pty_master_fd, TCSANOW, &ts) != 0) return -5;
+    return 0;
+}
+
+static void pty_t_close(VmHostTransport *t) {
+    (void)t;
+    if (g_pty_master_fd >= 0) {
+        close(g_pty_master_fd);
+        g_pty_master_fd = -1;
+    }
+}
+
+static VmHostTransport g_pty_transport = {
+    .read_nonblock = pty_t_read,
+    .write         = pty_t_write,
+    .flush         = pty_t_flush,
+    .set_raw       = pty_t_set_raw,
+    .close         = pty_t_close,
+    .is_terminal   = true,
+    .ctx           = NULL,
+};
+
+/* Create the pty pair, print the slave path, install stdio +
+ * transport. The slave is NOT held open here — the user
+ * connects whenever they want. */
+static bool setup_pty_transport(VmSystem *sys) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0) {
+        fprintf(stderr, "host: posix_openpt failed: %s\n", strerror(errno));
+        return false;
+    }
+    if (grantpt(master) != 0) {
+        fprintf(stderr, "host: grantpt failed: %s\n", strerror(errno));
+        close(master);
+        return false;
+    }
+    if (unlockpt(master) != 0) {
+        fprintf(stderr, "host: unlockpt failed: %s\n", strerror(errno));
+        close(master);
+        return false;
+    }
+    const char *slave_path = ptsname(master);
+    if (!slave_path) {
+        fprintf(stderr, "host: ptsname failed: %s\n", strerror(errno));
+        close(master);
+        return false;
+    }
+
+    /* Non-blocking mode on the master so reads return 0
+     * instead of blocking when no slave is connected. */
+    int flags = fcntl(master, F_GETFL, 0);
+    if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "host: fcntl O_NONBLOCK on pty master failed: %s\n",
+                strerror(errno));
+        close(master);
+        return false;
+    }
+
+    /* Put the slave's line discipline in raw mode by default —
+     * that's what TUI demos want. The shell handles its own
+     * line editing; cooked mode would echo and buffer in ways
+     * the shell doesn't expect. */
+    struct termios ts;
+    if (tcgetattr(master, &ts) == 0) {
+        cfmakeraw(&ts);
+        tcsetattr(master, TCSANOW, &ts);
+    }
+
+    g_pty_master_fd = master;
+
+    fprintf(stderr, "host: pty created at %s\n", slave_path);
+    fprintf(stderr, "host: connect with: screen %s\n", slave_path);
+    fprintf(stderr, "host:          or:  minicom -D %s\n", slave_path);
+    fprintf(stderr, "host: ready\n");
+    fflush(stderr);
+
+    VmHostStdioConfig sio = {0};
+    sio.raw_mode = false;   /* pty transport's set_raw owns this */
+    if (!vm_host_install_stdio_ex(sys, &sio)) {
+        fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
+        return false;
+    }
+    vm_host_set_transport(&g_pty_transport);
+
+    return true;
+}
+#endif  /* PTY_MODE_SUPPORTED */
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     /* If we were launched without a console attached (e.g. as
@@ -731,6 +959,7 @@ int main(int argc, char **argv) {
     bool host_fs_writable    = false;
     bool host_fs_disabled    = false;
     const char *pipe_name    = NULL;
+    bool        want_pty     = false;
     const char *cfg_path     = NULL;
     bool        no_config    = false;
 
@@ -777,6 +1006,8 @@ int main(int argc, char **argv) {
             host_fs_disabled = true;
         } else if (strncmp(argv[i], "--pipe=", 7) == 0) {
             pipe_name = argv[i] + 7;
+        } else if (strcmp(argv[i], "--pty") == 0) {
+            want_pty = true;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
             fprintf(stderr, "  --config=<path>     load config from <path>\n");
@@ -790,6 +1021,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  --host-fs-rw        allow writes to /host (default: read-only)\n");
             fprintf(stderr, "  --no-host-fs        disable /host mount\n");
             fprintf(stderr, "  --pipe=<name>       route stdio through a named pipe (Windows)\n");
+            fprintf(stderr, "  --pty               route stdio through a POSIX pty (Linux/Cygwin)\n");
             return 1;
         } else if (!elf_path) {
             elf_path = argv[i];
@@ -858,6 +1090,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+#ifndef PTY_MODE_SUPPORTED
+    if (want_pty) {
+        fprintf(stderr, "host: --pty is not supported on this platform "
+                        "(needs POSIX posix_openpt/grantpt).\n");
+        return 1;
+    }
+#endif
+    if (pipe_name && want_pty) {
+        fprintf(stderr, "host: --pipe and --pty are mutually exclusive\n");
+        return 1;
+    }
 
 #ifdef _WIN32
     /* mingw doesn't have struct sigaction. Use the simpler
@@ -971,6 +1214,15 @@ int main(int argc, char **argv) {
     if (pipe_name) {
 #ifdef PIPE_MODE_SUPPORTED
         if (!setup_pipe_transport(&sys, pipe_name)) {
+            return 1;
+        }
+#else
+        /* unreachable — we checked above */
+        return 1;
+#endif
+    } else if (want_pty) {
+#ifdef PTY_MODE_SUPPORTED
+        if (!setup_pty_transport(&sys)) {
             return 1;
         }
 #else
