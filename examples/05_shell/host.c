@@ -31,6 +31,7 @@
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_fs.h"
 #include "vm/vm_host_platform.h"
+#include "vm/vm_host_tui.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
 #include "storage/trashdrive.h"
@@ -1061,6 +1062,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "host: vm_host_install_platform failed\n");
             return 1;
         }
+    }
+
+    /* 6d. TUI service (terminal-canvas drawing). Always installed;
+     * guests that don't call SYS_TUI_INIT consume zero state. */
+    if (!vm_host_install_tui(&sys)) {
+        fprintf(stderr, "host: vm_host_install_tui failed\n");
+        return 1;
     }
 
     /* 6b. Mounts.

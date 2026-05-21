@@ -246,6 +246,23 @@
 #define SYS_TIMING_DEADLINE_REMAINING 1113  /* () → ticks until reload deadline, or 0 */
 /* 1114-1119 reserved for future small platform services */
 
+/* TUI service (1132-1147): terminal-canvas drawing as a host
+ * service. The canvas lives in the host; the guest sends
+ * batched drawing commands via SYS_TUI_FLUSH_DRAW. Lifecycle
+ * and presentation get their own direct syscalls.
+ *
+ * One VM at a time owns the canvas: SYS_TUI_INIT fails with
+ * -EBUSY if another VM already owns it. Matches Unix tty
+ * foreground semantics. */
+#define SYS_TUI_INIT                  1132  /* (rows, cols, flags) → 0 or -EBUSY */
+#define SYS_TUI_SHUTDOWN              1133  /* () → 0 (releases ownership) */
+#define SYS_TUI_GET_DIMS              1134  /* () → (rows<<16) | cols */
+#define SYS_TUI_PRESENT               1135  /* () → 0 */
+#define SYS_TUI_PRESENT_DIFF          1136  /* () → 0 */
+#define SYS_TUI_POLL_EVENT            1137  /* (event_ptr) → 1 if event, 0 if none */
+#define SYS_TUI_FLUSH_DRAW            1138  /* (cmd_buf, byte_len) → 0 or -errno */
+/* 1139-1147 reserved for future TUI services (tiles in T.3b, etc.) */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */
