@@ -19,6 +19,16 @@
 
 ENTRY(_start)
 
+/* Force the linker not to page-align LOAD segments. Default
+ * alignment is 0x1000 (one page) which pads ELFs with ~8 KB of
+ * zeros for our typical three-segment layout. Our VM has no
+ * MMU; the loader doesn't care about page boundaries. */
+PHDRS {
+    code   PT_LOAD FLAGS(0x5);   /* R+X */
+    rodata PT_LOAD FLAGS(0x4);   /* R */
+    data   PT_LOAD FLAGS(0x6);   /* RW */
+}
+
 MEMORY {
     code   (rx) : ORIGIN = 0x00000000, LENGTH = 0x10000   /* 64 KB */
     rodata (r)  : ORIGIN = 0x40000000, LENGTH = 0x10000
@@ -26,12 +36,13 @@ MEMORY {
 }
 
 SECTIONS {
-    .text   : { *(.text*) }   > code
-    .rodata : { *(.rodata*) } > rodata
-    .data   : { *(.data*) }   > data
+    .text   : { *(.text*) }   > code   :code
+    .rodata : { *(.rodata*) } > rodata :rodata
+    .data   : { *(.data*) }   > data   :data
     .bss    : {
         __bss_start = .;
         *(.bss*) *(COMMON)
         __bss_end = .;
-    } > data
+    } > data :data
+    /DISCARD/ : { *(.comment) *(.riscv.attributes) }
 }

@@ -348,6 +348,15 @@ VmLoadResult vm_load(VmCpu *cpu,
             continue;
         }
 
+        /* Empty PT_LOAD segments (filesz==0 && memsz==0) get
+         * emitted by some linker scripts (notably when a PHDR
+         * has no sections assigned to it) and contribute no
+         * loadable content. Skip them rather than trying to
+         * validate their meaningless vaddr/flags. */
+        if (p_filesz == 0 && p_memsz == 0) {
+            continue;
+        }
+
         /* Segment file extent must lie within the ELF image. */
         if (p_filesz > 0) {
             uint64_t seg_end = (uint64_t)p_offset + (uint64_t)p_filesz;
@@ -370,6 +379,9 @@ VmLoadResult vm_load(VmCpu *cpu,
         uint32_t p_vaddr  = rd32(ph + PHDR_VADDR);
         uint32_t p_filesz = rd32(ph + PHDR_FILESZ);
         uint32_t p_memsz  = rd32(ph + PHDR_MEMSZ);
+
+        /* Same skip rule as pass 1. */
+        if (p_filesz == 0 && p_memsz == 0) continue;
 
         VmLoadResult ar = apply_pt_load(cpu, elf, p_offset,
                                         p_filesz, p_memsz,

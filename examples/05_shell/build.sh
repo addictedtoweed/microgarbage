@@ -94,7 +94,13 @@ if have_guest_cc; then
     # library's ~6 KB.
     GUEST_LIB_SRCS=()
     GUEST_GC_CFLAGS=(-ffunction-sections -fdata-sections)
-    GUEST_GC_LDFLAGS=(-Wl,--gc-sections)
+    # -z max-page-size=4 collapses LOAD segment alignment from
+    # the default 4 KB to effectively none. Our loader has no
+    # MMU and doesn't care about page boundaries; the alignment
+    # padding was costing ~8 KB per ELF for a 3-segment layout.
+    # -s strips the symbol table, which on snake.elf is another
+    # ~1.2 KB of debug names we don't need at runtime.
+    GUEST_GC_LDFLAGS=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
     if [ -d "$EXAMPLE_DIR/host_files_src/lib" ]; then
         for libsrc in "$EXAMPLE_DIR"/host_files_src/lib/*.c; do
             [ -f "$libsrc" ] || continue
