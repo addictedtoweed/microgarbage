@@ -29,6 +29,7 @@
 
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
+#include "vm/vm_host_transport.h"
 #include "vm/vm_host_fs.h"
 #include "vm/vm_host_platform.h"
 #include "vm/vm_host_tui.h"
@@ -506,221 +507,106 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
  *      same custom-handler pattern
  * --------------------------------------------------------------- */
 
-/* Syscall numbers — duplicated from vm_ecall.h for clarity in
- * this contained section. */
-#define HOST_SYS_READ    63
-#define HOST_SYS_WRITE   64
-#define HOST_SYS_FFLUSH  82
-
 static HANDLE g_pipe_handle = INVALID_HANDLE_VALUE;
-
-/* === Pipe SYS_READ handler ===
+/* ============================================================
+ *  Pipe transport (round U.2)
  *
- * Non-blocking read on the HANDLE via PeekNamedPipe + ReadFile.
- * Returns:
- *   > 0  number of bytes read
- *   = 0  no data available right now (guest polls again later)
- *   < 0  -EIO on hard error
+ *  Implements the VmHostTransport vtable. Shares the named-pipe
+ *  HANDLE with the legacy pipe_sys_* ecall handlers (which are
+ *  no longer registered when the transport is active — see
+ *  setup_pipe_transport).
  *
- * The 'no data' case is what makes interactive guests work —
- * they spin a read+yield loop, and as long as we never block
- * inside the handler, the spawn pump can step the snake game's
- * frame loop normally. */
-static void pipe_sys_read(VmCpu *cpu, void *system) {
-    (void)system;
-    if (!cpu) return;
+ *  The write function performs LF→CRLF translation, but ONLY
+ *  for lone '\n' bytes (those not preceded by '\r'). This means:
+ *
+ *    - Shell cooked output (lone '\n' as line terminator) gets
+ *      the '\r' inserted, so PuTTY shows it correctly.
+ *    - TUI canvas escapes that emit '\r\n' deliberately pass
+ *      through unchanged. Adding a second '\r' would corrupt
+ *      cursor positioning.
+ *
+ *  The translation is single-pass and stateful across the call
+ *  via the `prev_was_cr` static — that's correct because the
+ *  transport instance is process-global today and we want
+ *  cross-call coherence. When U.4/U.5 make this per-session,
+ *  the state moves into transport ctx. */
 
-    uint32_t fd = cpu->regs[VM_REG_A0];
-    uint32_t guest_p = cpu->regs[VM_REG_A1];
-    uint32_t n = cpu->regs[VM_REG_A2];
-
-    /* File-fd path: any fd >= 3 belongs to vm_host_fs (FatFs or
-     * the /host passthrough). Translate the guest pointer here
-     * since vm_host_fs's routing function takes a host pointer. */
-    if (fd >= 3) {
-        if (n == 0) {
-            cpu->regs[VM_REG_A0] = 0;
-            return;
-        }
-        void *host_buf = vm_translate_write(cpu, guest_p, n);
-        if (!host_buf) {
-            cpu->regs[VM_REG_A0] = (uint32_t)-14;  /* -EFAULT */
-            return;
-        }
-        int32_t r = vm_host_fs_route_read((int)fd, host_buf, n);
-        cpu->regs[VM_REG_A0] = (uint32_t)r;
-        return;
-    }
-
-    if (fd != 0) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-9;  /* -EBADF */
-        return;
-    }
-    if (n == 0) {
-        cpu->regs[VM_REG_A0] = 0;
-        return;
-    }
-
-    /* PeekNamedPipe tells us how many bytes are queued without
-     * removing them. Zero queued = report 'no data' (read returns
-     * 0) — guest will yield and retry. Nonzero = ReadFile up to
-     * min(want, available), guaranteed not to block. */
+static int pipe_t_read(VmHostTransport *t, void *buf, unsigned cap) {
+    (void)t;
+    if (g_pipe_handle == INVALID_HANDLE_VALUE) return -5;  /* -EIO */
+    if (cap == 0) return 0;
     DWORD avail = 0;
     if (!PeekNamedPipe(g_pipe_handle, NULL, 0, NULL, &avail, NULL)) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-5;  /* -EIO */
-        return;
+        return -5;
     }
-    if (avail == 0) {
-        cpu->regs[VM_REG_A0] = 0;
-        return;
-    }
-
-    /* Bytes ARE available — translate the guest pointer and
-     * read directly into the guest's address space. */
-    void *host_buf = vm_translate_write(cpu, guest_p, n);
-    if (!host_buf) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-14;  /* -EFAULT */
-        return;
-    }
-
-    DWORD want = (DWORD)n;
+    if (avail == 0) return 0;
+    DWORD want = (DWORD)cap;
     if (want > avail) want = avail;
     DWORD got = 0;
-    if (!ReadFile(g_pipe_handle, host_buf, want, &got, NULL)) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-5;
-        return;
-    }
-    cpu->regs[VM_REG_A0] = (uint32_t)got;
+    if (!ReadFile(g_pipe_handle, buf, want, &got, NULL)) return -5;
+    return (int)got;
 }
 
-/* === Pipe SYS_WRITE handler ===
- *
- * Writes to the HANDLE via WriteFile, translating '\n' to '\r\n'
- * so output appears correctly in PuTTY (which has no terminal
- * driver to do that translation for us).
- *
- * The translation uses a small stack-buffered batching strategy:
- * scan the input for '\n', flush the run before it, emit
- * '\r\n', then continue. Worst case is one ReadFile per byte
- * of '\n'-heavy output, which is fine. */
-static void pipe_sys_write(VmCpu *cpu, void *system) {
-    (void)system;
-    if (!cpu) return;
-
-    uint32_t fd = cpu->regs[VM_REG_A0];
-    uint32_t guest_p = cpu->regs[VM_REG_A1];
-    uint32_t n = cpu->regs[VM_REG_A2];
-
-    /* File-fd path: any fd >= 3 belongs to vm_host_fs. We DON'T
-     * do the \n -> \r\n translation here — file content is
-     * supposed to be byte-exact. The translation only applies
-     * to the pipe transport's TTY emulation for stdout/stderr. */
-    if (fd >= 3) {
-        if (n == 0) {
-            cpu->regs[VM_REG_A0] = 0;
-            return;
-        }
-        const void *host_buf = vm_translate_read(cpu, guest_p, n);
-        if (!host_buf) {
-            cpu->regs[VM_REG_A0] = (uint32_t)-14;
-            return;
-        }
-        int32_t r = vm_host_fs_route_write((int)fd, host_buf, n);
-        cpu->regs[VM_REG_A0] = (uint32_t)r;
-        return;
-    }
-
-    if (fd != 1 && fd != 2) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-9;  /* -EBADF */
-        return;
-    }
-    if (n == 0) {
-        cpu->regs[VM_REG_A0] = 0;
-        return;
-    }
-
-    const void *vbuf = vm_translate_read(cpu, guest_p, n);
-    if (!vbuf) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-14;
-        return;
-    }
-    const char *buf = (const char *)vbuf;
-
-    /* Scan for '\n's. Write the run-up-to-each, then emit '\r\n'. */
-    DWORD written_total = 0;
+static int pipe_t_write(VmHostTransport *t, const void *buf, unsigned n) {
+    (void)t;
+    if (g_pipe_handle == INVALID_HANDLE_VALUE) return -5;
+    static int prev_was_cr = 0;
+    const char *p = (const char *)buf;
+    DWORD total_in = 0;
+    /* Scan through the buffer, batching runs that don't need
+     * translation. When we hit a lone '\n', emit "\r\n" instead. */
     size_t run_start = 0;
     for (size_t i = 0; i < n; i++) {
-        if (buf[i] != '\n') continue;
-
-        /* Flush any pending run [run_start .. i) — bytes before
-         * this newline. */
-        if (i > run_start) {
-            DWORD wr = 0;
-            if (!WriteFile(g_pipe_handle, buf + run_start,
-                           (DWORD)(i - run_start), &wr, NULL)) {
-                cpu->regs[VM_REG_A0] = (uint32_t)-5;
-                return;
+        char c = p[i];
+        if (c == '\n' && !prev_was_cr) {
+            if (i > run_start) {
+                DWORD wr = 0;
+                if (!WriteFile(g_pipe_handle, p + run_start,
+                               (DWORD)(i - run_start), &wr, NULL)) return -5;
             }
-            written_total += wr;
+            DWORD wr = 0;
+            if (!WriteFile(g_pipe_handle, "\r\n", 2, &wr, NULL)) return -5;
+            total_in += 1;          /* one source byte consumed */
+            run_start = i + 1;
+            prev_was_cr = 0;
+            continue;
         }
-        /* Emit "\r\n" for the newline. */
-        DWORD wr = 0;
-        if (!WriteFile(g_pipe_handle, "\r\n", 2, &wr, NULL)) {
-            cpu->regs[VM_REG_A0] = (uint32_t)-5;
-            return;
-        }
-        /* Count one byte (the guest only wrote one '\n', which
-         * we expanded to two — the guest's accounting tracks
-         * its own bytes). */
-        written_total += 1;
-        run_start = i + 1;
+        prev_was_cr = (c == '\r');
     }
-    /* Flush the trailing run after the last newline. */
     if (run_start < n) {
         DWORD wr = 0;
-        if (!WriteFile(g_pipe_handle, buf + run_start,
-                       (DWORD)(n - run_start), &wr, NULL)) {
-            cpu->regs[VM_REG_A0] = (uint32_t)-5;
-            return;
-        }
-        written_total += wr;
+        if (!WriteFile(g_pipe_handle, p + run_start,
+                       (DWORD)(n - run_start), &wr, NULL)) return -5;
+        total_in += (DWORD)(n - run_start);
     }
-    cpu->regs[VM_REG_A0] = written_total;
+    return (int)total_in;
 }
 
-/* === Pipe SYS_FFLUSH handler ===
- *
- * No-op: WriteFile on a Windows named pipe doesn't buffer
- * (the bytes go straight to the kernel pipe object), so
- * there's nothing for fflush to do. */
-static void pipe_sys_fflush(VmCpu *cpu, void *system) {
-    (void)system;
-    if (!cpu) return;
-    cpu->regs[VM_REG_A0] = 0;
+static int pipe_t_flush(VmHostTransport *t) {
+    (void)t;
+    /* WriteFile on a Windows named pipe is unbuffered at the
+     * application layer — bytes go straight to the kernel pipe
+     * object. Nothing for the transport to flush. */
+    return 0;
 }
 
-/* === TUI output hook (round U.1) ===
- *
- * The TUI host service emits canvas escape sequences directly
- * via write(1, ...). When the shell is running over a named
- * pipe the user's terminal is on the OTHER end of the pipe,
- * not on fd=1. Without this hook the TUI output would go to
- * whatever fd=1 still points at (the Cygwin terminal that
- * launched host.exe), and PuTTY-connected-to-pipe would see
- * the shell prompt but no game.
- *
- * Unlike pipe_sys_write, this hook does NOT translate '\n' to
- * '\r\n'. The TUI emits explicit '\r\n' where it wants line
- * breaks; injecting extra '\r' would corrupt cursor positioning. */
-static int pipe_tui_write(const void *buf, size_t n, void *ctx) {
-    (void)ctx;
-    if (g_pipe_handle == INVALID_HANDLE_VALUE) return 0;
-    DWORD wr = 0;
-    if (!WriteFile(g_pipe_handle, buf, (DWORD)n, &wr, NULL)) {
-        return -1;
-    }
-    return (int)wr;
+static int pipe_t_set_raw(VmHostTransport *t, bool enable) {
+    (void)t; (void)enable;
+    /* Pipes don't have a line discipline; raw mode is implicit
+     * (no terminal driver intervenes between us and PuTTY).
+     * Always report success. */
+    return 0;
 }
+
+static VmHostTransport g_pipe_transport = {
+    .read_nonblock = pipe_t_read,
+    .write         = pipe_t_write,
+    .flush         = pipe_t_flush,
+    .set_raw       = pipe_t_set_raw,
+    .close         = NULL,
+    .is_terminal   = true,
+    .ctx           = NULL,
+};
 
 /* Create the named pipe, wait for the client to connect, and
  * register our SYS_READ/SYS_WRITE/SYS_FFLUSH handlers on the
@@ -779,28 +665,20 @@ static bool setup_pipe_transport(VmSystem *sys, const char *name) {
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Register our pipe-aware handlers. They REPLACE whatever
-     * was installed by vm_host_install_stdio (which in pipe mode
-     * shouldn't have been called). */
-    if (!vm_ecall_register(sys->ecall_router, HOST_SYS_READ, pipe_sys_read)) {
-        fprintf(stderr, "host: register SYS_READ failed\n");
+    /* Round U.2: register the stdio handlers (SYS_READ/WRITE/FFLUSH)
+     * and then point the active transport at our pipe vtable. The
+     * stdio handlers consult the transport for every byte they
+     * move, so this single set_transport call diverts everything —
+     * shell prompt, guest puts/printf, AND TUI canvas escapes —
+     * to the pipe. No more ecall-registration overrides; no more
+     * separate TUI output hook. */
+    VmHostStdioConfig sio = {0};
+    sio.raw_mode = false;   /* the pipe transport's set_raw is a no-op */
+    if (!vm_host_install_stdio_ex(sys, &sio)) {
+        fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
         return false;
     }
-    if (!vm_ecall_register(sys->ecall_router, HOST_SYS_WRITE, pipe_sys_write)) {
-        fprintf(stderr, "host: register SYS_WRITE failed\n");
-        return false;
-    }
-    if (!vm_ecall_register(sys->ecall_router, HOST_SYS_FFLUSH, pipe_sys_fflush)) {
-        fprintf(stderr, "host: register SYS_FFLUSH failed\n");
-        return false;
-    }
-
-    /* Route TUI canvas output through the pipe. Without this,
-     * the TUI host service would write directly to fd=1 (which
-     * in pipe mode is still the launching terminal, not the
-     * pipe client). The shell would appear in PuTTY but games
-     * would appear in the Cygwin terminal that ran host.exe. */
-    vm_host_tui_set_output(pipe_tui_write, NULL);
+    vm_host_set_transport(&g_pipe_transport);
 
     return true;
 }

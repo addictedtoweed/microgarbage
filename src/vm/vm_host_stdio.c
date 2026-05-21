@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "vm/vm_host_stdio.h"
+#include "vm/vm_host_transport.h"
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
 
@@ -84,6 +85,34 @@ static FILE *g_err_file = NULL;
 static int   g_in_fd  = -1;
 static int   g_out_fd = -1;
 static int   g_err_fd = -1;
+
+/* ============================================================
+ *  Active transport (round U.2)
+ *
+ *  Lives here in stdio.c because that's the natural owner of
+ *  the SYS_READ/SYS_WRITE/SYS_FFLUSH handlers; the transport
+ *  is what those handlers ultimately consult.
+ *
+ *  NULL = use the legacy stdio path (g_in_file/g_out_file via
+ *  FILE* or fd overrides). When set, the handlers route to the
+ *  transport's vtable instead.
+ *
+ *  Future Round U work moves this from process-global to
+ *  per-session, but the lookup site (and the vtable shape)
+ *  stays identical.
+ * ============================================================ */
+
+static VmHostTransport *g_active_transport = NULL;
+
+VmHostTransport *vm_host_set_transport(VmHostTransport *t) {
+    VmHostTransport *prev = g_active_transport;
+    g_active_transport = t;
+    return prev;
+}
+
+VmHostTransport *vm_host_get_transport(void) {
+    return g_active_transport;
+}
 
 /* ============================================================
  *  Delegate hooks for file fds
@@ -225,6 +254,16 @@ static bool disable_raw_mode(void) {
  * if the fd is not a tty / Windows console or no stdio was
  * installed. */
 bool vm_host_stdio_set_raw_mode(bool enable) {
+    /* Round U.2: prefer the transport if it supplies a set_raw
+     * implementation. Transports that don't (NULL fn pointer)
+     * fall through to the legacy path; transports for non-terminal
+     * sinks (e.g. files) typically supply a no-op set_raw that
+     * returns 0. */
+    if (g_active_transport && g_active_transport->set_raw) {
+        return g_active_transport->set_raw(g_active_transport,
+                                           enable) >= 0;
+    }
+
     if (!g_in_file) return false;
     int fd = fileno(g_in_file);
     if (fd < 0) return false;
@@ -251,6 +290,15 @@ bool vm_host_stdio_set_raw_mode(bool enable) {
 }
 
 int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap) {
+    /* Round U.2: prefer the transport if one is installed. This
+     * is the path the TUI host service uses for input — when a
+     * pipe or TCP transport is active, this is how mouse/keyboard
+     * bytes reach the input parser. */
+    if (g_active_transport && g_active_transport->read_nonblock) {
+        return g_active_transport->read_nonblock(g_active_transport,
+                                                 buf, cap);
+    }
+
     if (!g_in_file || cap == 0) return 0;
     int src_fd = (g_in_fd >= 0) ? g_in_fd : fileno(g_in_file);
     if (src_fd < 0) return -1;
@@ -342,6 +390,33 @@ static void handle_write(VmCpu *cpu, void *system) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
         return;
     }
+
+    /* Round U.2: if a transport is installed, it owns stdout AND
+     * stderr (they're the same byte sink as far as the user is
+     * concerned). Route through it before the FILE/fd fallback.
+     * The transport's `write` is best-effort and may write less
+     * than `n`; we propagate the count to the guest. */
+    if (g_active_transport && g_active_transport->write) {
+        if (n == 0) {
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        const void *host_buf = vm_translate_read(cpu, guest_p, n);
+        if (!host_buf) {
+            cpu->trap_cause = TRAP_NONE;
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
+            return;
+        }
+        int w = g_active_transport->write(g_active_transport,
+                                          host_buf, n);
+        if (w < 0) {
+            cpu->regs[VM_REG_A0] = (uint32_t)w;   /* already negative errno */
+        } else {
+            cpu->regs[VM_REG_A0] = (uint32_t)w;
+        }
+        return;
+    }
+
     if (!dest && dest_fd < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
         return;
@@ -411,6 +486,18 @@ static void handle_fflush(VmCpu *cpu, void *system) {
     if (!cpu) return;
     uint32_t fd = cpu->regs[VM_REG_A0];
 
+    /* Round U.2: defer to transport if installed. fd 0/1/2 are
+     * all the same byte sink as far as the transport's concerned. */
+    if (g_active_transport && g_active_transport->flush) {
+        if (fd <= 2) {
+            int r = g_active_transport->flush(g_active_transport);
+            cpu->regs[VM_REG_A0] = (r >= 0) ? 0 : (uint32_t)r;
+            return;
+        }
+        cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EBADF);
+        return;
+    }
+
     if (fd == 0) {
         if (g_out_file) fflush(g_out_file);
         if (g_err_file && g_err_file != g_out_file) fflush(g_err_file);
@@ -461,8 +548,12 @@ static void handle_read(VmCpu *cpu, void *system) {
      * and most libcs do — flush-before-blocking-read is the rule
      * that makes interactive prompts work. */
     if (fd == 0) {
-        if (g_out_file) fflush(g_out_file);
-        if (g_err_file && g_err_file != g_out_file) fflush(g_err_file);
+        if (g_active_transport && g_active_transport->flush) {
+            (void)g_active_transport->flush(g_active_transport);
+        } else {
+            if (g_out_file) fflush(g_out_file);
+            if (g_err_file && g_err_file != g_out_file) fflush(g_err_file);
+        }
     }
 
     /* Delegate file fds to vm_host_fs if installed. */
@@ -483,6 +574,25 @@ static void handle_read(VmCpu *cpu, void *system) {
         }
         int32_t r = g_fs_read_hook((int)fd, host_buf, n);
         cpu->regs[VM_REG_A0] = (uint32_t)r;
+        return;
+    }
+
+    /* Round U.2: if a transport is installed, it owns stdin.
+     * Same routing pattern as handle_write. */
+    if (fd == 0 && g_active_transport && g_active_transport->read_nonblock) {
+        if (n == 0) {
+            cpu->regs[VM_REG_A0] = 0;
+            return;
+        }
+        void *host_buf = vm_translate_write(cpu, guest_p, n);
+        if (!host_buf) {
+            cpu->trap_cause = TRAP_NONE;
+            cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EFAULT);
+            return;
+        }
+        int r = g_active_transport->read_nonblock(g_active_transport,
+                                                  host_buf, n);
+        cpu->regs[VM_REG_A0] = (uint32_t)r;   /* >=0 or -errno */
         return;
     }
 
