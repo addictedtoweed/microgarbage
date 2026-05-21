@@ -726,7 +726,8 @@ static void cmd_help(void) {
     putln("  touch <path>         create empty file");
     putln("  cat <path>           print file contents");
     putln("  write <path> <text>  write text to file (truncating)");
-    putln("  run <path>           load and execute an ELF as a child VM");
+    putln("  run <path>           explicitly load and execute an ELF");
+    putln("  <path>               same as run; e.g. /host/snake.elf");
     putln("  history              show recent commands");
     putln("  meminfo              show slab allocator + per-VM stats");
     putln("  help                 this message");
@@ -1029,6 +1030,8 @@ static void cmd_write(int argc, char **argv) {
  *
  * Prints the child's exit code only if it's non-zero (so the
  * common success case is quiet, like Unix shells). */
+static void exec_path(const char *path);   /* defined below */
+
 static void cmd_run(int argc, char **argv) {
     if (argc < 2) { putln("run: usage: run <path>"); return; }
     char path[PATH_CAP];
@@ -1036,19 +1039,7 @@ static void cmd_run(int argc, char **argv) {
         putln("run: path too long");
         return;
     }
-    int rc = sys_spawn_and_wait(path);
-    if (rc < 0) {
-        perror_("run", rc);
-        return;
-    }
-    if (rc != 0) {
-        /* Mimic bash: print exit code only when non-zero. */
-        char buf[16];
-        char *p = fmt_u32((unsigned)rc, buf + sizeof(buf));
-        puts_("run: exit ");
-        puts_(p);
-        putln("");
-    }
+    exec_path(path);
 }
 
 /* ============================================================
@@ -1081,11 +1072,56 @@ static void cursor_reset_default(void)  { puts_("\x1b[0 q"); }
  *  Main loop
  * ============================================================ */
 
+/* Return non-zero if `tok` looks like a path the shell should
+ * try to execute directly. Two cases:
+ *
+ *   1. The token contains a '/' → it's an explicit path. Always
+ *      attempt to run it (resolves relative to cwd if it doesn't
+ *      start with '/'). If the file doesn't exist, the spawn
+ *      call returns -ENOENT and the caller prints a clear error.
+ *
+ *   2. The token has no '/' → resolve it against cwd. If a file
+ *      by that name exists in cwd, treat it as a path; otherwise
+ *      let the builtin lookup handle it. This way a bare token
+ *      like 'snake.elf' inside /host runs the file, but 'ls'
+ *      anywhere keeps invoking the builtin (builtins win on
+ *      name conflicts because they're checked first below).
+ *
+ * `path_out` is set to the resolved absolute path when this
+ * returns non-zero. */
+static int looks_like_runnable_path(const char *tok, char *path_out) {
+    if (resolve_path(tok, path_out) != 0) return 0;
+    /* Test existence by trying to open read-only. */
+    int fd = sys_openat(AT_FDCWD, path_out, O_RDONLY, 0);
+    if (fd < 0) return 0;
+    sys_close(fd);
+    return 1;
+}
+
+/* Run an already-resolved guest path as a child VM and report
+ * the result. Factored out of cmd_run so the path-first
+ * dispatcher can share it. */
+static void exec_path(const char *path) {
+    int rc = sys_spawn_and_wait(path);
+    if (rc < 0) {
+        perror_("run", rc);
+        return;
+    }
+    if (rc != 0) {
+        char buf[16];
+        char *p = fmt_u32((unsigned)rc, buf + sizeof(buf));
+        puts_("run: exit ");
+        puts_(p);
+        putln("");
+    }
+}
+
 static void dispatch(char *line) {
     char *argv[16];
     int argc = tokenize(line, argv, 16);
     if (argc == 0) return;       /* empty input */
 
+    /* Builtins win on name conflicts (Unix-like predictability). */
     if      (scmp(argv[0], "help")  == 0) cmd_help();
     else if (scmp(argv[0], "pwd")   == 0) cmd_pwd();
     else if (scmp(argv[0], "ls")    == 0) cmd_ls(argc, argv);
@@ -1105,8 +1141,16 @@ static void dispatch(char *line) {
         sys_tty_set_raw(0);             /* leave terminal cooked */
         sys_exit(0);
     } else {
-        puts_(argv[0]);
-        putln(": unknown command (type 'help')");
+        /* Not a builtin. If the token resolves to a file we can
+         * open, run it as a guest ELF (path-first command form).
+         * Otherwise print "unknown command". */
+        char path[PATH_CAP];
+        if (looks_like_runnable_path(argv[0], path)) {
+            exec_path(path);
+        } else {
+            puts_(argv[0]);
+            putln(": unknown command (type 'help')");
+        }
     }
 }
 
