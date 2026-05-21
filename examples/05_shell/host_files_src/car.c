@@ -51,8 +51,8 @@ static inline void sys1(uint32_t n, uint32_t a) {
 #define GAME_BOTTOM  30     /* last row */
 #define GAME_ROWS    (GAME_BOTTOM - GAME_TOP + 1)  /* 29 rows */
 
-#define ROAD_WIDTH    16    /* total road width including stripes */
-#define PLAYABLE_W    12    /* inside-the-stripes width */
+#define ROAD_WIDTH    22    /* total road width including stripes */
+#define PLAYABLE_W    18    /* inside-the-stripes width */
 
 #define CAR_HEIGHT    3
 #define CAR_WIDTH     4
@@ -181,19 +181,25 @@ static void make_enemy_tile(void) {
 }
 
 static void make_debris_tile(void) {
-    /* 1 row × 2 cols, gray rubble. */
+    /* 1 row × 2 cols. Bright orange/tan rubble on the road.
+     * Uses xterm 256-color 208 (bright orange) which contrasts
+     * sharply with the asphalt's dark gray bg=8. Full blocks
+     * rather than shaded for maximum visibility. */
     g_tile_debris = tui_tile_create(1, 2);
     if (g_tile_debris == TUI_TILE_NONE) return;
-    tui_tile_set(g_tile_debris, 1, 1, TUI_SHADE_DARK, 7, TUI_DEFAULT_COLOR, 0);
-    tui_tile_set(g_tile_debris, 1, 2, TUI_SHADE_DARK, 7, TUI_DEFAULT_COLOR, 0);
+    tui_tile_set(g_tile_debris, 1, 1, TUI_BLOCK_FULL, 208, TUI_DEFAULT_COLOR, 0);
+    tui_tile_set(g_tile_debris, 1, 2, TUI_BLOCK_FULL, 208, TUI_DEFAULT_COLOR, 0);
 }
 
 static void make_oil_tile(void) {
-    /* 1 row × 2 cols, dark with light shade overlay. */
+    /* 1 row × 2 cols. Iridescent oil slick — bright cyan-ish
+     * (xterm 256-color 51) on a dark blue (17) bg so it reads
+     * as "wet, slick, blue-black" rather than blending into the
+     * gray asphalt. Medium-shade glyph for the textured look. */
     g_tile_oil = tui_tile_create(1, 2);
     if (g_tile_oil == TUI_TILE_NONE) return;
-    tui_tile_set(g_tile_oil, 1, 1, TUI_SHADE_MEDIUM, 8, TUI_DEFAULT_COLOR, 0);
-    tui_tile_set(g_tile_oil, 1, 2, TUI_SHADE_MEDIUM, 8, TUI_DEFAULT_COLOR, 0);
+    tui_tile_set(g_tile_oil, 1, 1, TUI_SHADE_MEDIUM, 51, 17, 0);
+    tui_tile_set(g_tile_oil, 1, 2, TUI_SHADE_MEDIUM, 51, 17, 0);
 }
 
 static void make_pickup_tile(void) {
@@ -552,6 +558,11 @@ static void check_collisions(void) {
  *  Input handling
  * ============================================================ */
 
+/* True if the user explicitly quit via q/Esc during gameplay
+ * (as opposed to crashing). The main loop checks this to skip
+ * the game-over menu and return to title. */
+static bool g_user_quit = false;
+
 static void process_input(void) {
     TuiEvent ev;
     while (tui_poll_event(&ev)) {
@@ -559,7 +570,7 @@ static void process_input(void) {
             if (ev.key.key == 'q' || ev.key.key == 'Q' ||
                 ev.key.key == TUI_KEY_ESCAPE) {
                 g_dead = true;
-                g_death_frames = 30;   /* skip end screen and exit */
+                g_user_quit = true;
                 return;
             }
         } else if (ev.kind == TUI_EV_MOUSE) {
@@ -584,37 +595,263 @@ static void process_input(void) {
  *  End screen
  * ============================================================ */
 
-static void draw_game_over(void) {
-    /* Center a banner in the canvas. */
-    const char *line1 = "  CRASH!  ";
-    const char *line2 = "Press q to exit";
-    char score_line[40];
-    snprintf(score_line, sizeof(score_line), "Final score: %d  Distance: %d",
-             g_score, g_distance);
+/* ============================================================
+ *  Title screen, countdown, and game-over menu
+ *
+ *  Flow:
+ *    show_title_screen()   → user clicks START or hits Space/Enter,
+ *                            returns 1; or QUIT/Esc returns 0.
+ *    show_countdown()      → flashes "3" "2" "1" "GO!", ~500ms each.
+ *    [gameplay]
+ *    show_game_over_menu() → CONTINUE / EXIT, returns 1 or 0.
+ *
+ *  Each screen draws over the canvas without altering world state,
+ *  so the game-over menu can sit on top of the final-frame
+ *  playfield as a translucent-feeling modal.
+ * ============================================================ */
 
-    int mid_row = ROWS / 2;
-    int half_w = 18;
-    int box_left = (COLS - 2 * half_w) / 2;
+/* Render a road-themed title screen with the SPYHUNTER-ish vibe.
+ * Returns 1 if user starts, 0 if user quits. */
+static int show_title_screen(void) {
+    /* Background: dark with a faint road suggestion in the middle. */
+    tui_set_bg(0);
+    tui_fill_rect(1, 1, ROWS, COLS, ' ');
 
-    tui_set_fg(0);
-    tui_set_bg(9);  /* red */
-    tui_fill_rect(mid_row - 2, box_left, 5, 2 * half_w, ' ');
-    tui_set_attr(TUI_ATTR_BOLD);
-    tui_move(mid_row - 1, box_left + (2 * half_w - (int)strlen(line1)) / 2);
-    tui_puts(line1);
-    tui_set_attr(0);
+    /* Vertical road suggestion down the center: dark gray strip. */
+    int road_left  = (COLS - ROAD_WIDTH) / 2;
+    int road_right = road_left + ROAD_WIDTH - 1;
+    tui_set_bg(8);
+    tui_fill_rect(2, road_left, ROWS - 1, ROAD_WIDTH, ' ');
+    /* Yellow stripes on the edges. */
     tui_set_fg(11);
-    tui_move(mid_row, box_left + (2 * half_w - (int)strlen(score_line)) / 2);
-    tui_puts(score_line);
-    tui_set_fg(15);
-    tui_move(mid_row + 1, box_left + (2 * half_w - (int)strlen(line2)) / 2);
-    tui_puts(line2);
+    tui_set_bg(8);
+    for (int r = 2; r < ROWS; r++) {
+        tui_set_cell(r, road_left,  TUI_BLOCK_FULL, 11, 8, 0);
+        tui_set_cell(r, road_right, TUI_BLOCK_FULL, 11, 8, 0);
+    }
+    /* Center dashed line. */
+    int center = (road_left + road_right) / 2;
+    for (int r = 2; r < ROWS; r++) {
+        if (r & 1) tui_set_cell(r, center, TUI_BLOCK_FULL, 15, 8, 0);
+    }
     tui_reset();
+
+    /* Title text — big and offset. */
+    tui_set_bg(0);
+    tui_set_fg(196);   /* bright red */
+    tui_set_attr(TUI_ATTR_BOLD);
+    tui_move(5, (COLS - 11) / 2);
+    tui_puts("ROAD DODGE");
+    tui_reset();
+
+    tui_set_bg(0);
+    tui_set_fg(15);
+    tui_move(7, (COLS - 36) / 2);
+    tui_puts("Mouse to steer, dodge obstacles");
+    tui_move(8, (COLS - 32) / 2);
+    tui_puts("Grab the gold diamonds for +50");
+    tui_reset();
+
+    /* START + QUIT buttons. */
+    TuiButton start_btn = {
+        .row = 13, .col = COLS / 2 - 14, .h = 3, .w = 12,
+        .label = "START",
+        .fg = TUI_BRIGHT_WHITE, .bg = 28,           /* deep green */
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 22,
+    };
+    TuiButton quit_btn = {
+        .row = 13, .col = COLS / 2 + 2, .h = 3, .w = 12,
+        .label = "QUIT",
+        .fg = TUI_BRIGHT_WHITE, .bg = 88,           /* dark red */
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 52,
+    };
+    tui_button_draw(&start_btn);
+    tui_button_draw(&quit_btn);
+
+    tui_set_bg(0);
+    tui_set_fg(8);
+    tui_move(18, (COLS - 36) / 2);
+    tui_puts("click button, or Enter/Space/Esc");
+    tui_reset();
+
+    tui_present();
+
+    /* Drain stale input (e.g. the Enter that launched us). */
+    {
+        unsigned drain_ms = 150;
+        unsigned start_ms = sys0(SYS_TICKS_NOW);
+        while ((int)(sys0(SYS_TICKS_NOW) - start_ms) < (int)drain_ms) {
+            TuiEvent junk;
+            while (tui_poll_event(&junk)) { }
+            sys1(SYS_SLEEP_TICKS, 20);
+        }
+    }
+
+    for (;;) {
+        TuiEvent ev;
+        while (tui_poll_event(&ev)) {
+            if (ev.kind == TUI_EV_KEY) {
+                int k = ev.key.key;
+                if (k == TUI_KEY_ENTER || k == ' ') return 1;
+                if (k == TUI_KEY_ESCAPE || k == 'q' || k == 'Q') return 0;
+            } else if (ev.kind == TUI_EV_MOUSE) {
+                TuiButtonResult rs = tui_button_handle(&start_btn, &ev);
+                if (rs == TUI_BTN_CLICKED) return 1;
+                if (rs == TUI_BTN_REDRAW) tui_button_draw(&start_btn);
+                TuiButtonResult rq = tui_button_handle(&quit_btn, &ev);
+                if (rq == TUI_BTN_CLICKED) return 0;
+                if (rq == TUI_BTN_REDRAW) tui_button_draw(&quit_btn);
+            }
+        }
+        tui_present_diff();
+        sys1(SYS_SLEEP_TICKS, 20);
+    }
+}
+
+/* Show a 3-2-1-GO countdown overlay on top of the (already drawn)
+ * world. Each step holds for ~500ms, GO! for ~300ms. The world
+ * is redrawn behind the overlay each step so the player sees
+ * the road preview. */
+static void show_countdown(void) {
+    const char *steps[4] = { "3", "2", "1", "GO!" };
+    unsigned hold_ms[4]   = { 500, 500, 500, 300 };
+
+    for (int i = 0; i < 4; i++) {
+        /* Redraw the world underneath so it looks alive. */
+        draw_hud();
+        draw_world();
+        draw_car();
+
+        /* Big number in the center, drawn last so it's on top. */
+        int row = ROWS / 2;
+        int col = (COLS - 8) / 2;
+        TuiColor fg = (i == 3) ? 46 : 226;     /* green for GO, yellow for digits */
+
+        tui_set_bg(0);
+        tui_set_fg(fg);
+        tui_set_attr(TUI_ATTR_BOLD);
+        /* Bracket the digit with a small filled border for emphasis. */
+        tui_fill_rect(row - 1, col, 3, 8, ' ');
+        const char *s = steps[i];
+        int slen_s = (int)strlen(s);
+        int label_col = col + (8 - slen_s) / 2;
+        tui_move(row, label_col);
+        tui_puts(s);
+        tui_reset();
+
+        tui_present_diff();
+        sys1(SYS_SLEEP_TICKS, hold_ms[i]);
+    }
+}
+
+/* Game-over menu. Returns 1 to play again, 0 to exit. */
+static int show_game_over_menu(void) {
+    int box_h = 9;
+    int box_w = 40;
+    int box_row = ROWS / 2 - box_h / 2;
+    int box_col = (COLS - box_w) / 2;
+
+    /* Dim background by overdrawing the modal box solid. */
+    tui_set_bg(0);
+    tui_fill_rect(box_row, box_col, box_h, box_w, ' ');
+
+    /* Red double-border. */
+    tui_set_fg(196);
+    tui_set_attr(TUI_ATTR_BOLD);
+    tui_box_double(box_row, box_col, box_h, box_w);
+    tui_reset();
+
+    /* "CRASH!" title. */
+    tui_set_bg(0);
+    tui_set_fg(196);
+    tui_set_attr(TUI_ATTR_BOLD);
+    const char *title = "CRASH!";
+    int title_col = box_col + (box_w - 6) / 2;
+    tui_move(box_row + 1, title_col);
+    tui_puts(title);
+    tui_reset();
+
+    /* Score and distance line, centered. */
+    char score_line[40];
+    snprintf(score_line, sizeof(score_line),
+             "Score: %d   Distance: %d", g_score, g_distance);
+    int slen_score = (int)strlen(score_line);
+    tui_set_bg(0);
+    tui_set_fg(11);
+    tui_move(box_row + 3, box_col + (box_w - slen_score) / 2);
+    tui_puts(score_line);
+    tui_reset();
+
+    /* CONTINUE + EXIT buttons, side by side. */
+    TuiButton cont_btn = {
+        .row = box_row + 5, .col = box_col + 4, .h = 3, .w = 14,
+        .label = "CONTINUE",
+        .fg = TUI_BRIGHT_WHITE, .bg = 28,
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 22,
+    };
+    TuiButton exit_btn = {
+        .row = box_row + 5, .col = box_col + 22, .h = 3, .w = 14,
+        .label = "EXIT",
+        .fg = TUI_BRIGHT_WHITE, .bg = 88,
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 52,
+    };
+    tui_button_draw(&cont_btn);
+    tui_button_draw(&exit_btn);
+
+    tui_present_diff();
+
+    /* Drain accidental input from the crash frame. */
+    {
+        unsigned drain_ms = 250;
+        unsigned start_ms = sys0(SYS_TICKS_NOW);
+        while ((int)(sys0(SYS_TICKS_NOW) - start_ms) < (int)drain_ms) {
+            TuiEvent junk;
+            while (tui_poll_event(&junk)) { }
+            sys1(SYS_SLEEP_TICKS, 20);
+        }
+    }
+
+    for (;;) {
+        TuiEvent ev;
+        while (tui_poll_event(&ev)) {
+            if (ev.kind == TUI_EV_KEY) {
+                int k = ev.key.key;
+                if (k == TUI_KEY_ENTER || k == ' ') return 1;
+                if (k == TUI_KEY_ESCAPE || k == 'q' || k == 'Q') return 0;
+            } else if (ev.kind == TUI_EV_MOUSE) {
+                TuiButtonResult rc = tui_button_handle(&cont_btn, &ev);
+                if (rc == TUI_BTN_CLICKED) return 1;
+                if (rc == TUI_BTN_REDRAW) tui_button_draw(&cont_btn);
+                TuiButtonResult re = tui_button_handle(&exit_btn, &ev);
+                if (re == TUI_BTN_CLICKED) return 0;
+                if (re == TUI_BTN_REDRAW) tui_button_draw(&exit_btn);
+            }
+        }
+        tui_present_diff();
+        sys1(SYS_SLEEP_TICKS, 20);
+    }
 }
 
 /* ============================================================
  *  Main loop
  * ============================================================ */
+
+/* Reset all per-round state so the player can replay without
+ * relaunching. Called once before each play (after title, after
+ * game-over-CONTINUE). Tiles are NOT recreated — they live for
+ * the whole process. */
+static void reset_round_state(void) {
+    g_car_col = COLS / 2;
+    g_car_row = CAR_BOTTOM;
+    g_score = 0;
+    g_distance = 0;
+    g_speed = 1;
+    g_dead = false;
+    g_user_quit = false;
+    g_bend_target_center = COLS / 2;
+    g_bend_change_in = 25;
+    world_init();
+}
 
 int main(void) {
     if (!tui_init(TUI_USE_ALT_SCREEN | TUI_HIDE_CURSOR | TUI_USE_MOUSE |
@@ -623,6 +860,7 @@ int main(void) {
         return 1;
     }
 
+    /* Build all sprite tiles once. They persist across rounds. */
     make_car_tile();
     make_enemy_tile();
     make_debris_tile();
@@ -632,42 +870,50 @@ int main(void) {
     make_bush_tile();
     make_sign_tiles();
 
-    world_init();
+    /* Outer loop: title → reset → countdown → play → over → repeat.
+     * The user explicitly exits via QUIT on title or EXIT on the
+     * game-over menu. */
+    while (1) {
+        if (!show_title_screen()) break;  /* user picked QUIT */
 
-    /* Frame loop. Target ~15 FPS for smooth scrolling. */
-    while (!g_dead) {
-        process_input();
-        if (g_dead) break;
-        scroll_world(g_speed);
-        check_collisions();
-        if (g_dead) break;
-        /* Pickup credit accrues; distance also gives passive score. */
-        g_score += g_speed;
+        reset_round_state();
+        /* Draw the world once before the countdown so the user can
+         * see the starting position. */
         draw_hud();
         draw_world();
         draw_car();
-        tui_present_diff();
-        sys1(SYS_SLEEP_TICKS, 66);  /* ~15 FPS */
-    }
-
-    /* End screen until the user presses q or 5 seconds pass. */
-    int wait_frames = 75;     /* ~5s at 15 FPS */
-    while (wait_frames-- > 0) {
-        draw_world();
-        draw_car();
-        draw_game_over();
         tui_present();
-        TuiEvent ev;
-        while (tui_poll_event(&ev)) {
-            if (ev.kind == TUI_EV_KEY &&
-                (ev.key.key == 'q' || ev.key.key == 'Q' ||
-                 ev.key.key == TUI_KEY_ESCAPE ||
-                 ev.key.key == TUI_KEY_ENTER)) {
-                wait_frames = 0;
-                break;
-            }
+
+        show_countdown();
+
+        /* Frame loop. Target ~15 FPS for smooth scrolling. */
+        while (!g_dead) {
+            process_input();
+            if (g_dead) break;
+            scroll_world(g_speed);
+            check_collisions();
+            if (g_dead) break;
+            /* Pickup credit accrues; distance gives passive score. */
+            g_score += g_speed;
+            draw_hud();
+            draw_world();
+            draw_car();
+            tui_present_diff();
+            sys1(SYS_SLEEP_TICKS, 66);  /* ~15 FPS */
         }
-        sys1(SYS_SLEEP_TICKS, 66);
+
+        /* Hold the crash frame briefly so the player sees what
+         * happened, then show the menu. Skip the menu entirely
+         * if the user pressed q/Esc — they wanted out, not a
+         * dialog asking if they want out again. */
+        if (g_user_quit) continue;
+
+        sys1(SYS_SLEEP_TICKS, 400);
+
+        if (!show_game_over_menu()) break;   /* user picked EXIT */
+        /* CONTINUE: loop back to title... actually skip title and
+         * go straight to a new round, matching typical arcade
+         * "play again" UX. */
     }
 
     tui_shutdown();
