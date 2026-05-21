@@ -48,7 +48,43 @@ unset _VM_OBJS_DIR
 # Host compilation.
 # ---------------------------------------------------------------
 
-CC=${CC:-cc}
+# Pick a host compiler. On Cygwin we strongly prefer Cygwin's own
+# gcc over any mingw-w64 gcc that might be on PATH — the host
+# binary needs to share Cygwin's pty/tty layer so that running
+# from PuTTY (via SSH) doesn't pop a separate console window.
+#
+# Order of preference:
+#   1. $CC if the caller set it (no override)
+#   2. /usr/bin/gcc (this is Cygwin's gcc on Cygwin systems)
+#   3. plain 'cc'
+#
+# If we detect that the chosen compiler is mingw, we warn — the
+# user may want to install Cygwin's gcc-core for proper terminal
+# integration.
+if [ -z "${CC+x}" ]; then
+    if [ -x /usr/bin/gcc ]; then
+        CC=/usr/bin/gcc
+    else
+        CC=cc
+    fi
+fi
+
+# Detect mingw and warn. We test the resulting binary's target
+# triplet via -dumpmachine, which is fast and unambiguous.
+_HOST_MACHINE=$("$CC" -dumpmachine 2>/dev/null || echo unknown)
+case "$_HOST_MACHINE" in
+    *mingw*|*MinGW*|*w64*windows*)
+        cat >&2 << EOF
+WARN: $CC is a mingw/native-Windows compiler (target $_HOST_MACHINE).
+      The host binary will not share Cygwin's pty layer, which means
+      running it from PuTTY (over SSH to cygwin sshd) pops a new
+      console window instead of drawing in PuTTY itself.
+      For PuTTY support, install Cygwin's gcc-core package and
+      re-run with CC=/usr/bin/gcc.
+EOF
+        ;;
+esac
+unset _HOST_MACHINE
 
 # CFLAGS as an array. Each token is a separate element so spaces
 # inside REPO_ROOT don't get word-split when expanded. If the
