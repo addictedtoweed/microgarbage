@@ -261,7 +261,21 @@
 #define SYS_TUI_PRESENT_DIFF          1136  /* () → 0 */
 #define SYS_TUI_POLL_EVENT            1137  /* (event_ptr) → 1 if event, 0 if none */
 #define SYS_TUI_FLUSH_DRAW            1138  /* (cmd_buf, byte_len) → 0 or -errno */
-/* 1139-1147 reserved for future TUI services (tiles in T.3b, etc.) */
+
+/* Tile subsystem (1139-1146): per-VM sub-canvas allocations
+ * with blit and grab. See vm_host_tui.h.
+ *
+ * Handles are opaque (slot << 16) | generation. Destroying and
+ * recreating a tile returns a fresh handle, never the same value. */
+#define SYS_TUI_TILE_CREATE           1139  /* (rows, cols) → handle or -errno */
+#define SYS_TUI_TILE_DESTROY          1140  /* (handle) → 0 or -EBADF */
+#define SYS_TUI_TILE_SET              1141  /* (handle, rc_packed, c_attrs_packed, fg, bg) */
+#define SYS_TUI_TILE_FILL             1142  /* (handle, c_attrs_packed, fg, bg) → 0 */
+#define SYS_TUI_TILE_SET_TRANSPARENT  1143  /* (handle, row, col) → 0 */
+#define SYS_TUI_TILE_BLIT             1144  /* (handle, dest_row, dest_col) → 0 */
+#define SYS_TUI_TILE_GRAB             1145  /* (handle, src_packed_rc, hw_packed) → 0 */
+#define SYS_TUI_TILE_DIMS             1146  /* (handle) → (rows<<16)|cols or -EBADF */
+/* 1147 reserved */
 
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */

@@ -196,8 +196,40 @@ bool vm_host_install_tui(VmSystem *sys);
 /* Called by vm_system_unload_vm when a VM that owns the
  * canvas exits without calling SYS_TUI_SHUTDOWN. Restores
  * the terminal and releases ownership. Safe to call when
- * the VM didn't own the canvas. */
+ * the VM didn't own the canvas. Also frees any tiles the
+ * VM allocated. */
 void vm_host_tui_release_for_vm(uint16_t vm_id);
+
+/* ============================================================
+ *  Tile subsystem (round T.3b)
+ *
+ *  Tiles are per-VM sub-canvases. Each VM has up to
+ *  VM_TUI_TILES_PER_VM slots; cells come from a shared host
+ *  arena (VM_TUI_TILE_ARENA_BYTES). The handle is opaque:
+ *  internally (slot << 16) | generation, with the generation
+ *  bumped on each create so a stale handle from a destroyed
+ *  tile cannot accidentally alias a freshly-created one.
+ *
+ *  Layout per cell on the host: same as the canvas HostCell
+ *  (1B char + 2B fg + 2B bg + 1B attrs + 1B flags = 7B).
+ *
+ *  The transparent flag lives in the cell's flags field; blit
+ *  honors it (skip the canvas cell where the tile cell is
+ *  transparent).
+ * ============================================================ */
+
+#ifndef VM_TUI_TILES_PER_VM
+#define VM_TUI_TILES_PER_VM 16
+#endif
+
+#ifndef VM_TUI_TILE_ARENA_BYTES
+/* 16 KB worth of cells = ~2200 cells = enough for, e.g.,
+ * 8 tetris piece tiles (4×4 = 16 cells × 8 = 128 cells)
+ * + a 40×20 chrome tile (800 cells) + a few captures. */
+#define VM_TUI_TILE_ARENA_BYTES 16384
+#endif
+
+#define VM_TUI_CELL_TRANSPARENT (1u << 0)
 
 #ifdef __cplusplus
 }

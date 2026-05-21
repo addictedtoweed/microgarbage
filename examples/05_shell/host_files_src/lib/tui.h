@@ -363,8 +363,8 @@ void tui_box_ascii(int row, int col, int h, int w);
  *  Tile handle is an opaque ID — pass it around by value.
  * ============================================================ */
 
-typedef int TuiTileId;
-#define TUI_TILE_NONE  (-1)
+typedef unsigned int TuiTileId;
+#define TUI_TILE_NONE  ((TuiTileId)0)
 
 /* Create a new tile with the given dimensions. Returns a handle
  * or TUI_TILE_NONE on failure (out of arena or out of slots). */

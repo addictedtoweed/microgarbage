@@ -343,120 +343,105 @@ void tui_box_ascii(int row, int col, int h, int w) {
 }
 
 /* ============================================================
- *  Tiles — guest-side, expand to SET_CELL ops at blit time
+ *  Tiles — backed by host SYS_TUI_TILE_* syscalls (T.3b)
  *
- *  Round T.3b will move tiles into the host. For now, keep the
- *  tile data in guest RAM (small arena) so source compatibility
- *  is preserved.
+ *  Round T.3b moved tile storage into the host. The guest-side
+ *  arena is gone; the per-VM tile slot table and shared cell
+ *  arena live in vm_host_tui. Handles are opaque u32 values.
  * ============================================================ */
 
-typedef struct {
-    char     c;
-    uint16_t fg;
-    uint16_t bg;
-    uint8_t  attrs;
-    uint8_t  flags;    /* TUI_CELL_TRANSPARENT */
-} GuestCell;
+#define SYS_TUI_TILE_CREATE          1139
+#define SYS_TUI_TILE_DESTROY         1140
+#define SYS_TUI_TILE_SET             1141
+#define SYS_TUI_TILE_FILL            1142
+#define SYS_TUI_TILE_SET_TRANSPARENT 1143
+#define SYS_TUI_TILE_BLIT            1144
+#define SYS_TUI_TILE_GRAB            1145
 
-#define TILE_ARENA_BYTES TUI_TILE_ARENA_BYTES
-#define TILE_MAX_COUNT   TUI_TILE_MAX_COUNT
+static inline uint32_t sys4(uint32_t n, uint32_t a, uint32_t b,
+                             uint32_t c, uint32_t d) {
+    register uint32_t a0 asm("a0") = a;
+    register uint32_t a1 asm("a1") = b;
+    register uint32_t a2 asm("a2") = c;
+    register uint32_t a3 asm("a3") = d;
+    register uint32_t a7 asm("a7") = n;
+    asm volatile ("ecall" : "+r"(a0)
+                  : "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
+    return a0;
+}
 
-typedef struct {
-    int rows, cols;
-    GuestCell *cells;     /* into g_tile_arena */
-    bool in_use;
-} TileSlot;
-
-static uint8_t   g_tile_arena[TILE_ARENA_BYTES];
-static unsigned  g_tile_arena_used = 0;
-static TileSlot  g_tile_slots[TILE_MAX_COUNT];
+static inline uint32_t sys5(uint32_t n, uint32_t a, uint32_t b,
+                             uint32_t c, uint32_t d, uint32_t e) {
+    register uint32_t a0 asm("a0") = a;
+    register uint32_t a1 asm("a1") = b;
+    register uint32_t a2 asm("a2") = c;
+    register uint32_t a3 asm("a3") = d;
+    register uint32_t a4 asm("a4") = e;
+    register uint32_t a7 asm("a7") = n;
+    asm volatile ("ecall" : "+r"(a0)
+                  : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+    return a0;
+}
 
 TuiTileId tui_tile_create(int rows, int cols) {
-    if (rows <= 0 || cols <= 0) return TUI_TILE_NONE;
-    unsigned need = (unsigned)rows * (unsigned)cols * sizeof(GuestCell);
-    if (g_tile_arena_used + need > TILE_ARENA_BYTES) return TUI_TILE_NONE;
-    int slot = -1;
-    for (int i = 0; i < TILE_MAX_COUNT; i++) {
-        if (!g_tile_slots[i].in_use) { slot = i; break; }
-    }
-    if (slot < 0) return TUI_TILE_NONE;
-    g_tile_slots[slot].rows = rows;
-    g_tile_slots[slot].cols = cols;
-    g_tile_slots[slot].cells = (GuestCell *)(g_tile_arena + g_tile_arena_used);
-    g_tile_slots[slot].in_use = true;
-    g_tile_arena_used += need;
-    /* Initialize with transparent cells. */
-    for (unsigned i = 0; i < (unsigned)(rows * cols); i++) {
-        g_tile_slots[slot].cells[i].c = ' ';
-        g_tile_slots[slot].cells[i].fg = TUI_DEFAULT_COLOR;
-        g_tile_slots[slot].cells[i].bg = TUI_DEFAULT_COLOR;
-        g_tile_slots[slot].cells[i].attrs = 0;
-        g_tile_slots[slot].cells[i].flags = TUI_CELL_TRANSPARENT;
-    }
-    return (TuiTileId)slot;
+    /* Must flush pending draw commands so the host's canvas state
+     * is current — tile create itself doesn't touch the canvas,
+     * but the host may need a consistent state for arena layout. */
+    flush_cmds();
+    int32_t r = (int32_t)sys2(SYS_TUI_TILE_CREATE,
+                               (uint32_t)rows, (uint32_t)cols);
+    if (r <= 0) return TUI_TILE_NONE;
+    return (TuiTileId)r;
 }
 
 void tui_tile_destroy(TuiTileId tile) {
-    if (tile < 0 || tile >= TILE_MAX_COUNT) return;
-    g_tile_slots[tile].in_use = false;
-    /* arena memory not reclaimed — same behavior as old impl */
+    if (tile == TUI_TILE_NONE) return;
+    flush_cmds();
+    sys1(SYS_TUI_TILE_DESTROY, (uint32_t)tile);
 }
 
 void tui_tile_set(TuiTileId tile, int row, int col,
                   char c, TuiColor fg, TuiColor bg, unsigned attrs) {
-    if (tile < 0 || tile >= TILE_MAX_COUNT) return;
-    TileSlot *s = &g_tile_slots[tile];
-    if (!s->in_use) return;
-    if (row < 1 || row > s->rows || col < 1 || col > s->cols) return;
-    GuestCell *cell = &s->cells[(row - 1) * s->cols + (col - 1)];
-    cell->c = c;
-    cell->fg = (uint16_t)fg;
-    cell->bg = (uint16_t)bg;
-    cell->attrs = (uint8_t)attrs;
-    cell->flags = 0;
+    if (tile == TUI_TILE_NONE) return;
+    flush_cmds();
+    uint32_t rc = ((uint32_t)row << 16) | (uint32_t)(col & 0xffff);
+    uint32_t ca = ((uint32_t)(unsigned char)c << 8) | (attrs & 0xff);
+    sys5(SYS_TUI_TILE_SET, (uint32_t)tile, rc, ca,
+         (uint32_t)fg, (uint32_t)bg);
 }
 
 void tui_tile_set_transparent(TuiTileId tile, int row, int col) {
-    if (tile < 0 || tile >= TILE_MAX_COUNT) return;
-    TileSlot *s = &g_tile_slots[tile];
-    if (!s->in_use) return;
-    if (row < 1 || row > s->rows || col < 1 || col > s->cols) return;
-    s->cells[(row - 1) * s->cols + (col - 1)].flags = TUI_CELL_TRANSPARENT;
+    if (tile == TUI_TILE_NONE) return;
+    flush_cmds();
+    sys3(SYS_TUI_TILE_SET_TRANSPARENT,
+         (uint32_t)tile, (uint32_t)row, (uint32_t)col);
 }
 
 void tui_tile_fill(TuiTileId tile, char c, TuiColor fg, TuiColor bg,
                    unsigned attrs) {
-    if (tile < 0 || tile >= TILE_MAX_COUNT) return;
-    TileSlot *s = &g_tile_slots[tile];
-    if (!s->in_use) return;
-    for (int i = 0; i < s->rows * s->cols; i++) {
-        s->cells[i].c = c;
-        s->cells[i].fg = (uint16_t)fg;
-        s->cells[i].bg = (uint16_t)bg;
-        s->cells[i].attrs = (uint8_t)attrs;
-        s->cells[i].flags = 0;
-    }
+    if (tile == TUI_TILE_NONE) return;
+    flush_cmds();
+    uint32_t ca = ((uint32_t)(unsigned char)c << 8) | (attrs & 0xff);
+    sys4(SYS_TUI_TILE_FILL, (uint32_t)tile, ca,
+         (uint32_t)fg, (uint32_t)bg);
 }
 
 void tui_blit_tile(TuiTileId tile, int dest_row, int dest_col) {
-    if (tile < 0 || tile >= TILE_MAX_COUNT) return;
-    TileSlot *s = &g_tile_slots[tile];
-    if (!s->in_use) return;
-    for (int r = 0; r < s->rows; r++) {
-        for (int c = 0; c < s->cols; c++) {
-            GuestCell *cell = &s->cells[r * s->cols + c];
-            if (cell->flags & TUI_CELL_TRANSPARENT) continue;
-            tui_set_cell(dest_row + r, dest_col + c,
-                         cell->c, (TuiColor)cell->fg,
-                         (TuiColor)cell->bg, cell->attrs);
-        }
-    }
+    if (tile == TUI_TILE_NONE) return;
+    /* Blit modifies the host canvas, so any pending draw commands
+     * must be applied first to maintain correct stacking order. */
+    flush_cmds();
+    sys3(SYS_TUI_TILE_BLIT, (uint32_t)tile,
+         (uint32_t)dest_row, (uint32_t)dest_col);
 }
 
 void tui_grab(int src_row, int src_col, int h, int w, TuiTileId dest_tile) {
-    /* Grab is not supported without a guest-side canvas view.
-     * In a future round (T.3b) the host will expose SYS_TUI_GRAB. */
-    (void)src_row; (void)src_col; (void)h; (void)w; (void)dest_tile;
+    if (dest_tile == TUI_TILE_NONE) return;
+    /* Grab reads the current canvas, so flush pending draws first. */
+    flush_cmds();
+    uint32_t rc = ((uint32_t)src_row << 16) | (uint32_t)(src_col & 0xffff);
+    uint32_t hw = ((uint32_t)h << 16) | (uint32_t)(w & 0xffff);
+    sys3(SYS_TUI_TILE_GRAB, (uint32_t)dest_tile, rc, hw);
 }
 
 /* ============================================================

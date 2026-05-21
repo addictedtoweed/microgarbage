@@ -429,6 +429,207 @@ static void test_poll_event_function_keys(void) {
     fixture_teardown();
 }
 
+/* ============================================================
+ *  Tile tests (T.3b)
+ * ============================================================ */
+
+static void test_tile_create_returns_handle(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 10, 40, 0);
+
+    /* Create a 4x4 tile. */
+    int32_t h = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    ASSERT(h > 0);
+    /* Lower 8 bits = slot (should be 0 for first tile). */
+    ASSERT_EQ_INT(0, h & 0xff);
+    /* Bits 15..8 = vm_id (0 in this fixture). */
+    ASSERT_EQ_INT(0, (h >> 8) & 0xff);
+    /* Bits 31..16 = generation > 0. */
+    ASSERT((h >> 16) > 0);
+
+    /* TILE_DIMS returns (rows<<16)|cols. */
+    int32_t d = invoke_syscall(SYS_TUI_TILE_DIMS, h, 0, 0);
+    ASSERT_EQ_INT((4 << 16) | 4, d);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_tile_destroy_invalidates_handle(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 10, 40, 0);
+
+    int32_t h = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    ASSERT(h > 0);
+
+    ASSERT_EQ_INT(0, invoke_syscall(SYS_TUI_TILE_DESTROY, h, 0, 0));
+
+    /* Stale handle now returns EBADF. */
+    int32_t d = invoke_syscall(SYS_TUI_TILE_DIMS, h, 0, 0);
+    ASSERT_EQ_INT(-(int32_t)VM_EBADF, d);
+
+    /* Re-create: should get a different handle (generation bumped). */
+    int32_t h2 = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    ASSERT(h2 > 0);
+    ASSERT(h2 != h);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_tile_fill_then_blit(void) {
+    ASSERT(fixture_init());
+    Capture cap;
+    ASSERT(cap_begin(&cap));
+
+    invoke_syscall(SYS_TUI_INIT, 10, 40, 0);
+
+    /* 3x3 tile filled with 'X' (no transparency). */
+    int32_t h = invoke_syscall(SYS_TUI_TILE_CREATE, 3, 3, 0);
+    ASSERT(h > 0);
+    /* TILE_FILL: a1=(c<<8)|attrs, a2=fg, a3=bg */
+    uint32_t ca = ((uint32_t)'X' << 8) | 0;
+    g_cpu.regs[VM_REG_A7] = SYS_TUI_TILE_FILL;
+    g_cpu.regs[VM_REG_A0] = (uint32_t)h;
+    g_cpu.regs[VM_REG_A1] = ca;
+    g_cpu.regs[VM_REG_A2] = 7;
+    g_cpu.regs[VM_REG_A3] = VM_TUI_DEFAULT_COLOR;
+    vm_ecall_dispatch(g_sys.ecall_router, &g_cpu, &g_sys);
+    ASSERT_EQ_INT(0, (int32_t)g_cpu.regs[VM_REG_A0]);
+
+    /* Blit at (2, 5). */
+    g_cpu.regs[VM_REG_A7] = SYS_TUI_TILE_BLIT;
+    g_cpu.regs[VM_REG_A0] = (uint32_t)h;
+    g_cpu.regs[VM_REG_A1] = 2;
+    g_cpu.regs[VM_REG_A2] = 5;
+    vm_ecall_dispatch(g_sys.ecall_router, &g_cpu, &g_sys);
+    ASSERT_EQ_INT(0, (int32_t)g_cpu.regs[VM_REG_A0]);
+
+    /* Present and verify the X's made it to the terminal. */
+    invoke_syscall(SYS_TUI_PRESENT, 0, 0, 0);
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+
+    size_t n = 0;
+    char *out = cap_end(&cap, &n);
+    /* We should see "XXX" in the output for at least one row. */
+    ASSERT(strstr(out, "XXX") != NULL);
+    free(out);
+    fixture_teardown();
+}
+
+static void test_tile_set_then_blit_with_transparency(void) {
+    ASSERT(fixture_init());
+    Capture cap;
+    ASSERT(cap_begin(&cap));
+
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+
+    /* Background fill canvas via flush_draw OP_FILL_RECT row=1,col=1,h=5,w=10 with 'B' */
+    uint8_t *db = g_data;
+    int o = 0;
+    db[o++] = VM_TUI_OP_FILL_RECT;
+    db[o++] = 1; db[o++] = 0;       /* row=1 */
+    db[o++] = 1; db[o++] = 0;       /* col=1 */
+    db[o++] = 5; db[o++] = 0;       /* h=5 */
+    db[o++] = 10; db[o++] = 0;      /* w=10 */
+    db[o++] = 'B';
+    db[o++] = VM_TUI_OP_END;
+    invoke_syscall(SYS_TUI_FLUSH_DRAW, 0x80000000u, (uint32_t)o, 0);
+
+    /* 2x2 tile, fill with 'F', then set (1,1) transparent. */
+    int32_t h = invoke_syscall(SYS_TUI_TILE_CREATE, 2, 2, 0);
+    ASSERT(h > 0);
+
+    uint32_t ca = ((uint32_t)'F' << 8) | 0;
+    g_cpu.regs[VM_REG_A7] = SYS_TUI_TILE_FILL;
+    g_cpu.regs[VM_REG_A0] = (uint32_t)h;
+    g_cpu.regs[VM_REG_A1] = ca;
+    g_cpu.regs[VM_REG_A2] = VM_TUI_DEFAULT_COLOR;
+    g_cpu.regs[VM_REG_A3] = VM_TUI_DEFAULT_COLOR;
+    vm_ecall_dispatch(g_sys.ecall_router, &g_cpu, &g_sys);
+
+    /* Mark cell (1, 1) transparent. */
+    invoke_syscall(SYS_TUI_TILE_SET_TRANSPARENT, (uint32_t)h, 1, 1);
+
+    /* Blit at (2, 2). Canvas cell (2,2) stays 'B'; (2,3) becomes 'F'. */
+    g_cpu.regs[VM_REG_A7] = SYS_TUI_TILE_BLIT;
+    g_cpu.regs[VM_REG_A0] = (uint32_t)h;
+    g_cpu.regs[VM_REG_A1] = 2;
+    g_cpu.regs[VM_REG_A2] = 2;
+    vm_ecall_dispatch(g_sys.ecall_router, &g_cpu, &g_sys);
+
+    invoke_syscall(SYS_TUI_PRESENT, 0, 0, 0);
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+
+    size_t n = 0;
+    char *out = cap_end(&cap, &n);
+    /* Both 'B' and 'F' should be in the output. */
+    ASSERT(strchr(out, 'B') != NULL);
+    ASSERT(strchr(out, 'F') != NULL);
+    free(out);
+    fixture_teardown();
+}
+
+static void test_tile_other_vm_handle_rejected(void) {
+    ASSERT(fixture_init());
+
+    /* VM 0 owns the canvas and creates a tile. */
+    g_cpu.vm_id = 0;
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+    int32_t h = invoke_syscall(SYS_TUI_TILE_CREATE, 2, 2, 0);
+    ASSERT(h > 0);
+
+    /* Switch to VM 1 — that VM can't use VM 0's handle (it doesn't
+     * even own the canvas; gets EBUSY first). */
+    g_cpu.vm_id = 1;
+    int32_t d = invoke_syscall(SYS_TUI_TILE_DIMS, h, 0, 0);
+    ASSERT_EQ_INT(-(int32_t)VM_EBUSY, d);
+
+    g_cpu.vm_id = 0;
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_tile_release_on_vm_unload(void) {
+    ASSERT(fixture_init());
+
+    g_cpu.vm_id = 0;
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+    /* Create several tiles. */
+    int32_t h1 = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    int32_t h2 = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    int32_t h3 = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    ASSERT(h1 > 0 && h2 > 0 && h3 > 0);
+
+    /* Simulate VM 0 dying without proper cleanup. */
+    vm_host_tui_release_for_vm(0);
+
+    /* After release, VM 0 starting fresh can create tiles again
+     * (slots reclaimed). */
+    invoke_syscall(SYS_TUI_INIT, 5, 10, 0);
+    int32_t h4 = invoke_syscall(SYS_TUI_TILE_CREATE, 4, 4, 0);
+    ASSERT(h4 > 0);
+    /* Stale handle should be rejected. */
+    int32_t d = invoke_syscall(SYS_TUI_TILE_DIMS, h1, 0, 0);
+    ASSERT_EQ_INT(-(int32_t)VM_EBADF, d);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
+static void test_tile_create_oversize_rejected(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 10, 40, 0);
+
+    /* Try to create a tile much larger than canvas → ENOMEM
+     * (we cap at VM_TUI_MAX_ROWS/COLS). */
+    int32_t h = invoke_syscall(SYS_TUI_TILE_CREATE, 999, 999, 0);
+    ASSERT_EQ_INT(-(int32_t)VM_ENOMEM, h);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
 int main(void) {
     TEST_SUITE("vm_host_tui");
     RUN(test_init_shutdown);
@@ -445,5 +646,12 @@ int main(void) {
     RUN(test_poll_event_arrow_keys);
     RUN(test_poll_event_sgr_mouse);
     RUN(test_poll_event_function_keys);
+    RUN(test_tile_create_returns_handle);
+    RUN(test_tile_destroy_invalidates_handle);
+    RUN(test_tile_fill_then_blit);
+    RUN(test_tile_set_then_blit_with_transparency);
+    RUN(test_tile_other_vm_handle_rejected);
+    RUN(test_tile_release_on_vm_unload);
+    RUN(test_tile_create_oversize_rejected);
     return TEST_SUITE_RESULT();
 }
