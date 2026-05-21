@@ -307,6 +307,214 @@ static int poll_inputs(void) {
 }
 
 /* ============================================================
+ *  Menu screens (round D.3)
+ *
+ *  We have three states the game can be in outside of active
+ *  play: title screen at startup, game-over screen after a
+ *  collision, and the actual playing state. Title and game-
+ *  over both wait on the same input pattern: any key, mouse
+ *  click on a button, then dispatch to either "start play"
+ *  or "quit."
+ *
+ *  Both screens use the buttons from lib/tui.h plus accept
+ *  Enter/Space as keyboard shortcuts for the primary action.
+ * ============================================================ */
+
+/* Add TUI buttons that snake's menus can use. The widget itself
+ * is in lib/tui.h. */
+
+static void reset_game_state(void) {
+    /* Snake: 4 cells, centered, heading right. */
+    g_head_idx = 3;
+    g_tail_idx = 0;
+    g_length = 4;
+    for (unsigned i = 0; i < g_length; i++) {
+        g_snake[i].x = (unsigned char)(PLAY_W / 2 - 2 + i);
+        g_snake[i].y = (unsigned char)(PLAY_H / 2);
+    }
+    g_dx = 1; g_dy = 0;
+    g_score = 0;
+    place_food();
+}
+
+/* Render a centered title screen. Returns 1 if user chose start,
+ * 0 if user chose quit (Esc / q). */
+static int show_title_screen(void) {
+    /* Wipe the canvas to black. */
+    tui_set_bg(TUI_BLACK);
+    tui_fill_rect(1, 1, 22, 50, ' ');
+    tui_reset();
+
+    /* "SNAKE" title in big colored block, centered. */
+    tui_set_bg(TUI_BLACK);
+    tui_set_fg(TUI_BRIGHT_GREEN);
+    tui_set_attr(TUI_ATTR_BOLD);
+    tui_move(5, 22);
+    tui_puts("SNAKE");
+    tui_reset();
+
+    tui_set_bg(TUI_BLACK);
+    tui_set_fg(TUI_BRIGHT_WHITE);
+    tui_move(8, 14);
+    tui_puts("arrow keys or WASD to move");
+    tui_move(9, 14);
+    tui_puts("eat the red food, don't bite yourself");
+    tui_reset();
+
+    /* Two side-by-side buttons: START (default) and QUIT. */
+    TuiButton start_btn = {
+        .row = 13, .col = 12, .h = 3, .w = 12,
+        .label = "START",
+        .fg = TUI_BRIGHT_WHITE, .bg = 28,         /* green-ish */
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 22,
+    };
+    TuiButton quit_btn = {
+        .row = 13, .col = 28, .h = 3, .w = 12,
+        .label = "QUIT",
+        .fg = TUI_BRIGHT_WHITE, .bg = 88,         /* dark red */
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 52,
+    };
+    tui_button_draw(&start_btn);
+    tui_button_draw(&quit_btn);
+
+    tui_set_bg(TUI_BLACK);
+    tui_set_fg(TUI_BRIGHT_BLACK);
+    tui_move(17, 13);
+    tui_puts("Enter/Space = start    Esc/q = quit");
+    tui_reset();
+
+    tui_present();
+
+    unsigned hz = sys_tick_hz();
+    if (hz == 0) hz = 1000;
+
+    /* Drain any input that's already queued (e.g. the Enter that
+     * launched us from the shell). */
+    {
+        unsigned drain_until = sys_ticks_now() + (hz / 7);
+        TuiEvent junk;
+        while ((int)(sys_ticks_now() - drain_until) < 0) {
+            while (tui_poll_event(&junk)) { }
+            sys_sleep_until(sys_ticks_now() + (hz / 100));
+        }
+    }
+
+    for (;;) {
+        TuiEvent ev;
+        while (tui_poll_event(&ev)) {
+            if (ev.kind == TUI_EV_KEY) {
+                int k = ev.key.key;
+                if (k == TUI_KEY_ENTER || k == ' ') return 1;
+                if (k == TUI_KEY_ESCAPE || k == 'q' || k == 'Q') return 0;
+            } else if (ev.kind == TUI_EV_MOUSE) {
+                TuiButtonResult rs = tui_button_handle(&start_btn, &ev);
+                if (rs == TUI_BTN_CLICKED) return 1;
+                if (rs == TUI_BTN_REDRAW) tui_button_draw(&start_btn);
+                TuiButtonResult rq = tui_button_handle(&quit_btn, &ev);
+                if (rq == TUI_BTN_CLICKED) return 0;
+                if (rq == TUI_BTN_REDRAW) tui_button_draw(&quit_btn);
+            }
+        }
+        tui_present_diff();
+        sys_sleep_until(sys_ticks_now() + (hz / 50));   /* ~20 ms */
+    }
+}
+
+/* Game-over screen. Returns 1 to play again, 0 to quit. */
+static int show_game_over_screen(const char *reason) {
+    /* Center the dialog over the play area. */
+    int box_h = 9;
+    int box_w = 38;
+    int box_row = cell_row(PLAY_H / 2 - 3);
+    int box_col = cell_col(PLAY_W / 2 - box_w / 2 + 1);
+
+    tui_set_bg(TUI_BLACK);
+    tui_fill_rect(box_row, box_col, box_h, box_w, ' ');
+
+    tui_set_fg(TUI_BRIGHT_RED);
+    tui_set_attr(TUI_ATTR_BOLD);
+    tui_box_double(box_row, box_col, box_h, box_w);
+    tui_reset();
+    tui_set_bg(TUI_BLACK);
+
+    const char *title = "GAME OVER";
+    int title_col = box_col + (box_w - 9) / 2;
+    tui_move(box_row + 1, title_col);
+    tui_set_fg(TUI_BRIGHT_RED);
+    tui_set_attr(TUI_ATTR_BOLD);
+    tui_puts(title);
+
+    tui_set_attr(TUI_ATTR_NONE);
+    tui_set_fg(TUI_BRIGHT_WHITE);
+    unsigned reason_len = slen(reason);
+    int reason_col = box_col + (box_w - (int)reason_len) / 2;
+    tui_move(box_row + 2, reason_col);
+    tui_puts(reason);
+
+    char score_buf[12];
+    char *score_str = fmt_u(g_score, score_buf + sizeof(score_buf));
+    unsigned score_str_len = slen(score_str);
+    unsigned score_total = 7 + score_str_len;
+    int score_col = box_col + (box_w - (int)score_total) / 2;
+    tui_move(box_row + 3, score_col);
+    tui_set_fg(TUI_BRIGHT_YELLOW);
+    tui_puts("score: ");
+    tui_puts(score_str);
+    tui_reset();
+
+    /* Buttons. */
+    TuiButton play_btn = {
+        .row = box_row + 5, .col = box_col + 4, .h = 3, .w = 12,
+        .label = "PLAY AGAIN",
+        .fg = TUI_BRIGHT_WHITE, .bg = 28,
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 22,
+    };
+    TuiButton exit_btn = {
+        .row = box_row + 5, .col = box_col + 22, .h = 3, .w = 12,
+        .label = "EXIT",
+        .fg = TUI_BRIGHT_WHITE, .bg = 88,
+        .pressed_fg = TUI_BRIGHT_WHITE, .pressed_bg = 52,
+    };
+    tui_button_draw(&play_btn);
+    tui_button_draw(&exit_btn);
+
+    tui_present_diff();
+
+    unsigned hz = sys_tick_hz();
+    if (hz == 0) hz = 1000;
+
+    /* Drain any input that arrived during the collision frame. */
+    {
+        unsigned drain_until = sys_ticks_now() + (hz / 4);
+        TuiEvent junk;
+        while ((int)(sys_ticks_now() - drain_until) < 0) {
+            while (tui_poll_event(&junk)) { }
+            sys_sleep_until(sys_ticks_now() + (hz / 100));
+        }
+    }
+
+    for (;;) {
+        TuiEvent ev;
+        while (tui_poll_event(&ev)) {
+            if (ev.kind == TUI_EV_KEY) {
+                int k = ev.key.key;
+                if (k == TUI_KEY_ENTER || k == ' ') return 1;
+                if (k == TUI_KEY_ESCAPE || k == 'q' || k == 'Q') return 0;
+            } else if (ev.kind == TUI_EV_MOUSE) {
+                TuiButtonResult rp = tui_button_handle(&play_btn, &ev);
+                if (rp == TUI_BTN_CLICKED) return 1;
+                if (rp == TUI_BTN_REDRAW) tui_button_draw(&play_btn);
+                TuiButtonResult re = tui_button_handle(&exit_btn, &ev);
+                if (re == TUI_BTN_CLICKED) return 0;
+                if (re == TUI_BTN_REDRAW) tui_button_draw(&exit_btn);
+            }
+        }
+        tui_present_diff();
+        sys_sleep_until(sys_ticks_now() + (hz / 50));
+    }
+}
+
+/* ============================================================
  *  Entry point
  * ============================================================ */
 
@@ -331,32 +539,31 @@ void _start(void) {
      * border (16×42) plus chrome without wasting cycles on areas
      * we don't draw to. */
     tui_init(TUI_USE_ALT_SCREEN | TUI_USE_RAW |
-             TUI_HIDE_CURSOR | TUI_USE_SYNC_OUTPUT,
+             TUI_HIDE_CURSOR | TUI_USE_SYNC_OUTPUT |
+             TUI_USE_MOUSE,
              22, 50);
 
-    /* Initial snake: 4 cells, centered, heading right. */
-    g_head_idx = 3;
-    g_tail_idx = 0;
-    g_length = 4;
-    for (unsigned i = 0; i < g_length; i++) {
-        g_snake[i].x = (unsigned char)(PLAY_W / 2 - 2 + i);
-        g_snake[i].y = (unsigned char)(PLAY_H / 2);
-    }
-    g_dx = 1; g_dy = 0;
-    g_score = 0;
+    unsigned hz = sys_tick_hz();
+    if (hz == 0) hz = 1000;
 
-    place_food();
+    /* Show the title screen first. User decides whether to play. */
+    if (!show_title_screen()) {
+        tui_shutdown();
+        sys_exit(0);
+    }
+
+play_again:
+    /* (Re)initialize game state and draw the initial frame. */
+    reset_game_state();
+    /* Wipe the canvas — we may be coming from a previous game-
+     * over screen and need a clean playfield. */
+    tui_set_bg(TUI_BLACK);
+    tui_fill_rect(1, 1, 22, 50, ' ');
+    tui_reset();
     draw_chrome();
     draw_snake_initial();
     draw_food();
-    /* First present is full — there's no valid front buffer yet,
-     * so tui_present primes it. Subsequent frames use the diff
-     * path. */
     tui_present();
-
-    /* Pacing setup: 8 fps (125 ms / frame). */
-    unsigned hz = sys_tick_hz();
-    if (hz == 0) hz = 1000;
 
     /* Drain any input that arrived during startup (e.g., the
      * Enter key that launched us). 150 ms grace window. */
@@ -437,93 +644,12 @@ void _start(void) {
         sys_yield_until_reload();
     }
 
-    /* Game-over screen, if applicable. Draws a centered banner
-     * inside a small box, then waits for the user to press any
-     * key before exiting. This replaces the previous fixed 1.5s
-     * timeout, which on slow terminals could be missed entirely
-     * — and now the user explicitly acknowledges the end of the
-     * game rather than blinking back to the shell. */
+    /* Game-over screen: ask the user whether to play again or
+     * exit. Uses the shared menu from round D.3. */
     if (game_over) {
-        /* Box dimensions: 5 rows tall, wide enough for the
-         * longest expected message. Centered horizontally in
-         * the playfield. */
-        int box_h = 5;
-        int box_w = 36;
-        int box_row = cell_row(PLAY_H / 2 - 2);
-        int box_col = cell_col(PLAY_W / 2 - box_w / 2 + 1);
-
-        /* Clear the box interior first so any snake body or
-         * food underneath gets erased. Use a dark bg to make
-         * the dialog visually distinct. */
-        tui_set_bg(TUI_BLACK);
-        tui_fill_rect(box_row, box_col, box_h, box_w, ' ');
-
-        /* Bright red double-line border. */
-        tui_set_fg(TUI_BRIGHT_RED);
-        tui_set_attr(TUI_ATTR_BOLD);
-        tui_box_double(box_row, box_col, box_h, box_w);
-        tui_reset();
-        tui_set_bg(TUI_BLACK);
-
-        /* "GAME OVER" centered on line 2 of the box. */
-        const char *title = "GAME OVER";
-        int title_col = box_col + (box_w - 9) / 2;
-        tui_move(box_row + 1, title_col);
-        tui_set_fg(TUI_BRIGHT_RED);
-        tui_set_attr(TUI_ATTR_BOLD);
-        tui_puts(title);
-
-        /* Reason on line 3, centered. */
-        tui_set_attr(TUI_ATTR_NONE);
-        tui_set_fg(TUI_BRIGHT_WHITE);
-        /* Figure out reason length to center it. */
-        unsigned reason_len = slen(over_reason);
-        int reason_col = box_col + (box_w - (int)reason_len) / 2;
-        tui_move(box_row + 2, reason_col);
-        tui_puts(over_reason);
-
-        /* "score: N" on line 4, centered. */
-        char score_buf[12];
-        char *score_str = fmt_u(g_score, score_buf + sizeof(score_buf));
-        unsigned score_str_len = slen(score_str);
-        unsigned score_total = 7 + score_str_len;   /* "score: " + digits */
-        int score_col = box_col + (box_w - (int)score_total) / 2;
-        tui_move(box_row + 3, score_col);
-        tui_set_fg(TUI_BRIGHT_YELLOW);
-        tui_puts("score: ");
-        tui_puts(score_str);
-
-        /* Hint at bottom of playfield. */
-        tui_reset();
-        tui_set_fg(TUI_BRIGHT_BLACK);
-        int hint_row = cell_row(PLAY_H) + 1;
-        tui_move(hint_row, cell_col(0));
-        tui_puts("press any key to exit");
-        tui_reset();
-        /* Diff present is fine here too — only the dialog box
-         * cells changed since the last gameplay frame, so the
-         * emission is bounded (about 200 cells = a few hundred
-         * bytes). */
-        tui_present_diff();
-
-        /* Drain any leftover input that arrived during the
-         * collision frame (e.g., the key that turned snake into
-         * the wall), then wait for a fresh keypress. We require
-         * a fresh press, not just any byte, so a held-down arrow
-         * doesn't blow past the screen. */
         sys_set_reload_period(0);
-        {
-            unsigned drain_until = sys_ticks_now() + (hz / 4); /* 250 ms */
-            TuiEvent junk;
-            while ((int)(sys_ticks_now() - drain_until) < 0) {
-                while (tui_poll_event(&junk)) { /* discard */ }
-                sys_sleep_until(sys_ticks_now() + (hz / 100));
-            }
-        }
-        for (;;) {
-            TuiEvent ev;
-            if (tui_poll_event(&ev) && ev.kind == TUI_EV_KEY) break;
-            sys_sleep_until(sys_ticks_now() + (hz / 50)); /* 20 ms */
+        if (show_game_over_screen(over_reason)) {
+            goto play_again;
         }
     }
 
