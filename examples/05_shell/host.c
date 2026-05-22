@@ -971,23 +971,112 @@ typedef struct {
     tcp_sock_t client_fd;
     int        port;
     int        prev_was_cr;   /* LF→CRLF state, per-connection */
+
+    /* Telnet IAC filter state (per-connection). Many clients
+     * (PuTTY's default "Telnet" type, the telnet command, etc.)
+     * open with a burst of IAC negotiation. We don't speak Telnet,
+     * but we strip these sequences so they don't reach the shell as
+     * garbage (the classic "^C and stray chars on connect"), and we
+     * answer WILL/DO with WONT/DONT so the client stops asking.
+     *
+     * iac_state: 0 = ground, 1 = saw IAC, 2 = saw IAC+verb (await
+     * option), 3 = inside subnegotiation, 4 = subneg saw IAC. */
+    int     iac_state;
+    uint8_t iac_verb;         /* the WILL/WONT/DO/DONT byte, in state 2 */
 } TcpCtx;
 
-static tcp_sock_t tcp_ctx_cfd(VmHostTransport *t) {
-    TcpCtx *c = (TcpCtx *)t->ctx;
-    return c ? c->client_fd : TCP_SOCK_INVALID;
+/* Telnet command bytes. */
+#define TELNET_IAC  255
+#define TELNET_SE   240
+#define TELNET_SB   250
+#define TELNET_WILL 251
+#define TELNET_WONT 252
+#define TELNET_DO   253
+#define TELNET_DONT 254
+
+/* Send a raw reply on the client socket (best-effort). Used to
+ * answer Telnet negotiation. */
+static void tcp_raw_send(tcp_sock_t cfd, const void *p, int n) {
+    if (cfd == TCP_SOCK_INVALID) return;
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    (void)send(cfd, (const char *)p, n, 0);
+#else
+    (void)send(cfd, p, (size_t)n, 0);
+#endif
+}
+
+/* Filter Telnet IAC sequences out of `raw` (n bytes), writing the
+ * surviving data bytes to `out`. Returns the number of data bytes
+ * written. Answers WILL/DO negotiation with WONT/DONT on `cfd` so
+ * the client settles. State persists across calls via ctx (IAC
+ * sequences can split across reads). A literal 0xFF byte arrives as
+ * IAC IAC and is passed through as a single 0xFF. */
+static int telnet_filter(TcpCtx *ctx, tcp_sock_t cfd,
+                         const unsigned char *raw, int n,
+                         unsigned char *out) {
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char b = raw[i];
+        switch (ctx->iac_state) {
+        case 0:   /* ground */
+            if (b == TELNET_IAC) ctx->iac_state = 1;
+            else                 out[w++] = b;
+            break;
+        case 1:   /* saw IAC */
+            if (b == TELNET_IAC) {            /* IAC IAC → literal 0xFF */
+                out[w++] = 0xFF; ctx->iac_state = 0;
+            } else if (b == TELNET_WILL || b == TELNET_WONT ||
+                       b == TELNET_DO   || b == TELNET_DONT) {
+                ctx->iac_verb = b; ctx->iac_state = 2;
+            } else if (b == TELNET_SB) {
+                ctx->iac_state = 3;            /* subnegotiation begins */
+            } else {
+                ctx->iac_state = 0;            /* 2-byte command, ignore */
+            }
+            break;
+        case 2: { /* IAC <verb> <option> — refuse everything */
+            uint8_t resp[3] = { TELNET_IAC, 0, b };
+            if (ctx->iac_verb == TELNET_DO)        resp[1] = TELNET_WONT;
+            else if (ctx->iac_verb == TELNET_WILL) resp[1] = TELNET_DONT;
+            else resp[1] = 0;
+            if (resp[1]) tcp_raw_send(cfd, resp, 3);
+            ctx->iac_state = 0;
+            break;
+        }
+        case 3:   /* inside subnegotiation: skip until IAC SE */
+            if (b == TELNET_IAC) ctx->iac_state = 4;
+            break;
+        case 4:   /* subneg saw IAC */
+            if (b == TELNET_SE)       ctx->iac_state = 0;  /* end subneg */
+            else if (b == TELNET_IAC) ctx->iac_state = 4;  /* escaped FF */
+            else                      ctx->iac_state = 3;  /* keep skipping */
+            break;
+        }
+    }
+    return w;
 }
 
 static int tcp_t_read(VmHostTransport *t, void *buf, unsigned cap) {
-    tcp_sock_t cfd = tcp_ctx_cfd(t);
+    TcpCtx *ctx = (TcpCtx *)t->ctx;
+    tcp_sock_t cfd = ctx ? ctx->client_fd : TCP_SOCK_INVALID;
     if (cfd == TCP_SOCK_INVALID) return -5;
     if (cap == 0) return 0;
+
+    /* Read into scratch, then strip Telnet IAC into the caller's
+     * buffer. The filter never grows the data, so `cap` bytes of
+     * scratch always suffice. */
+    unsigned char scratch[512];
+    unsigned want = cap < sizeof(scratch) ? cap : (unsigned)sizeof(scratch);
 #if defined(_WIN32) && !defined(__CYGWIN__)
-    int r = recv(cfd, (char *)buf, (int)cap, 0);
+    int r = recv(cfd, (char *)scratch, (int)want, 0);
 #else
-    ssize_t r = recv(cfd, buf, cap, 0);
+    ssize_t r = recv(cfd, scratch, want, 0);
 #endif
-    if (r > 0) return (int)r;
+    if (r > 0) {
+        /* If the read was entirely negotiation, w can be 0 — that's
+         * "no data this poll", not EOF. */
+        return telnet_filter(ctx, cfd, scratch, (int)r, (unsigned char *)buf);
+    }
     if (r == 0) return 0;   /* client closed (or 0-byte send) */
     int err = tcp_last_errno();
     if (err == TCP_WOULDBLOCK) return 0;
@@ -1688,6 +1777,8 @@ int main(int argc, char **argv) {
             tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
             tcp_ctxs[i].port      = tcp_ports[i];
             tcp_ctxs[i].prev_was_cr = 0;
+            tcp_ctxs[i].iac_state = 0;
+            tcp_ctxs[i].iac_verb  = 0;
             if (tcp_ctxs[i].listen_fd == TCP_SOCK_INVALID) {
                 fprintf(stderr, "host: failed to listen on port %d\n",
                         tcp_ports[i]);
