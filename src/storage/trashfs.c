@@ -51,6 +51,13 @@ static uint8_t *block_ptr(uint8_t *region, uint32_t block) {
     return region + (size_t)block * TRASHFS_BLOCK_SIZE;
 }
 
+/* Pointer to inode i's 64 bytes within the region. */
+static uint8_t *inode_ptr(TrashfsVolume *vol, uint32_t i) {
+    uint32_t blk = vol->inode_start + (i / TRASHFS_INODES_PER_BLOCK);
+    uint32_t off = (i % TRASHFS_INODES_PER_BLOCK) * TRASHFS_INODE_SIZE;
+    return block_ptr(vol->region, blk) + off;
+}
+
 /* ---- geometry computation ---------------------------------- *
  *
  *  Given total_blocks and an optional inode hint, compute the
@@ -279,15 +286,172 @@ uint32_t trashfs_free_inodes(const TrashfsVolume *vol) {
 }
 
 /* ============================================================
- *  Phase 2: read-only path.
+ *  Phase 3 support: block + inode allocation.
  * ============================================================ */
 
-/* Pointer to inode i's 64 bytes within the region. */
-static uint8_t *inode_ptr(TrashfsVolume *vol, uint32_t i) {
-    uint32_t blk = vol->inode_start + (i / TRASHFS_INODES_PER_BLOCK);
-    uint32_t off = (i % TRASHFS_INODES_PER_BLOCK) * TRASHFS_INODE_SIZE;
-    return block_ptr(vol->region, blk) + off;
+static bool bitmap_test_v(TrashfsVolume *vol, uint32_t block) {
+    const uint8_t *bm = block_ptr(vol->region, vol->bitmap_start);
+    return (bm[block >> 3] >> (block & 7u)) & 1u;
 }
+static void bitmap_set_v(TrashfsVolume *vol, uint32_t block) {
+    uint8_t *bm = block_ptr(vol->region, vol->bitmap_start);
+    bm[block >> 3] |= (uint8_t)(1u << (block & 7u));
+}
+static void bitmap_clear_v(TrashfsVolume *vol, uint32_t block) {
+    uint8_t *bm = block_ptr(vol->region, vol->bitmap_start);
+    bm[block >> 3] &= (uint8_t)~(1u << (block & 7u));
+}
+
+/* Allocate one free data block. Marks it used, zeroes its contents
+ * (important: indirect-pointer blocks must start all-zero = all
+ * "none"), decrements free_blocks. Returns TRASHFS_BLOCK_NONE (0) if
+ * the volume is full. */
+static uint32_t alloc_block_v(TrashfsVolume *vol) {
+    for (uint32_t b = vol->data_start; b < vol->total_blocks; b++) {
+        if (!bitmap_test_v(vol, b)) {
+            bitmap_set_v(vol, b);
+            memset(block_ptr(vol->region, b), 0, TRASHFS_BLOCK_SIZE);
+            if (vol->free_blocks > 0) vol->free_blocks--;
+            return b;
+        }
+    }
+    return TRASHFS_BLOCK_NONE;
+}
+
+/* Free a data block: clear its bit, bump free_blocks. */
+static void free_block_v(TrashfsVolume *vol, uint32_t block) {
+    if (block == TRASHFS_BLOCK_NONE) return;
+    if (block < vol->data_start || block >= vol->total_blocks) return;
+    if (bitmap_test_v(vol, block)) {
+        bitmap_clear_v(vol, block);
+        vol->free_blocks++;
+    }
+}
+
+/* Allocate a free inode. Returns its number, or UINT32_MAX if none. */
+static uint32_t alloc_inode_v(TrashfsVolume *vol) {
+    for (uint32_t i = 0; i < vol->inode_count; i++) {
+        uint8_t *in = inode_ptr(vol, i);
+        if ((rd16(in + 0) & TRASHFS_MODE_USED) == 0u) {
+            if (vol->free_inodes > 0) vol->free_inodes--;
+            return i;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* Growth counterpart to map_lbn: return the physical block for a
+ * file's logical block 'lbn', allocating it AND any missing indirect
+ * pointer blocks along the way. Returns TRASHFS_BLOCK_NONE on ENOSPC
+ * (any required allocation failing). The inode pointer 'inode' is a
+ * live pointer into the region, so writes through it persist. */
+static uint32_t bmap_alloc(TrashfsVolume *vol, uint8_t *inode, uint32_t lbn) {
+    const uint32_t P = TRASHFS_PTRS_PER_BLOCK;
+
+    /* Helper: ensure a pointer slot at 'slot_ptr' names an allocated
+     * block; if it's none, allocate one and store it. Returns the
+     * block, or NONE on ENOSPC. */
+    /* (Inlined below per level since slot locations differ.) */
+
+    /* Direct */
+    if (lbn < TRASHFS_DIRECT_PTRS) {
+        uint8_t *slot = inode + 16u + lbn * 4u;
+        uint32_t b = rd32(slot);
+        if (b == TRASHFS_BLOCK_NONE) {
+            b = alloc_block_v(vol);
+            if (b == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(slot, b);
+        }
+        return b;
+    }
+    lbn -= TRASHFS_DIRECT_PTRS;
+
+    /* Single indirect */
+    if (lbn < P) {
+        uint8_t *sp = inode + 48u;
+        uint32_t single = rd32(sp);
+        if (single == TRASHFS_BLOCK_NONE) {
+            single = alloc_block_v(vol);
+            if (single == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(sp, single);
+        }
+        uint8_t *slot = block_ptr(vol->region, single) + lbn * 4u;
+        uint32_t b = rd32(slot);
+        if (b == TRASHFS_BLOCK_NONE) {
+            b = alloc_block_v(vol);
+            if (b == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(slot, b);
+        }
+        return b;
+    }
+    lbn -= P;
+
+    /* Double indirect */
+    if (lbn < P * P) {
+        uint8_t *dp = inode + 52u;
+        uint32_t dbl = rd32(dp);
+        if (dbl == TRASHFS_BLOCK_NONE) {
+            dbl = alloc_block_v(vol);
+            if (dbl == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(dp, dbl);
+        }
+        uint8_t *l1slot = block_ptr(vol->region, dbl) + (lbn / P) * 4u;
+        uint32_t l1 = rd32(l1slot);
+        if (l1 == TRASHFS_BLOCK_NONE) {
+            l1 = alloc_block_v(vol);
+            if (l1 == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(l1slot, l1);
+        }
+        uint8_t *slot = block_ptr(vol->region, l1) + (lbn % P) * 4u;
+        uint32_t b = rd32(slot);
+        if (b == TRASHFS_BLOCK_NONE) {
+            b = alloc_block_v(vol);
+            if (b == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(slot, b);
+        }
+        return b;
+    }
+    lbn -= P * P;
+
+    /* Triple indirect */
+    if (lbn < P * P * P) {
+        uint8_t *tp = inode + 56u;
+        uint32_t triple = rd32(tp);
+        if (triple == TRASHFS_BLOCK_NONE) {
+            triple = alloc_block_v(vol);
+            if (triple == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(tp, triple);
+        }
+        uint8_t *l1slot = block_ptr(vol->region, triple) + (lbn / (P * P)) * 4u;
+        uint32_t l1 = rd32(l1slot);
+        if (l1 == TRASHFS_BLOCK_NONE) {
+            l1 = alloc_block_v(vol);
+            if (l1 == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(l1slot, l1);
+        }
+        uint8_t *l2slot = block_ptr(vol->region, l1) + ((lbn / P) % P) * 4u;
+        uint32_t l2 = rd32(l2slot);
+        if (l2 == TRASHFS_BLOCK_NONE) {
+            l2 = alloc_block_v(vol);
+            if (l2 == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(l2slot, l2);
+        }
+        uint8_t *slot = block_ptr(vol->region, l2) + (lbn % P) * 4u;
+        uint32_t b = rd32(slot);
+        if (b == TRASHFS_BLOCK_NONE) {
+            b = alloc_block_v(vol);
+            if (b == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+            wr32(slot, b);
+        }
+        return b;
+    }
+
+    return TRASHFS_BLOCK_NONE;   /* beyond max file size */
+}
+
+/* ============================================================
+ *  Phase 2: read-only path.
+ * ============================================================ */
 
 /* Read pointer slot 'idx' from a block of 32 uint32 pointers. */
 static uint32_t ptr_in_block(TrashfsVolume *vol, uint32_t block, uint32_t idx) {
@@ -373,29 +537,6 @@ static const char *normalize_name(const char *name, uint32_t *out_len) {
     while (name[n] != '\0') n++;
     *out_len = n;
     return name;
-}
-
-TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
-                           uint32_t flags, TrashfsFile *f) {
-    (void)flags;   /* Phase 2: read-only; flags reserved */
-    if (!vol || !vol->mounted || !name || !f) return TRASHFS_ERR_INVALID_ARG;
-
-    uint32_t len = 0;
-    const char *nm = normalize_name(name, &len);
-    if (len == 0 || len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
-
-    uint32_t ino = 0; uint8_t type = 0;
-    if (!dir_find(vol, nm, len, &ino, &type)) return TRASHFS_ERR_NOT_FOUND;
-
-    const uint8_t *inode = inode_ptr(vol, ino);
-    memset(f, 0, sizeof(*f));
-    f->vol    = vol;
-    f->inode  = ino;
-    f->size   = rd32(inode + 4u);
-    f->pos    = 0;
-    f->is_dir = (type == TRASHFS_TYPE_DIR);
-    f->open   = true;
-    return TRASHFS_OK;
 }
 
 TrashfsResult trashfs_read(TrashfsFile *f, void *buf, uint32_t n,
@@ -514,4 +655,244 @@ TrashfsResult trashfs_closedir(TrashfsDir *d) {
     if (!d) return TRASHFS_ERR_INVALID_ARG;
     d->open = false;
     return TRASHFS_OK;
+}
+
+/* ============================================================
+ *  Phase 3: write path — allocation, growth, in-place, unlink.
+ * ============================================================ */
+
+/* Free every data + indirect block referenced by an inode, walking
+ * all four pointer levels. Used by truncate (O_TRUNC) and unlink.
+ * Leaves all pointer slots zeroed and size 0; caller sets the inode's
+ * other fields (or frees the inode). */
+static void free_all_blocks(TrashfsVolume *vol, uint8_t *inode) {
+    const uint32_t P = TRASHFS_PTRS_PER_BLOCK;
+
+    /* Direct */
+    for (uint32_t i = 0; i < TRASHFS_DIRECT_PTRS; i++) {
+        uint8_t *slot = inode + 16u + i * 4u;
+        free_block_v(vol, rd32(slot));
+        wr32(slot, TRASHFS_BLOCK_NONE);
+    }
+
+    /* Single indirect */
+    {
+        uint32_t single = rd32(inode + 48u);
+        if (single != TRASHFS_BLOCK_NONE) {
+            uint8_t *sb = block_ptr(vol->region, single);
+            for (uint32_t i = 0; i < P; i++) free_block_v(vol, rd32(sb + i * 4u));
+            free_block_v(vol, single);
+        }
+        wr32(inode + 48u, TRASHFS_BLOCK_NONE);
+    }
+
+    /* Double indirect */
+    {
+        uint32_t dbl = rd32(inode + 52u);
+        if (dbl != TRASHFS_BLOCK_NONE) {
+            uint8_t *db = block_ptr(vol->region, dbl);
+            for (uint32_t i = 0; i < P; i++) {
+                uint32_t l1 = rd32(db + i * 4u);
+                if (l1 == TRASHFS_BLOCK_NONE) continue;
+                uint8_t *l1b = block_ptr(vol->region, l1);
+                for (uint32_t j = 0; j < P; j++) free_block_v(vol, rd32(l1b + j * 4u));
+                free_block_v(vol, l1);
+            }
+            free_block_v(vol, dbl);
+        }
+        wr32(inode + 52u, TRASHFS_BLOCK_NONE);
+    }
+
+    /* Triple indirect */
+    {
+        uint32_t triple = rd32(inode + 56u);
+        if (triple != TRASHFS_BLOCK_NONE) {
+            uint8_t *tb = block_ptr(vol->region, triple);
+            for (uint32_t i = 0; i < P; i++) {
+                uint32_t l1 = rd32(tb + i * 4u);
+                if (l1 == TRASHFS_BLOCK_NONE) continue;
+                uint8_t *l1b = block_ptr(vol->region, l1);
+                for (uint32_t j = 0; j < P; j++) {
+                    uint32_t l2 = rd32(l1b + j * 4u);
+                    if (l2 == TRASHFS_BLOCK_NONE) continue;
+                    uint8_t *l2b = block_ptr(vol->region, l2);
+                    for (uint32_t k = 0; k < P; k++) free_block_v(vol, rd32(l2b + k * 4u));
+                    free_block_v(vol, l2);
+                }
+                free_block_v(vol, l1);
+            }
+            free_block_v(vol, triple);
+        }
+        wr32(inode + 56u, TRASHFS_BLOCK_NONE);
+    }
+}
+
+TrashfsResult trashfs_write(TrashfsFile *f, const void *buf, uint32_t n,
+                            uint32_t *out_written, uint32_t now) {
+    if (!f || !f->open || !buf) return TRASHFS_ERR_INVALID_ARG;
+    if (out_written) *out_written = 0;
+    if (f->is_dir) return TRASHFS_ERR_INVALID_ARG;
+
+    uint8_t *inode = inode_ptr(f->vol, f->inode);
+    const uint8_t *src = (const uint8_t *)buf;
+    uint32_t done = 0;
+
+    while (done < n) {
+        uint32_t lbn  = f->pos / TRASHFS_BLOCK_SIZE;
+        uint32_t boff = f->pos % TRASHFS_BLOCK_SIZE;
+        uint32_t room = TRASHFS_BLOCK_SIZE - boff;
+        uint32_t want = n - done;
+        uint32_t chunk = (want < room) ? want : room;
+
+        uint32_t blk = bmap_alloc(f->vol, inode, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) {
+            /* ENOSPC. If we've written nothing at all, report it; else
+             * a short write is success with a short count. */
+            break;
+        }
+        memcpy(block_ptr(f->vol->region, blk) + boff, src + done, chunk);
+        done   += chunk;
+        f->pos += chunk;
+
+        /* Grow size if we wrote past the old end. */
+        if (f->pos > f->size) f->size = f->pos;
+    }
+
+    /* Persist size + modified to the inode. */
+    wr32(inode + 4u, f->size);
+    wr32(inode + 12u, now);
+
+    if (out_written) *out_written = done;
+    if (done == 0 && n > 0) return TRASHFS_ERR_NO_SPACE;
+    return TRASHFS_OK;
+}
+
+/* ---- directory entry insertion / removal ------------------- */
+
+/* Find a free directory slot (inode==0) in the root, or grow the root
+ * directory by one entry-slot, returning a pointer to the 48-byte
+ * slot. Returns NULL on ENOSPC. *grew is set if the dir size grew. */
+static uint8_t *root_alloc_dirent(TrashfsVolume *vol, bool *grew) {
+    uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
+    uint32_t dsize = rd32(root + 4u);
+    *grew = false;
+
+    /* Reuse a freed slot first. */
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
+         off += TRASHFS_DIRENT_SIZE) {
+        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+        uint32_t blk = map_lbn(vol, root, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) continue;
+        uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
+        if (rd32(e + 0) == 0u) return e;   /* free slot */
+    }
+
+    /* Append a new slot at the end, allocating a block if needed. */
+    uint32_t off = dsize;
+    uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+    uint32_t blk = bmap_alloc(vol, root, lbn);
+    if (blk == TRASHFS_BLOCK_NONE) return NULL;
+    uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
+    wr32(root + 4u, dsize + TRASHFS_DIRENT_SIZE);
+    *grew = true;
+    return e;
+}
+
+TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
+                           uint32_t flags, TrashfsFile *f) {
+    if (!vol || !vol->mounted || !name || !f) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t len = 0;
+    const char *nm = normalize_name(name, &len);
+    if (len == 0 || len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t ino = 0; uint8_t type = 0;
+    bool found = dir_find(vol, nm, len, &ino, &type);
+
+    if (!found) {
+        if (!(flags & TRASHFS_O_CREAT)) return TRASHFS_ERR_NOT_FOUND;
+
+        /* Create: allocate an inode + a directory entry. */
+        uint32_t newino = alloc_inode_v(vol);
+        if (newino == 0xFFFFFFFFu) return TRASHFS_ERR_NO_SPACE;
+
+        bool grew = false;
+        uint8_t *slot = root_alloc_dirent(vol, &grew);
+        if (!slot) {
+            /* Roll back the inode reservation. */
+            vol->free_inodes++;   /* alloc_inode_v decremented it */
+            return TRASHFS_ERR_NO_SPACE;
+        }
+
+        /* Initialize the new inode as an empty regular file. */
+        uint8_t *in = inode_ptr(vol, newino);
+        memset(in, 0, TRASHFS_INODE_SIZE);
+        wr16(in + 0, (uint16_t)TRASHFS_MODE_USED);   /* regular file */
+        wr16(in + 2, 1u);                            /* links */
+        /* size 0, timestamps 0, all pointers 0 (from memset) */
+
+        /* Fill the directory entry. */
+        wr32(slot + 0, newino);
+        slot[4] = TRASHFS_TYPE_FILE;
+        slot[5] = (uint8_t)len;
+        memcpy(slot + 6, nm, len);
+        /* pad bytes: zero them defensively (a reused slot may have old data) */
+        memset(slot + 6 + len, 0, TRASHFS_DIRENT_SIZE - 6u - len);
+
+        ino  = newino;
+        type = TRASHFS_TYPE_FILE;
+    }
+
+    const uint8_t *inode = inode_ptr(vol, ino);
+    memset(f, 0, sizeof(*f));
+    f->vol    = vol;
+    f->inode  = ino;
+    f->is_dir = (type == TRASHFS_TYPE_DIR);
+    f->open   = true;
+
+    if ((flags & TRASHFS_O_TRUNC) && !f->is_dir) {
+        uint8_t *in = inode_ptr(vol, ino);
+        free_all_blocks(vol, in);
+        wr32(in + 4u, 0u);          /* size = 0 */
+        f->size = 0;
+    } else {
+        f->size = rd32(inode + 4u);
+    }
+
+    f->pos = (flags & TRASHFS_O_APPEND) ? f->size : 0u;
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_unlink(TrashfsVolume *vol, const char *name) {
+    if (!vol || !vol->mounted || !name) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t len = 0;
+    const char *nm = normalize_name(name, &len);
+    if (len == 0 || len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
+
+    /* Locate the directory entry (and clear it). We scan directly so
+     * we can both find the inode and zero the slot in one pass. */
+    uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
+    uint32_t dsize = rd32(root + 4u);
+
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
+         off += TRASHFS_DIRENT_SIZE) {
+        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+        uint32_t blk = map_lbn(vol, root, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) continue;
+        uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
+        uint32_t einode = rd32(e + 0);
+        if (einode == 0u) continue;
+        uint8_t elen = e[5];
+        if (elen == len && memcmp(e + 6, nm, len) == 0) {
+            /* Free the file's blocks + inode, clear the dir slot. */
+            uint8_t *in = inode_ptr(vol, einode);
+            free_all_blocks(vol, in);
+            memset(in, 0, TRASHFS_INODE_SIZE);   /* mode=0 -> inode free */
+            vol->free_inodes++;
+            memset(e, 0, TRASHFS_DIRENT_SIZE);   /* inode=0 -> slot free */
+            return TRASHFS_OK;
+        }
+    }
+    return TRASHFS_ERR_NOT_FOUND;
 }

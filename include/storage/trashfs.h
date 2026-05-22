@@ -202,9 +202,12 @@ uint32_t trashfs_free_inodes(const TrashfsVolume *vol);
 #define TRASHFS_SEEK_CUR 1
 #define TRASHFS_SEEK_END 2
 
-/* Open flags (Phase 2 understands none yet — files must exist;
- * O_CREAT/O_TRUNC arrive in Phase 3). Reserved for forward use. */
+/* Open flags. Phase 2 understood none (files had to exist). Phase 3
+ * adds creation and truncation. */
 #define TRASHFS_O_RDONLY 0x0000u
+#define TRASHFS_O_CREAT  0x0001u   /* create the file if absent       */
+#define TRASHFS_O_TRUNC  0x0002u   /* truncate to zero on open        */
+#define TRASHFS_O_APPEND 0x0004u   /* position at EOF before writes   */
 
 /* An open file handle. Bound to a mounted volume + an inode. */
 typedef struct {
@@ -234,9 +237,10 @@ typedef struct {
     uint32_t size;      /* file size in bytes                    */
 } TrashfsDirent_Out;
 
-/* Open an existing file by name (flat namespace; a leading '/' is
- * accepted and ignored). Fills *f. Returns TRASHFS_ERR_NOT_FOUND if
- * no such file. Phase 2: read-only, no creation. */
+/* Open a file by name (flat namespace; a leading '/' is accepted and
+ * ignored). With TRASHFS_O_CREAT, a missing file is created; without
+ * it, a missing file returns TRASHFS_ERR_NOT_FOUND. TRASHFS_O_TRUNC
+ * frees the file's blocks and resets size to 0. Fills *f. */
 TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
                            uint32_t flags, TrashfsFile *f);
 
@@ -246,6 +250,16 @@ TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
 TrashfsResult trashfs_read(TrashfsFile *f, void *buf, uint32_t n,
                            uint32_t *out_read);
 
+/* Write up to n bytes at the current position, allocating blocks as
+ * needed (growing the file and its indirect structure) and writing in
+ * place within the existing size. Returns bytes written via
+ * *out_written. On insufficient space, allocates what it can and
+ * returns a short count with TRASHFS_OK; if nothing could be written
+ * because the volume is full, returns TRASHFS_ERR_NO_SPACE. Updates
+ * size (if grown) and the modified timestamp. */
+TrashfsResult trashfs_write(TrashfsFile *f, const void *buf, uint32_t n,
+                            uint32_t *out_written, uint32_t now);
+
 /* Reposition. Returns the new absolute position via *out_pos. Seeking
  * past EOF is allowed (reads there return 0 / EOF until Phase 3's
  * write can extend the file). */
@@ -254,6 +268,11 @@ TrashfsResult trashfs_lseek(TrashfsFile *f, int32_t off, int whence,
 
 /* Close a file handle. */
 TrashfsResult trashfs_close(TrashfsFile *f);
+
+/* Remove a file by name, freeing its data blocks (and indirect
+ * blocks) and its inode, and clearing its directory entry. Returns
+ * TRASHFS_ERR_NOT_FOUND if absent. (Phase 3.) */
+TrashfsResult trashfs_unlink(TrashfsVolume *vol, const char *name);
 
 /* Open the (root) directory for iteration. Phase 2 has a flat
  * namespace, so this opens the root regardless of path. */
