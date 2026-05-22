@@ -722,9 +722,18 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
      * override to fd 0 should just use the default behavior. */
 
     /* Determine the fd to use for nonblock and raw-mode operations.
-     * Prefer the override if set; otherwise fall back to fileno. */
+     * Prefer the override if set; otherwise fall back to fileno.
+     *
+     * Only make stdin non-blocking when we'll actually read it as an
+     * interactive terminal (raw mode true). In the transport modes
+     * (pipe / pty / TCP) raw is false and the host never reads its
+     * own fd 0 — input arrives via the transport — so there's no
+     * reason to alter fd 0's flags. Avoiding it also sidesteps a
+     * Cygwin quirk where O_NONBLOCK on the controlling terminal can
+     * perturb its line discipline. (The default interactive stdio
+     * shell sets raw=true, so it still gets non-blocking input.) */
     int in_fd = (override_in >= 0) ? override_in : fileno(in);
-    if (in_fd >= 0) {
+    if (raw && in_fd >= 0) {
         set_nonblock(in_fd);
     }
 

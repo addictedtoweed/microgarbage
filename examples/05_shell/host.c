@@ -527,6 +527,31 @@ static BOOL WINAPI on_console_ctrl(DWORD type) {
             return FALSE;
     }
 }
+
+/* Warn if this NATIVE Windows build is running without a real Win32
+ * console attached — the classic "native host.exe launched under
+ * mintty/Cygwin pty" case. There, Ctrl-C is NOT delivered as a
+ * console CTRL_C_EVENT (mintty is a pty, not a console) and the
+ * native process doesn't see Cygwin's POSIX SIGINT either, so Ctrl-C
+ * appears dead once a session is connected. Detect it and tell the
+ * user how to get working Ctrl-C. GetConsoleMode on the stdin handle
+ * succeeds only for a genuine console. */
+static void warn_if_no_real_console(void) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) {
+        fprintf(stderr,
+            "host: NOTE — no real Windows console detected (looks like\n"
+            "      mintty / a Cygwin pty). Ctrl-C may not stop the host\n"
+            "      once a session is connected. For working Ctrl-C, run\n"
+            "      host.exe from cmd.exe or PowerShell, or under mintty\n"
+            "      use 'winpty ./host.exe ...', or stop it with\n"
+            "      'kill -INT <pid>' from another terminal.\n");
+        fflush(stderr);
+    }
+#endif
+}
 #endif
 
 /* Portable short sleep, used by the multi-session run loop to yield
@@ -1539,6 +1564,7 @@ int main(int argc, char **argv) {
      * it's the primary mechanism. Harmless elsewhere (not compiled). */
 #if defined(__CYGWIN__) || defined(_WIN32)
     SetConsoleCtrlHandler(on_console_ctrl, TRUE);
+    warn_if_no_real_console();
 #endif
 
     /* 1. Initialize the block device. */

@@ -135,6 +135,41 @@ simultaneous sessions (see Multi-session below).
 Build: native Windows requires `-lws2_32`. The Linux `build.sh`
 auto-detects MSYS/MINGW environments and links it.
 
+#### Stopping the host (Ctrl-C) — native build under mintty
+
+If you build the **native** host with `build-win.sh`/`build-win.ps1`
+(a real Windows `.exe`, no `cygwin1.dll`) and then run it inside
+**mintty** (the default Cygwin terminal), Ctrl-C may not stop the
+host once a TCP session is connected. This is not a host bug — it's
+the native-binary-under-pty mismatch:
+
+- The native `.exe` doesn't link `cygwin1.dll`, so it never sees
+  Cygwin's POSIX `SIGINT`.
+- mintty is a pty, not a Win32 console, so it never generates the
+  console `CTRL_C_EVENT` that the host's `SetConsoleCtrlHandler`
+  would catch.
+
+With no session connected the host is idle enough that Ctrl-C still
+lands; once it's busy in Winsock calls for a live session, the
+interrupt is swallowed.
+
+Fixes, in order of preference:
+
+- **Run the native host from `cmd.exe` or PowerShell** (a real
+  Windows console). Ctrl-C works in all cases there — and this is
+  how it'll run on the eventual native-Windows target anyway.
+- Under mintty, launch via `winpty`: `winpty ./host.exe --tcp=5000`.
+  `winpty` bridges the pty to a real console for native programs.
+- Or stop it with `kill -INT <pid>` from another Cygwin terminal.
+
+The native host prints a one-line NOTE at startup when it detects it
+has no real console, as a reminder.
+
+(The Cygwin `build.sh` build — linked against `cygwin1.dll` — does
+participate in Cygwin signals, so Ctrl-C under mintty behaves
+normally there. The tradeoff is a Cygwin-DLL dependency rather than
+a standalone `.exe`.)
+
 #### Connecting with PuTTY
 
 Connection type **Raw** or **Telnet** both work. The host speaks a
