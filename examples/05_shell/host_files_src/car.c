@@ -854,7 +854,13 @@ static void reset_round_state(void) {
 }
 
 int main(void) {
-    if (!tui_init(TUI_USE_ALT_SCREEN | TUI_HIDE_CURSOR | TUI_USE_MOUSE |
+    /* car steers by bare mouse movement, so it needs any-motion
+     * tracking (1003), not button-only (1002). TUI_USE_MOUSE_MOTION
+     * selects that. Without it, moving the mouse without holding a
+     * button reported nothing — the car wouldn't follow, and under
+     * PuTTY stray reports leaked onto the screen as text. */
+    if (!tui_init(TUI_USE_ALT_SCREEN | TUI_HIDE_CURSOR |
+                  TUI_USE_MOUSE | TUI_USE_MOUSE_MOTION |
                   TUI_USE_RAW | TUI_USE_SYNC_OUTPUT,
                   ROWS, COLS)) {
         return 1;

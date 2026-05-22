@@ -439,10 +439,21 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
         const char *s = "\x1b[?25l";
         hwrite(1, s, 6);
     }
-    if (flags & VM_TUI_USE_MOUSE) {
-        /* SGR mouse (1006) + button-motion (1002). */
-        const char *s = "\x1b[?1002h\x1b[?1006h";
-        hwrite(1, s, 16);
+    if (flags & (VM_TUI_USE_MOUSE | VM_TUI_USE_MOUSE_MOTION)) {
+        /* SGR encoding (1006) always. Tracking mode depends on the
+         * flag: any-motion (1003) when the UI follows the bare
+         * cursor, button-motion (1002) otherwise. 1003 reports every
+         * pointer move; 1002 only reports motion while a button is
+         * held — which is wrong for a "move to steer" game and is
+         * what made car.elf appear unresponsive (and leak stray
+         * reports as text) under PuTTY. */
+        if (flags & VM_TUI_USE_MOUSE_MOTION) {
+            const char *s = "\x1b[?1003h\x1b[?1006h";
+            hwrite(1, s, 16);
+        } else {
+            const char *s = "\x1b[?1002h\x1b[?1006h";
+            hwrite(1, s, 16);
+        }
     }
     /* TUI_USE_RAW: switch the controlling tty into raw mode so
      * keystrokes and mouse events reach us byte-by-byte instead
@@ -474,10 +485,12 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
 static void do_shutdown(void) {
     if (!g_initialized) return;
 
-    /* Restore terminal state in reverse order. */
-    if (g_flags & VM_TUI_USE_MOUSE) {
-        const char *s = "\x1b[?1006l\x1b[?1002l";
-        hwrite(1, s, 16);
+    /* Restore terminal state in reverse order. Disable SGR (1006)
+     * plus BOTH tracking modes — we don't track which was on, and
+     * disabling an inactive mode is harmless. */
+    if (g_flags & (VM_TUI_USE_MOUSE | VM_TUI_USE_MOUSE_MOTION)) {
+        const char *s = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
+        hwrite(1, s, 24);
     }
     if (g_flags & VM_TUI_HIDE_CURSOR) {
         const char *s = "\x1b[?25h";
@@ -1129,8 +1142,15 @@ static bool finish_mouse(char final, InEvent *out) {
             case 1: button = VM_TUI_MB_MIDDLE; break;
             case 2: button = VM_TUI_MB_RIGHT;  break;
             default:
-                csi_reset(); g_in_state = IN_STATE_GROUND;
-                return false;
+                /* (b & 3) == 3: "no button". In any-motion tracking
+                 * (xterm mode 1003) the terminal reports bare cursor
+                 * movement with this code and the motion bit (32)
+                 * set. Treat it as a motion event with no button —
+                 * this is exactly what a move-to-steer UI needs.
+                 * Without this, every bare-motion report was dropped
+                 * and the cursor-following game saw nothing. */
+                button = VM_TUI_MB_NONE;
+                break;
         }
         if (b & 32) drag = true;
     }

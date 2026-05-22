@@ -72,6 +72,13 @@ extern "C" {
 #define VM_TUI_HIDE_CURSOR         (1u << 2)
 #define VM_TUI_USE_MOUSE           (1u << 3)
 #define VM_TUI_USE_SYNC_OUTPUT     (1u << 4)
+/* VM_TUI_USE_MOUSE_MOTION: report ALL pointer motion, not just
+ * motion while a button is held. Maps to xterm mode 1003 (any-event
+ * tracking) instead of 1002 (button-event tracking). Use this for
+ * UIs that follow the bare cursor — e.g. a game steered by moving
+ * the mouse without clicking. Implies VM_TUI_USE_MOUSE.
+ * (Bit 5 is reserved for bracketed paste on the guest side.) */
+#define VM_TUI_USE_MOUSE_MOTION    (1u << 6)
 
 /* ============================================================
  *  Cell + color types — mirrored from the guest tui.h so the

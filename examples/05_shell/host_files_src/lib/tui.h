@@ -119,6 +119,14 @@ typedef enum {
 
     /* (Reserved for future round) Enable bracketed paste mode. */
     TUI_USE_BRACKETED_PASTE = (1u << 5),
+
+    /* Report ALL pointer motion, not just motion while a button is
+     * held. Maps to xterm any-event tracking (mode 1003) instead of
+     * button-event tracking (1002). Use for UIs steered by moving
+     * the bare cursor (e.g. a mouse-driven game). Implies the same
+     * SGR event delivery as TUI_USE_MOUSE; you don't need to set
+     * both, but setting both is harmless. */
+    TUI_USE_MOUSE_MOTION    = (1u << 6),
 } TuiInitFlags;
 
 /* ============================================================

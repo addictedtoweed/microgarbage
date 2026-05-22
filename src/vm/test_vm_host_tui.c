@@ -407,6 +407,30 @@ static void test_poll_event_sgr_mouse(void) {
     fixture_teardown();
 }
 
+/* Any-motion tracking (xterm 1003): the terminal reports bare
+ * cursor movement with button code 35 (motion bit 32 + "no button"
+ * 3). The parser must accept this as a motion event with
+ * VM_TUI_MB_NONE rather than dropping it — move-to-steer UIs (car)
+ * depend on it. */
+static void test_poll_event_sgr_mouse_bare_motion(void) {
+    ASSERT(fixture_init());
+    invoke_syscall(SYS_TUI_INIT, 20, 80, 0);
+
+    /* CSI < 35 ; 12 ; 7 M : motion, no button, col=12, row=7. */
+    vm_host_tui_test_inject_input_("\x1b[<35;12;7M", 11);
+    uint32_t evp = 0x80000000u;
+    int32_t r = invoke_syscall(SYS_TUI_POLL_EVENT, evp, 0, 0);
+    ASSERT_EQ_INT(1, r);
+    VmTuiEventRecord *ev = (VmTuiEventRecord *)g_data;
+    ASSERT_EQ_INT(VM_TUI_EVK_MOUSE, ev->kind);
+    ASSERT_EQ_INT(VM_TUI_MB_NONE, ev->button);
+    ASSERT_EQ_INT(7,  ev->row);
+    ASSERT_EQ_INT(12, ev->col);
+
+    invoke_syscall(SYS_TUI_SHUTDOWN, 0, 0, 0);
+    fixture_teardown();
+}
+
 static void test_poll_event_function_keys(void) {
     ASSERT(fixture_init());
     invoke_syscall(SYS_TUI_INIT, 20, 80, 0);
@@ -645,6 +669,7 @@ int main(void) {
     RUN(test_poll_event_enter);
     RUN(test_poll_event_arrow_keys);
     RUN(test_poll_event_sgr_mouse);
+    RUN(test_poll_event_sgr_mouse_bare_motion);
     RUN(test_poll_event_function_keys);
     RUN(test_tile_create_returns_handle);
     RUN(test_tile_destroy_invalidates_handle);
