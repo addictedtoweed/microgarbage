@@ -370,6 +370,8 @@ typedef enum {
     BLOCK_YIELDED,           /* SYS_YIELD — wake next cycle      */
     BLOCK_MAILBOX_RECV,      /* SYS_RECV waiting for a message   */
     BLOCK_SLEEP,             /* SYS_SLEEP waiting for ticks      */
+    BLOCK_ON_CHILD,          /* SYS_SPAWN_AND_WAIT — wakes when   *
+                              * the spawned child VM halts        */
 } VmBlockReason;
 
 /* ============================================================
@@ -498,6 +500,13 @@ typedef struct VmCpu {
      * UINT32_MAX for "no timeout, block indefinitely" (only
      * sensible for BLOCK_MAILBOX_RECV). */
     uint32_t block_deadline;
+
+    /* When block_reason == BLOCK_ON_CHILD, the vm_id of the spawned
+     * child this VM is waiting on. The child's exit path (in
+     * vm_system_unload_vm) finds the waiting parent by scanning for
+     * this value, delivers the child's exit code into the parent's
+     * a0, and clears the parent's block. UINT16_MAX when not waiting. */
+    uint16_t block_child_vm;
 
     /* === Periodic auto-reload timer (per-VM, optional) ===
      *

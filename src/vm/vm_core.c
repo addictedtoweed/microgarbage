@@ -28,6 +28,9 @@ void vm_init(VmCpu *cpu, uint16_t vm_id) {
     if (!cpu) return;
     memset(cpu, 0, sizeof(*cpu));
     cpu->vm_id = vm_id;
+    /* 0 is a valid vm_id, so the "not waiting on a child" sentinel
+     * must be explicit — memset's zero would mean "waiting on vm 0". */
+    cpu->block_child_vm = UINT16_MAX;
 }
 
 void vm_reset(VmCpu *cpu) {
@@ -41,6 +44,7 @@ void vm_reset(VmCpu *cpu) {
 
     memcpy(cpu->regions, saved_regions, sizeof(saved_regions));
     cpu->vm_id = saved_id;
+    cpu->block_child_vm = UINT16_MAX;
 }
 
 /* ============================================================

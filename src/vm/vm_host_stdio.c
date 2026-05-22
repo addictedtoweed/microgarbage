@@ -134,6 +134,16 @@ VmHostTransport *vm_host_get_transport_for_vm(uint16_t vm_id) {
     return g_default_transport;
 }
 
+/* Unload hook: clear a VM's per-VM transport binding when it exits,
+ * so a later VM that reuses the same vm_id slot doesn't inherit a
+ * stale transport pointer. Registered by vm_host_install_stdio_ex. */
+static void stdio_transport_unload_hook(uint16_t vm_id, void *userdata) {
+    (void)userdata;
+    if (vm_id < VM_SCHED_MAX_VMS) {
+        g_transport_by_vm[vm_id] = NULL;
+    }
+}
+
 /* ============================================================
  *  Delegate hooks for file fds
  *
@@ -771,5 +781,11 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
     g_in_fd    = override_in;
     g_out_fd   = override_out;
     g_err_fd   = override_err;
+
+    /* Clear a VM's per-VM transport binding when it unloads, so a
+     * reused vm_id slot doesn't inherit a stale transport pointer.
+     * Registered once; the hook is idempotent (NULLing an already-
+     * NULL slot is fine). */
+    vm_system_register_unload_hook(sys, stdio_transport_unload_hook, NULL);
     return true;
 }

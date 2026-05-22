@@ -391,6 +391,12 @@ VmCpu *vm_sched_get(const VmSched *s, uint16_t vm_id);
 
 bool vm_sched_wake_mailbox(VmSched *s, uint16_t vm_id, int32_t a0_value);
 
+/* Wake a parent VM blocked in SYS_SPAWN_AND_WAIT on a child that
+ * has halted. Delivers a0_value (child exit code or -errno) and
+ * transitions the parent blocked → ready. Returns false if vm_id
+ * isn't currently blocked on BLOCK_ON_CHILD. */
+bool vm_sched_wake_child(VmSched *s, uint16_t vm_id, int32_t a0_value);
+
 /* Force a VM into the halted state. Removes from both bitmaps,
  * sets cpu->halted. Subsequent vm_step calls return HALTED
  * immediately. */

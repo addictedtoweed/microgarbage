@@ -451,7 +451,19 @@ static uint8_t *slurp(const char *path, size_t *out_size) {
 
 /* SYS_SPAWN_AND_WAIT: write guest_minimal.elf into the FatFs
  * volume, spawn it via the syscall, verify return value is 0
- * (the minimal program is sys_exit(0)). */
+ * (the minimal program is sys_exit(0)).
+ *
+ * Round V: spawn is ASYNCHRONOUS. The syscall parks the parent
+ * (BLOCK_ON_CHILD) and returns; the child runs under the scheduler
+ * and, when it halts, vm_system_reap_halted_children delivers the
+ * exit code to the parent's a0 and wakes it. So this test must:
+ *   1. register the fake parent as a real scheduler VM (so the
+ *      reap can find it to wake it),
+ *   2. invoke the spawn syscall,
+ *   3. confirm the parent parked on a child,
+ *   4. step the system until the parent wakes,
+ *   5. read the delivered exit code from a0.
+ */
 static void test_spawn_and_wait_minimal_elf(void) {
     const char *elf_path = locate_minimal_elf();
     if (!elf_path) {
@@ -466,6 +478,17 @@ static void test_spawn_and_wait_minimal_elf(void) {
 
     ASSERT(fixture_init());
 
+    /* Register the fake parent as a REAL scheduler VM so the async
+     * machinery (block transition, reap, wake) operates exactly as
+     * in production. g_cpu has a writable DATA region but no real
+     * CODE; that's fine because once it parks on the child we clear
+     * its ready bit by hand (mirroring the block transition that
+     * vm_sched_step applies after a real spawn ecall, which the
+     * test's direct invoke_syscall dispatch bypasses) — so the
+     * scheduler never tries to fetch an instruction from it. */
+    ASSERT(vm_sched_register_at(g_sys.sched, &g_cpu, 0) == 0);
+    g_sys.vms[0] = &g_cpu;
+
     /* Write the ELF into the FatFs volume at /spawn.elf. */
     FIL ff;
     ASSERT(f_open(&ff, "0:/spawn.elf", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK);
@@ -475,14 +498,34 @@ static void test_spawn_and_wait_minimal_elf(void) {
     ASSERT(f_close(&ff) == FR_OK);
     free(elf);
 
-    /* Spawn it. The path "/spawn.elf" gets translated to
-     * "0:/spawn.elf" by our path resolver. */
+    /* Spawn it. The async handler loads the child, parks g_cpu
+     * (BLOCK_ON_CHILD), and returns. */
     uint32_t path = put_string("/td0/spawn.elf", 0);
-    int32_t rc = invoke_syscall(SYS_SPAWN_AND_WAIT, path, 0, 0, 0);
+    (void)invoke_syscall(SYS_SPAWN_AND_WAIT, path, 0, 0, 0);
 
-    /* guest_minimal calls sys_exit(0); exit code masked to 8 bits
-     * by our handler. */
-    ASSERT_EQ_INT(rc, 0);
+    /* Parent parked on a child. */
+    ASSERT_EQ_INT(g_cpu.block_reason, BLOCK_ON_CHILD);
+    ASSERT(g_cpu.block_child_vm != 0xffff);
+
+    /* Apply the block transition the scheduler would have applied
+     * after a real spawn ecall (invoke_syscall's direct dispatch
+     * skips it): parent out of ready, into blocked, so wake_child's
+     * bm_test(blocked) precondition holds and the parent is never
+     * stepped. */
+    g_sys.sched->ready   &= ~(1ull << 0);
+    g_sys.sched->blocked |=  (1ull << 0);
+
+    /* Step until the parent is woken (child halted + reaped), with a
+     * sane cap to guard against a hang. */
+    int guard = 100000;
+    while (g_cpu.block_reason == BLOCK_ON_CHILD && guard-- > 0) {
+        vm_system_step(&g_sys);
+    }
+    ASSERT(guard > 0);                          /* didn't time out */
+    ASSERT_EQ_INT(g_cpu.block_reason, BLOCK_NONE);
+
+    /* guest_minimal calls sys_exit(0); exit code masked to 8 bits. */
+    ASSERT_EQ_INT((int32_t)g_cpu.regs[VM_REG_A0], 0);
 
     fixture_teardown();
 }

@@ -173,6 +173,28 @@ bool vm_sched_wake_mailbox(VmSched *s, uint16_t vm_id, int32_t a0_value) {
     return true;
 }
 
+/* Wake a parent VM that was blocked in SYS_SPAWN_AND_WAIT on a
+ * child that has now halted. Delivers `a0_value` (the child's exit
+ * code, or a negative errno) into the parent's a0 and moves it
+ * blocked → ready. Returns false if vm_id isn't a VM blocked on a
+ * child (e.g. it was already woken, or never waited). */
+bool vm_sched_wake_child(VmSched *s, uint16_t vm_id, int32_t a0_value) {
+    if (!s) return false;
+    if (vm_id >= VM_SCHED_MAX_VMS) return false;
+    VmCpu *cpu = s->vms[vm_id];
+    if (!cpu) return false;
+    if (cpu->block_reason != BLOCK_ON_CHILD) return false;
+    if (!bm_test(s->blocked, vm_id)) return false;
+
+    cpu->block_reason   = BLOCK_NONE;
+    cpu->block_deadline = 0;
+    cpu->block_child_vm = UINT16_MAX;
+    cpu->regs[VM_REG_A0] = (uint32_t)a0_value;
+    bm_clear(&s->blocked, vm_id);
+    bm_set(&s->ready, vm_id);
+    return true;
+}
+
 void vm_sched_halt(VmSched *s, uint16_t vm_id) {
     if (!s) return;
     if (vm_id >= VM_SCHED_MAX_VMS) return;
@@ -257,6 +279,14 @@ static uint32_t wake_expired_timeouts(VmSched *s) {
                     if (delta < next_deadline_delta) next_deadline_delta = delta;
                 }
             }
+            break;
+
+        case BLOCK_ON_CHILD:
+            /* Event-driven, no timeout: the parent stays blocked
+             * until its child halts, at which point the reap path
+             * (vm_system_reap_halted_children) calls
+             * vm_sched_wake_child. Nothing to do here — leave it
+             * blocked and don't contribute a deadline. */
             break;
 
         case BLOCK_NONE:

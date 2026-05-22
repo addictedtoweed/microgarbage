@@ -1261,7 +1261,66 @@ bool vm_system_run(VmSystem *sys, uint64_t max_cycles) {
     return vm_sched_run(sys->sched, max_cycles);
 }
 
+/* Reap halted child VMs and wake any parent blocked on them.
+ *
+ * Round V: SYS_SPAWN_AND_WAIT parks the parent (BLOCK_ON_CHILD) and
+ * lets the scheduler run the child as a normal VM. When the child
+ * halts, the scheduler clears it from the ready/blocked sets but
+ * leaves the VmCpu loaded. This sweep finds those halted-but-loaded
+ * children, delivers each one's exit code to the parent waiting on
+ * it, wakes the parent, and unloads the child (firing unload hooks,
+ * which release tiles, TUI sessions, and the transport binding).
+ *
+ * A child with no waiting parent (shouldn't happen via spawn, but
+ * be defensive) is still unloaded so its slot is reclaimed.
+ *
+ * Called once per vm_system_step, after the scheduler advances.
+ */
+static void vm_system_reap_halted_children(VmSystem *sys) {
+    VmSched *sched = sys->sched;
+    for (uint16_t cid = 0; cid < VM_SCHED_MAX_VMS; cid++) {
+        VmCpu *child = sys->vms[cid];
+        if (!child || !child->halted) continue;
+
+        /* Find a parent parked on this child. */
+        uint16_t parent_id = UINT16_MAX;
+        for (uint16_t pid = 0; pid < VM_SCHED_MAX_VMS; pid++) {
+            VmCpu *p = sys->vms[pid];
+            if (p && p->block_reason == BLOCK_ON_CHILD &&
+                p->block_child_vm == cid) {
+                parent_id = pid;
+                break;
+            }
+        }
+
+        if (parent_id != UINT16_MAX) {
+            /* Deliver the child's exit status the same way the old
+             * synchronous pump did. A child that halted via a
+             * synchronous exception (illegal instr, bad memory
+             * access, misalignment — the TRAP_ILLEGAL_INSTR..
+             * TRAP_INSTR_MISALIGNED range) crashed → -EIO. A clean
+             * exit (SYS_EXIT leaves trap_cause == TRAP_ECALL, or a
+             * forced TRAP_HALT) delivers the low 8 bits of a0. */
+            int32_t a0;
+            bool crashed = (child->trap_cause >= TRAP_ILLEGAL_INSTR &&
+                            child->trap_cause <= TRAP_INSTR_MISALIGNED);
+            if (crashed) {
+                a0 = -(int32_t)VM_EIO;
+            } else {
+                a0 = (int32_t)(child->regs[VM_REG_A0] & 0xff);
+            }
+            vm_sched_wake_child(sched, parent_id, a0);
+        }
+
+        /* Reclaim the child. Unload hooks (TUI session release, tile
+         * release, transport-binding clear) fire here. */
+        vm_system_unload_vm(sys, cid);
+    }
+}
+
 VmSchedStepResult vm_system_step(VmSystem *sys) {
     if (!sys) return VM_SCHED_ALL_HALTED;
-    return vm_sched_step(sys->sched);
+    VmSchedStepResult r = vm_sched_step(sys->sched);
+    vm_system_reap_halted_children(sys);
+    return r;
 }

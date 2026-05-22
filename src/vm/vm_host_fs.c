@@ -1255,22 +1255,23 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Pump the new VM until it halts. We step ONLY the spawned
-     * VM — other VMs in the scheduler don't tick during this
-     * time, which keeps the model simple.
+    /* Round V: spawn is now ASYNCHRONOUS. We register the child as
+     * a normal scheduler VM and BLOCK THE PARENT on it, then return
+     * to the scheduler. The host's main vm_system_step loop runs the
+     * child alongside every other session — so spawning a long-lived
+     * TUI program in one session no longer freezes the others.
      *
-     * We have to do a few things the main scheduler normally
-     * does on our behalf, because we're not going through
-     * vm_sched_step here:
+     * Lifecycle:
+     *   - here: load child, inherit transport, park parent
+     *           (BLOCK_ON_CHILD, block_child_vm = child id)
+     *   - main loop: scheduler runs child + all siblings
+     *   - child halts: vm_system_reap_halted_children() delivers the
+     *     child's exit code to the parent's a0, wakes the parent,
+     *     clears the child's transport binding, and unloads the child
      *
-     *   - Refresh sys->sched->global_tick from the host tick
-     *     source each iteration, so the child's SYS_TICKS_NOW
-     *     sees forward progress and SYS_SLEEP_* deadlines can
-     *     actually be reached.
-     *   - Honor BLOCK_SLEEP / BLOCK_YIELDED: a child that calls
-     *     sys_sleep_until needs us to wait until its deadline
-     *     before stepping it again, otherwise the loop becomes
-     *     a busy-wait that never makes timing progress.
+     * (The old design pumped the child in a nested loop right here,
+     * which commandeered the host run loop and starved all other
+     * VMs for the child's entire lifetime — the multi-session freeze.)
      */
     VmCpu *child = sys->vms[lr.assigned_vm_id];
     if (!child) {
@@ -1278,135 +1279,19 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Round U.7b: the child inherits the parent's transport binding.
-     * Without this, a spawned TUI program (e.g. snake.elf launched
-     * from a shell bound to a TCP/pty/pipe transport) would have no
-     * transport of its own — its canvas output would resolve to NULL
-     * and vanish. The shell's stdio works because the SHELL's vm_id
-     * is bound; the spawned child has a fresh vm_id that needs the
-     * same binding. We restore the parent's binding for the child's
-     * slot when the child exits (below), in case slot reuse matters. */
-    VmHostTransport *parent_t =
-        vm_host_get_transport_for_vm(cpu->vm_id);
+    /* The child inherits the parent's transport binding so its TUI
+     * canvas output reaches the same client. Cleared when the child
+     * is reaped (see vm_system_reap_halted_children). */
+    VmHostTransport *parent_t = vm_host_get_transport_for_vm(cpu->vm_id);
     if (parent_t) {
         vm_host_set_transport_for_vm((uint16_t)lr.assigned_vm_id, parent_t);
     }
 
-    VmSched *sched = sys->sched;
-
-    while (!child->halted) {
-        /* Refresh global_tick from the host's tick source. */
-        if (sched->config.tick_source) {
-            sched->global_tick =
-                sched->config.tick_source(sched->config.tick_source_userdata);
-        }
-
-        /* If the child is blocked on a sleep, decide whether
-         * its deadline has been reached. We use the same
-         * wraparound-safe comparison the scheduler does. */
-        if (child->block_reason == BLOCK_SLEEP) {
-            uint32_t now = sched->global_tick;
-            uint32_t deadline = child->block_deadline;
-            int32_t delta = (int32_t)(deadline - now);
-
-            if (delta <= 0) {
-                /* Deadline reached. Wake. */
-                child->block_reason = BLOCK_NONE;
-                child->block_deadline = 0;
-                child->regs[VM_REG_A0] = 0;
-            } else {
-                /* Still asleep. Hand the host CPU back so we
-                 * don't pin a core, then re-check.
-                 *
-                 * We use a fixed 1 ms nanosleep regardless of
-                 * how far the deadline is. This is intentional:
-                 *
-                 * - On Linux/macOS with high-res timers, 1 ms
-                 *   sleeps are precise enough that we hit the
-                 *   deadline within ~1 ms of overshoot, which
-                 *   is fine for game-frame pacing.
-                 *
-                 * - On Cygwin/Windows where the OS timer ticks
-                 *   at 15.6 ms by default, ANY sleep rounds up
-                 *   to a multiple of that. Asking for 1 ms or
-                 *   asking for 100 ms doesn't matter — we'll
-                 *   wake when the OS scheduler next runs us.
-                 *   The benefit of asking for the small amount
-                 *   is responsiveness: if the user hits 'q' at
-                 *   tick 50 and the deadline is at tick 1000,
-                 *   we don't sleep for 1 full second before
-                 *   re-checking input — we check every OS tick.
-                 *
-                 * Result: 8 fps on Linux is exactly 8 fps. 8 fps
-                 * on Cygwin is approximately 8 fps with up to
-                 * ±15 ms jitter per frame, but the AVERAGE rate
-                 * is correct because the tick source is read
-                 * fresh each iteration. */
-                struct timespec ts = { 0, 1000000L };   /* 1 ms */
-                nanosleep(&ts, NULL);
-                continue;
-            }
-        } else if (child->block_reason == BLOCK_YIELDED) {
-            /* YIELD is "wake on next pass" — just clear it
-             * and step. */
-            child->block_reason = BLOCK_NONE;
-            child->regs[VM_REG_A0] = 0;
-        }
-
-        VmStepResult r = vm_step(child, 4096, NULL);
-        if (r == VM_STEP_ECALL) {
-            vm_ecall_dispatch(sched->config.ecall_router, child, sys);
-        } else if (r == VM_STEP_TRAPPED) {
-            /* The child crashed (illegal instruction, bad memory
-             * access, etc.). Before returning to the parent, do
-             * cleanup the child can't do for itself:
-             *
-             *   1. Restore the terminal to cooked mode. The child
-             *      may have called SYS_TTY_SET_RAW(1) and trapped
-             *      before getting to its SYS_TTY_SET_RAW(0) on
-             *      exit; without this restore, the parent shell
-             *      inherits a broken terminal.
-             *   2. Print a brief diagnostic to stderr so the user
-             *      knows something went wrong (otherwise the only
-             *      sign is a nonzero exit code).
-             *
-             * We don't try to clear the screen or restore cursor
-             * — the host doesn't know what the child was doing on
-             * screen and over-cleaning could hide useful info. */
-            vm_host_stdio_set_raw_mode(false);
-            fprintf(stderr, "\r\nspawn: child trapped (cause=%u, trap_pc=0x%08x)\r\n",
-                    (unsigned)child->trap_cause, child->trap_pc);
-            child->halted = true;
-            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
-            goto child_done;
-        }
-        /* VM_STEP_HALTED and VM_STEP_QUANTUM_EXPIRED loop back. */
-    }
-
-    /* Child halted normally. Its exit code is in regs[a0]. We
-     * mask to 8 bits to match Unix exit-status conventions and
-     * to keep our return positive (negative values would look
-     * like errors). */
-    {
-        uint32_t exit_code = child->regs[VM_REG_A0] & 0xff;
-        cpu->regs[VM_REG_A0] = exit_code;
-    }
-
-child_done:
-    /* Round U.7b: clear the child's inherited transport binding so
-     * the slot doesn't carry a stale pointer if vm_id is reused by
-     * a later spawn that shouldn't inherit it. */
-    vm_host_set_transport_for_vm((uint16_t)lr.assigned_vm_id, NULL);
-
-    /* Reclaim the child's resources by unloading the VM. This
-     * walks its region table and slab_frees each RAM-backed
-     * region, frees the mailbox storage and VmCpu, unregisters
-     * the scheduler slot, and NULLs sys->vms[].
-     *
-     * Per-block freeing via the slab means the parent can spawn
-     * again immediately — the freed bytes go back to their bins
-     * and are picked up by the next allocation. */
-    vm_system_unload_vm(sys, (uint16_t)lr.assigned_vm_id);
+    /* Park the parent on the child. The scheduler moves the parent
+     * out of the ready set; the reap path wakes it with the exit
+     * code in a0. We do NOT set a0 here — it's delivered at wake. */
+    cpu->block_reason   = BLOCK_ON_CHILD;
+    cpu->block_child_vm = (uint16_t)lr.assigned_vm_id;
 }
 
 
