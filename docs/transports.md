@@ -204,6 +204,13 @@ interactive client.
 
 ## Adding a new transport
 
+**Fastest path:** copy `examples/05_shell/transport_template.c` to
+`transport_<yours>.c`, fill in the five functions (it's a working
+loopback you replace piece by piece), call your `setup` from `main()`,
+and add the file to the build. The template is ~50 lines of code with
+a per-function "change this" comment; the rest of this section is the
+same steps in prose.
+
 Five things to implement:
 
 1. **A `setup_*` function** that creates whatever underlying resource
