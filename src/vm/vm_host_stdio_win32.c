@@ -66,6 +66,41 @@ static DWORD  g_saved_out_mode = 0;
 static HANDLE g_saved_in_handle = INVALID_HANDLE_VALUE;
 static HANDLE g_saved_out_handle = INVALID_HANDLE_VALUE;
 
+/* Console codepage save/restore. The default console codepage is
+ * often 437 / a regional OEM page, not UTF-8 — which mangles the
+ * UTF-8 bytes the guest emits (box-drawing, etc.) on output and
+ * corrupts typed characters on input, while bare-ASCII mouse escape
+ * sequences pass through unscathed (the classic "mouse works but
+ * text is garbled" symptom). We switch both directions to UTF-8 and
+ * restore on shutdown. */
+static bool g_cp_saved = false;
+static UINT g_saved_in_cp = 0;
+static UINT g_saved_out_cp = 0;
+
+static void win32_restore_codepage(void);   /* fwd: used in atexit below */
+
+static void win32_set_utf8_codepage(void) {
+    if (!g_cp_saved) {
+        g_saved_in_cp  = GetConsoleCP();
+        g_saved_out_cp = GetConsoleOutputCP();
+        g_cp_saved = true;
+        /* Restore the user's original codepage once, at process
+         * exit — not on every raw-mode toggle (the shell flips raw
+         * on/off as it spawns/reaps games, but the codepage should
+         * stay UTF-8 for the whole run). */
+        atexit(win32_restore_codepage);
+    }
+    SetConsoleCP(CP_UTF8);         /* input  (reads)  */
+    SetConsoleOutputCP(CP_UTF8);   /* output (writes) */
+}
+
+static void win32_restore_codepage(void) {
+    if (!g_cp_saved) return;
+    if (g_saved_in_cp)  SetConsoleCP(g_saved_in_cp);
+    if (g_saved_out_cp) SetConsoleOutputCP(g_saved_out_cp);
+    g_cp_saved = false;
+}
+
 /* ============================================================
  *  Public: attach to parent's console, or allocate one.
  *
@@ -88,7 +123,10 @@ int vm_host_stdio_win32_attach_console_if_native(void) {
     DWORD probe;
     if (h != INVALID_HANDLE_VALUE && h != NULL &&
         GetConsoleMode(h, &probe)) {
-        /* Already have a working console. */
+        /* Already have a working console (launched from cmd /
+         * PowerShell / Windows Terminal — the common case). Still
+         * force UTF-8 so text isn't mangled. */
+        win32_set_utf8_codepage();
         return 0;
     }
 
@@ -101,6 +139,7 @@ int vm_host_stdio_win32_attach_console_if_native(void) {
         freopen("CONIN$",  "r", stdin);
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
+        win32_set_utf8_codepage();
         return 1;
     }
 
@@ -111,6 +150,7 @@ int vm_host_stdio_win32_attach_console_if_native(void) {
         freopen("CONIN$",  "r", stdin);
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
+        win32_set_utf8_codepage();
         return 1;
     }
 

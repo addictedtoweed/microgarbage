@@ -522,6 +522,18 @@ static BOOL WINAPI on_console_ctrl(DWORD type) {
         case CTRL_BREAK_EVENT:
         case CTRL_CLOSE_EVENT:
             g_stop = 1;
+            /* Visible confirmation the handler fired. If you press
+             * Ctrl-C and DON'T see this line, the event isn't
+             * reaching the process (console-mode / delivery issue);
+             * if you DO see it but the host doesn't stop, the run
+             * loop or teardown is the culprit. */
+            {
+                static const char msg[] =
+                    "\nhost: console interrupt received, stopping...\n";
+                DWORD wrote = 0;
+                WriteFile(GetStdHandle(STD_ERROR_HANDLE),
+                          msg, (DWORD)(sizeof(msg) - 1), &wrote, NULL);
+            }
             return TRUE;   /* handled */
         default:
             return FALSE;
