@@ -502,6 +502,33 @@ static bool realtime_clock_source(void *userdata,
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int signo) { (void)signo; g_stop = 1; }
 
+/* On Windows (native AND Cygwin), Ctrl-C arrives first as a Windows
+ * console CTRL_C_EVENT. Cygwin *usually* translates that into a
+ * POSIX SIGINT, but that translation is unreliable when the process
+ * is doing Winsock I/O — which is exactly our case (a TCP host).
+ * The symptom: Ctrl-C does nothing while a socket session is live.
+ *
+ * Registering a console control handler catches the event directly
+ * and sets the same stop flag, independent of POSIX signal
+ * delivery. Returning TRUE marks the event handled so the default
+ * "terminate immediately" behavior doesn't also fire — we want a
+ * clean shutdown via the run loop noticing g_stop. This is also the
+ * robust path for the native-Windows host, where signal(SIGINT) is
+ * only loosely emulated by the CRT. */
+#if defined(__CYGWIN__) || defined(_WIN32)
+static BOOL WINAPI on_console_ctrl(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+            g_stop = 1;
+            return TRUE;   /* handled */
+        default:
+            return FALSE;
+    }
+}
+#endif
+
 /* Portable short sleep, used by the multi-session run loop to yield
  * the CPU when no shell is runnable. Keeps the loop from spinning a
  * core at 100% (which on Cygwin also delays SIGINT delivery, making
@@ -1503,6 +1530,15 @@ int main(int argc, char **argv) {
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
     sigaction(SIGINT, &sa, NULL);
+#endif
+
+    /* On Windows (native and Cygwin) ALSO catch the console Ctrl-C
+     * event directly. On Cygwin the POSIX-signal translation above
+     * is unreliable while we're in Winsock calls, so this is what
+     * actually makes Ctrl-C work for the TCP host; on native Windows
+     * it's the primary mechanism. Harmless elsewhere (not compiled). */
+#if defined(__CYGWIN__) || defined(_WIN32)
+    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 #endif
 
     /* 1. Initialize the block device. */
