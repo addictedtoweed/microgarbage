@@ -128,8 +128,15 @@ if [ "$NO_GUEST" != "1" ]; then
     if command -v "$GUEST_CC" >/dev/null 2>&1; then
         step "compiling guest shell.elf for embedding (RV32IMC)..."
         _GLD="$REPO_ROOT/examples/common/guest.ld"
-        _GCF=(-march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -O2)
-        "$GUEST_CC" "${_GCF[@]}" -Wl,-T,"$(guest_path "$_GLD")" \
+        # Build the embedded shell for size: -Os + gc-sections strips
+        # unused guest-runtime code, page-size=4 drops segment-align
+        # padding, -s strips symbols. Safe for XIP (segments stay
+        # >=4-byte aligned; bin2c aligns the array to 4). Mirrors the
+        # POSIX build.sh shell flags.
+        _GCF=(-march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles
+              -ffreestanding -Os -ffunction-sections -fdata-sections)
+        _GLDF=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
+        "$GUEST_CC" "${_GCF[@]}" "${_GLDF[@]}" -Wl,-T,"$(guest_path "$_GLD")" \
             -o "$(guest_path "$BUILD_DIR/shell.elf")" \
             "$(guest_path "$EXAMPLE_DIR/shell.c")"
         step "baking shell.elf into host.exe (bin2c)..."
@@ -186,10 +193,11 @@ else
         GC=(-ffunction-sections -fdata-sections)
         GLD=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
 
-        step "compiling guest shell.elf (RV32IMC)..."
-        "$GUEST_CC" "${GCFLAGS[@]}" -Wl,-T,"$(guest_path "$GUEST_LD")" \
-            -o "$(guest_path "$BUILD_DIR/shell.elf")" \
-            "$(guest_path "$EXAMPLE_DIR/shell.c")"
+        # NOTE: shell.elf was already built (for size) and embedded
+        # earlier, before the host compile. We don't rebuild it here —
+        # doing so with the plain spawnable flags would overwrite the
+        # size-optimized on-disk copy and make it inconsistent with the
+        # embedded image. The spawnable demos below still build here.
 
         mkdir -p "$HOST_FILES"
         LIB_SRCS=()

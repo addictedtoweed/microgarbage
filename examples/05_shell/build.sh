@@ -60,7 +60,19 @@ SHELL_DATA_C="$GEN_DIR/shell_elf_data.c"
 
 if have_guest_cc; then
     echo "05_shell: compiling guest shell (RV32IMC)..."
-    "$GUEST_CC" "${GUEST_CFLAGS[@]}" \
+    # The embedded shell is the highest-value guest to shrink — it's
+    # baked into every host and XIP-executed. Build it for size, the
+    # same way the spawnable guests are: -Os codegen, per-function/
+    # data sections + --gc-sections so the linker strips the parts of
+    # the guest runtime library this guest never calls, page-size=4 to
+    # drop 4 KB segment-alignment padding (our loader has no MMU), and
+    # -s to strip symbols. This is safe for XIP: page-size=4 keeps
+    # segments >=4-byte aligned (XIP needs only 2), and bin2c aligns
+    # the embedded array to 4 bytes.
+    SHELL_SIZE_CFLAGS=(-Os -ffunction-sections -fdata-sections)
+    SHELL_SIZE_LDFLAGS=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
+    "$GUEST_CC" "${GUEST_CFLAGS[@]}" "${SHELL_SIZE_CFLAGS[@]}" \
+        "${SHELL_SIZE_LDFLAGS[@]}" \
         -Wl,-T,"$(guest_path "$GUEST_LD")" \
         -o "$(guest_path "$BUILD_DIR/shell.elf")" \
         "$(guest_path "$EXAMPLE_DIR/shell.c")"

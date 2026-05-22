@@ -198,9 +198,10 @@ if (-not $NoGuest) {
         $guestLd  = Join-Path $RepoRoot "examples\common\guest.ld"
         $shellC   = Join-Path $ExampleDir "shell.c"
         $shellElf = Join-Path $BuildDir "shell.elf"
-        $gcf = @("-march=rv32imc","-mabi=ilp32","-nostdlib","-nostartfiles","-ffreestanding","-O2")
+        $gcf = @("-march=rv32imc","-mabi=ilp32","-nostdlib","-nostartfiles","-ffreestanding","-Os","-ffunction-sections","-fdata-sections")
+        $gldf = @("-Wl,--gc-sections","-Wl,-z,max-page-size=4","-Wl,-s")
         Write-Step "compiling guest shell.elf for embedding (RV32IMC)..."
-        & $GuestCc @gcf "-Wl,-T,$guestLd" "-o" $shellElf $shellC
+        & $GuestCc @gcf @gldf "-Wl,-T,$guestLd" "-o" $shellElf $shellC
         if ($LASTEXITCODE -ne 0) { Die "guest shell.elf compile failed" }
         Write-Step "baking shell.elf into host.exe (bin2c)..."
         # On native Windows $Cc is itself native, so it's fine to build
@@ -257,9 +258,9 @@ if ($NoGuest) {
         $gcCflags  = @("-ffunction-sections","-fdata-sections")
         $gcLdflags = @("-Wl,--gc-sections","-Wl,-z,max-page-size=4","-Wl,-s")
 
-        Write-Step "compiling guest shell.elf (RV32IMC)..."
-        & $GuestCc @guestCflags "-Wl,-T,$guestLd" "-o" $shellElf $shellC
-        if ($LASTEXITCODE -ne 0) { Die "guest shell.elf compile failed" }
+        # shell.elf was already built for size and embedded earlier;
+        # don't rebuild it here (would overwrite the size-optimized
+        # on-disk copy with the plain one). Spawnable demos below only.
 
         # Spawnable guests under host_files_src/*.c, linked against
         # everything in host_files_src/lib/*.c. Output to host_files/.
