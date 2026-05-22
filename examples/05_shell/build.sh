@@ -134,6 +134,7 @@ esac
     "$HOST_PLATFORM_SRC" \
     "$REPO_ROOT/src/vm/vm_host_fs.c" \
     "$REPO_ROOT/src/storage/trashdrive.c" \
+    "$REPO_ROOT/src/storage/trashfs.c" \
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \
     "$REPO_ROOT/src/util/inicfg.c" \
     "$FATFS_DIR/ff_wrapped.c" \

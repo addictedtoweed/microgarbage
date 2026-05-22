@@ -297,6 +297,17 @@ bool vm_host_fs_mount_fatfs(const char *name,
                             uint8_t pdrv,
                             void *fatfs);
 
+/* Mount a trashfs volume under <name>. The 'vol' argument is a
+ * pointer to a mounted TrashfsVolume (passed as void* to avoid
+ * pulling storage/trashfs.h into this header). Stored as-is; the
+ * volume must outlive this mount. Guests reach it through the same
+ * openat/read/write/lseek/readdir/unlinkat ABI as any other mount —
+ * trashfs is just a third backend behind this seam.
+ *
+ * Returns true on success; false on invalid name, full table,
+ * duplicate name, or NULL volume. */
+bool vm_host_fs_mount_trashfs(const char *name, void *vol);
+
 /* Remove a mount by name. Returns true if the mount existed and
  * was removed; false if no such mount. Doesn't touch the
  * underlying backend (FatFs is left mounted; host directory is

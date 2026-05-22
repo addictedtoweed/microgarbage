@@ -64,6 +64,7 @@ typedef SOCKET tcp_sock_t;
 #include "vm/vm_core.h"
 #include "storage/trashdrive.h"
 #include "storage/trashdrive_fatfs.h"
+#include "storage/trashfs.h"
 #include "util/inicfg.h"
 #include "ff.h"
 
@@ -162,6 +163,14 @@ static uint8_t g_local[LOCAL_BYTES];
 
 static TrashDrive g_drive;
 static FATFS g_fs;
+
+/* trashfs RAM disk (mounted as /trash0). A dedicated region the
+ * filesystem owns directly — no block-device layer, unlike the FatFs
+ * tmpfs. 128 KB is plenty to demonstrate the integration; on a real
+ * target this is sized to the available internal RAM / PSRAM. */
+#define TRASHFS_REGION_BYTES (128 * 1024)
+static uint8_t g_trashfs_region[TRASHFS_REGION_BYTES];
+static TrashfsVolume g_trashfs_vol;
 
 /* ---------------------------------------------------------------
  * Host configuration (vm.cfg + CLI overrides).
@@ -1516,6 +1525,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* 4b. Format + mount the trashfs RAM disk (mounted as /trash0
+     * below). Like the FatFs tmpfs, it's RAM-backed, so we format
+     * fresh each run. trashfs replaces FatFs in the RAM-disk role on
+     * targets that don't need PC-readable removable media; here it
+     * runs alongside td0 to exercise the integration. now=0: RTC not
+     * yet wired, so timestamps are 0 (see docs/trashfs-format.md). */
+    if (trashfs_format(g_trashfs_region, TRASHFS_REGION_BYTES, 0, 0)
+            != TRASHFS_OK) {
+        fprintf(stderr, "host: trashfs_format failed\n");
+        return 1;
+    }
+    if (trashfs_mount(&g_trashfs_vol, g_trashfs_region, TRASHFS_REGION_BYTES)
+            != TRASHFS_OK) {
+        fprintf(stderr, "host: trashfs_mount failed\n");
+        return 1;
+    }
+
     /* Pre-create a few items in the volume so `ls` has something
      * to show on first launch. Pure convenience — remove if you
      * want a truly empty start. */
@@ -1685,6 +1711,11 @@ int main(int argc, char **argv) {
         /* No mount section in vm.cfg — use built-in defaults. */
         if (!vm_host_fs_mount_fatfs("td0", 0, &g_fs)) {
             fprintf(stderr, "host: vm_host_fs_mount_fatfs('td0') failed\n");
+            return 1;
+        }
+
+        if (!vm_host_fs_mount_trashfs("trash0", &g_trashfs_vol)) {
+            fprintf(stderr, "host: vm_host_fs_mount_trashfs('trash0') failed\n");
             return 1;
         }
 

@@ -27,6 +27,8 @@
 #include "ff.h"
 #undef DIR
 
+#include "storage/trashfs.h"
+
 #include <dirent.h>
 
 #include <stdlib.h>
@@ -63,6 +65,8 @@ typedef enum {
     SLOT_HOST_FILE,   /* Host-filesystem file (u.host) */
     SLOT_ROOT,        /* Synthetic root listing — yields mount names */
     SLOT_HOST_DIR,    /* Host-filesystem directory (u.host_dir) */
+    SLOT_TRASH_FILE,  /* trashfs file (u.tfile) */
+    SLOT_TRASH_DIR,   /* trashfs directory (u.tdir) */
 } SlotKind;
 
 typedef struct {
@@ -83,6 +87,8 @@ typedef struct {
             char path[VM_HOST_FS_MAX_PATH];
             size_t path_len;
         } host_dir;
+        TrashfsFile tfile;     /* SLOT_TRASH_FILE */
+        TrashfsDir  tdir;      /* SLOT_TRASH_DIR  */
     } u;
 } FdSlot;
 
@@ -143,9 +149,10 @@ static void free_slot(FdSlot *s) {
  * (default 8). The order of entries doesn't matter; lookup is by
  * name. */
 typedef enum {
-    MOUNT_KIND_FREE  = 0,    /* slot is empty (memset state) */
-    MOUNT_KIND_HOST  = 1,
-    MOUNT_KIND_FATFS = 2,
+    MOUNT_KIND_FREE   = 0,    /* slot is empty (memset state) */
+    MOUNT_KIND_HOST   = 1,
+    MOUNT_KIND_FATFS  = 2,
+    MOUNT_KIND_TRASHFS= 3,
 } MountKind;
 
 #define MOUNT_NAME_MAX 15    /* names fit in [A-Za-z0-9_-]{1,15} */
@@ -162,6 +169,9 @@ typedef struct {
     /* FATFS fields */
     uint8_t  fatfs_volume;    /* FatFs pdrv number */
     FATFS   *fatfs_struct;    /* host-owned, may be NULL */
+
+    /* TRASHFS fields */
+    TrashfsVolume *trashfs_vol; /* host-owned mounted volume */
 } Mount;
 
 static Mount    g_mounts[VM_HOST_FS_MAX_MOUNTS];
@@ -171,6 +181,7 @@ static unsigned g_mount_count = 0;
 typedef enum {
     PATH_BACKEND_FATFS = 0,
     PATH_BACKEND_HOST  = 1,
+    PATH_BACKEND_TRASHFS = 2,
 } PathBackend;
 
 /* Lookup a mount by name. Returns NULL if not found. */
@@ -264,8 +275,10 @@ static bool is_root_path(const char *path) {
 static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
                               char *out, size_t cap,
                               PathBackend *out_backend,
-                              bool *out_writable) {
+                              bool *out_writable,
+                              const Mount **out_mount) {
     if (cap < 16) return -VM_EINVAL;
+    if (out_mount) *out_mount = NULL;
 
     /* Stage 1: copy the raw guest path into a scratch buffer. */
     char raw[VM_HOST_FS_MAX_PATH];
@@ -313,6 +326,26 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
 
         *out_backend  = PATH_BACKEND_HOST;
         *out_writable = m->writable;
+        if (out_mount) *out_mount = m;
+        return 0;
+    }
+
+    if (m->kind == MOUNT_KIND_TRASHFS) {
+        /* Flat namespace: the "path" is just the filename within the
+         * mount (rel without its leading slash). The volume is
+         * reached via *out_mount. Reject any subdirectory component
+         * for now (no subdirs yet). */
+        const char *fname = rel;
+        if (*fname == '/') fname++;
+        /* No nested paths in the flat namespace. */
+        if (strchr(fname, '/') != NULL) return -VM_ENOENT;
+        size_t fl = strlen(fname);
+        if (fl + 1 > cap) return -VM_ENAMETOOLONG;
+        memcpy(out, fname, fl + 1);   /* may be "" for the mount root */
+
+        *out_backend  = PATH_BACKEND_TRASHFS;
+        *out_writable = true;
+        if (out_mount) *out_mount = m;
         return 0;
     }
 
@@ -328,6 +361,7 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
     *out_backend  = PATH_BACKEND_FATFS;
     *out_writable = true;     /* FatFs writability is per-mount-or-not;
                                  * for now all FatFs mounts are r/w. */
+    if (out_mount) *out_mount = m;
     return 0;
 }
 
@@ -338,7 +372,7 @@ static int copy_path(VmCpu *cpu, uint32_t guest_addr,
                      char *out, size_t cap) {
     PathBackend backend;
     bool writable;
-    int r = resolve_guest_path(cpu, guest_addr, out, cap, &backend, &writable);
+    int r = resolve_guest_path(cpu, guest_addr, out, cap, &backend, &writable, NULL);
     if (r < 0) return r;
     if (backend == PATH_BACKEND_HOST) {
         /* Caller doesn't support host paths. Tell them no. */
@@ -448,6 +482,12 @@ static int32_t fs_read_fd(int fd, void *buf, uint32_t n) {
         if (br < n && ferror(s->u.host)) return -VM_EIO;
         return (int32_t)br;
     }
+    if (s->kind == SLOT_TRASH_FILE) {
+        uint32_t got = 0;
+        TrashfsResult r = trashfs_read(&s->u.tfile, buf, n, &got);
+        if (r != TRASHFS_OK) return -VM_EIO;
+        return (int32_t)got;
+    }
     return -VM_EBADF;
 }
 
@@ -467,6 +507,14 @@ static int32_t fs_write_fd(int fd, const void *buf, uint32_t n) {
         size_t bw = fwrite(buf, 1, n, s->u.host);
         if (bw < n) return -VM_EIO;
         return (int32_t)bw;
+    }
+    if (s->kind == SLOT_TRASH_FILE) {
+        uint32_t wrote = 0;
+        /* now=0: RTC not yet wired; timestamps stay 0 (see spec). */
+        TrashfsResult r = trashfs_write(&s->u.tfile, buf, n, &wrote, 0);
+        if (r == TRASHFS_ERR_NO_SPACE) return -VM_ENOSPC;
+        if (r != TRASHFS_OK) return -VM_EIO;
+        return (int32_t)wrote;
     }
     return -VM_EBADF;
 }
@@ -488,6 +536,10 @@ static int32_t fs_close_fd(int fd) {
         if (fclose(s->u.host) != 0) result = -VM_EIO;
     } else if (s->kind == SLOT_HOST_DIR) {
         if (closedir(s->u.host_dir.dir) != 0) result = -VM_EIO;
+    } else if (s->kind == SLOT_TRASH_FILE) {
+        trashfs_close(&s->u.tfile);
+    } else if (s->kind == SLOT_TRASH_DIR) {
+        trashfs_closedir(&s->u.tdir);
     } else if (s->kind == SLOT_ROOT) {
         /* No underlying resource; nothing to free beyond the slot. */
     }
@@ -560,8 +612,9 @@ static void handle_openat(VmCpu *cpu, void *system) {
     char buf[VM_HOST_FS_MAX_PATH];
     PathBackend backend;
     bool writable;
+    const Mount *mnt = NULL;
     int rp = resolve_guest_path(cpu, path, buf, sizeof(buf),
-                                 &backend, &writable);
+                                 &backend, &writable, &mnt);
     if (rp < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)rp;
         return;
@@ -654,6 +707,52 @@ static void handle_openat(VmCpu *cpu, void *system) {
             return;
         }
         s->u.host = f;
+        cpu->regs[VM_REG_A0] = (uint32_t)fd;
+        return;
+    }
+
+    /* ---- trashfs path ---- */
+    if (backend == PATH_BACKEND_TRASHFS) {
+        TrashfsVolume *vol = mnt ? mnt->trashfs_vol : NULL;
+        if (!vol) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO; return; }
+
+        if (flags & VM_O_DIRECTORY) {
+            if ((flags & VM_O_ACCMODE) != VM_O_RDONLY) {
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EISDIR;
+                return;
+            }
+            int fd = alloc_fd(SLOT_TRASH_DIR);
+            if (fd < 0) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE; return; }
+            FdSlot *s = &g_fds[fd - FD_BASE];
+            TrashfsResult tr = trashfs_opendir(vol, &s->u.tdir);
+            if (tr != TRASHFS_OK) {
+                free_slot(s);
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
+                return;
+            }
+            cpu->regs[VM_REG_A0] = (uint32_t)fd;
+            return;
+        }
+
+        /* Map VM_O_* to trashfs flags. */
+        uint32_t tflags = 0;
+        if (flags & VM_O_CREAT)  tflags |= TRASHFS_O_CREAT;
+        if (flags & VM_O_TRUNC)  tflags |= TRASHFS_O_TRUNC;
+        if (flags & VM_O_APPEND) tflags |= TRASHFS_O_APPEND;
+
+        int fd = alloc_fd(SLOT_TRASH_FILE);
+        if (fd < 0) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE; return; }
+        FdSlot *s = &g_fds[fd - FD_BASE];
+        TrashfsResult tr = trashfs_open(vol, buf, tflags, &s->u.tfile);
+        if (tr != TRASHFS_OK) {
+            free_slot(s);
+            int e = (tr == TRASHFS_ERR_NOT_FOUND) ? -VM_ENOENT
+                  : (tr == TRASHFS_ERR_NO_SPACE)  ? -VM_ENOSPC
+                  : (tr == TRASHFS_ERR_INVALID_ARG) ? -VM_EINVAL
+                  : -VM_EIO;
+            cpu->regs[VM_REG_A0] = (uint32_t)e;
+            return;
+        }
         cpu->regs[VM_REG_A0] = (uint32_t)fd;
         return;
     }
@@ -783,6 +882,27 @@ static void handle_lseek(VmCpu *cpu, void *system) {
         return;
     }
 
+    /* trashfs fd path. */
+    if (s->kind == SLOT_TRASH_FILE) {
+        int w;
+        switch (whence) {
+            case VM_SEEK_SET: w = TRASHFS_SEEK_SET; break;
+            case VM_SEEK_CUR: w = TRASHFS_SEEK_CUR; break;
+            case VM_SEEK_END: w = TRASHFS_SEEK_END; break;
+            default:
+                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
+                return;
+        }
+        uint32_t newpos = 0;
+        TrashfsResult r = trashfs_lseek(&s->u.tfile, off, w, &newpos);
+        if (r != TRASHFS_OK) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
+            return;
+        }
+        cpu->regs[VM_REG_A0] = newpos;
+        return;
+    }
+
     /* FatFs fd path. */
     if (s->kind != SLOT_FILE) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
@@ -860,9 +980,30 @@ static void handle_unlinkat(VmCpu *cpu, void *system) {
     }
 
     char buf[VM_HOST_FS_MAX_PATH];
-    int p = copy_path(cpu, path, buf, sizeof(buf));
+    PathBackend backend;
+    bool writable;
+    const Mount *mnt = NULL;
+    int p = resolve_guest_path(cpu, path, buf, sizeof(buf),
+                               &backend, &writable, &mnt);
     if (p < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)p;
+        return;
+    }
+
+    if (backend == PATH_BACKEND_HOST) {
+        /* Host passthrough unlink isn't supported (read-only view). */
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EROFS;
+        return;
+    }
+
+    if (backend == PATH_BACKEND_TRASHFS) {
+        TrashfsVolume *vol = mnt ? mnt->trashfs_vol : NULL;
+        if (!vol) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO; return; }
+        TrashfsResult r = trashfs_unlink(vol, buf);
+        int e = (r == TRASHFS_OK)            ? 0
+              : (r == TRASHFS_ERR_NOT_FOUND) ? -VM_ENOENT
+              : -VM_EIO;
+        cpu->regs[VM_REG_A0] = (uint32_t)e;
         return;
     }
 
@@ -982,6 +1123,30 @@ static void handle_readdir(VmCpu *cpu, void *system) {
         return;
     }
 
+    if (s->kind == SLOT_TRASH_DIR) {
+        TrashfsDirent_Out e;
+        bool have = false;
+        TrashfsResult r = trashfs_readdir(&s->u.tdir, &e, &have);
+        if (r != TRASHFS_OK) {
+            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
+            return;
+        }
+        if (!have) {
+            cpu->regs[VM_REG_A0] = 1;   /* end of directory */
+            return;
+        }
+        memset(out, 0, sizeof(VmDirent));
+        out->type = (e.type == TRASHFS_TYPE_DIR) ? VM_DT_DIR : VM_DT_REG;
+        out->size = e.size;
+        size_t name_max = sizeof(out->name) - 1;
+        size_t n = e.name_len;
+        if (n > name_max) n = name_max;
+        memcpy(out->name, e.name, n);
+        out->name[n] = '\0';
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+
     if (s->kind != SLOT_DIR) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
         return;
@@ -1088,6 +1253,23 @@ bool vm_host_fs_mount_fatfs(const char *name, uint8_t pdrv,
     m->fatfs_volume = pdrv;
     m->fatfs_struct = (FATFS *)fatfs;
     m->writable     = true;     /* FatFs mounts are always r/w for now */
+    g_mount_count++;
+    return true;
+}
+
+bool vm_host_fs_mount_trashfs(const char *name, void *vol) {
+    if (!valid_mount_name(name)) return false;
+    if (find_mount(name)) return false;
+    if (!vol) return false;
+
+    Mount *m = find_free_mount_slot();
+    if (!m) return false;
+
+    memset(m, 0, sizeof(*m));
+    m->kind        = MOUNT_KIND_TRASHFS;
+    memcpy(m->name, name, strlen(name) + 1);
+    m->trashfs_vol = (TrashfsVolume *)vol;
+    m->writable    = true;
     g_mount_count++;
     return true;
 }
@@ -1204,7 +1386,7 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     PathBackend backend;
     bool writable;
     int rp = resolve_guest_path(cpu, path_addr, buf, sizeof(buf),
-                                 &backend, &writable);
+                                 &backend, &writable, NULL);
     if (rp < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)rp;
         return;
