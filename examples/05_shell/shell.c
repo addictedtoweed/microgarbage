@@ -690,6 +690,38 @@ static int is_known_builtin(const char *name) {
     return 0;
 }
 
+/* Access kinds for reject_if_builtin's message. */
+#define BLTN_READ   0   /* "read-protected"  — cat, cp source */
+#define BLTN_WRITE  1   /* "write-protected" — write/rm/mkdir/... */
+#define BLTN_BOTH   2   /* "read/write protected" — mv (reads + removes) */
+
+/* The /builtin directory and its entries are synthetic — they're
+ * native built-in commands, not real files — so read/write/delete
+ * can't work on them. Without this, those operations failed with a
+ * misleading "no such file or directory" even though `ls` shows the
+ * entry. This prints a friendly, explicit protection message under
+ * `cmd` and returns 1 so the caller bails before the doomed syscall.
+ * Returns 0 for ordinary paths. `kind` picks the wording. */
+static int reject_if_builtin(const char *cmd, const char *path, int kind) {
+    char name[64];
+    int is_dir  = is_builtin_dir(path);
+    int is_file = is_builtin_file(path, name, sizeof(name));
+    if (!is_dir && !is_file) return 0;
+
+    puts_(cmd);
+    puts_(": '");
+    puts_(path);
+    puts_("' is ");
+    if (kind == BLTN_READ)       puts_("read-protected");
+    else if (kind == BLTN_WRITE) puts_("write-protected");
+    else                         puts_("read/write protected");
+    /* The directory itself vs a specific command reads slightly
+     * differently, but both are built-in, not files. */
+    if (is_dir) puts_(" (built-in command directory)\n");
+    else        puts_(" (built-in command)\n");
+    return 1;
+}
+
 static void comp_init(CompList *cl) {
     cl->count = 0;
     cl->pool_used = 0;
@@ -1452,6 +1484,7 @@ static void cmd_mkdir(int argc, char **argv) {
         putln("mkdir: path too long");
         return;
     }
+    if (reject_if_builtin("mkdir", path, BLTN_WRITE)) return;
     int r = sys_mkdirat(AT_FDCWD, path, 0);
     if (r < 0) perror_("mkdir", r);
 }
@@ -1463,6 +1496,7 @@ static void cmd_rmdir(int argc, char **argv) {
         putln("rmdir: path too long");
         return;
     }
+    if (reject_if_builtin("rmdir", path, BLTN_WRITE)) return;
     /* FatFs's f_unlink handles directories (must be empty); we
      * pass AT_REMOVEDIR for clarity though FatFs ignores it. */
     int r = sys_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
@@ -1476,6 +1510,7 @@ static void cmd_rm(int argc, char **argv) {
         putln("rm: path too long");
         return;
     }
+    if (reject_if_builtin("rm", path, BLTN_WRITE)) return;
     int r = sys_unlinkat(AT_FDCWD, path, 0);
     if (r < 0) perror_("rm", r);
 }
@@ -1487,6 +1522,7 @@ static void cmd_touch(int argc, char **argv) {
         putln("touch: path too long");
         return;
     }
+    if (reject_if_builtin("touch", path, BLTN_WRITE)) return;
     /* Open with O_CREAT and immediately close. If the file
      * already exists, this is a no-op. */
     int fd = sys_openat(AT_FDCWD, path, O_WRONLY | O_CREAT, 0);
@@ -1501,6 +1537,7 @@ static void cmd_cat(int argc, char **argv) {
         putln("cat: path too long");
         return;
     }
+    if (reject_if_builtin("cat", path, BLTN_READ)) return;
     int fd = sys_openat(AT_FDCWD, path, O_RDONLY, 0);
     if (fd < 0) { perror_("cat", fd); return; }
 
@@ -1521,6 +1558,7 @@ static void cmd_write(int argc, char **argv) {
         putln("write: path too long");
         return;
     }
+    if (reject_if_builtin("write", path, BLTN_WRITE)) return;
     int fd = sys_openat(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC, 0);
     if (fd < 0) { perror_("write", fd); return; }
 
@@ -1569,6 +1607,8 @@ static void cmd_cp(int argc, char **argv) {
         putln("cp: dst path too long");
         return;
     }
+    if (reject_if_builtin("cp", src, BLTN_READ)) return;
+    if (reject_if_builtin("cp", dst, BLTN_WRITE)) return;
 
     int sfd = sys_openat(AT_FDCWD, src, O_RDONLY, 0);
     if (sfd < 0) { perror_("cp", sfd); return; }
@@ -1604,6 +1644,8 @@ static void cmd_mv(int argc, char **argv) {
         putln("mv: dst path too long");
         return;
     }
+    if (reject_if_builtin("mv", src, BLTN_BOTH)) return;
+    if (reject_if_builtin("mv", dst, BLTN_WRITE)) return;
 
     int sfd = sys_openat(AT_FDCWD, src, O_RDONLY, 0);
     if (sfd < 0) { perror_("mv", sfd); return; }
