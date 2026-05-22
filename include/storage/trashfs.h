@@ -189,6 +189,84 @@ uint32_t trashfs_free_blocks(const TrashfsVolume *vol);
 uint32_t trashfs_inode_count(const TrashfsVolume *vol);
 uint32_t trashfs_free_inodes(const TrashfsVolume *vol);
 
+/* ---- Phase 2 API: read-only path --------------------------- *
+ *
+ *  open (existing files only — creation is Phase 3), read, lseek,
+ *  readdir, close. These walk the inode block list (direct ->
+ *  single -> double -> triple indirect) to map a file offset to a
+ *  data block. No allocation happens here.
+ */
+
+/* Whence values for trashfs_lseek (match POSIX SEEK_*). */
+#define TRASHFS_SEEK_SET 0
+#define TRASHFS_SEEK_CUR 1
+#define TRASHFS_SEEK_END 2
+
+/* Open flags (Phase 2 understands none yet — files must exist;
+ * O_CREAT/O_TRUNC arrive in Phase 3). Reserved for forward use. */
+#define TRASHFS_O_RDONLY 0x0000u
+
+/* An open file handle. Bound to a mounted volume + an inode. */
+typedef struct {
+    TrashfsVolume *vol;
+    uint32_t inode;     /* inode number of the open file        */
+    uint32_t size;      /* cached file size                     */
+    uint32_t pos;       /* current read/write position          */
+    bool     is_dir;    /* opened as a directory?               */
+    bool     open;
+} TrashfsFile;
+
+/* A directory iteration handle (for readdir). */
+typedef struct {
+    TrashfsVolume *vol;
+    uint32_t inode;     /* the directory's inode                */
+    uint32_t size;      /* directory size in bytes              */
+    uint32_t pos;       /* byte offset of the next entry to scan */
+    bool     open;
+} TrashfsDir;
+
+/* What readdir yields to the caller. */
+typedef struct {
+    char     name[TRASHFS_NAME_MAX + 1]; /* NUL-terminated for ease */
+    uint8_t  name_len;
+    uint8_t  type;      /* TRASHFS_TYPE_FILE / TRASHFS_TYPE_DIR  */
+    uint32_t inode;
+    uint32_t size;      /* file size in bytes                    */
+} TrashfsDirent_Out;
+
+/* Open an existing file by name (flat namespace; a leading '/' is
+ * accepted and ignored). Fills *f. Returns TRASHFS_ERR_NOT_FOUND if
+ * no such file. Phase 2: read-only, no creation. */
+TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
+                           uint32_t flags, TrashfsFile *f);
+
+/* Read up to n bytes at the current position. Returns the byte count
+ * via *out_read (0 at EOF). Unallocated blocks within the file (holes)
+ * read as zero. Advances the position. */
+TrashfsResult trashfs_read(TrashfsFile *f, void *buf, uint32_t n,
+                           uint32_t *out_read);
+
+/* Reposition. Returns the new absolute position via *out_pos. Seeking
+ * past EOF is allowed (reads there return 0 / EOF until Phase 3's
+ * write can extend the file). */
+TrashfsResult trashfs_lseek(TrashfsFile *f, int32_t off, int whence,
+                            uint32_t *out_pos);
+
+/* Close a file handle. */
+TrashfsResult trashfs_close(TrashfsFile *f);
+
+/* Open the (root) directory for iteration. Phase 2 has a flat
+ * namespace, so this opens the root regardless of path. */
+TrashfsResult trashfs_opendir(TrashfsVolume *vol, TrashfsDir *d);
+
+/* Yield the next directory entry. *out_have is set to true if an
+ * entry was produced, false at end-of-directory. */
+TrashfsResult trashfs_readdir(TrashfsDir *d, TrashfsDirent_Out *ent,
+                              bool *out_have);
+
+/* Close a directory handle. */
+TrashfsResult trashfs_closedir(TrashfsDir *d);
+
 #ifdef __cplusplus
 }
 #endif

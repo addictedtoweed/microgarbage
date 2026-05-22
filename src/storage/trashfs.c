@@ -277,3 +277,241 @@ uint32_t trashfs_inode_count(const TrashfsVolume *vol) {
 uint32_t trashfs_free_inodes(const TrashfsVolume *vol) {
     return vol ? vol->free_inodes : 0u;
 }
+
+/* ============================================================
+ *  Phase 2: read-only path.
+ * ============================================================ */
+
+/* Pointer to inode i's 64 bytes within the region. */
+static uint8_t *inode_ptr(TrashfsVolume *vol, uint32_t i) {
+    uint32_t blk = vol->inode_start + (i / TRASHFS_INODES_PER_BLOCK);
+    uint32_t off = (i % TRASHFS_INODES_PER_BLOCK) * TRASHFS_INODE_SIZE;
+    return block_ptr(vol->region, blk) + off;
+}
+
+/* Read pointer slot 'idx' from a block of 32 uint32 pointers. */
+static uint32_t ptr_in_block(TrashfsVolume *vol, uint32_t block, uint32_t idx) {
+    if (block == TRASHFS_BLOCK_NONE) return TRASHFS_BLOCK_NONE;
+    const uint8_t *p = block_ptr(vol->region, block);
+    return rd32(p + idx * 4u);
+}
+
+/* Map a file's logical block number (offset / BLOCK_SIZE) to its
+ * physical block, walking direct -> single -> double -> triple
+ * indirect. Returns TRASHFS_BLOCK_NONE for an unallocated block
+ * (a hole, or beyond what's been allocated). Read-only: never
+ * allocates. */
+static uint32_t map_lbn(TrashfsVolume *vol, const uint8_t *inode, uint32_t lbn) {
+    const uint32_t P = TRASHFS_PTRS_PER_BLOCK;            /* 32 */
+
+    /* Direct: 0 .. 7 */
+    if (lbn < TRASHFS_DIRECT_PTRS) {
+        return rd32(inode + 16u + lbn * 4u);
+    }
+    lbn -= TRASHFS_DIRECT_PTRS;
+
+    /* Single indirect: next P blocks */
+    if (lbn < P) {
+        uint32_t single = rd32(inode + 48u);
+        return ptr_in_block(vol, single, lbn);
+    }
+    lbn -= P;
+
+    /* Double indirect: next P*P blocks */
+    if (lbn < P * P) {
+        uint32_t dbl = rd32(inode + 52u);
+        uint32_t l1  = ptr_in_block(vol, dbl, lbn / P);     /* which 2nd-level block */
+        return ptr_in_block(vol, l1, lbn % P);
+    }
+    lbn -= P * P;
+
+    /* Triple indirect: next P*P*P blocks */
+    if (lbn < P * P * P) {
+        uint32_t triple = rd32(inode + 56u);
+        uint32_t l1 = ptr_in_block(vol, triple, lbn / (P * P));
+        uint32_t l2 = ptr_in_block(vol, l1, (lbn / P) % P);
+        return ptr_in_block(vol, l2, lbn % P);
+    }
+
+    /* Beyond the maximum addressable file size. */
+    return TRASHFS_BLOCK_NONE;
+}
+
+/* Scan the root directory for an entry named (name,len). On match,
+ * returns true and fills *out_inode / *out_type. */
+static bool dir_find(TrashfsVolume *vol, const char *name, uint32_t len,
+                     uint32_t *out_inode, uint8_t *out_type) {
+    const uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
+    uint32_t dsize = rd32(root + 4u);
+
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
+         off += TRASHFS_DIRENT_SIZE) {
+        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+        uint32_t blk = map_lbn(vol, root, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) continue;   /* hole — skip */
+        const uint8_t *e = block_ptr(vol->region, blk)
+                         + (off % TRASHFS_BLOCK_SIZE);
+        uint32_t einode = rd32(e + 0);
+        if (einode == 0u) continue;                /* empty/deleted slot */
+        uint8_t  etype = e[4];
+        uint8_t  elen  = e[5];
+        if (elen == len && memcmp(e + 6, name, len) == 0) {
+            if (out_inode) *out_inode = einode;
+            if (out_type)  *out_type  = etype;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Strip a single leading '/', returning name + length. Flat
+ * namespace: we don't parse deeper path components. */
+static const char *normalize_name(const char *name, uint32_t *out_len) {
+    if (!name) { *out_len = 0; return NULL; }
+    if (name[0] == '/') name++;
+    uint32_t n = 0;
+    while (name[n] != '\0') n++;
+    *out_len = n;
+    return name;
+}
+
+TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
+                           uint32_t flags, TrashfsFile *f) {
+    (void)flags;   /* Phase 2: read-only; flags reserved */
+    if (!vol || !vol->mounted || !name || !f) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t len = 0;
+    const char *nm = normalize_name(name, &len);
+    if (len == 0 || len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t ino = 0; uint8_t type = 0;
+    if (!dir_find(vol, nm, len, &ino, &type)) return TRASHFS_ERR_NOT_FOUND;
+
+    const uint8_t *inode = inode_ptr(vol, ino);
+    memset(f, 0, sizeof(*f));
+    f->vol    = vol;
+    f->inode  = ino;
+    f->size   = rd32(inode + 4u);
+    f->pos    = 0;
+    f->is_dir = (type == TRASHFS_TYPE_DIR);
+    f->open   = true;
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_read(TrashfsFile *f, void *buf, uint32_t n,
+                           uint32_t *out_read) {
+    if (!f || !f->open || !buf) return TRASHFS_ERR_INVALID_ARG;
+    if (out_read) *out_read = 0;
+
+    const uint8_t *inode = inode_ptr(f->vol, f->inode);
+    uint8_t *dst = (uint8_t *)buf;
+    uint32_t done = 0;
+
+    while (done < n && f->pos < f->size) {
+        uint32_t lbn   = f->pos / TRASHFS_BLOCK_SIZE;
+        uint32_t boff  = f->pos % TRASHFS_BLOCK_SIZE;
+        uint32_t avail = TRASHFS_BLOCK_SIZE - boff;          /* in this block */
+        uint32_t left_in_file = f->size - f->pos;
+        uint32_t want = n - done;
+        uint32_t chunk = avail;
+        if (chunk > want) chunk = want;
+        if (chunk > left_in_file) chunk = left_in_file;
+
+        uint32_t blk = map_lbn(f->vol, inode, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) {
+            /* Hole: reads as zeros. */
+            memset(dst + done, 0, chunk);
+        } else {
+            const uint8_t *src = block_ptr(f->vol->region, blk) + boff;
+            memcpy(dst + done, src, chunk);
+        }
+        done    += chunk;
+        f->pos  += chunk;
+    }
+
+    if (out_read) *out_read = done;
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_lseek(TrashfsFile *f, int32_t off, int whence,
+                            uint32_t *out_pos) {
+    if (!f || !f->open) return TRASHFS_ERR_INVALID_ARG;
+
+    int64_t base;
+    switch (whence) {
+        case TRASHFS_SEEK_SET: base = 0; break;
+        case TRASHFS_SEEK_CUR: base = (int64_t)f->pos; break;
+        case TRASHFS_SEEK_END: base = (int64_t)f->size; break;
+        default: return TRASHFS_ERR_INVALID_ARG;
+    }
+    int64_t np = base + (int64_t)off;
+    if (np < 0) return TRASHFS_ERR_INVALID_ARG;
+    /* Seeking past EOF is permitted (sparse / future-write); we cap
+     * at UINT32_MAX defensively. */
+    if (np > (int64_t)0xFFFFFFFFu) return TRASHFS_ERR_INVALID_ARG;
+    f->pos = (uint32_t)np;
+    if (out_pos) *out_pos = f->pos;
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_close(TrashfsFile *f) {
+    if (!f) return TRASHFS_ERR_INVALID_ARG;
+    f->open = false;
+    return TRASHFS_OK;
+}
+
+/* ---- directory iteration ----------------------------------- */
+
+TrashfsResult trashfs_opendir(TrashfsVolume *vol, TrashfsDir *d) {
+    if (!vol || !vol->mounted || !d) return TRASHFS_ERR_INVALID_ARG;
+    const uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
+    memset(d, 0, sizeof(*d));
+    d->vol   = vol;
+    d->inode = TRASHFS_ROOT_INODE;
+    d->size  = rd32(root + 4u);
+    d->pos   = 0;
+    d->open  = true;
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_readdir(TrashfsDir *d, TrashfsDirent_Out *ent,
+                              bool *out_have) {
+    if (!d || !d->open || !ent) return TRASHFS_ERR_INVALID_ARG;
+    if (out_have) *out_have = false;
+
+    const uint8_t *dirnode = inode_ptr(d->vol, d->inode);
+
+    while (d->pos + TRASHFS_DIRENT_SIZE <= d->size) {
+        uint32_t off = d->pos;
+        d->pos += TRASHFS_DIRENT_SIZE;
+
+        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+        uint32_t blk = map_lbn(d->vol, dirnode, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) continue;
+        const uint8_t *e = block_ptr(d->vol->region, blk)
+                         + (off % TRASHFS_BLOCK_SIZE);
+        uint32_t einode = rd32(e + 0);
+        if (einode == 0u) continue;   /* empty/deleted slot — skip */
+
+        uint8_t etype = e[4];
+        uint8_t elen  = e[5];
+        if (elen > TRASHFS_NAME_MAX) elen = TRASHFS_NAME_MAX; /* defensive */
+        memcpy(ent->name, e + 6, elen);
+        ent->name[elen] = '\0';
+        ent->name_len = elen;
+        ent->type  = etype;
+        ent->inode = einode;
+        ent->size  = rd32(inode_ptr(d->vol, einode) + 4u);
+
+        if (out_have) *out_have = true;
+        return TRASHFS_OK;
+    }
+    /* End of directory — out_have stays false. */
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_closedir(TrashfsDir *d) {
+    if (!d) return TRASHFS_ERR_INVALID_ARG;
+    d->open = false;
+    return TRASHFS_OK;
+}
