@@ -52,6 +52,7 @@
 param(
     [switch]$Clean,
     [switch]$NoGuest,
+    [switch]$NoWerror,
     [string]$Cc = "x86_64-w64-mingw32-gcc",
     [string]$GuestCc = ""
 )
@@ -168,6 +169,9 @@ $cflags = @(
     "-I$FatfsDir",
     "-I$FatfsSrc"
 )
+# Warnings-as-errors, ON by default (enforces zero-warning state).
+# Pass -NoWerror if a stricter mingw flags something unexpected.
+if (-not $NoWerror) { $cflags += "-Werror" }
 
 # Native Windows needs WinSock2 for the TCP transport.
 $libs = @("-lws2_32")

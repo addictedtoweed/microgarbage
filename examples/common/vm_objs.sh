@@ -97,6 +97,14 @@ if [ -z "${CFLAGS+x}" ]; then
         -D_POSIX_C_SOURCE=200809L
         -I"${REPO_ROOT}/include"
     )
+    # Warnings-as-errors, ON by default, so the zero-warning state is
+    # enforced by the compiler rather than by eyeballing output. A
+    # contributor on a stricter/newer toolchain that flags something
+    # we don't see can opt out with WERROR=0 to get a building tree
+    # (and please report the warning). See CONTRIBUTING.md.
+    if [ "${WERROR:-1}" != "0" ]; then
+        CFLAGS+=(-Werror)
+    fi
 else
     # Caller-supplied string; convert to a single-element array
     # so "${CFLAGS[@]}" still works in build.sh. This means

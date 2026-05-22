@@ -46,6 +46,15 @@ case "${1:-build}" in
     --no-guest) NO_GUEST=1 ;;
 esac
 
+# Warnings-as-errors, ON by default (enforces the zero-warning state).
+# Opt out with WERROR=0 if a stricter/newer mingw flags something we
+# don't see — you'll get a building host.exe and visible warnings to
+# report. See CONTRIBUTING.md.
+WERROR_FLAG=()
+if [ "${WERROR:-1}" != "0" ]; then
+    WERROR_FLAG=(-Werror)
+fi
+
 # Host compiler: default to mingw-w64. Must target native Windows.
 CC="${CC:-x86_64-w64-mingw32-gcc}"
 if ! command -v "$CC" >/dev/null 2>&1; then
@@ -106,7 +115,7 @@ step "compiling native host.exe (with FatFs)..."
 # compile clean. (Cygwin/Linux libc handle %z natively; only the
 # native msvcrt-linked build needs this.)
 "$CC" -Wall -Wextra -Wpedantic -std=c11 -O2 -DHAVE_FATFS \
-    -D__USE_MINGW_ANSI_STDIO=1 \
+    -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" \
     -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
     -o "$BUILD_DIR/host.exe" \
     "$EXAMPLE_DIR/host.c" \
