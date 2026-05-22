@@ -61,6 +61,15 @@ static uint8_t heat[ROWS][COLS];
 #define BURN_RADIUS  2
 #define SEED_MIN     180
 
+/* When the button is held but the cursor is motionless, the terminal
+ * stops sending mouse events, so the active burn above never fires.
+ * We keep a gentle "ember" going at the last position each frame
+ * while the button is held: a smaller radius and a heat FLOOR (we
+ * raise cells toward this, not slam them to 255) so a resting cursor
+ * smoulders rather than blowing up into a full flare. */
+#define BURN_IDLE_RADIUS  1
+#define BURN_IDLE_FLOOR   200
+
 static inline uint32_t rnd(void) { return sys0(SYS_RAND); }
 
 /* Map a heat value to a (glyph, fg) pair on the fire ramp. Cooler
@@ -129,6 +138,20 @@ static void burn_at(int row, int col) {
     }
 }
 
+/* EMBER: gentle burn for a held-but-motionless cursor. Smaller
+ * radius, and only raises cells toward BURN_IDLE_FLOOR (never above
+ * it), so a resting cursor smoulders steadily instead of flaring to
+ * full white. */
+static void ember_at(int row, int col) {
+    for (int dr = -BURN_IDLE_RADIUS; dr <= BURN_IDLE_RADIUS; dr++) {
+        for (int dc = -BURN_IDLE_RADIUS; dc <= BURN_IDLE_RADIUS; dc++) {
+            int r = row + dr, c = col + dc;
+            if (r < 0 || r >= ROWS || c < 0 || c >= COLS) continue;
+            if (heat[r][c] < BURN_IDLE_FLOOR) heat[r][c] = BURN_IDLE_FLOOR;
+        }
+    }
+}
+
 /* CUT: zero heat along the line from (r0,c0) to (r1,c1) so a fast
  * swipe leaves one continuous cool channel, not dotted gaps.
  * Integer Bresenham — no floats. */
@@ -170,6 +193,8 @@ int main(void) {
 
     int  have_prev = 0;          /* do we have a last drag point? */
     int  prev_r = 0, prev_c = 0; /* last drag position */
+    int  button_held = 0;        /* button currently down? */
+    int  last_r = 0, last_c = 0; /* last position the button was at */
 
     for (;;) {
         /* --- input: drain all pending events this frame --------- */
@@ -185,6 +210,12 @@ int main(void) {
                 /* Coordinates are 1-indexed; convert to 0-based. */
                 int r = clampi(ev.mouse.row - 1, 0, ROWS - 1);
                 int c = clampi(ev.mouse.col - 1, 0, COLS - 1);
+
+                /* Track button state for the motionless-ember path
+                 * below. press==true is press or motion-with-button;
+                 * press==false is release. */
+                if (ev.mouse.press) { button_held = 1; last_r = r; last_c = c; }
+                else                { button_held = 0; }
 
                 if (ev.mouse.drag) {
                     if (have_prev) {
@@ -202,12 +233,18 @@ int main(void) {
                     }
                     prev_r = r; prev_c = c; have_prev = 1;
                 } else {
-                    /* Button released (or a non-drag report): forget
-                     * the path so the next drag starts fresh. */
+                    /* Not a drag report: forget the path so the next
+                     * drag measures speed fresh. (button_held above
+                     * still tracks press/release for the ember.) */
                     have_prev = 0;
                 }
             }
         }
+
+        /* Held but motionless: the terminal sends no events while the
+         * cursor sits still, so keep a gentle ember alive at the last
+         * known position each frame. */
+        if (button_held) ember_at(last_r, last_c);
 
         /* --- simulate + draw ----------------------------------- */
         seed_bottom();
