@@ -13,6 +13,7 @@
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_host_stdio.h"
+#include "vm/vm_host_transport.h"
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
 #include "vm/vm_system.h"
@@ -1277,6 +1278,20 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         return;
     }
 
+    /* Round U.7b: the child inherits the parent's transport binding.
+     * Without this, a spawned TUI program (e.g. snake.elf launched
+     * from a shell bound to a TCP/pty/pipe transport) would have no
+     * transport of its own — its canvas output would resolve to NULL
+     * and vanish. The shell's stdio works because the SHELL's vm_id
+     * is bound; the spawned child has a fresh vm_id that needs the
+     * same binding. We restore the parent's binding for the child's
+     * slot when the child exits (below), in case slot reuse matters. */
+    VmHostTransport *parent_t =
+        vm_host_get_transport_for_vm(cpu->vm_id);
+    if (parent_t) {
+        vm_host_set_transport_for_vm((uint16_t)lr.assigned_vm_id, parent_t);
+    }
+
     VmSched *sched = sys->sched;
 
     while (!child->halted) {
@@ -1378,6 +1393,11 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     }
 
 child_done:
+    /* Round U.7b: clear the child's inherited transport binding so
+     * the slot doesn't carry a stale pointer if vm_id is reused by
+     * a later spawn that shouldn't inherit it. */
+    vm_host_set_transport_for_vm((uint16_t)lr.assigned_vm_id, NULL);
+
     /* Reclaim the child's resources by unloading the VM. This
      * walks its region table and slab_frees each RAM-backed
      * region, frees the mailbox storage and VmCpu, unregisters

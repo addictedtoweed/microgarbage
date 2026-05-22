@@ -668,6 +668,7 @@ static VmHostTransport g_pipe_transport = {
  * Returns true on success. On failure, prints a diagnostic and
  * returns false; the caller should exit. */
 static bool setup_pipe_transport(VmSystem *sys, const char *name) {
+    (void)sys;   /* stdio install moved to main() in U.7b */
     /* Pipe naming: callers can pass either a fully-qualified
      * "\\\\.\\pipe\\foo" or a short "foo". Translate short forms
      * to the full prefix to make the CLI friendlier. */
@@ -718,19 +719,11 @@ static bool setup_pipe_transport(VmSystem *sys, const char *name) {
     fprintf(stderr, "host: client connected.\n");
     fflush(stderr);
 
-    /* Round U.2: register the stdio handlers (SYS_READ/WRITE/FFLUSH)
-     * and then point the active transport at our pipe vtable. The
-     * stdio handlers consult the transport for every byte they
-     * move, so this single set_transport call diverts everything —
-     * shell prompt, guest puts/printf, AND TUI canvas escapes —
-     * to the pipe. No more ecall-registration overrides; no more
-     * separate TUI output hook. */
-    VmHostStdioConfig sio = {0};
-    sio.raw_mode = false;   /* the pipe transport's set_raw is a no-op */
-    if (!vm_host_install_stdio_ex(sys, &sio)) {
-        fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
-        return false;
-    }
+    /* Round U.2/U.7b: stdio handlers are installed by main() before
+     * this is called. We only point the process-default transport
+     * at our pipe vtable. The stdio handlers consult the transport
+     * for every byte — shell prompt, guest puts/printf, AND TUI
+     * canvas escapes all divert to the pipe. */
     vm_host_set_transport(&g_pipe_transport);
 
     return true;
@@ -884,6 +877,7 @@ static VmHostTransport g_pty_transport = {
  * transport. The slave is NOT held open here — the user
  * connects whenever they want. */
 static bool setup_pty_transport(VmSystem *sys) {
+    (void)sys;   /* stdio install moved to main() in U.7b */
     int master = posix_openpt(O_RDWR | O_NOCTTY);
     if (master < 0) {
         fprintf(stderr, "host: posix_openpt failed: %s\n", strerror(errno));
@@ -934,12 +928,8 @@ static bool setup_pty_transport(VmSystem *sys) {
     fprintf(stderr, "host: ready\n");
     fflush(stderr);
 
-    VmHostStdioConfig sio = {0};
-    sio.raw_mode = false;   /* pty transport's set_raw owns this */
-    if (!vm_host_install_stdio_ex(sys, &sio)) {
-        fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
-        return false;
-    }
+    /* stdio handlers are installed by main() before this is called
+     * (U.7b). We only set the process-default transport here. */
     vm_host_set_transport(&g_pty_transport);
 
     return true;
@@ -973,17 +963,29 @@ static bool setup_pty_transport(VmSystem *sys) {
  *  either way.
  * ============================================================ */
 
-static tcp_sock_t g_tcp_listen_fd = TCP_SOCK_INVALID;
-static tcp_sock_t g_tcp_client_fd = TCP_SOCK_INVALID;
+/* Per-instance TCP transport state. The transport struct's ctx
+ * points at one of these, so multiple TCP transports (multiple
+ * --tcp= ports) each have their own sockets. */
+typedef struct {
+    tcp_sock_t listen_fd;
+    tcp_sock_t client_fd;
+    int        port;
+    int        prev_was_cr;   /* LF→CRLF state, per-connection */
+} TcpCtx;
+
+static tcp_sock_t tcp_ctx_cfd(VmHostTransport *t) {
+    TcpCtx *c = (TcpCtx *)t->ctx;
+    return c ? c->client_fd : TCP_SOCK_INVALID;
+}
 
 static int tcp_t_read(VmHostTransport *t, void *buf, unsigned cap) {
-    (void)t;
-    if (g_tcp_client_fd == TCP_SOCK_INVALID) return -5;
+    tcp_sock_t cfd = tcp_ctx_cfd(t);
+    if (cfd == TCP_SOCK_INVALID) return -5;
     if (cap == 0) return 0;
 #if defined(_WIN32) && !defined(__CYGWIN__)
-    int r = recv(g_tcp_client_fd, (char *)buf, (int)cap, 0);
+    int r = recv(cfd, (char *)buf, (int)cap, 0);
 #else
-    ssize_t r = recv(g_tcp_client_fd, buf, cap, 0);
+    ssize_t r = recv(cfd, buf, cap, 0);
 #endif
     if (r > 0) return (int)r;
     if (r == 0) return 0;   /* client closed (or 0-byte send) */
@@ -996,45 +998,41 @@ static int tcp_t_read(VmHostTransport *t, void *buf, unsigned cap) {
 }
 
 static int tcp_t_write(VmHostTransport *t, const void *buf, unsigned n) {
-    (void)t;
-    if (g_tcp_client_fd == TCP_SOCK_INVALID) return -5;
-    static int prev_was_cr = 0;
+    TcpCtx *ctx = (TcpCtx *)t->ctx;
+    tcp_sock_t cfd = ctx ? ctx->client_fd : TCP_SOCK_INVALID;
+    if (cfd == TCP_SOCK_INVALID) return -5;
     const char *p = (const char *)buf;
     unsigned total_in = 0;
     size_t run_start = 0;
     for (size_t i = 0; i < n; i++) {
         char c = p[i];
-        if (c == '\n' && !prev_was_cr) {
+        if (c == '\n' && !ctx->prev_was_cr) {
             if (i > run_start) {
 #if defined(_WIN32) && !defined(__CYGWIN__)
-                int w = send(g_tcp_client_fd, p + run_start,
-                             (int)(i - run_start), 0);
+                int w = send(cfd, p + run_start, (int)(i - run_start), 0);
 #else
-                ssize_t w = send(g_tcp_client_fd, p + run_start,
-                                 i - run_start, 0);
+                ssize_t w = send(cfd, p + run_start, i - run_start, 0);
 #endif
                 if (w < 0 && tcp_last_errno() != TCP_WOULDBLOCK) return -5;
             }
 #if defined(_WIN32) && !defined(__CYGWIN__)
-            int w2 = send(g_tcp_client_fd, "\r\n", 2, 0);
+            int w2 = send(cfd, "\r\n", 2, 0);
 #else
-            ssize_t w2 = send(g_tcp_client_fd, "\r\n", 2, 0);
+            ssize_t w2 = send(cfd, "\r\n", 2, 0);
 #endif
             if (w2 < 0 && tcp_last_errno() != TCP_WOULDBLOCK) return -5;
             total_in += 1;
             run_start = i + 1;
-            prev_was_cr = 0;
+            ctx->prev_was_cr = 0;
             continue;
         }
-        prev_was_cr = (c == '\r');
+        ctx->prev_was_cr = (c == '\r');
     }
     if (run_start < n) {
 #if defined(_WIN32) && !defined(__CYGWIN__)
-        int w = send(g_tcp_client_fd, p + run_start,
-                     (int)(n - run_start), 0);
+        int w = send(cfd, p + run_start, (int)(n - run_start), 0);
 #else
-        ssize_t w = send(g_tcp_client_fd, p + run_start,
-                         n - run_start, 0);
+        ssize_t w = send(cfd, p + run_start, n - run_start, 0);
 #endif
         if (w < 0 && tcp_last_errno() != TCP_WOULDBLOCK) return -5;
         total_in += (unsigned)(n - run_start);
@@ -1044,46 +1042,28 @@ static int tcp_t_write(VmHostTransport *t, const void *buf, unsigned n) {
 
 static int tcp_t_flush(VmHostTransport *t) {
     (void)t;
-    /* send() goes straight to the kernel socket buffer; no app-
-     * level buffering to flush. Nagle is controlled separately
-     * via TCP_NODELAY (set at connect time). */
     return 0;
 }
 
 static int tcp_t_set_raw(VmHostTransport *t, bool enable) {
     (void)t; (void)enable;
-    /* TCP has no line discipline. The client decides what to do
-     * with bytes; we just pass them through. */
     return 0;
 }
 
 static void tcp_t_close(VmHostTransport *t) {
-    (void)t;
-    if (g_tcp_client_fd != TCP_SOCK_INVALID) {
-        tcp_close(g_tcp_client_fd);
-        g_tcp_client_fd = TCP_SOCK_INVALID;
+    TcpCtx *c = (TcpCtx *)t->ctx;
+    if (!c) return;
+    if (c->client_fd != TCP_SOCK_INVALID) {
+        tcp_close(c->client_fd);
+        c->client_fd = TCP_SOCK_INVALID;
     }
-    if (g_tcp_listen_fd != TCP_SOCK_INVALID) {
-        tcp_close(g_tcp_listen_fd);
-        g_tcp_listen_fd = TCP_SOCK_INVALID;
+    if (c->listen_fd != TCP_SOCK_INVALID) {
+        tcp_close(c->listen_fd);
+        c->listen_fd = TCP_SOCK_INVALID;
     }
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSACleanup();
-#endif
 }
 
-static VmHostTransport g_tcp_transport = {
-    .read_nonblock = tcp_t_read,
-    .write         = tcp_t_write,
-    .flush         = tcp_t_flush,
-    .set_raw       = tcp_t_set_raw,
-    .close         = tcp_t_close,
-    .is_terminal   = true,
-    .ctx           = NULL,
-};
-
-/* Set the given socket to non-blocking mode. Returns 0 on
- * success, -1 on failure. */
+/* Set the given socket to non-blocking mode. */
 static int tcp_set_nonblock(tcp_sock_t s) {
 #if defined(_WIN32) && !defined(__CYGWIN__)
     u_long mode = 1;
@@ -1095,23 +1075,28 @@ static int tcp_set_nonblock(tcp_sock_t s) {
 #endif
 }
 
-/* Listen on TCP port, wait for the first connection, install
- * stdio + transport. */
-static bool setup_tcp_transport(VmSystem *sys, int port) {
 #if defined(_WIN32) && !defined(__CYGWIN__)
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "host: WSAStartup failed\n");
-        return false;
-    }
+static bool g_wsa_started = false;
 #endif
 
+/* Create a listening socket on `port`. Returns the listen fd or
+ * TCP_SOCK_INVALID. Does NOT accept yet. */
+static tcp_sock_t tcp_listen(int port) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    if (!g_wsa_started) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            fprintf(stderr, "host: WSAStartup failed\n");
+            return TCP_SOCK_INVALID;
+        }
+        g_wsa_started = true;
+    }
+#endif
     tcp_sock_t lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd == TCP_SOCK_INVALID) {
         fprintf(stderr, "host: socket() failed\n");
-        return false;
+        return TCP_SOCK_INVALID;
     }
-    /* SO_REUSEADDR so quick restarts don't hit TIME_WAIT. */
     int yes = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
 
@@ -1123,58 +1108,39 @@ static bool setup_tcp_transport(VmSystem *sys, int port) {
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == TCP_SOCK_ERROR) {
         fprintf(stderr, "host: bind(port=%d) failed\n", port);
         tcp_close(lfd);
-        return false;
+        return TCP_SOCK_INVALID;
     }
     if (listen(lfd, 1) == TCP_SOCK_ERROR) {
         fprintf(stderr, "host: listen() failed\n");
         tcp_close(lfd);
-        return false;
+        return TCP_SOCK_INVALID;
     }
-    g_tcp_listen_fd = lfd;
+    /* Non-blocking accept so the main loop can poll N listeners. */
+    tcp_set_nonblock(lfd);
+    return lfd;
+}
 
-    fprintf(stderr, "host: listening on TCP port %d\n", port);
-    fprintf(stderr, "host: connect with: nc localhost %d   "
-                    "(or telnet/PuTTY raw)\n", port);
-    fprintf(stderr, "host: waiting for client ...\n");
-    fflush(stderr);
-
-    /* Blocking accept — we want the first connection before the
-     * shell starts. */
+/* Try to accept a pending connection on a listening ctx. Returns
+ * true if a client just connected (client_fd now valid). */
+static bool tcp_try_accept(TcpCtx *c) {
+    if (c->client_fd != TCP_SOCK_INVALID) return false;  /* already have one */
     struct sockaddr_in cli;
 #if defined(_WIN32) && !defined(__CYGWIN__)
     int cli_len = sizeof(cli);
 #else
     socklen_t cli_len = sizeof(cli);
 #endif
-    tcp_sock_t cfd = accept(lfd, (struct sockaddr *)&cli, &cli_len);
-    if (cfd == TCP_SOCK_INVALID) {
-        fprintf(stderr, "host: accept() failed\n");
-        tcp_close(lfd);
-        g_tcp_listen_fd = TCP_SOCK_INVALID;
-        return false;
-    }
+    tcp_sock_t cfd = accept(c->listen_fd, (struct sockaddr *)&cli, &cli_len);
+    if (cfd == TCP_SOCK_INVALID) return false;   /* EWOULDBLOCK = no client yet */
 
-    /* Disable Nagle for low-latency interactive use. */
     int nodelay = 1;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
                (const char *)&nodelay, sizeof(nodelay));
-    /* Non-blocking so read_nonblock works. */
     tcp_set_nonblock(cfd);
-
-    g_tcp_client_fd = cfd;
-    fprintf(stderr, "host: client connected from %s:%d\n",
-            inet_ntoa(cli.sin_addr),
-            (int)ntohs(cli.sin_port));
+    c->client_fd = cfd;
+    fprintf(stderr, "host: [:%d] client connected from %s:%d\n",
+            c->port, inet_ntoa(cli.sin_addr), (int)ntohs(cli.sin_port));
     fflush(stderr);
-
-    VmHostStdioConfig sio = {0};
-    sio.raw_mode = false;
-    if (!vm_host_install_stdio_ex(sys, &sio)) {
-        fprintf(stderr, "host: vm_host_install_stdio_ex failed\n");
-        return false;
-    }
-    vm_host_set_transport(&g_tcp_transport);
-
     return true;
 }
 #endif  /* TCP_MODE_SUPPORTED */
@@ -1227,7 +1193,10 @@ int main(int argc, char **argv) {
     bool host_fs_disabled    = false;
     const char *pipe_name    = NULL;
     bool        want_pty     = false;
-    int         tcp_port     = -1;
+    /* U.7b: collect up to MAX_TCP_PORTS --tcp= ports for multi-session. */
+#define MAX_TCP_PORTS 16
+    int         tcp_ports[MAX_TCP_PORTS];
+    int         n_tcp_ports  = 0;
     const char *cfg_path     = NULL;
     bool        no_config    = false;
 
@@ -1282,7 +1251,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "host: --tcp port out of range (1..65535)\n");
                 return 1;
             }
-            tcp_port = (int)p;
+            if (n_tcp_ports >= MAX_TCP_PORTS) {
+                fprintf(stderr, "host: too many --tcp ports (max %d)\n",
+                        MAX_TCP_PORTS);
+                return 1;
+            }
+            tcp_ports[n_tcp_ports++] = (int)p;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
             fprintf(stderr, "  --config=<path>     load config from <path>\n");
@@ -1378,13 +1352,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     {
-        int transports_chosen = 0;
-        if (pipe_name) transports_chosen++;
-        if (want_pty)  transports_chosen++;
-        if (tcp_port >= 0) transports_chosen++;
-        if (transports_chosen > 1) {
-            fprintf(stderr, "host: only one of --pipe / --pty / --tcp "
-                            "can be used at a time (for now)\n");
+        /* pipe and pty are single-instance transports; TCP can be
+         * multi-instance (multiple --tcp= ports = multiple sessions).
+         * But mixing single-instance transports with each other or
+         * with TCP isn't supported in this round — keep it to either
+         * one pipe/pty, OR one-or-more TCP ports. */
+        int single_chosen = 0;
+        if (pipe_name) single_chosen++;
+        if (want_pty)  single_chosen++;
+        if (single_chosen > 1) {
+            fprintf(stderr, "host: only one of --pipe / --pty at a time\n");
+            return 1;
+        }
+        if (single_chosen > 0 && n_tcp_ports > 0) {
+            fprintf(stderr, "host: --tcp can't be combined with "
+                            "--pipe / --pty (for now)\n");
             return 1;
         }
     }
@@ -1493,19 +1475,28 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Stdio install: either default (process stdin/stdout/stderr)
-     * via the portable bridge, or routed through a named pipe with
-     * Windows-direct handlers. The pipe call BLOCKS until a client
-     * connects, so the user sees the "waiting" message first and
-     * the shell banner once PuTTY is attached. */
+    /* Stdio handlers are always installed: they consult the
+     * per-VM transport table (U.6) for every byte. For single-
+     * instance transports (pipe/pty) we also set a process-default
+     * transport. For multi-instance TCP, we bind per-VM after each
+     * connection is accepted and a shell is spawned. */
+    {
+        VmHostStdioConfig sio = {0};
+        sio.raw_mode = (pipe_name || want_pty || n_tcp_ports > 0)
+                           ? false : hc.raw_mode;
+        if (!vm_host_install_stdio_ex(&sys, &sio)) {
+            fprintf(stderr, "host: vm_host_install_stdio failed\n");
+            return 1;
+        }
+    }
+
     if (pipe_name) {
 #ifdef PIPE_MODE_SUPPORTED
         if (!setup_pipe_transport(&sys, pipe_name)) {
             return 1;
         }
 #else
-        /* unreachable — we checked above */
-        return 1;
+        return 1;   /* unreachable — checked above */
 #endif
     } else if (want_pty) {
 #ifdef PTY_MODE_SUPPORTED
@@ -1513,21 +1504,12 @@ int main(int argc, char **argv) {
             return 1;
         }
 #else
-        /* unreachable — we checked above */
-        return 1;
+        return 1;   /* unreachable — checked above */
 #endif
-    } else if (tcp_port >= 0) {
-        if (!setup_tcp_transport(&sys, tcp_port)) {
-            return 1;
-        }
-    } else {
-        VmHostStdioConfig sio = {0};
-        sio.raw_mode = hc.raw_mode;
-        if (!vm_host_install_stdio_ex(&sys, &sio)) {
-            fprintf(stderr, "host: vm_host_install_stdio failed\n");
-            return 1;
-        }
     }
+    /* TCP multi-session is set up after fs/platform install, just
+     * before the run loop (it needs the session pool and spawns
+     * VMs lazily as clients connect). */
     if (!vm_host_install_fs(&sys)) {
         fprintf(stderr, "host: vm_host_install_fs failed\n");
         return 1;
@@ -1671,6 +1653,142 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* ============================================================
+     *  7+8. Load shells and run.
+     *
+     *  Two modes:
+     *
+     *   (a) Multi-session TCP: one or more --tcp= ports. We create
+     *       a session pool, set up N non-blocking listeners, and
+     *       enter the run loop. As each client connects we spawn a
+     *       shell VM bound to that connection's transport. The loop
+     *       runs until all spawned shells have exited AND no
+     *       listeners remain that could still produce a client.
+     *
+     *   (b) Single session: pipe / pty / default stdio. Load one
+     *       shell, run until it exits. (The transport was already
+     *       set as the process default above.)
+     * ============================================================ */
+
+#ifdef TCP_MODE_SUPPORTED
+    if (n_tcp_ports > 0) {
+        /* Session pool sized to the number of ports. Lives on the
+         * stack of main() — fine on a dev host; an MCU build would
+         * use a static or SDRAM-placed array. */
+        static VmTuiSession tui_pool[MAX_TCP_PORTS];
+        vm_host_tui_set_pool(tui_pool, (unsigned)n_tcp_ports);
+
+        /* Per-port transport contexts + structs. */
+        static TcpCtx          tcp_ctxs[MAX_TCP_PORTS];
+        static VmHostTransport tcp_transports[MAX_TCP_PORTS];
+        bool   spawned[MAX_TCP_PORTS] = {0};
+
+        for (int i = 0; i < n_tcp_ports; i++) {
+            tcp_ctxs[i].listen_fd = tcp_listen(tcp_ports[i]);
+            tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
+            tcp_ctxs[i].port      = tcp_ports[i];
+            tcp_ctxs[i].prev_was_cr = 0;
+            if (tcp_ctxs[i].listen_fd == TCP_SOCK_INVALID) {
+                fprintf(stderr, "host: failed to listen on port %d\n",
+                        tcp_ports[i]);
+                return 1;
+            }
+            tcp_transports[i].read_nonblock = tcp_t_read;
+            tcp_transports[i].write         = tcp_t_write;
+            tcp_transports[i].flush         = tcp_t_flush;
+            tcp_transports[i].set_raw       = tcp_t_set_raw;
+            tcp_transports[i].close         = tcp_t_close;
+            tcp_transports[i].is_terminal   = true;
+            tcp_transports[i].ctx           = &tcp_ctxs[i];
+            fprintf(stderr, "host: listening on TCP port %d "
+                    "(connect: nc localhost %d)\n",
+                    tcp_ports[i], tcp_ports[i]);
+        }
+        fprintf(stderr, "host: %d session(s) ready; connect clients now.\n",
+                n_tcp_ports);
+        fflush(stderr);
+
+        int n_spawned = 0;
+        for (;;) {
+            if (g_stop) {
+                fprintf(stderr, "\nhost: SIGINT received, stopping.\n");
+                break;
+            }
+
+            /* Accept pending connections and spawn a shell per new
+             * client. */
+            for (int i = 0; i < n_tcp_ports; i++) {
+                if (spawned[i]) continue;
+                if (tcp_try_accept(&tcp_ctxs[i])) {
+                    VmLoadVmResult lr = vm_system_load_vm(
+                        &sys, elf, elf_size, 16 * 1024,
+                        VM_BACKING_COPY_RAM, VM_BACKING_COPY_RAM);
+                    if (lr.code != VM_SYS_OK) {
+                        fprintf(stderr, "host: [:%d] load failed (code=%d)\n",
+                                tcp_ctxs[i].port, lr.code);
+                        /* Drop the connection; leave the slot open for
+                         * a retry on the next accept. */
+                        tcp_close(tcp_ctxs[i].client_fd);
+                        tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
+                        continue;
+                    }
+                    spawned[i] = true;
+                    n_spawned++;
+                    vm_host_set_transport_for_vm(lr.assigned_vm_id,
+                                                 &tcp_transports[i]);
+                    fprintf(stderr, "host: [:%d] shell spawned (vm %u)\n",
+                            tcp_ctxs[i].port, (unsigned)lr.assigned_vm_id);
+                    fflush(stderr);
+                }
+            }
+
+            /* Step the scheduler if there's anything to run. */
+            if (n_spawned > 0) {
+                VmSchedStepResult r = vm_system_step(&sys);
+                if (r == VM_SCHED_ALL_HALTED && n_spawned == n_tcp_ports) {
+                    /* Every port has had a client AND every spawned
+                     * shell has exited — nothing more can happen. Stop.
+                     *
+                     * If some ports haven't seen a client yet, we keep
+                     * running (their listeners are still open); the user
+                     * Ctrl-C's when done. This matches the demo flow:
+                     * launch host, connect N clients, they each exit,
+                     * host exits once the last one does. */
+                    break;
+                }
+                /* Some shells halted but not all ports have connected
+                 * yet — keep looping so late clients can still join. */
+            } else {
+                /* No shells yet — avoid a busy spin while waiting
+                 * for the first connection. */
+#if defined(_WIN32) && !defined(__CYGWIN__)
+                Sleep(10);
+#else
+                struct timespec ts = {0, 10 * 1000 * 1000};
+                nanosleep(&ts, NULL);
+#endif
+            }
+        }
+
+        /* Tear down all transports. */
+        for (int i = 0; i < n_tcp_ports; i++) {
+            if (tcp_transports[i].close) {
+                tcp_transports[i].close(&tcp_transports[i]);
+            }
+        }
+#if defined(_WIN32) && !defined(__CYGWIN__)
+        if (g_wsa_started) { WSACleanup(); g_wsa_started = false; }
+#endif
+
+        vm_system_destroy(&sys);
+        f_mount(NULL, "0:", 0);
+        free(elf);
+        return 0;
+    }
+#endif  /* TCP_MODE_SUPPORTED */
+
+    /* ----- Single-session path (pipe / pty / default stdio) ----- */
+
     /* 7. Load the shell. */
     VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 16 * 1024,
                                           VM_BACKING_COPY_RAM,
@@ -1693,11 +1811,6 @@ int main(int argc, char **argv) {
         if (r == VM_SCHED_ALL_HALTED) {
             break;
         }
-        /* VM_SCHED_IDLE means all VMs are blocked. The shell
-         * blocks on SYS_READ when the user isn't typing — but
-         * our SYS_READ is non-blocking (returns 0), so the shell
-         * actually loops with SYS_YIELDs. We won't see IDLE in
-         * practice. */
     }
 
     vm_system_destroy(&sys);
