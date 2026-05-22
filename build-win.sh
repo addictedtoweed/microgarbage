@@ -55,6 +55,19 @@ if [ "${WERROR:-1}" != "0" ]; then
     WERROR_FLAG=(-Werror)
 fi
 
+# RELEASE=1 produces a size-optimized, stripped distributable: the
+# host.exe is stripped (-s; removes ~180 KB of DWARF that mingw emits
+# by default) and the spawnable guests are built for size (-Os). The
+# embedded shell is size-built regardless. Default keeps host symbols
+# for development.
+HOST_STRIP=()
+GUEST_OPT=()
+if [ "${RELEASE:-0}" = "1" ]; then
+    step "RELEASE build — stripping host.exe, -Os guests"
+    HOST_STRIP=(-s)
+    GUEST_OPT=(-Os)
+fi
+
 # Host compiler: default to mingw-w64. Must target native Windows.
 CC="${CC:-x86_64-w64-mingw32-gcc}"
 if ! command -v "$CC" >/dev/null 2>&1; then
@@ -164,8 +177,8 @@ step "compiling native host.exe (with FatFs)..."
 # selects mingw's own C99-compliant stdio so those format specifiers
 # compile clean. (Cygwin/Linux libc handle %z natively; only the
 # native msvcrt-linked build needs this.)
-"$CC" -Wall -Wextra -Wpedantic -std=c11 -O2 -DHAVE_FATFS \
-    -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" \
+"$CC" -Wall -Wextra -Wpedantic -std=c11 -Os -DHAVE_FATFS \
+    -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" "${HOST_STRIP[@]}" \
     -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
     -I"$EXAMPLE_DIR" \
     -o "$BUILD_DIR/host.exe" \
@@ -211,7 +224,7 @@ else
             [ -f "$src" ] || continue
             name=$(basename "$src" .c)
             step "compiling host_files/$name.elf (spawnable)..."
-            "$GUEST_CC" "${GCFLAGS[@]}" "${GC[@]}" \
+            "$GUEST_CC" "${GCFLAGS[@]}" "${GUEST_OPT[@]}" "${GC[@]}" \
                 -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
                 -I"$(guest_path "$EXAMPLE_DIR/host_files_src/lib/include")" \
                 -Wl,-T,"$(guest_path "$GUEST_LD")" "${GLD[@]}" \

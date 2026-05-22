@@ -23,6 +23,19 @@ case "${1:-build}" in
         ;;
 esac
 
+# RELEASE=1 builds a size-optimized, fully stripped set: the host is
+# stripped of debug info (-s, ~60% smaller on disk) and the spawnable
+# guests are built for size (-Os). The embedded shell is already
+# size-built regardless. Default (RELEASE unset/0) keeps host debug
+# symbols for development. Mirrors the WERROR=0 opt-out style.
+HOST_STRIP=()
+GUEST_OPT=()
+if [ "${RELEASE:-0}" = "1" ]; then
+    echo "05_shell: RELEASE build — stripping host, -Os guests"
+    HOST_STRIP=(-s)
+    GUEST_OPT=(-Os)
+fi
+
 # Check that FatFs is present.
 FATFS_DIR="$REPO_ROOT/third_party/fatfs"
 FATFS_SOURCE="$FATFS_DIR/source"
@@ -106,7 +119,12 @@ HOST_LIBS=()
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) HOST_LIBS+=(-lws2_32) ;;
 esac
-"$CC" "${CFLAGS[@]}" \
+# The host is almost all cold code (FatFs, setup, transports, the
+# shell waits on I/O), so build it for size with -Os. The one hot
+# file — vm_core.c, the interpreter loop — pins itself back to -O2
+# via a #pragma, so this doesn't slow execution. -Os comes after
+# CFLAGS so it overrides the -O2 there.
+"$CC" "${CFLAGS[@]}" -Os "${HOST_STRIP[@]}" \
     -DHAVE_FATFS \
     -I"$FATFS_DIR" -I"$FATFS_SOURCE" \
     -o "$BUILD_DIR/host" \
@@ -168,7 +186,7 @@ if have_guest_cc; then
         [ -f "$src" ] || continue
         name=$(basename "$src" .c)
         echo "05_shell: compiling host_files/$name.elf (spawnable)..."
-        "$GUEST_CC" "${GUEST_CFLAGS[@]}" "${GUEST_GC_CFLAGS[@]}" \
+        "$GUEST_CC" "${GUEST_CFLAGS[@]}" "${GUEST_OPT[@]}" "${GUEST_GC_CFLAGS[@]}" \
             -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
             -I"$(guest_path "$EXAMPLE_DIR/host_files_src/lib/include")" \
             -Wl,-T,"$(guest_path "$GUEST_LD")" \

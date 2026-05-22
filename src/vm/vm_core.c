@@ -17,6 +17,18 @@
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 
+/* This file is the interpreter hot path — fetch/decode/execute runs
+ * for every guest instruction. Size-optimized builds compile the
+ * rest of the host at -Os; we pin THIS translation unit to -O2 so
+ * the dispatch loop stays fast regardless of the command-line -O
+ * level. (GCC/Clang extension; supported by every toolchain we use:
+ * mingw, the riscv-none-elf cross, and desktop gcc/clang.) If a
+ * future compiler lacks it, the pragma is ignored and the file just
+ * inherits the command-line level — correct, just not speed-pinned. */
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC optimize ("O2")
+#endif
+
 #include "vm/vm_core.h"
 #include <string.h>
 

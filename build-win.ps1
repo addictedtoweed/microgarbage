@@ -53,6 +53,7 @@ param(
     [switch]$Clean,
     [switch]$NoGuest,
     [switch]$NoWerror,
+    [switch]$Release,
     [string]$Cc = "x86_64-w64-mingw32-gcc",
     [string]$GuestCc = ""
 )
@@ -158,7 +159,7 @@ $hostMain = Join-Path $ExampleDir "host.c"
 $hostExe  = Join-Path $BuildDir "host.exe"
 
 $cflags = @(
-    "-Wall", "-Wextra", "-Wpedantic", "-std=c11", "-O2",
+    "-Wall", "-Wextra", "-Wpedantic", "-std=c11", "-Os",
     "-DHAVE_FATFS",
     # msvcrt's printf doesn't understand C99 %z/%ll length modifiers;
     # this makes mingw use its own C99-compliant stdio so size_t
@@ -172,6 +173,17 @@ $cflags = @(
 # Warnings-as-errors, ON by default (enforces zero-warning state).
 # Pass -NoWerror if a stricter mingw flags something unexpected.
 if (-not $NoWerror) { $cflags += "-Werror" }
+
+# -Release: size-optimized, stripped distributable. Strips host.exe
+# (-s; drops ~180 KB of DWARF mingw emits by default) and builds
+# spawnable guests for size (-Os). Embedded shell is size-built
+# regardless. Default keeps host symbols for development.
+$guestOpt = @()
+if ($Release) {
+    Write-Step "RELEASE build - stripping host.exe, -Os guests"
+    $cflags += "-s"
+    $guestOpt = @("-Os")
+}
 
 # Native Windows needs WinSock2 for the TCP transport.
 $libs = @("-lws2_32")
@@ -277,7 +289,7 @@ if ($NoGuest) {
             $name = $_.BaseName
             $outElf = Join-Path $HostFiles "$name.elf"
             Write-Step "compiling host_files\$name.elf (spawnable)..."
-            $gargs = $guestCflags + $gcCflags +
+            $gargs = $guestCflags + $guestOpt + $gcCflags +
                      @("-I$libInc","-I$libInc2","-Wl,-T,$guestLd") +
                      $gcLdflags + @("-o",$outElf,$_.FullName) + $libSrcs
             & $GuestCc @gargs
