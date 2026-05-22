@@ -1,7 +1,9 @@
 # Transports
 
-> Status: Round U in progress. U.1–U.4 done, U.5 (per-VM TUI state)
-> and U.6 (multi-session orchestration) are next.
+> Status: Round U complete. Pluggable transports (stdio, pipe, pty,
+> TCP) with per-VM routing and multi-session orchestration. One host
+> process can run N independent shell sessions, each on its own
+> transport with its own canvas and input.
 
 A **transport** is the host-side mechanism by which a guest's
 console-style I/O reaches the user. The base abstraction is a
@@ -75,8 +77,9 @@ and TUI canvas escapes (which emit explicit `'\r\n'` already) without
 needing the caller to know which kind of byte it's writing.
 
 The stateful tracking is per-transport-instance via a `prev_was_cr`
-flag in the transport's static state. In multi-session mode (U.5/U.6)
-this becomes per-session.
+flag. For multi-instance TCP it lives in the per-connection `ctx`
+(so two sessions don't share LF→CRLF state); for the single-instance
+pipe/pty transports it's a static.
 
 ## Available transports
 
@@ -114,15 +117,18 @@ terminal emulator: `screen /dev/pts/N`, `minicom -D /dev/pts/N`, etc.
 
 ### `--tcp=<port>` — TCP socket
 
-Listens on the given port, accepts the first connection, that
-socket is the transport. Cross-platform: BSD sockets on POSIX,
-WinSock2 on native Windows.
+Listens on the given port; each accepted connection becomes a
+session. Cross-platform: BSD sockets on POSIX, WinSock2 on native
+Windows. Repeatable: pass `--tcp=` multiple times for multiple
+simultaneous sessions (see Multi-session below).
 
 - Available: all platforms (POSIX + native Windows via WinSock)
 - `is_terminal`: true
 - `set_raw`: no-op (TCP has no line discipline; the client owns
   its own terminal mode)
 - `flush`: no-op
+- Multi-instance: per-connection state (sockets, LF→CRLF) lives
+  behind the vtable `ctx`, so N transports coexist
 - Sets `TCP_NODELAY` for low-latency interactive use
 - Sets `SO_REUSEADDR` for quick restarts
 
@@ -131,12 +137,12 @@ auto-detects MSYS/MINGW environments and links it.
 
 ## Comparison
 
-| Transport | Platforms       | Network? | TTY semantics | Use case                       |
-|-----------|-----------------|----------|---------------|--------------------------------|
-| stdio     | all             | no       | inherited     | default; running from a shell  |
-| pipe      | Windows/Cygwin  | local    | none          | PuTTY/serial-like UX on Windows |
-| pty       | POSIX           | no       | real          | screen/minicom on Linux        |
-| tcp       | all             | yes      | none          | remote shells, demo of N hosts |
+| Transport | Platforms       | Network? | TTY semantics | Multi? | Use case                        |
+|-----------|-----------------|----------|---------------|--------|---------------------------------|
+| stdio     | all             | no       | inherited     | no     | default; running from a shell   |
+| pipe      | Windows/Cygwin  | local    | none          | no     | PuTTY/serial-like UX on Windows |
+| pty       | POSIX           | no       | real          | no     | screen/minicom on Linux         |
+| tcp       | all             | yes      | none          | yes    | remote shells, N-session demo   |
 
 ## Adding a new transport
 
@@ -214,41 +220,80 @@ they all go through the same vtable.
   the host's. The shim layer at the top of host.c needs one more
   `#ifdef` branch for lwIP.
 
-## Multi-session (round U.5 / U.6)
+## Multi-session
 
-Today there is **one active transport** at a time. The TUI service
-has globals (canvas, pen state, input parser) that are likewise
-singletons. Round U.5 makes those globals per-session (keyed by
-VM id). Round U.6 lets the host accept multiple transport
-instances simultaneously, spawning a fresh shell VM per connection.
+One host process can run **N independent shell sessions**, each on
+its own transport, each with its own canvas, pen state, and input
+parser. This works today.
 
-The vtable doesn't change. What changes:
+### Usage
 
-- `vm_host_set_transport` becomes `vm_host_set_transport_for_vm(vm_id, t)`
-  with the old single-arg form preserved as backward-compat
-- TUI globals (`g_canvas`, `g_pen_*`, `g_in_state`, ...) move into
-  a `VmTuiSession` struct, one per VM that has called `SYS_TUI_INIT`
-- The input parser's "byte arrived" path looks up which session
-  the bytes came from (by which transport delivered them) and
-  feeds that session's parser
-- Owner-lock (`g_owner_vm` returning `-EBUSY`) is relaxed: each
-  session has its own owner
+```
+./host --tcp=5678 --tcp=5679 --tcp=5680
+```
 
-User-facing wins after U.5/U.6:
-- Multiple PuTTY connections to one host process, each with its
-  own shell, history, and TUI surface
-- Demo case: one Pi running `host --tcp=5678 --tcp=5679 --tcp=5680`
-  serves three independent shell sessions
-- MCU case: one STM32 with UART + USB CDC + Ethernet TCP simultaneously
-  serves three concurrent users
+Three TCP listeners come up. As each client connects (`nc localhost
+5678`, etc.), a shell VM is spawned and bound to that connection.
+Each session is fully independent — separate cwd, history, and TUI
+surface. A TUI program launched in one session (snake, car) renders
+only to that session's client.
+
+Up to `MAX_TCP_PORTS` (16) `--tcp=` ports are accepted. `--pipe` and
+`--pty` remain single-instance and can't be combined with `--tcp` or
+each other (multi-instancing them is a future refinement; TCP is the
+demo-relevant multi case).
+
+### Lifecycle
+
+The host runs until every port has had a client **and** all spawned
+shells have exited. Ports that never get a client keep their
+listeners open — Ctrl-C to abort. This matches the demo flow: launch
+the host, connect your clients, they each `exit`, the host exits with
+the last one. Reconnect-after-exit is a future refinement.
+
+### How it works
+
+- **Per-VM transport routing** (U.6): `vm_host_set_transport_for_vm(vm_id, t)`
+  binds a transport to a specific VM. Every I/O site resolves the
+  transport via the calling VM. The old single-arg
+  `vm_host_set_transport(t)` still works and sets a process default;
+  lookup precedence is per-VM → default → legacy stdio.
+
+- **Caller-provided session pool** (U.7a): the host supplies backing
+  storage via `vm_host_tui_set_pool(pool, count)`. Each VM that calls
+  `SYS_TUI_INIT` is allocated a slot, freed on shutdown/exit. The
+  build sizes the pool to its RAM budget — 1-2 sessions in internal
+  SRAM on a bare MCU, 16 in external SDRAM or freely on a PC. Per
+  session is ~33 KB at the default 30×80 canvas.
+
+- **Multi-instance TCP** (U.7b): each TCP transport's per-connection
+  state (sockets, LF→CRLF tracking) lives behind the vtable's `ctx`
+  pointer, so N transports coexist. pipe/pty stay single-instance.
+
+- **Spawn inheritance** (U.7b): when a shell spawns a child VM (e.g.
+  running `snake.elf`), the child inherits the parent's transport
+  binding — otherwise the spawned program's canvas output would
+  resolve to no transport and vanish.
+
+### MCU mapping
+
+On the eventual STM32 target, the same machinery maps a UART, a USB
+CDC ACM endpoint, and an Ethernet TCP socket each to a session — so
+one board can serve a local serial console and a remote network shell
+at once, sized by a pool that fits the chip's RAM.
 
 ## Round U progress
 
 ```
-U.1  ✅  TUI output hook (quick fix; superseded by U.2)
-U.2  ✅  Unified transport interface
-U.3  ✅  POSIX pty transport
-U.4  ✅  TCP socket transport
-U.5  ⏳  Per-VM TUI canvas + input parser state
-U.6      Multi-session orchestration
+U.1   ✅  TUI output hook (quick fix; superseded by U.2)
+U.2   ✅  Unified transport interface
+U.3   ✅  POSIX pty transport
+U.4   ✅  TCP socket transport
+U.5a  ✅  Transports design doc
+U.5   ✅  Per-VM TUI session struct
+U.6   ✅  Per-VM transport routing
+U.7a  ✅  Caller-provided session pool + per-VM resolution
+U.7b  ✅  Multi-session orchestration
 ```
+
+Round U is complete.
