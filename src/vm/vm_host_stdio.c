@@ -650,6 +650,29 @@ static void handle_read(VmCpu *cpu, void *system) {
         return;
     }
 
+#ifdef _WIN32
+    /* On native Windows a console in raw/VT mode is NOT readable via
+     * the MSVCRT read() shim with POSIX non-blocking semantics — that
+     * path returns 0/-1 spuriously and the shell mistakes it for EOF
+     * ("stdin closed" the moment you launch from cmd/PowerShell). When
+     * we put the console into raw mode ourselves (g_win32_raw_active),
+     * read through the Win32 console reader, which uses
+     * WaitForSingleObject + ReadFile and returns:
+     *   >0  bytes read
+     *    0  no input ready right now (NOT eof)
+     *   <0  genuine error
+     * Mirror those into the guest a0 the same way the rest of this
+     * handler does. This is the read counterpart to the win32 routing
+     * already present in vm_host_stdio_read_bytes_nonblock(). */
+    if (g_win32_raw_active) {
+        int wr = vm_host_stdio_win32_read_bytes_nonblock(src_fd, host_buf, n);
+        if (wr > 0)      cpu->regs[VM_REG_A0] = (uint32_t)wr;
+        else if (wr == 0) cpu->regs[VM_REG_A0] = 0;             /* no data */
+        else              cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EIO);
+        return;
+    }
+#endif
+
     ssize_t r = read(src_fd, host_buf, n);
     if (r > 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)r;
