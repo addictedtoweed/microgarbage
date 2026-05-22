@@ -259,7 +259,8 @@ static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
     if (inicfg_get_int(cfg, "memory", "local_kb", &lv)) {
         if (lv < 32 || lv > (long)(LOCAL_BYTES / 1024)) {
             fprintf(stderr, "vm.cfg: [memory] local_kb=%ld out of range "
-                    "(32..%zu)\n", lv, (size_t)(LOCAL_BYTES / 1024));
+                    "(32..%llu)\n", lv,
+                    (unsigned long long)(LOCAL_BYTES / 1024));
             return false;
         }
         hc->local_bytes = (size_t)lv * 1024;
@@ -267,7 +268,8 @@ static bool apply_inicfg(const IniCfg *cfg, HostConfig *hc) {
     if (inicfg_get_int(cfg, "memory", "shared_kb", &lv)) {
         if (lv < 8 || lv > (long)(SHARED_BYTES / 1024)) {
             fprintf(stderr, "vm.cfg: [memory] shared_kb=%ld out of range "
-                    "(8..%zu)\n", lv, (size_t)(SHARED_BYTES / 1024));
+                    "(8..%llu)\n", lv,
+                    (unsigned long long)(SHARED_BYTES / 1024));
             return false;
         }
         hc->shared_bytes = (size_t)lv * 1024;
@@ -1391,16 +1393,16 @@ int main(int argc, char **argv) {
      * silently clamped or wrapping). */
     if (cli_local_kb >= 0) {
         if (cli_local_kb < 32 || cli_local_kb > (long)(LOCAL_BYTES / 1024)) {
-            fprintf(stderr, "host: --local-kb=%ld out of range (32..%zu)\n",
-                    cli_local_kb, (size_t)(LOCAL_BYTES / 1024));
+            fprintf(stderr, "host: --local-kb=%ld out of range (32..%llu)\n",
+                    cli_local_kb, (unsigned long long)(LOCAL_BYTES / 1024));
             return 1;
         }
         hc.local_bytes = (size_t)cli_local_kb * 1024;
     }
     if (cli_shared_kb >= 0) {
         if (cli_shared_kb < 8 || cli_shared_kb > (long)(SHARED_BYTES / 1024)) {
-            fprintf(stderr, "host: --shared-kb=%ld out of range (8..%zu)\n",
-                    cli_shared_kb, (size_t)(SHARED_BYTES / 1024));
+            fprintf(stderr, "host: --shared-kb=%ld out of range (8..%llu)\n",
+                    cli_shared_kb, (unsigned long long)(SHARED_BYTES / 1024));
             return 1;
         }
         hc.shared_bytes = (size_t)cli_shared_kb * 1024;
@@ -1556,10 +1558,11 @@ int main(int argc, char **argv) {
     };
     if (!vm_system_init(&sys, &cfg)) {
         fprintf(stderr, "host: vm_system_init failed "
-                "(local=%zu shared=%zu max_vms=%u spawn_data_kb=%u — "
+                "(local=%llu shared=%llu max_vms=%u spawn_data_kb=%u — "
                 "try smaller values in vm.cfg or via --max-vms / "
                 "--spawn-data-kb)\n",
-                hc.local_bytes, hc.shared_bytes,
+                (unsigned long long)hc.local_bytes,
+                (unsigned long long)hc.shared_bytes,
                 (unsigned)hc.max_vms, (unsigned)hc.spawn_data_kb);
         return 1;
     }
