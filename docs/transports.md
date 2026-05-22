@@ -135,6 +135,30 @@ simultaneous sessions (see Multi-session below).
 Build: native Windows requires `-lws2_32`. The Linux `build.sh`
 auto-detects MSYS/MINGW environments and links it.
 
+#### Connecting with PuTTY (important)
+
+Use connection type **Raw** (you're talking to a bare socket, not
+SSH/telnet). Because Raw mode has no protocol to negotiate terminal
+behavior, PuTTY guesses — and for Raw it usually guesses wrong, so
+set these explicitly under **Terminal**:
+
+- **Local echo: Force off**
+- **Local line editing: Force off**
+
+If you leave them on (the Raw-mode default), PuTTY echoes everything
+*it* sends back to its own screen and buffers a whole line before
+sending it. Symptoms: Tab shows as `^I` instead of completing,
+Ctrl-C shows as `^C`, the games' mouse reports flood the screen as
+`^[[<32;..M` text, and the shell's character-at-a-time line editing
+doesn't work because PuTTY only sends on Enter. With both forced
+off, PuTTY sends each keystroke raw and the shell behaves correctly.
+
+This is purely a client setting — the host can't force it over a raw
+socket (no negotiation channel). `nc` doesn't have this problem
+because it never echoes or line-buffers, but `nc` also can't render
+mouse or colors well; PuTTY (configured as above) is the better
+interactive client.
+
 ## Comparison
 
 | Transport | Platforms       | Network? | TTY semantics | Multi? | Use case                        |
