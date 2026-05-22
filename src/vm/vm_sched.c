@@ -385,6 +385,22 @@ static uint32_t effective_quantum(const VmSched *s, uint16_t vm_id,
 VmSchedStepResult vm_sched_step(VmSched *s) {
     if (!s) return VM_SCHED_ALL_HALTED;
 
+    /* 0. If the host provides a wall-clock tick_source, sample it
+     *    NOW — before waking timers — so deadlines are evaluated
+     *    against current time even when no VM runs this step. Without
+     *    this, global_tick only advanced inside the run-a-VM branch
+     *    below, so when EVERY VM was blocked (e.g. a parked shell that
+     *    spawned a child + a child sleeping between frames) the clock
+     *    froze and sleeping VMs never woke — the classic "spawned TUI
+     *    game renders its first frame then hangs" deadlock introduced
+     *    once spawn became async (the parent no longer busy-runs).
+     *    With no tick_source, ticks == retired instructions, which
+     *    can only advance by running a VM, so there's nothing to do
+     *    here in that mode. */
+    if (s->config.tick_source) {
+        s->global_tick = s->config.tick_source(s->config.tick_source_userdata);
+    }
+
     /* 1. Wake any blocked VMs whose deadlines have passed. */
     (void)wake_expired_timeouts(s);
 
