@@ -185,6 +185,69 @@ typedef struct {
 } VmTuiEventRecord;
 
 /* ============================================================
+ *  Session (round U.5/U.7)
+ *
+ *  All per-session TUI state. The host provides backing storage
+ *  for one or more of these via vm_host_tui_set_pool(); each VM
+ *  that calls SYS_TUI_INIT is bound to one. The struct is exposed
+ *  here (rather than kept opaque) precisely so the host can size
+ *  a static array of them and decide where that memory lives —
+ *  internal SRAM for 1-2 sessions, external SDRAM for many.
+ *
+ *  Per-session size is dominated by the two canvas buffers:
+ *    2 * VM_TUI_MAX_ROWS * VM_TUI_MAX_COLS * sizeof(HostCell).
+ *  At the default 30x80 that's ~33 KB. A future round will allow
+ *  sizing the canvas to the requested dimensions instead of the
+ *  compile-time max, which shrinks small terminals further.
+ * ============================================================ */
+
+/* On-host cell: mirrors the guest's TuiCell wire layout. */
+typedef struct {
+    char     c;
+    uint16_t fg;
+    uint16_t bg;
+    uint8_t  attrs;
+    uint8_t  flags;
+} __attribute__((packed)) VmTuiHostCell;
+
+#ifndef VM_TUI_IN_BUF_CAP
+#define VM_TUI_IN_BUF_CAP 256
+#endif
+#ifndef VM_TUI_MAX_CSI_PARAMS
+#define VM_TUI_MAX_CSI_PARAMS 6
+#endif
+
+typedef struct VmTuiSession {
+    uint16_t owner_vm;       /* UINT16_MAX = free slot */
+    bool     initialized;
+    unsigned flags;
+
+    int rows, cols;
+
+    VmTuiHostCell canvas[VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
+    VmTuiHostCell front [VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
+    bool     front_valid;
+
+    bool raw_mode_we_set;
+
+    uint16_t pen_fg, pen_bg;
+    uint8_t  pen_attrs;
+
+    int cur_row, cur_col;
+    int clip_r, clip_c, clip_h, clip_w;
+
+    uint8_t  in_buf[VM_TUI_IN_BUF_CAP];
+    unsigned in_head, in_tail;
+
+    int  in_state;
+    int  csi_params[VM_TUI_MAX_CSI_PARAMS];
+    int  csi_n_params, csi_curr;
+    bool csi_has_curr;
+    char csi_intermediate;
+    int  esc_idle_polls;
+} VmTuiSession;
+
+/* ============================================================
  *  Installation
  * ============================================================ */
 
@@ -200,6 +263,33 @@ bool vm_host_install_tui(VmSystem *sys);
  * the VM didn't own the canvas. Also frees any tiles the
  * VM allocated. */
 void vm_host_tui_release_for_vm(uint16_t vm_id);
+
+/* ============================================================
+ *  Session pool (round U.7)
+ *
+ *  Provide backing storage for sessions. The host owns the
+ *  memory; the TUI module never allocates. Call once at startup,
+ *  before any VM runs.
+ *
+ *    Dev host:   static VmTuiSession pool[16];
+ *                vm_host_tui_set_pool(pool, 16);
+ *
+ *    MCU+SDRAM:  put the array in an SDRAM linker section, then
+ *                vm_host_tui_set_pool(pool, 16);
+ *
+ *    MCU bare:   static VmTuiSession pool[2];
+ *                vm_host_tui_set_pool(pool, 2);
+ *
+ *  If never called, the module falls back to a single built-in
+ *  session — exactly the pre-U.7 single-shell behavior. So
+ *  existing demos that don't call this keep working unchanged.
+ *
+ *  Sessions are allocated lazily: a VM gets a slot on its first
+ *  SYS_TUI_INIT and releases it at SYS_TUI_SHUTDOWN or VM exit.
+ *  When the pool is exhausted, further SYS_TUI_INIT calls return
+ *  -EBUSY to the guest.
+ * ============================================================ */
+void vm_host_tui_set_pool(VmTuiSession *pool, unsigned count);
 
 /* ============================================================
  *  Output transport hook (round U.1)

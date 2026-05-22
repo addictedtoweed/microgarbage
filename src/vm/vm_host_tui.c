@@ -88,105 +88,144 @@ static void             hwrite(int fd, const void *p, size_t n);
  *  migrate to using it instead of touching g_session directly.
  * ============================================================ */
 
-/* The TuiCell layout matches the guest's: 6 bytes packed. */
-typedef struct {
-    char     c;
-    uint16_t fg;
-    uint16_t bg;
-    uint8_t  attrs;
-    uint8_t  flags;
-} __attribute__((packed)) HostCell;
+/* HostCell is the header's VmTuiHostCell; alias to keep the
+ * ~100 references in this file unchanged. */
+typedef VmTuiHostCell HostCell;
 
-#define VM_TUI_IN_BUF_CAP   256
-#define VM_TUI_MAX_CSI_PARAMS 6
+/* The VmTuiSession struct now lives in vm_host_tui.h (the host
+ * needs its size to declare a pool). IN_BUF_CAP / MAX_CSI_PARAMS
+ * also come from the header. */
 
-typedef struct VmTuiSession {
-    /* Canvas owner. UINT16_MAX = no owner; SYS_TUI_INIT records
-     * the caller's vm_id, SYS_TUI_SHUTDOWN clears it. Non-owners
-     * get -EBUSY from TUI syscalls (POLL_EVENT excepted — non-
-     * owners see an empty event queue, no error). */
-    uint16_t owner_vm;
-    bool     initialized;
-    unsigned flags;
+/* ============================================================
+ *  Session pool (round U.7)
+ *
+ *  The host provides the backing storage for sessions via
+ *  vm_host_tui_set_pool(pool, count). This matches the platform's
+ *  caller-feeds-memory philosophy (slab, bump, trashdrive all work
+ *  this way): the build that knows its RAM budget decides how many
+ *  sessions to allow, and where that memory lives.
+ *
+ *    Dev host:   static VmTuiSession pool[16];   (~1.7 MB, free)
+ *    MCU+SDRAM:  pool in external SDRAM section   (16 sessions, cheap)
+ *    MCU bare:   static VmTuiSession pool[2];     (~222 KB internal)
+ *
+ *  If the host never calls set_pool, we fall back to a single
+ *  built-in session (g_fallback_session) so existing single-shell
+ *  demos work unchanged — they get exactly the U.5/U.6 behavior.
+ *
+ *  Session-to-VM binding: each session's owner_vm records which VM
+ *  owns it. cur_session() resolves the session for the VM that's
+ *  currently executing a TUI ECALL (tracked by g_current_vm, set
+ *  at handler entry). A VM's session is allocated lazily on its
+ *  first SYS_TUI_INIT and freed at SYS_TUI_SHUTDOWN / VM exit.
+ * ============================================================ */
 
-    /* Active canvas dimensions (1..VM_TUI_MAX_*). Set at init. */
-    int rows;
-    int cols;
+static VmTuiSession  g_fallback_session;
+static VmTuiSession *g_pool       = NULL;
+static unsigned      g_pool_count = 0;
 
-    /* Back + front buffer pair. The back buffer is what guests
-     * draw into; the front buffer holds what's currently on the
-     * terminal. present_diff compares them to compute the minimal
-     * output. */
-    HostCell canvas[VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
-    HostCell front [VM_TUI_MAX_ROWS][VM_TUI_MAX_COLS];
-    bool     front_valid;
+/* The VM currently executing a TUI ECALL. Set at the top of every
+ * handler (see TUI_ENTER). UINT16_MAX when no handler is active —
+ * which only happens during the atexit/unload paths, where we use
+ * the most-recently-active session. */
+static uint16_t g_current_vm = UINT16_MAX;
 
-    /* Did THIS session toggle raw mode on at init? If so, we
-     * un-toggle on shutdown. If the caller's tty was already raw
-     * before init, we don't un-toggle. */
-    bool raw_mode_we_set;
-
-    /* Pen — current fg/bg/attr for OP_PUTC / OP_PUTS / OP_FILL. */
-    uint16_t pen_fg;
-    uint16_t pen_bg;
-    uint8_t  pen_attrs;
-
-    /* Notional cursor (1-indexed). Doesn't drive the terminal
-     * cursor directly; it's what OP_MOVE / OP_PUTC operate on. */
-    int cur_row;
-    int cur_col;
-
-    /* Clip rect (1-indexed). h/w default to full canvas. */
-    int clip_r, clip_c, clip_h, clip_w;
-
-    /* Input buffer (ring; head <= tail, wraps at IN_BUF_CAP). */
-    uint8_t  in_buf[VM_TUI_IN_BUF_CAP];
-    unsigned in_head;
-    unsigned in_tail;
-
-    /* Input parser state machine. */
-    int  in_state;
-    int  csi_params[VM_TUI_MAX_CSI_PARAMS];
-    int  csi_n_params;
-    int  csi_curr;
-    bool csi_has_curr;
-    char csi_intermediate;
-    int  esc_idle_polls;
-} VmTuiSession;
-
-static VmTuiSession g_session = {
-    .owner_vm        = UINT16_MAX,
-    .initialized     = false,
-    .flags           = 0,
-    .rows            = VM_TUI_MAX_ROWS,
-    .cols            = VM_TUI_MAX_COLS,
-    .front_valid     = false,
-    .raw_mode_we_set = false,
-    .pen_fg          = VM_TUI_DEFAULT_COLOR,
-    .pen_bg          = VM_TUI_DEFAULT_COLOR,
-    .pen_attrs       = VM_TUI_ATTR_NONE,
-    .cur_row         = 1,
-    .cur_col         = 1,
-    .clip_r          = 1,
-    .clip_c          = 1,
-    .clip_h          = VM_TUI_MAX_ROWS,
-    .clip_w          = VM_TUI_MAX_COLS,
-    .in_head         = 0,
-    .in_tail         = 0,
-    .in_state        = 0,   /* IN_STATE_GROUND — defined below */
-    .csi_n_params    = 0,
-    .csi_curr        = 0,
-    .csi_has_curr    = false,
-    .csi_intermediate= 0,
-    .esc_idle_polls  = 0,
-};
-
-/* In U.5, the "current session" is always &g_session. U.6 will
- * make this a (vm_id → session) lookup. ECALL handlers use this
- * accessor so the U.6 migration is local to one function. */
-static inline VmTuiSession *cur_session(void) {
-    return &g_session;
+/* One-time init of a session to its default (cleared) state. */
+static void session_reset(VmTuiSession *s) {
+    memset(s, 0, sizeof(*s));
+    s->owner_vm        = UINT16_MAX;
+    s->initialized     = false;
+    s->flags           = 0;
+    s->rows            = VM_TUI_MAX_ROWS;
+    s->cols            = VM_TUI_MAX_COLS;
+    s->front_valid     = false;
+    s->raw_mode_we_set = false;
+    s->pen_fg          = VM_TUI_DEFAULT_COLOR;
+    s->pen_bg          = VM_TUI_DEFAULT_COLOR;
+    s->pen_attrs       = VM_TUI_ATTR_NONE;
+    s->cur_row         = 1;
+    s->cur_col         = 1;
+    s->clip_r          = 1;
+    s->clip_c          = 1;
+    s->clip_h          = VM_TUI_MAX_ROWS;
+    s->clip_w          = VM_TUI_MAX_COLS;
+    /* in_* and csi_* are zeroed by memset, which matches their
+     * defaults (IN_STATE_GROUND == 0). */
 }
+
+void vm_host_tui_set_pool(VmTuiSession *pool, unsigned count) {
+    g_pool       = pool;
+    g_pool_count = count;
+    for (unsigned i = 0; i < count; i++) session_reset(&pool[i]);
+}
+
+/* The fallback session is statically zero-initialized, which
+ * means its owner_vm starts at 0 — but 0 is a VALID vm_id, so we
+ * must explicitly mark it free (UINT16_MAX) before first use.
+ * This flag drives a one-time fixup. */
+static bool g_fallback_inited = false;
+
+static void fallback_init_once(void) {
+    if (!g_fallback_inited) {
+        g_fallback_session.owner_vm = UINT16_MAX;
+        g_fallback_inited = true;
+    }
+}
+
+/* Find the session owned by vm_id, or NULL if none. */
+static VmTuiSession *session_find(uint16_t vm_id) {
+    if (!g_pool) {
+        fallback_init_once();
+        return (g_fallback_session.owner_vm == vm_id)
+                   ? &g_fallback_session : NULL;
+    }
+    for (unsigned i = 0; i < g_pool_count; i++) {
+        if (g_pool[i].owner_vm == vm_id) return &g_pool[i];
+    }
+    return NULL;
+}
+
+/* Allocate a session for vm_id (or return its existing one).
+ * Returns NULL if the pool is full. */
+static VmTuiSession *session_alloc(uint16_t vm_id) {
+    VmTuiSession *existing = session_find(vm_id);
+    if (existing) return existing;
+
+    if (!g_pool) {
+        /* Single fallback session. Available only if unowned. */
+        if (g_fallback_session.owner_vm == UINT16_MAX) {
+            session_reset(&g_fallback_session);
+            return &g_fallback_session;
+        }
+        return NULL;
+    }
+    for (unsigned i = 0; i < g_pool_count; i++) {
+        if (g_pool[i].owner_vm == UINT16_MAX) {
+            session_reset(&g_pool[i]);
+            return &g_pool[i];
+        }
+    }
+    return NULL;   /* pool full */
+}
+
+/* The session for whichever VM is currently in a TUI ECALL.
+ * Falls back to the fallback session (or pool slot 0) when no
+ * handler context is active or the VM has no session yet — this
+ * keeps init-time and teardown-time accesses safe. */
+static VmTuiSession *cur_session(void) {
+    if (g_current_vm != UINT16_MAX) {
+        VmTuiSession *s = session_find(g_current_vm);
+        if (s) return s;
+    }
+    /* No active session for the current VM. Return a stable
+     * scratch session so accesses don't crash; its owner_vm
+     * stays UINT16_MAX so it's never mistaken for a real one. */
+    return g_pool ? &g_pool[0] : &g_fallback_session;
+}
+
+/* Set/clear the current-VM context. Called at handler entry/exit. */
+static inline void tui_enter(uint16_t vm_id) { g_current_vm = vm_id; }
+static inline void tui_leave(void)           { g_current_vm = UINT16_MAX; }
 
 /* ============================================================
  *  Transport-routing helpers (used by every hwrite-callsite
@@ -200,8 +239,9 @@ static inline VmTuiSession *cur_session(void) {
  * has an owner yet (TUI never initialized), falls back to the
  * default transport so init-time output still works. */
 static VmHostTransport *hresolve_transport(void) {
-    if (g_session.owner_vm != UINT16_MAX) {
-        VmHostTransport *t = vm_host_get_transport_for_vm(g_session.owner_vm);
+    VmTuiSession *s = cur_session();
+    if (s->owner_vm != UINT16_MAX) {
+        VmHostTransport *t = vm_host_get_transport_for_vm(s->owner_vm);
         if (t) return t;
     }
     return vm_host_get_transport();
@@ -238,47 +278,50 @@ static void hwrite(int fd, const void *p, size_t n) {
 
 /* Forward decl for atexit hook + raw mode reset. */
 static void do_shutdown(void);
+static void tui_atexit_shutdown_all(void);
 
-/* Compatibility shims: the existing code below uses the old
- * global names extensively (~160 references). Rather than churn
- * every reference at the same time as introducing the struct,
- * we keep the old names working via #define indirection. U.6
- * will remove these in favor of explicit cur_session()->field
- * accesses; for now they keep the diff focused on STATE LAYOUT,
- * not access syntax.
+/* Compatibility shims (round U.5, repointed in U.7): the code
+ * below uses the old global names extensively (~160 references).
+ * In U.5 they aliased a single g_session. In U.7 they resolve
+ * through cur_session(), which returns the session owned by the
+ * VM currently in a TUI ECALL (tracked by g_current_vm).
  *
- * Care: any local variable in this file named after a shim macro
- * will silently rewrite — check before adding locals like `flags`,
- * `rows`, `cols`, `cur_row`, `cur_col`. We grepped at the time of
- * the refactor; no collisions today. */
-#define g_owner_vm           (g_session.owner_vm)
-#define g_initialized        (g_session.initialized)
-#define g_flags              (g_session.flags)
-#define g_rows               (g_session.rows)
-#define g_cols               (g_session.cols)
-#define g_raw_mode_we_set    (g_session.raw_mode_we_set)
-#define g_pen_fg             (g_session.pen_fg)
-#define g_pen_bg             (g_session.pen_bg)
-#define g_pen_attrs          (g_session.pen_attrs)
-#define g_cur_row            (g_session.cur_row)
-#define g_cur_col            (g_session.cur_col)
-#define g_clip_r             (g_session.clip_r)
-#define g_clip_c             (g_session.clip_c)
-#define g_clip_h             (g_session.clip_h)
-#define g_clip_w             (g_session.clip_w)
-#define g_canvas             (g_session.canvas)
-#define g_front              (g_session.front)
-#define g_front_valid        (g_session.front_valid)
-#define g_in_buf             (g_session.in_buf)
-#define g_in_head            (g_session.in_head)
-#define g_in_tail            (g_session.in_tail)
-#define g_in_state           (g_session.in_state)
-#define g_csi_params         (g_session.csi_params)
-#define g_csi_n_params       (g_session.csi_n_params)
-#define g_csi_curr           (g_session.csi_curr)
-#define g_csi_has_curr       (g_session.csi_has_curr)
-#define g_csi_intermediate   (g_session.csi_intermediate)
-#define g_esc_idle_polls     (g_session.esc_idle_polls)
+ * This is the trick that kept U.7 from becoming a 160-site manual
+ * edit: the access SYNTAX stays `g_owner_vm`, but the TARGET is
+ * now per-VM. Correctness rests on g_current_vm being set (via
+ * tui_enter) before any of these are touched — which every ECALL
+ * handler does at its top.
+ *
+ * Care: any local named after a shim macro silently rewrites.
+ * Checked at refactor time; no collisions. */
+#define g_owner_vm           (cur_session()->owner_vm)
+#define g_initialized        (cur_session()->initialized)
+#define g_flags              (cur_session()->flags)
+#define g_rows               (cur_session()->rows)
+#define g_cols               (cur_session()->cols)
+#define g_raw_mode_we_set    (cur_session()->raw_mode_we_set)
+#define g_pen_fg             (cur_session()->pen_fg)
+#define g_pen_bg             (cur_session()->pen_bg)
+#define g_pen_attrs          (cur_session()->pen_attrs)
+#define g_cur_row            (cur_session()->cur_row)
+#define g_cur_col            (cur_session()->cur_col)
+#define g_clip_r             (cur_session()->clip_r)
+#define g_clip_c             (cur_session()->clip_c)
+#define g_clip_h             (cur_session()->clip_h)
+#define g_clip_w             (cur_session()->clip_w)
+#define g_canvas             (cur_session()->canvas)
+#define g_front              (cur_session()->front)
+#define g_front_valid        (cur_session()->front_valid)
+#define g_in_buf             (cur_session()->in_buf)
+#define g_in_head            (cur_session()->in_head)
+#define g_in_tail            (cur_session()->in_tail)
+#define g_in_state           (cur_session()->in_state)
+#define g_csi_params         (cur_session()->csi_params)
+#define g_csi_n_params       (cur_session()->csi_n_params)
+#define g_csi_curr           (cur_session()->csi_curr)
+#define g_csi_has_curr       (cur_session()->csi_has_curr)
+#define g_csi_intermediate   (cur_session()->csi_intermediate)
+#define g_esc_idle_polls     (cur_session()->esc_idle_polls)
 
 /* ============================================================
  *  Internal: bounds + drawable check
@@ -332,20 +375,33 @@ static void canvas_clear(void) {
  * ============================================================ */
 
 static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
-    /* If someone else owns the canvas, refuse. If the same VM
-     * inits twice, treat as idempotent (no-op). */
-    if (g_owner_vm != UINT16_MAX && g_owner_vm != vm_id) {
+    /* Round U.7: each VM gets its OWN session. Allocate (or find)
+     * this VM's session and make it current before touching any
+     * shim-macro state. The old "one global canvas, -EBUSY for
+     * everyone else" lock is gone — multiple VMs can each own a
+     * session simultaneously, one per transport. The only refusal
+     * now is pool exhaustion. */
+    tui_enter(vm_id);
+    VmTuiSession *s = session_alloc(vm_id);
+    if (!s) {
+        /* Pool full — no free session for this VM. */
+        tui_leave();
         return -VM_EBUSY;
     }
+    s->owner_vm = vm_id;
 
     /* Register an atexit hook on the FIRST init we ever do.
-     * If the host process exits while a guest still owns the
+     * If the host process exits while a guest still owns a
      * canvas (Ctrl-C, fatal error, etc.), this restores the
      * terminal so the parent shell doesn't inherit alt-screen,
-     * raw mode, mouse reporting, or hidden cursor. */
+     * raw mode, mouse reporting, or hidden cursor.
+     *
+     * U.7: the atexit hook shuts down ALL active sessions, not
+     * just the "current" one — at process exit there may be
+     * several, and g_current_vm is meaningless. */
     static bool atexit_registered = false;
     if (!atexit_registered) {
-        atexit(do_shutdown);
+        atexit(tui_atexit_shutdown_all);
         atexit_registered = true;
     }
 
@@ -457,6 +513,30 @@ static void do_shutdown(void) {
     g_initialized = false;
     g_owner_vm    = UINT16_MAX;
     g_flags       = 0;
+}
+
+/* Shut down every active session. Called from atexit at process
+ * exit, when several sessions may be live and there's no single
+ * "current" VM. Iterates the pool (or the lone fallback session),
+ * making each owned session current in turn and tearing it down so
+ * its terminal state (alt-screen, raw mode, mouse, cursor) is
+ * restored. */
+static void tui_atexit_shutdown_all(void) {
+    if (!g_pool) {
+        if (g_fallback_session.owner_vm != UINT16_MAX) {
+            tui_enter(g_fallback_session.owner_vm);
+            do_shutdown();
+            tui_leave();
+        }
+        return;
+    }
+    for (unsigned i = 0; i < g_pool_count; i++) {
+        if (g_pool[i].owner_vm != UINT16_MAX) {
+            tui_enter(g_pool[i].owner_vm);
+            do_shutdown();
+            tui_leave();
+        }
+    }
 }
 
 /* ============================================================
@@ -1503,6 +1583,7 @@ static int32_t tile_grab(TileSlot *s, int src_row, int src_col, int h, int w) {
 
 static void handle_tui_init(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     int rows = (int)cpu->regs[VM_REG_A0];
     int cols = (int)cpu->regs[VM_REG_A1];
     unsigned flags = cpu->regs[VM_REG_A2];
@@ -1512,6 +1593,7 @@ static void handle_tui_init(VmCpu *cpu, void *system) {
 
 static void handle_tui_shutdown(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     /* Only owner can shut down. Non-owners no-op succeed. */
     if (g_owner_vm == cpu->vm_id) do_shutdown();
     cpu->regs[VM_REG_A0] = 0;
@@ -1519,12 +1601,14 @@ static void handle_tui_shutdown(VmCpu *cpu, void *system) {
 
 static void handle_tui_get_dims(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (!g_initialized) { cpu->regs[VM_REG_A0] = 0; return; }
     cpu->regs[VM_REG_A0] = (uint32_t)((g_rows << 16) | g_cols);
 }
 
 static void handle_tui_present(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1535,6 +1619,7 @@ static void handle_tui_present(VmCpu *cpu, void *system) {
 
 static void handle_tui_present_diff(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1545,6 +1630,7 @@ static void handle_tui_present_diff(VmCpu *cpu, void *system) {
 
 static void handle_tui_poll_event(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     uint32_t out_addr = cpu->regs[VM_REG_A0];
 
     if (g_owner_vm != cpu->vm_id) {
@@ -1575,6 +1661,7 @@ static void handle_tui_poll_event(VmCpu *cpu, void *system) {
 
 static void handle_tui_flush_draw(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     uint32_t buf_addr = cpu->regs[VM_REG_A0];
     uint32_t buf_len  = cpu->regs[VM_REG_A1];
 
@@ -1611,6 +1698,7 @@ static void handle_tui_flush_draw(VmCpu *cpu, void *system) {
 
 static void handle_tile_create(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1627,6 +1715,7 @@ static void handle_tile_create(VmCpu *cpu, void *system) {
 
 static void handle_tile_destroy(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1644,6 +1733,7 @@ static void handle_tile_destroy(VmCpu *cpu, void *system) {
  */
 static void handle_tile_set(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1673,6 +1763,7 @@ static void handle_tile_set(VmCpu *cpu, void *system) {
  */
 static void handle_tile_fill(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1693,6 +1784,7 @@ static void handle_tile_fill(VmCpu *cpu, void *system) {
 
 static void handle_tile_set_transparent(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1707,6 +1799,7 @@ static void handle_tile_set_transparent(VmCpu *cpu, void *system) {
 
 static void handle_tile_blit(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1726,6 +1819,7 @@ static void handle_tile_blit(VmCpu *cpu, void *system) {
  */
 static void handle_tile_grab(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1744,6 +1838,7 @@ static void handle_tile_grab(VmCpu *cpu, void *system) {
 
 static void handle_tile_dims(VmCpu *cpu, void *system) {
     (void)system;
+    tui_enter(cpu->vm_id);
     if (g_owner_vm != cpu->vm_id) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
         return;
@@ -1827,5 +1922,10 @@ fail:          return false;
 
 void vm_host_tui_release_for_vm(uint16_t vm_id) {
     tile_release_for_vm(vm_id);
-    if (g_owner_vm == vm_id) do_shutdown();
+    /* Resolve this VM's session before consulting/clearing it. */
+    tui_enter(vm_id);
+    if (session_find(vm_id) && g_owner_vm == vm_id) {
+        do_shutdown();   /* clears owner_vm → frees the session slot */
+    }
+    tui_leave();
 }
