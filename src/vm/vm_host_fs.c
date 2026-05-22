@@ -1332,6 +1332,7 @@ uint32_t vm_host_fs_get_spawn_data_size(void) {
  * for the host mount).
  */
 static uint8_t *slurp_file(const char *path, PathBackend backend,
+                           const Mount *mnt,
                            size_t *out_size, int32_t *out_err) {
     if (backend == PATH_BACKEND_HOST) {
         FILE *f = fopen(path, "rb");
@@ -1346,6 +1347,24 @@ static uint8_t *slurp_file(const char *path, PathBackend backend,
         fclose(f);
         if (r != (size_t)sz) { free(buf); *out_err = VM_EIO; return NULL; }
         *out_size = (size_t)sz;
+        return buf;
+    } else if (backend == PATH_BACKEND_TRASHFS) {
+        TrashfsVolume *vol = mnt ? mnt->trashfs_vol : NULL;
+        if (!vol) { *out_err = VM_EIO; return NULL; }
+        TrashfsFile tf;
+        TrashfsResult tr = trashfs_open(vol, path, 0, &tf);
+        if (tr != TRASHFS_OK) {
+            *out_err = (tr == TRASHFS_ERR_NOT_FOUND) ? VM_ENOENT : VM_EIO;
+            return NULL;
+        }
+        size_t sz = tf.size;
+        uint8_t *buf = malloc(sz ? sz : 1);
+        if (!buf) { trashfs_close(&tf); *out_err = VM_ENOMEM; return NULL; }
+        uint32_t got = 0;
+        tr = trashfs_read(&tf, buf, (uint32_t)sz, &got);
+        trashfs_close(&tf);
+        if (tr != TRASHFS_OK || got != sz) { free(buf); *out_err = VM_EIO; return NULL; }
+        *out_size = sz;
         return buf;
     } else {
         FIL f;
@@ -1385,8 +1404,9 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     char buf[VM_HOST_FS_MAX_PATH];
     PathBackend backend;
     bool writable;
+    const Mount *mnt = NULL;
     int rp = resolve_guest_path(cpu, path_addr, buf, sizeof(buf),
-                                 &backend, &writable, NULL);
+                                 &backend, &writable, &mnt);
     if (rp < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)rp;
         return;
@@ -1395,7 +1415,7 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     /* Slurp the whole ELF into RAM. */
     size_t elf_size = 0;
     int32_t err = 0;
-    uint8_t *elf = slurp_file(buf, backend, &elf_size, &err);
+    uint8_t *elf = slurp_file(buf, backend, mnt, &elf_size, &err);
     if (!elf) {
         cpu->regs[VM_REG_A0] = (uint32_t)(-err);
         return;
