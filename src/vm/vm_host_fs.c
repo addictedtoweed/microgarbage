@@ -1310,10 +1310,37 @@ extern bool vm_host_stdio_set_raw_mode(bool enable);
 /* SYS_TTY_SET_RAW
  *   a0 = enable (0 = cooked, nonzero = raw)
  *   → a0 = 0 on success, -ENOTTY if stdin isn't a tty
- */
+ *
+ * Routing matters here. A guest in a multi-session deployment (e.g.
+ * each TCP client gets its own shell VM) must only affect ITS OWN
+ * transport. If we naively called vm_host_stdio_set_raw_mode(), that
+ * helper consults the DEFAULT transport — which is NULL in TCP mode —
+ * and then falls through to raw-mode the HOST's own console (fd 0).
+ * That had a nasty side effect: the moment a connected shell asked
+ * for raw mode, the host's PowerShell/cmd console lost
+ * ENABLE_PROCESSED_INPUT, so Ctrl-C stopped generating a console
+ * CTRL_C_EVENT (it became a literal 0x03 byte) and the host could no
+ * longer be interrupted — but only AFTER a client connected. We
+ * therefore route through the calling VM's bound transport first;
+ * for a TCP session that's the socket transport, whose set_raw is a
+ * harmless no-op (a socket has no line discipline). Only a genuine
+ * single-session stdio guest (no per-VM transport, no default) falls
+ * through to the real console, which is correct for that case. */
 static void handle_tty_set_raw(VmCpu *cpu, void *system) {
     (void)system;
     bool enable = (cpu->regs[VM_REG_A0] != 0);
+
+    VmHostTransport *vt = vm_host_get_transport_for_vm(cpu->vm_id);
+    if (vt) {
+        /* This VM owns a transport. If it can set raw, use it; if it
+         * has no set_raw (or it's a no-op), that's success too — the
+         * guest's request is satisfied for that medium. We must NOT
+         * fall through to the host console for a transport-bound VM. */
+        bool ok = vt->set_raw ? (vt->set_raw(vt, enable) >= 0) : true;
+        cpu->regs[VM_REG_A0] = ok ? 0 : (uint32_t)-((int32_t)VM_EIO);
+        return;
+    }
+
     if (vm_host_stdio_set_raw_mode(enable)) {
         cpu->regs[VM_REG_A0] = 0;
     } else {
