@@ -1422,6 +1422,15 @@ static void cmd_cd(int argc, char **argv) {
         putln("cd: path too long");
         return;
     }
+    /* /builtin is a synthetic directory (served from the in-process
+     * builtin table, not a real mount), so sys_openat would fail on
+     * it. Accept it directly — same special-case ls uses — so the
+     * user can cd in and `ls` the builtins. Normalize "/builtin/" to
+     * "/builtin" for a tidy prompt. */
+    if (is_builtin_dir(path)) {
+        scpy(g_cwd, BUILTIN_PREFIX, CWD_CAP);
+        return;
+    }
     /* Verify it's a directory by opening it. */
     int fd = sys_openat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0);
     if (fd < 0) { perror_("cd", fd); return; }
