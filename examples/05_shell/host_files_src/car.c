@@ -1,10 +1,11 @@
-/* car.c — mouse-tracking car dodge game.
+/* car.c — car dodge game (keyboard or mouse steering).
  *
  * You control a 3-row tall car at the bottom of a scrolling
- * road. Move the mouse to steer left/right (and up/down within
- * a dodge window). Dodge oncoming cars, debris, and oil slicks.
- * Grab the yellow ◆ pickups for bonus score. Road bends; trees
- * and road signs drift past on the shoulders.
+ * road. Steer with the arrow keys / WASD / hjkl, or with the
+ * mouse if your terminal reports pointer motion. Dodge oncoming
+ * cars, debris, and oil slicks. Grab the yellow diamonds for
+ * bonus score. Road bends; trees and road signs drift past on
+ * the shoulders.
  *
  * Score = distance survived + pickups grabbed. Game continues
  * until you crash (overlap an obstacle or run off the road).
@@ -567,14 +568,39 @@ static void process_input(void) {
     TuiEvent ev;
     while (tui_poll_event(&ev)) {
         if (ev.kind == TUI_EV_KEY) {
-            if (ev.key.key == 'q' || ev.key.key == 'Q' ||
-                ev.key.key == TUI_KEY_ESCAPE) {
+            int k = ev.key.key;
+            if (k == 'q' || k == 'Q' || k == TUI_KEY_ESCAPE) {
                 g_dead = true;
                 g_user_quit = true;
                 return;
             }
+            /* Keyboard steering: arrows / WASD / hjkl. Works on any
+             * client, including terminals that don't report mouse
+             * motion (e.g. PuTTY, which doesn't implement xterm
+             * any-motion tracking) and on hardware with no mouse at
+             * all. Each press nudges the car one cell; hold to move
+             * continuously via key repeat. */
+            int dcol = 0, drow = 0;
+            if (k == TUI_KEY_LEFT  || k == 'a' || k == 'A' || k == 'h') dcol = -1;
+            else if (k == TUI_KEY_RIGHT || k == 'd' || k == 'D' || k == 'l') dcol = +1;
+            else if (k == TUI_KEY_UP   || k == 'w' || k == 'W' || k == 'k') drow = -1;
+            else if (k == TUI_KEY_DOWN || k == 's' || k == 'S' || k == 'j') drow = +1;
+
+            if (dcol) {
+                int t = g_car_col + dcol;
+                if (t < 1) t = 1;
+                if (t > COLS) t = COLS;
+                g_car_col = t;
+            }
+            if (drow) {
+                int t = g_car_row + drow;
+                if (t < CAR_DODGE_TOP) t = CAR_DODGE_TOP;
+                if (t > CAR_BOTTOM)    t = CAR_BOTTOM;
+                g_car_row = t;
+            }
         } else if (ev.kind == TUI_EV_MOUSE) {
-            /* Track position to where the mouse is. */
+            /* Mouse steering (when the client reports motion or drag):
+             * track the car to the pointer. */
             int target_col = ev.mouse.col;
             int target_row = ev.mouse.row;
             if (target_col < 1) target_col = 1;
@@ -647,7 +673,7 @@ static int show_title_screen(void) {
     tui_set_bg(0);
     tui_set_fg(15);
     tui_move(7, (COLS - 36) / 2);
-    tui_puts("Mouse to steer, dodge obstacles");
+    tui_puts("Arrows / WASD / mouse to steer");
     tui_move(8, (COLS - 32) / 2);
     tui_puts("Grab the gold diamonds for +50");
     tui_reset();
