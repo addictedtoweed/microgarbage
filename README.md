@@ -175,6 +175,44 @@ So for example, to use `music_player`, copy and build:
 `music_player.c`, `audio_mixer.c`, `ring_buffer.c`, and the
 corresponding headers in `include/`.
 
+## Building the host
+
+The shell host (`examples/05_shell`) is the main interactive
+deliverable. Its **target runtime is native Windows** — a
+self-contained `.exe` that uses the Win32 paths (WinSock2,
+`SetConsoleMode`) and does not depend on `cygwin1.dll`. Embedded
+toolchains (STM32CubeIDE, ST-LINK, vendor flashers) live on native
+Windows, so the dev host matches.
+
+The compiler decides the target, not the shell you launch from, so
+mingw-w64 always produces a native binary — even when invoked from
+a Cygwin prompt. Two equivalent entry points produce the same
+`build/host.exe`:
+
+```powershell
+# From PowerShell (or cmd):
+.\build-win.ps1                 # native host.exe + guest ELFs
+.\build-win.ps1 -NoGuest        # host only
+.\build-win.ps1 -Clean
+```
+
+```sh
+# From a Cygwin or MSYS2 shell:
+./build-win.sh                  # native host.exe + guest ELFs
+./build-win.sh --no-guest       # host only
+./build-win.sh clean
+```
+
+Both default to `x86_64-w64-mingw32-gcc` and link `-lws2_32`.
+Override the compilers with `-Cc`/`-GuestCc` (PowerShell) or
+`CC=`/`GUEST_CC=` (bash).
+
+The older per-example `build.sh` scripts use **Cygwin's own gcc**
+on purpose: that binary links `cygwin1.dll`, exercises the POSIX
+code paths, and is what the platform-neutral unit-test suites build
+against for fast local iteration. Use `build.sh` for tests;
+`build-win.*` for the shippable host.
+
 ## Building the tests
 
 From the `garbage/` directory:

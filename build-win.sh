@@ -1,0 +1,161 @@
+#!/bin/bash
+# build-win.sh — build the microgarbage shell host as a NATIVE
+# Windows .exe from a Cygwin or MSYS2 shell, using mingw-w64.
+#
+# This is the bash counterpart to build-win.ps1. Both produce the
+# SAME artifact: a self-contained native Windows host that does NOT
+# depend on cygwin1.dll and uses the Win32 code paths (WinSock2,
+# SetConsoleMode, etc.) — i.e. the `_WIN32 && !__CYGWIN__` branches.
+#
+# Why a separate script from build.sh:
+#   build.sh uses Cygwin's own gcc on purpose (POSIX paths, the
+#   pty/tty layer for running under Cygwin's sshd, and the unit
+#   tests). That binary links cygwin1.dll and exercises the POSIX
+#   code paths. This script instead drives mingw-w64 to emit the
+#   shippable native binary. The compiler — not the shell — decides
+#   the target, so running this from Cygwin still yields native.
+#
+# Usage:
+#   ./build-win.sh            build native host.exe + guest ELFs
+#   ./build-win.sh --no-guest host only (skip RISC-V guests)
+#   ./build-win.sh clean      remove build artifacts
+#
+# Override compilers via env:
+#   CC=x86_64-w64-mingw32-gcc        (host; must be mingw-w64)
+#   GUEST_CC=riscv-none-elf-gcc      (guest RISC-V cross)
+
+set -e
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+EXAMPLE_DIR="$REPO_ROOT/examples/05_shell"
+BUILD_DIR="$EXAMPLE_DIR/build"
+HOST_FILES="$EXAMPLE_DIR/host_files"
+FATFS_DIR="$REPO_ROOT/third_party/fatfs"
+FATFS_SRC="$FATFS_DIR/source"
+
+step() { echo "build-win: $*"; }
+die()  { echo "build-win: ERROR - $*" >&2; exit 1; }
+
+NO_GUEST=0
+case "${1:-build}" in
+    clean)
+        rm -rf "$BUILD_DIR" "$HOST_FILES"
+        step "cleaned"
+        exit 0
+        ;;
+    --no-guest) NO_GUEST=1 ;;
+esac
+
+# Host compiler: default to mingw-w64. Must target native Windows.
+CC="${CC:-x86_64-w64-mingw32-gcc}"
+if ! command -v "$CC" >/dev/null 2>&1; then
+    die "host compiler '$CC' not found.
+      Install mingw-w64:
+        - Cygwin: setup package 'mingw64-x86_64-gcc-core'
+        - MSYS2:  pacman -S mingw-w64-x86_64-gcc
+      or set CC=<compiler>."
+fi
+MACHINE=$("$CC" -dumpmachine 2>/dev/null || echo unknown)
+case "$MACHINE" in
+    *mingw*|*w64*windows*)
+        step "host compiler: $CC (target $MACHINE) - native Windows OK" ;;
+    *)
+        step "WARNING: $CC targets '$MACHINE', not obviously native Windows."
+        step "         a native build wants mingw-w64; continuing anyway." ;;
+esac
+
+# FatFs presence.
+[ -f "$FATFS_SRC/ff.c" ] || die "FatFs not found at $FATFS_SRC/ff.c
+      See third_party/fatfs/PLACEHOLDER.md."
+
+mkdir -p "$BUILD_DIR"
+
+VM_CORE=(
+    "$REPO_ROOT/src/vm/vm_core.c"
+    "$REPO_ROOT/src/vm/vm_loader.c"
+    "$REPO_ROOT/src/vm/vm_ecall.c"
+    "$REPO_ROOT/src/vm/vm_ecall_handlers.c"
+    "$REPO_ROOT/src/vm/vm_mailbox.c"
+    "$REPO_ROOT/src/vm/vm_sched.c"
+    "$REPO_ROOT/src/vm/vm_system.c"
+    "$REPO_ROOT/src/vm/vm_host_stdio.c"
+    "$REPO_ROOT/src/vm/vm_host_stdio_win32.c"
+    "$REPO_ROOT/src/vm/vm_host_platform.c"
+    "$REPO_ROOT/src/vm/vm_host_tui.c"
+    "$REPO_ROOT/src/memory/bump.c"
+    "$REPO_ROOT/src/memory/slab_stack.c"
+    "$REPO_ROOT/src/containers/fifo_queue.c"
+    "$REPO_ROOT/src/containers/ring_buffer.c"
+)
+HOST_EXTRA=(
+    "$REPO_ROOT/src/vm/vm_host_fs.c"
+    "$REPO_ROOT/src/storage/trashdrive.c"
+    "$REPO_ROOT/src/storage/trashdrive_fatfs.c"
+    "$REPO_ROOT/src/util/inicfg.c"
+)
+FATFS_SRCS=(
+    "$FATFS_DIR/ff_wrapped.c"
+    "$FATFS_SRC/ffsystem.c"
+)
+
+step "compiling native host.exe (with FatFs)..."
+"$CC" -Wall -Wextra -Wpedantic -std=c11 -O2 -DHAVE_FATFS \
+    -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
+    -o "$BUILD_DIR/host.exe" \
+    "$EXAMPLE_DIR/host.c" \
+    "${VM_CORE[@]}" "${HOST_EXTRA[@]}" "${FATFS_SRCS[@]}" \
+    -lws2_32
+step "built $BUILD_DIR/host.exe"
+
+# Guest ELFs (platform-neutral). The RISC-V cross-compiler may be a
+# native-Windows .exe under Cygwin, in which case it needs Windows
+# paths — reuse the path-translation logic from vm_objs.sh by sourcing
+# it just for guest_path()/GUEST_CC. (Host vars are overridden above.)
+if [ "$NO_GUEST" = "1" ]; then
+    step "skipping guest ELFs (--no-guest)"
+else
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/examples/common/vm_objs.sh" >/dev/null 2>&1 || true
+    if ! command -v "$GUEST_CC" >/dev/null 2>&1; then
+        step "WARNING: RISC-V cross '$GUEST_CC' not found; skipping guests."
+    else
+        step "guest compiler: $GUEST_CC"
+        GUEST_LD="$REPO_ROOT/examples/common/guest.ld"
+        GCFLAGS=(-march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -O2)
+        GC=(-ffunction-sections -fdata-sections)
+        GLD=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
+
+        step "compiling guest shell.elf (RV32IMC)..."
+        "$GUEST_CC" "${GCFLAGS[@]}" -Wl,-T,"$(guest_path "$GUEST_LD")" \
+            -o "$(guest_path "$BUILD_DIR/shell.elf")" \
+            "$(guest_path "$EXAMPLE_DIR/shell.c")"
+
+        mkdir -p "$HOST_FILES"
+        LIB_SRCS=()
+        if [ -d "$EXAMPLE_DIR/host_files_src/lib" ]; then
+            for libsrc in "$EXAMPLE_DIR"/host_files_src/lib/*.c; do
+                [ -f "$libsrc" ] || continue
+                LIB_SRCS+=("$(guest_path "$libsrc")")
+            done
+        fi
+        for src in "$EXAMPLE_DIR"/host_files_src/*.c; do
+            [ -f "$src" ] || continue
+            name=$(basename "$src" .c)
+            step "compiling host_files/$name.elf (spawnable)..."
+            "$GUEST_CC" "${GCFLAGS[@]}" "${GC[@]}" \
+                -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
+                -I"$(guest_path "$EXAMPLE_DIR/host_files_src/lib/include")" \
+                -Wl,-T,"$(guest_path "$GUEST_LD")" "${GLD[@]}" \
+                -o "$(guest_path "$HOST_FILES/$name.elf")" \
+                "$(guest_path "$src")" "${LIB_SRCS[@]}"
+        done
+    fi
+fi
+
+echo ""
+step "done. Native host: $BUILD_DIR/host.exe"
+echo "  Run from PowerShell/cmd:"
+echo "    host.exe                       # single stdio session"
+echo "    host.exe --tcp=5000            # one TCP session"
+echo "    host.exe --tcp=5000 --tcp=5001 # two sessions"
+echo "  Connect with PuTTY (Raw or Telnet), or: nc localhost 5000"
