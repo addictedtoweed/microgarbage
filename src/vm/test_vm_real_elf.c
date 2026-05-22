@@ -206,12 +206,70 @@ static void test_hello3_sum_of_squares_runs(void) {
     free(elf);
 }
 
+/* Round V.6 lifecycle: the multi-session TCP host detects that a
+ * session ended — and thus that its port can accept a reconnection —
+ * by checking whether the shell's VM is still registered:
+ * vm_sched_get(sched, vm_id) == NULL means it exited.
+ *
+ * That only works if stepping the system to halt actually UNLOADS
+ * the halted VM (vs leaving it parked as halted). vm_system_step
+ * runs the reap, which unloads any halted VM. This test pins that
+ * contract: after stepping a top-level VM to exit, vm_sched_get
+ * returns NULL for its id. If this regressed, reconnection would
+ * silently break (the slot would never reopen). */
+static void test_stepped_halt_unloads_vm(void) {
+    uint8_t *elf = NULL;
+    size_t elf_size = 0;
+    if (load_file("examples/01_hello/build/guest_minimal.elf",
+                  &elf, &elf_size) != 0) {
+        FAIL("could not open guest_minimal.elf (run from repo root)");
+        return;
+    }
+
+    VmSystem sys;
+    VmSystemConfig cfg = {
+        .shared_storage = g_shared_storage,
+        .shared_storage_size = SHARED_BYTES,
+        .local_storage = g_local_storage,
+        .local_storage_size = LOCAL_BYTES,
+        .max_vms = 2,
+        .spawn_data_kb = 16,
+        .baseline_quantum = 100,
+    };
+    ASSERT(vm_system_init(&sys, &cfg));
+
+    VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 4096,
+                                          VM_BACKING_COPY_RAM,
+                                          VM_BACKING_COPY_RAM);
+    ASSERT_EQ_INT(VM_SYS_OK, lr.code);
+    uint16_t id = (uint16_t)lr.assigned_vm_id;
+
+    /* Right after load it's registered. */
+    ASSERT(vm_sched_get(sys.sched, id) != NULL);
+
+    /* Step like the host loop does, until the reap unloads it (or a
+     * sane cap). guest_minimal is li/li/ecall(SYS_EXIT). */
+    int guard = 1000;
+    while (vm_sched_get(sys.sched, id) != NULL && guard-- > 0) {
+        vm_system_step(&sys);
+    }
+    ASSERT(guard > 0);   /* it did get unloaded */
+
+    /* THE CONTRACT: a halted top-level VM is gone from the scheduler.
+     * This is exactly the signal the host uses to reopen the port. */
+    ASSERT(vm_sched_get(sys.sched, id) == NULL);
+
+    vm_system_destroy(&sys);
+    free(elf);
+}
+
 int main(void) {
     TEST_SUITE("vm_real_elf");
 
     RUN(test_hello_elf_runs_and_exits);
     RUN(test_hello2_factorial_runs);
     RUN(test_hello3_sum_of_squares_runs);
+    RUN(test_stepped_halt_unloads_vm);
 
     return TEST_SUITE_RESULT();
 }

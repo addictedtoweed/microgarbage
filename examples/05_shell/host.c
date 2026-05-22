@@ -42,6 +42,7 @@
 #if defined(_WIN32) && !defined(__CYGWIN__)
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <windows.h>   /* Sleep() for host_sleep_ms */
 typedef SOCKET tcp_sock_t;
 #  define TCP_SOCK_INVALID INVALID_SOCKET
 #  define TCP_SOCK_ERROR   SOCKET_ERROR
@@ -500,6 +501,22 @@ static bool realtime_clock_source(void *userdata,
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int signo) { (void)signo; g_stop = 1; }
+
+/* Portable short sleep, used by the multi-session run loop to yield
+ * the CPU when no shell is runnable. Keeps the loop from spinning a
+ * core at 100% (which on Cygwin also delays SIGINT delivery, making
+ * Ctrl-C feel dead). Native Windows uses Sleep(ms); POSIX/Cygwin
+ * use nanosleep. */
+static void host_sleep_ms(unsigned ms) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)((ms % 1000u) * 1000000ul);
+    nanosleep(&ts, NULL);
+#endif
+}
 
 static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
     FILE *f = fopen(path, "rb");
@@ -1770,7 +1787,14 @@ int main(int argc, char **argv) {
         /* Per-port transport contexts + structs. */
         static TcpCtx          tcp_ctxs[MAX_TCP_PORTS];
         static VmHostTransport tcp_transports[MAX_TCP_PORTS];
-        bool   spawned[MAX_TCP_PORTS] = {0};
+        /* Per-slot runtime state. A slot cycles:
+         *   LISTENING (no client) -> accept -> ACTIVE (shell running)
+         *   -> shell exits -> back to LISTENING.
+         * slot_vm holds the shell's vm_id while ACTIVE. The host runs
+         * until Ctrl-C (g_stop); ports stay open for reconnection. */
+        bool     slot_active[MAX_TCP_PORTS] = {0};
+        uint16_t slot_vm[MAX_TCP_PORTS];
+        for (int i = 0; i < MAX_TCP_PORTS; i++) slot_vm[i] = UINT16_MAX;
 
         for (int i = 0; i < n_tcp_ports; i++) {
             tcp_ctxs[i].listen_fd = tcp_listen(tcp_ports[i]);
@@ -1804,19 +1828,41 @@ int main(int argc, char **argv) {
             "      'Local echo' = Force off and 'Local line editing'\n"
             "      = Force off, else PuTTY echoes your own keystrokes\n"
             "      and buffers lines instead of sending keys live.\n");
+        fprintf(stderr, "host: ports stay open — reconnect any time. "
+                        "Ctrl-C to stop the host.\n");
         fflush(stderr);
 
-        int n_spawned = 0;
         for (;;) {
             if (g_stop) {
                 fprintf(stderr, "\nhost: SIGINT received, stopping.\n");
                 break;
             }
 
-            /* Accept pending connections and spawn a shell per new
-             * client. */
+            /* 1. Reap exited shells: a slot whose VM is gone (the
+             *    reap in vm_system_step unloaded it) goes back to
+             *    LISTENING so its port accepts a new client. */
             for (int i = 0; i < n_tcp_ports; i++) {
-                if (spawned[i]) continue;
+                if (!slot_active[i]) continue;
+                if (vm_sched_get(sys.sched, slot_vm[i]) == NULL) {
+                    /* Shell for this port has exited. Close the client
+                     * socket and reopen the slot for reconnection. */
+                    if (tcp_ctxs[i].client_fd != TCP_SOCK_INVALID) {
+                        tcp_close(tcp_ctxs[i].client_fd);
+                        tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
+                    }
+                    tcp_ctxs[i].prev_was_cr = 0;
+                    tcp_ctxs[i].iac_state   = 0;
+                    slot_active[i] = false;
+                    slot_vm[i]     = UINT16_MAX;
+                    fprintf(stderr, "host: [:%d] session ended; "
+                            "port open for reconnection\n", tcp_ctxs[i].port);
+                    fflush(stderr);
+                }
+            }
+
+            /* 2. Accept new clients on idle slots and spawn a shell. */
+            for (int i = 0; i < n_tcp_ports; i++) {
+                if (slot_active[i]) continue;
                 if (tcp_try_accept(&tcp_ctxs[i])) {
                     VmLoadVmResult lr = vm_system_load_vm(
                         &sys, elf, elf_size, 16 * 1024,
@@ -1824,14 +1870,12 @@ int main(int argc, char **argv) {
                     if (lr.code != VM_SYS_OK) {
                         fprintf(stderr, "host: [:%d] load failed (code=%d)\n",
                                 tcp_ctxs[i].port, lr.code);
-                        /* Drop the connection; leave the slot open for
-                         * a retry on the next accept. */
                         tcp_close(tcp_ctxs[i].client_fd);
                         tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
                         continue;
                     }
-                    spawned[i] = true;
-                    n_spawned++;
+                    slot_active[i] = true;
+                    slot_vm[i]     = (uint16_t)lr.assigned_vm_id;
                     vm_host_set_transport_for_vm(lr.assigned_vm_id,
                                                  &tcp_transports[i]);
                     fprintf(stderr, "host: [:%d] shell spawned (vm %u)\n",
@@ -1840,38 +1884,36 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Step the scheduler if there's anything to run. */
-            if (n_spawned > 0) {
+            /* 3. Run the scheduler one step if any shell is live;
+             *    otherwise sleep briefly so we don't busy-spin while
+             *    waiting for connections (and so Ctrl-C is responsive
+             *    — a hot loop can delay signal handling on Cygwin). */
+            int n_active = 0;
+            for (int i = 0; i < n_tcp_ports; i++) if (slot_active[i]) n_active++;
+
+            if (n_active > 0) {
                 VmSchedStepResult r = vm_system_step(&sys);
-                if (r == VM_SCHED_ALL_HALTED && n_spawned == n_tcp_ports) {
-                    /* Every port has had a client AND every spawned
-                     * shell has exited — nothing more can happen. Stop.
-                     *
-                     * If some ports haven't seen a client yet, we keep
-                     * running (their listeners are still open); the user
-                     * Ctrl-C's when done. This matches the demo flow:
-                     * launch host, connect N clients, they each exit,
-                     * host exits once the last one does. */
-                    break;
+                if (r != VM_SCHED_RAN) {
+                    /* IDLE (all shells blocked on input) or ALL_HALTED
+                     * (nothing ran this step) — yield the CPU briefly.
+                     * Without this the loop spins at 100% when sessions
+                     * are connected but idle, which both wastes a core
+                     * and makes SIGINT sluggish under Cygwin. */
+                    host_sleep_ms(5);
                 }
-                /* Some shells halted but not all ports have connected
-                 * yet — keep looping so late clients can still join. */
             } else {
-                /* No shells yet — avoid a busy spin while waiting
-                 * for the first connection. */
-#if defined(_WIN32) && !defined(__CYGWIN__)
-                Sleep(10);
-#else
-                struct timespec ts = {0, 10 * 1000 * 1000};
-                nanosleep(&ts, NULL);
-#endif
+                host_sleep_ms(10);
             }
         }
 
-        /* Tear down all transports. */
+        /* Tear down all transports + listeners. */
         for (int i = 0; i < n_tcp_ports; i++) {
             if (tcp_transports[i].close) {
                 tcp_transports[i].close(&tcp_transports[i]);
+            }
+            if (tcp_ctxs[i].listen_fd != TCP_SOCK_INVALID) {
+                tcp_close(tcp_ctxs[i].listen_fd);
+                tcp_ctxs[i].listen_fd = TCP_SOCK_INVALID;
             }
         }
 #if defined(_WIN32) && !defined(__CYGWIN__)
