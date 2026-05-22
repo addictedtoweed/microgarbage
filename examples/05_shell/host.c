@@ -57,6 +57,7 @@ typedef SOCKET tcp_sock_t;
 #include "vm/vm_host_transport.h"
 #include "vm/vm_host_fs.h"
 #include "vm/vm_host_platform.h"
+#include "vm/host_platform.h"
 #include "vm/vm_host_tui.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
@@ -438,105 +439,12 @@ static bool load_host_config(const char *path, HostConfig *hc) {
 }
 
 /* ---------------------------------------------------------------
- * Tick source: milliseconds since first call.
- *
- * The scheduler calls this on each step to refresh global_tick.
- * Guests see tick units of one millisecond, and SYS_TICK_HZ
- * returns 1000. The tick wraps at 2^32 ms ≈ 49.7 days of
- * continuous runtime.
- *
- * We anchor at the first call so global_tick starts at 0 (or
- * close to it) — easier to reason about than raw monotonic time
- * which can be a giant number. CLOCK_MONOTONIC is immune to
- * wall-clock adjustments (NTP, manual set).
+ * Platform primitives (time, sleep, stop hook) now live behind the
+ * host platform layer — see include/vm/host_platform.h and
+ * src/host/platform_{posix,win,stub}.c. host.c calls the interface
+ * rather than the OS directly, so Windows/Linux/MCU differences stay
+ * in one place per platform.
  * --------------------------------------------------------------- */
-static struct timespec g_t0;
-static int             g_t0_set = 0;
-
-static uint32_t monotonic_ms_ticks(void *userdata) {
-    (void)userdata;
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    if (!g_t0_set) {
-        g_t0 = t;
-        g_t0_set = 1;
-    }
-    /* Difference in milliseconds. Borrow from seconds if nsec
-     * went backwards relative to the anchor — without that, a
-     * signed long subtraction (-500_000_000) cast to uint64
-     * blows up to a near-2^64 value and the millisecond math
-     * skews badly once per second of real time. */
-    long sec_delta  = (long)(t.tv_sec  - g_t0.tv_sec);
-    long nsec_delta = (long)(t.tv_nsec - g_t0.tv_nsec);
-    if (nsec_delta < 0) {
-        sec_delta  -= 1;
-        nsec_delta += 1000000000L;
-    }
-    uint64_t ms = (uint64_t)sec_delta * 1000ULL
-                + (uint64_t)nsec_delta / 1000000ULL;
-    /* The cast to uint32 truncates to 49.7-day wraparound, which
-     * is the documented intended behavior. */
-    return (uint32_t)ms;
-}
-
-/* ---------------------------------------------------------------
- * Realtime (wall-clock) source for SYS_REALTIME_NOW.
- * Uses CLOCK_REALTIME — subject to NTP/manual adjustments, unlike
- * the monotonic source above. Embedded hosts without an RTC would
- * leave this NULL and SYS_REALTIME_NOW returns -ENOSYS.
- * --------------------------------------------------------------- */
-static bool realtime_clock_source(void *userdata,
-                                   uint32_t *seconds_out,
-                                   uint32_t *nanos_out) {
-    (void)userdata;
-    struct timespec t;
-    if (clock_gettime(CLOCK_REALTIME, &t) != 0) return false;
-    /* Truncate to 32-bit Unix epoch seconds. This wraps in 2106;
-     * for a microcontroller that's not really an issue in any
-     * scenario I can imagine. */
-    *seconds_out = (uint32_t)t.tv_sec;
-    *nanos_out   = (uint32_t)t.tv_nsec;
-    return true;
-}
-
-static volatile sig_atomic_t g_stop = 0;
-static void on_sigint(int signo) { (void)signo; g_stop = 1; }
-
-/* On Windows (native AND Cygwin), Ctrl-C arrives first as a Windows
- * console CTRL_C_EVENT. Cygwin *usually* translates that into a
- * POSIX SIGINT, but that translation is unreliable when the process
- * is doing Winsock I/O — which is exactly our case (a TCP host).
- * The symptom: Ctrl-C does nothing while a socket session is live.
- *
- * Registering a console control handler catches the event directly
- * and sets the same stop flag, independent of POSIX signal
- * delivery. Returning TRUE marks the event handled so the default
- * "terminate immediately" behavior doesn't also fire — we want a
- * clean shutdown via the run loop noticing g_stop. This is also the
- * robust path for the native-Windows host, where signal(SIGINT) is
- * only loosely emulated by the CRT. */
-#if defined(__CYGWIN__) || defined(_WIN32)
-static BOOL WINAPI on_console_ctrl(DWORD type) {
-    switch (type) {
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-            g_stop = 1;
-            /* Brief notice so a clean Ctrl-C shutdown is visibly
-             * distinct from a hard kill. Written with WriteFile (not
-             * fprintf): this handler runs on a separate OS thread, so
-             * we avoid the C stdio lock the main thread may hold. */
-            {
-                static const char msg[] = "\nhost: stopping...\n";
-                DWORD wrote = 0;
-                WriteFile(GetStdHandle(STD_ERROR_HANDLE),
-                          msg, (DWORD)(sizeof(msg) - 1), &wrote, NULL);
-            }
-            return TRUE;   /* handled */
-        default:
-            return FALSE;
-    }
-}
 
 /* Warn if this NATIVE Windows build is running without a real Win32
  * console attached — the classic "native host.exe launched under
@@ -545,7 +453,10 @@ static BOOL WINAPI on_console_ctrl(DWORD type) {
  * native process doesn't see Cygwin's POSIX SIGINT either, so Ctrl-C
  * appears dead once a session is connected. Detect it and tell the
  * user how to get working Ctrl-C. GetConsoleMode on the stdin handle
- * succeeds only for a genuine console. */
+ * succeeds only for a genuine console.
+ *
+ * This is host *policy* (user-facing advice), not a platform
+ * primitive, so it stays here rather than in the platform layer. */
 static void warn_if_no_real_console(void) {
 #if defined(_WIN32) && !defined(__CYGWIN__)
     HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
@@ -560,25 +471,18 @@ static void warn_if_no_real_console(void) {
             "      'kill -INT <pid>' from another terminal.\n");
         fflush(stderr);
     }
-#endif
-}
-#endif
-
-/* Portable short sleep, used by the multi-session run loop to yield
- * the CPU when no shell is runnable. Keeps the loop from spinning a
- * core at 100% (which on Cygwin also delays SIGINT delivery, making
- * Ctrl-C feel dead). Native Windows uses Sleep(ms); POSIX/Cygwin
- * use nanosleep. */
-static void host_sleep_ms(unsigned ms) {
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    Sleep(ms);
 #else
-    struct timespec ts;
-    ts.tv_sec  = (time_t)(ms / 1000u);
-    ts.tv_nsec = (long)((ms % 1000u) * 1000000ul);
-    nanosleep(&ts, NULL);
+    /* Non-native-Windows builds always have a usable controlling
+     * terminal for our purposes; nothing to warn about. */
 #endif
 }
+
+/* Thin alias kept so existing call sites read unchanged. The real
+ * implementation is per-platform in src/host/platform_*.c. */
+static inline void host_sleep_ms(unsigned ms) {
+    host_platform_sleep_ms(ms);
+}
+
 
 static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
     FILE *f = fopen(path, "rb");
@@ -1557,25 +1461,14 @@ int main(int argc, char **argv) {
         }
     }
 
-#ifdef _WIN32
-    /* mingw doesn't have struct sigaction. Use the simpler
-     * signal() ANSI API; SIGINT is what we care about (Ctrl-C). */
-    signal(SIGINT, on_sigint);
-#else
-    struct sigaction sa = {0};
-    sa.sa_handler = on_sigint;
-    sigaction(SIGINT, &sa, NULL);
-#endif
+    /* Install the platform's stop/interrupt handler(s): SIGINT on
+     * POSIX, SIGINT + console control handler on Windows. The run
+     * loop below polls host_platform_stop_requested(). */
+    host_platform_install_stop_handler();
 
-    /* On Windows (native and Cygwin) ALSO catch the console Ctrl-C
-     * event directly. On Cygwin the POSIX-signal translation above
-     * is unreliable while we're in Winsock calls, so this is what
-     * actually makes Ctrl-C work for the TCP host; on native Windows
-     * it's the primary mechanism. Harmless elsewhere (not compiled). */
-#if defined(__CYGWIN__) || defined(_WIN32)
-    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
+    /* Host-policy advice (native Windows only): warn if there's no
+     * real console, where Ctrl-C can't be delivered. No-op elsewhere. */
     warn_if_no_real_console();
-#endif
 
     /* 1. Initialize the block device. */
     if (trash_init(&g_drive, g_pool, sizeof(g_pool)) != TRASH_OK) {
@@ -1658,7 +1551,7 @@ int main(int argc, char **argv) {
          * CLOCK_MONOTONIC. Guests can use SYS_SLEEP_TICKS and
          * SYS_SLEEP_UNTIL to pace themselves at human timescales
          * (animations, polling, periodic loops). */
-        .tick_source         = monotonic_ms_ticks,
+        .tick_source         = host_platform_monotonic_ms,
         .ticks_per_second    = 1000,
     };
     if (!vm_system_init(&sys, &cfg)) {
@@ -1717,14 +1610,14 @@ int main(int argc, char **argv) {
      * sequence on each host run. */
     {
         VmHostPlatformConfig pcfg = {0};
-        pcfg.realtime_source   = realtime_clock_source;
+        pcfg.realtime_source   = host_platform_realtime;
         pcfg.realtime_userdata = NULL;
-        struct timespec t;
-        if (clock_gettime(CLOCK_REALTIME, &t) == 0) {
+        uint32_t sec = 0, nsec = 0;
+        if (host_platform_realtime(NULL, &sec, &nsec)) {
             /* Mix sec and nsec into the seed so two runs in the
              * same second still differ. SplitMix64 will diffuse. */
-            pcfg.rand_seed = ((uint64_t)t.tv_sec << 32) ^
-                             (uint64_t)t.tv_nsec ^
+            pcfg.rand_seed = ((uint64_t)sec << 32) ^
+                             (uint64_t)nsec ^
                              0x9E3779B97F4A7C15ULL;
         }
         if (!vm_host_install_platform(&sys, &pcfg)) {
@@ -1923,8 +1816,8 @@ int main(int argc, char **argv) {
         fflush(stderr);
 
         for (;;) {
-            if (g_stop) {
-                fprintf(stderr, "\nhost: SIGINT received, stopping.\n");
+            if (host_platform_stop_requested()) {
+                fprintf(stderr, "\nhost: stop requested, shutting down.\n");
                 break;
             }
 
@@ -2033,8 +1926,8 @@ int main(int argc, char **argv) {
      * loop rather than vm_system_run so SIGINT can break us out
      * cleanly. */
     for (;;) {
-        if (g_stop) {
-            fprintf(stderr, "\nhost: SIGINT received, stopping.\n");
+        if (host_platform_stop_requested()) {
+            fprintf(stderr, "\nhost: stop requested, shutting down.\n");
             break;
         }
         VmSchedStepResult r = vm_system_step(&sys);

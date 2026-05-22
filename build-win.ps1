@@ -141,6 +141,7 @@ $vmCore = @(
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
 $hostExtra = @(
+    "src\host\platform_win.c",
     "src\vm\vm_host_fs.c",
     "src\storage\trashdrive.c",
     "src\storage\trashdrive_fatfs.c",

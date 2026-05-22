@@ -60,6 +60,7 @@ esac
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
     "${VM_CORE_SRCS[@]}" \
+    "$HOST_PLATFORM_SRC" \
     "$REPO_ROOT/src/vm/vm_host_fs.c" \
     "$REPO_ROOT/src/storage/trashdrive.c" \
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \

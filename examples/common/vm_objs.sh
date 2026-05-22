@@ -127,6 +127,31 @@ VM_CORE_SRCS=(
 )
 
 # ---------------------------------------------------------------
+# Host platform layer (src/host/platform_*.c — implements
+# include/vm/host_platform.h: time, sleep, stop hook).
+#
+# Exactly one platform file per build, chosen here by target. A host
+# that uses the run loop / stop hook links HOST_PLATFORM_SRC; pure
+# library examples that don't need it can ignore it.
+#
+# Selection mirrors the source-file guards:
+#   - native Windows (mingw)  -> platform_win.c
+#   - Linux / Cygwin (POSIX)  -> platform_posix.c
+# Detected from the compiler's target triple so it matches whichever
+# CC is in use (native vs cross).
+# ---------------------------------------------------------------
+_vm_objs_target="$("${CC:-cc}" -dumpmachine 2>/dev/null || echo unknown)"
+case "$_vm_objs_target" in
+    *mingw*|*windows-gnu*)
+        HOST_PLATFORM_SRC="${REPO_ROOT}/src/host/platform_win.c"
+        ;;
+    *)
+        HOST_PLATFORM_SRC="${REPO_ROOT}/src/host/platform_posix.c"
+        ;;
+esac
+
+
+# ---------------------------------------------------------------
 # Guest compilation.
 # ---------------------------------------------------------------
 

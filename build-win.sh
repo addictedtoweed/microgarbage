@@ -88,6 +88,7 @@ VM_CORE=(
     "$REPO_ROOT/src/containers/ring_buffer.c"
 )
 HOST_EXTRA=(
+    "$REPO_ROOT/src/host/platform_win.c"
     "$REPO_ROOT/src/vm/vm_host_fs.c"
     "$REPO_ROOT/src/storage/trashdrive.c"
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c"
