@@ -1085,18 +1085,36 @@ static int tcp_t_read(VmHostTransport *t, void *buf, unsigned cap) {
     unsigned char scratch[512];
     unsigned want = cap < sizeof(scratch) ? cap : (unsigned)sizeof(scratch);
 #if defined(_WIN32) && !defined(__CYGWIN__)
+    /* Winsock honors the FIONBIO non-blocking flag set at accept;
+     * recv returns WSAEWOULDBLOCK when no data is ready. */
     int r = recv(cfd, (char *)scratch, (int)want, 0);
 #else
-    ssize_t r = recv(cfd, scratch, want, 0);
+    /* MSG_DONTWAIT forces a non-blocking read on THIS call regardless
+     * of the socket's O_NONBLOCK flag. Belt-and-suspenders: Cygwin's
+     * POSIX layer does not always honor fcntl(O_NONBLOCK) for every
+     * socket, and a blocking recv here would freeze the entire host
+     * (the run loop can't return to check g_stop, so Ctrl-C appears
+     * dead until the client disconnects). MSG_DONTWAIT closes that
+     * hole on Cygwin and Linux alike. */
+    ssize_t r = recv(cfd, scratch, want, MSG_DONTWAIT);
 #endif
     if (r > 0) {
-        /* If the read was entirely negotiation, w can be 0 — that's
-         * "no data this poll", not EOF. */
+        /* If the read was entirely Telnet negotiation, the filter
+         * yields 0 — that's "no data this poll", not EOF. */
         return telnet_filter(ctx, cfd, scratch, (int)r, (unsigned char *)buf);
     }
-    if (r == 0) return 0;   /* client closed (or 0-byte send) */
+    if (r == 0) {
+        /* recv() == 0 on a non-blocking socket means the peer has
+         * performed an orderly shutdown — the client disconnected.
+         * Report EOF (-1) so the guest's read sees end-of-input and
+         * the shell exits, which lets the run loop free this slot
+         * and reopen the port. (Previously this returned 0 = "no
+         * data", so a disconnect was never noticed and the session
+         * lingered forever.) */
+        return -1;
+    }
     int err = tcp_last_errno();
-    if (err == TCP_WOULDBLOCK) return 0;
+    if (err == TCP_WOULDBLOCK) return 0;   /* no data right now */
 #if !defined(_WIN32) || defined(__CYGWIN__)
     if (err == EINTR) return 0;
 #endif
