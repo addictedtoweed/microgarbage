@@ -1798,12 +1798,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "host: %d session(s) ready; connect clients now.\n",
                 n_tcp_ports);
         fprintf(stderr,
-            "host: PuTTY users — connection type 'Raw', and under\n"
-            "      Terminal set 'Local echo' = Force OFF and\n"
-            "      'Local line editing' = Force OFF. Otherwise PuTTY\n"
-            "      echoes your keystrokes (Tab shows as ^I, Ctrl-C as\n"
-            "      ^C) and its own mouse reports, and buffers lines\n"
-            "      instead of sending keys to the shell as you type.\n");
+            "host: PuTTY — connection type Raw OR Telnet both work\n"
+            "      (the host absorbs Telnet negotiation). For the\n"
+            "      cleanest line editing, under Terminal set\n"
+            "      'Local echo' = Force off and 'Local line editing'\n"
+            "      = Force off, else PuTTY echoes your own keystrokes\n"
+            "      and buffers lines instead of sending keys live.\n");
         fflush(stderr);
 
         int n_spawned = 0;
