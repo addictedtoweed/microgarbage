@@ -100,7 +100,13 @@ FATFS_SRCS=(
 )
 
 step "compiling native host.exe (with FatFs)..."
+# -D__USE_MINGW_ANSI_STDIO=1: msvcrt's printf doesn't understand C99
+# %z/%ll length modifiers, so mingw warns on every %zu (size_t). This
+# selects mingw's own C99-compliant stdio so those format specifiers
+# compile clean. (Cygwin/Linux libc handle %z natively; only the
+# native msvcrt-linked build needs this.)
 "$CC" -Wall -Wextra -Wpedantic -std=c11 -O2 -DHAVE_FATFS \
+    -D__USE_MINGW_ANSI_STDIO=1 \
     -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
     -o "$BUILD_DIR/host.exe" \
     "$EXAMPLE_DIR/host.c" \

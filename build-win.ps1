@@ -159,6 +159,11 @@ $hostExe  = Join-Path $BuildDir "host.exe"
 $cflags = @(
     "-Wall", "-Wextra", "-Wpedantic", "-std=c11", "-O2",
     "-DHAVE_FATFS",
+    # msvcrt's printf doesn't understand C99 %z/%ll length modifiers;
+    # this makes mingw use its own C99-compliant stdio so size_t
+    # format specifiers (%zu) compile clean. Without it, native
+    # builds warn on every %zu in the host.
+    "-D__USE_MINGW_ANSI_STDIO=1",
     "-I$IncludeDir",
     "-I$FatfsDir",
     "-I$FatfsSrc"
