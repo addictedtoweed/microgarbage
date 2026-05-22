@@ -1969,6 +1969,13 @@ int main(int argc, char **argv) {
         if (r == VM_SCHED_ALL_HALTED) {
             break;
         }
+        if (r != VM_SCHED_RAN) {
+            /* IDLE: the shell is parked waiting for input (it sleeps
+             * briefly between polls rather than busy-yielding). Yield
+             * the CPU so we don't spin a core at 100% — which also
+             * keeps SIGINT responsive on Cygwin. */
+            host_sleep_ms(5);
+        }
     }
 
     vm_system_destroy(&sys);

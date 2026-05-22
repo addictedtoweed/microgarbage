@@ -45,6 +45,7 @@
 #define SYS_SLAB_STATS 1106
 #define SYS_VM_STATS   1107
 #define SYS_YIELD    1040
+#define SYS_SLEEP_TICKS  1045
 #define SYS_SPAWN_AND_WAIT  1104
 #define SYS_TTY_SET_RAW     1105
 
@@ -167,6 +168,17 @@ static inline int sys_readdir(int fd, Dirent *out) {
 static inline void sys_yield(void) {
     register int a7 asm("a7") = SYS_YIELD;
     asm volatile ("ecall" : : "r"(a7) : "memory");
+}
+
+/* Block this VM for `n` ticks (host ticks are wall-clock ms, so
+ * n ~= milliseconds). Used by the idle input wait so a shell that's
+ * just sitting at the prompt PARKS instead of busy-yielding — which
+ * lets the host scheduler go idle and the host process stay
+ * responsive to Ctrl-C. n==0 is a plain yield. */
+static inline void sys_sleep_ticks(unsigned n) {
+    register unsigned a0 asm("a0") = n;
+    register int a7 asm("a7") = SYS_SLEEP_TICKS;
+    asm volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
 }
 
 static inline void sys_exit(int code) {
@@ -1012,7 +1024,14 @@ static int readline_raw(char *buf, unsigned cap) {
             return -1;
         }
         if (r == 0) {
-            sys_yield();
+            /* No input ready. PARK briefly rather than busy-yielding:
+             * a tight sys_yield loop keeps this VM perpetually ready,
+             * which pins the host's scheduler at 100% CPU and (on
+             * Cygwin) starves SIGINT so the host can't be Ctrl-C'd
+             * while any session is connected. Sleeping ~15ms drops
+             * the VM out of the ready set so the host loop goes idle;
+             * 15ms is well below human-perceptible keystroke latency. */
+            sys_sleep_ticks(15);
             continue;
         }
 
