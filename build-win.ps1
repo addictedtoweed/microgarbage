@@ -176,9 +176,52 @@ if (-not $NoWerror) { $cflags += "-Werror" }
 # Native Windows needs WinSock2 for the TCP transport.
 $libs = @("-lws2_32")
 
+# ----------------------------------------------------------------
+# Bake the guest shell into host.exe (XIP-executed at runtime). The
+# host embeds build\shell.elf via tools\bin2c, so a distributed
+# host.exe needs no external .elf. shell.elf must exist before the
+# host compile; if guests are skipped or the cross is missing, emit
+# an empty stub (host then needs an explicit ELF path).
+# ----------------------------------------------------------------
+$genDir = Join-Path $BuildDir "gen"
+New-Item -ItemType Directory -Force -Path $genDir | Out-Null
+$shellDataC = Join-Path $genDir "shell_elf_data.c"
+$baked = $false
+if (-not $NoGuest) {
+    if (-not $GuestCc) {
+        foreach ($cand in @("riscv-none-elf-gcc","riscv64-unknown-elf-gcc",
+                             "riscv32-unknown-elf-gcc","riscv64-elf-gcc")) {
+            if (Get-Command $cand -ErrorAction SilentlyContinue) { $GuestCc = $cand; break }
+        }
+    }
+    if ($GuestCc -and (Get-Command $GuestCc -ErrorAction SilentlyContinue)) {
+        $guestLd  = Join-Path $RepoRoot "examples\common\guest.ld"
+        $shellC   = Join-Path $ExampleDir "shell.c"
+        $shellElf = Join-Path $BuildDir "shell.elf"
+        $gcf = @("-march=rv32imc","-mabi=ilp32","-nostdlib","-nostartfiles","-ffreestanding","-O2")
+        Write-Step "compiling guest shell.elf for embedding (RV32IMC)..."
+        & $GuestCc @gcf "-Wl,-T,$guestLd" "-o" $shellElf $shellC
+        if ($LASTEXITCODE -ne 0) { Die "guest shell.elf compile failed" }
+        Write-Step "baking shell.elf into host.exe (bin2c)..."
+        # On native Windows $Cc is itself native, so it's fine to build
+        # bin2c with it (produces a Windows exe that runs here).
+        $bin2c = Join-Path $BuildDir "bin2c.exe"
+        & $Cc "-O2" "-o" $bin2c (Join-Path $ExampleDir "tools\bin2c.c")
+        if ($LASTEXITCODE -ne 0) { Die "bin2c compile failed" }
+        & $bin2c $shellElf "shell_elf" $shellDataC
+        if ($LASTEXITCODE -ne 0) { Die "bin2c run failed" }
+        $baked = $true
+    }
+}
+if (-not $baked) {
+    Write-Step "no embedded shell (-NoGuest or cross missing) - empty stub"
+    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`n" |
+        Set-Content -Path $shellDataC -Encoding ASCII
+}
+
 Write-Step "compiling native host.exe (with FatFs)..."
-$allSrc = @($hostMain) + $vmCore + $hostExtra + $fatfs
-$ccArgs = $cflags + @("-o", $hostExe) + $allSrc + $libs
+$allSrc = @($hostMain) + @($shellDataC) + $vmCore + $hostExtra + $fatfs
+$ccArgs = $cflags + @("-I$ExampleDir") + @("-o", $hostExe) + $allSrc + $libs
 & $Cc @ccArgs
 if ($LASTEXITCODE -ne 0) { Die "host compile failed (exit $LASTEXITCODE)" }
 Write-Step "built $hostExe"

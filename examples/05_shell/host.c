@@ -58,6 +58,7 @@ typedef SOCKET tcp_sock_t;
 #include "vm/vm_host_fs.h"
 #include "vm/vm_host_platform.h"
 #include "vm/host_platform.h"
+#include "shell_embedded.h"
 #include "vm/vm_host_tui.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
@@ -1372,7 +1373,17 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (!elf_path) elf_path = "build/shell.elf";
+    /* No explicit ELF path → use the baked-in shell image (XIP).
+     * An explicit path still loads from disk (COPY_RAM) for dev. */
+    bool use_embedded = (elf_path == NULL);
+    if (use_embedded && shell_elf_len == 0) {
+        fprintf(stderr,
+            "host: no embedded shell in this build and no ELF path given.\n"
+            "      Pass a path, e.g.  host build/shell.elf\n"
+            "      (embedded shell is omitted when the build had no guest\n"
+            "      cross-compiler.)\n");
+        return 1;
+    }
 
     /* ----- Load HostConfig: defaults -> vm.cfg -> CLI overrides -----
      *
@@ -1529,11 +1540,27 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 5. Load the guest ELF. */
-    uint8_t *elf = NULL;
-    size_t elf_size = 0;
-    if (load_file(elf_path, &elf, &elf_size) != 0) {
-        return 1;
+    /* 5. Resolve the guest ELF image: the baked-in array (XIP) or a
+     * file from disk (COPY_RAM). For the embedded image we keep a
+     * const pointer; for the disk path we own a malloc'd buffer. The
+     * backing mode is chosen to match: XIP for the embedded image
+     * (executes straight out of the host's .rodata — flash, on an
+     * MCU), COPY_RAM for a disk image (no stable backing to point
+     * at). */
+    const uint8_t *elf = NULL;
+    size_t   elf_size  = 0;
+    uint8_t *elf_owned = NULL;   /* non-NULL only for the disk path */
+    VmBacking elf_backing = VM_BACKING_COPY_RAM;
+    if (use_embedded) {
+        elf         = shell_elf;
+        elf_size    = shell_elf_len;
+        elf_backing = VM_BACKING_XIP;
+    } else {
+        if (load_file(elf_path, &elf_owned, &elf_size) != 0) {
+            return 1;
+        }
+        elf         = elf_owned;
+        elf_backing = VM_BACKING_COPY_RAM;
     }
 
     /* 6. Build the VmSystem and install both bridges. Memory
@@ -1852,7 +1879,7 @@ int main(int argc, char **argv) {
                 if (tcp_try_accept(&tcp_ctxs[i])) {
                     VmLoadVmResult lr = vm_system_load_vm(
                         &sys, elf, elf_size, 16 * 1024,
-                        VM_BACKING_COPY_RAM, VM_BACKING_COPY_RAM);
+                        elf_backing, elf_backing);
                     if (lr.code != VM_SYS_OK) {
                         fprintf(stderr, "host: [:%d] load failed (code=%d)\n",
                                 tcp_ctxs[i].port, lr.code);
@@ -1908,7 +1935,7 @@ int main(int argc, char **argv) {
 
         vm_system_destroy(&sys);
         f_mount(NULL, "0:", 0);
-        free(elf);
+        free(elf_owned);   /* NULL for the embedded/XIP image — safe */
         return 0;
     }
 #endif  /* TCP_MODE_SUPPORTED */
@@ -1917,8 +1944,8 @@ int main(int argc, char **argv) {
 
     /* 7. Load the shell. */
     VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 16 * 1024,
-                                          VM_BACKING_COPY_RAM,
-                                          VM_BACKING_COPY_RAM);
+                                          elf_backing,
+                                          elf_backing);
     if (lr.code != VM_SYS_OK) {
         fprintf(stderr, "host: load failed (code=%d)\n", lr.code);
         return 1;
@@ -1948,6 +1975,6 @@ int main(int argc, char **argv) {
 
     vm_system_destroy(&sys);
     f_mount(NULL, "0:", 0);
-    free(elf);
+    free(elf_owned);   /* NULL for the embedded/XIP image — safe */
     return 0;
 }

@@ -108,6 +108,49 @@ FATFS_SRCS=(
     "$FATFS_SRC/ffsystem.c"
 )
 
+# ------------------------------------------------------------------
+# Bake the guest shell into host.exe (XIP-executed at runtime). The
+# host embeds build/shell.elf as a C array via tools/bin2c, so a
+# distributed host.exe needs no external .elf. shell.elf must exist
+# before the host compile; if guests are skipped or the cross isn't
+# present, emit an empty stub (host then needs an explicit ELF path).
+# ------------------------------------------------------------------
+GEN_DIR="$BUILD_DIR/gen"
+mkdir -p "$GEN_DIR"
+SHELL_DATA_C="$GEN_DIR/shell_elf_data.c"
+_baked=0
+if [ "$NO_GUEST" != "1" ]; then
+    # Resolve the guest cross (sourcing vm_objs.sh sets GUEST_CC and
+    # guest_path()); host vars were already set above and we don't use
+    # them here.
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/examples/common/vm_objs.sh" >/dev/null 2>&1 || true
+    if command -v "$GUEST_CC" >/dev/null 2>&1; then
+        step "compiling guest shell.elf for embedding (RV32IMC)..."
+        _GLD="$REPO_ROOT/examples/common/guest.ld"
+        _GCF=(-march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -O2)
+        "$GUEST_CC" "${_GCF[@]}" -Wl,-T,"$(guest_path "$_GLD")" \
+            -o "$(guest_path "$BUILD_DIR/shell.elf")" \
+            "$(guest_path "$EXAMPLE_DIR/shell.c")"
+        step "baking shell.elf into host.exe (bin2c)..."
+        # bin2c is a BUILD-TIME tool — it must run on the build
+        # machine, so compile it with a native host compiler, NOT $CC
+        # (which here is the mingw cross and would produce a Windows
+        # exe that can't run during a Linux/Cygwin build). Prefer an
+        # explicit BUILD_CC, else cc, else gcc.
+        BUILD_CC="${BUILD_CC:-cc}"
+        command -v "$BUILD_CC" >/dev/null 2>&1 || BUILD_CC=gcc
+        "$BUILD_CC" -O2 -o "$BUILD_DIR/bin2c" "$EXAMPLE_DIR/tools/bin2c.c"
+        "$BUILD_DIR/bin2c" "$BUILD_DIR/shell.elf" shell_elf "$SHELL_DATA_C"
+        _baked=1
+    fi
+fi
+if [ "$_baked" != "1" ]; then
+    step "no embedded shell (--no-guest or cross missing) — empty stub"
+    printf '#include <stddef.h>\nconst unsigned char shell_elf[] = {0};\nconst size_t shell_elf_len = 0;\n' \
+        > "$SHELL_DATA_C"
+fi
+
 step "compiling native host.exe (with FatFs)..."
 # -D__USE_MINGW_ANSI_STDIO=1: msvcrt's printf doesn't understand C99
 # %z/%ll length modifiers, so mingw warns on every %zu (size_t). This
@@ -117,8 +160,10 @@ step "compiling native host.exe (with FatFs)..."
 "$CC" -Wall -Wextra -Wpedantic -std=c11 -O2 -DHAVE_FATFS \
     -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" \
     -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
+    -I"$EXAMPLE_DIR" \
     -o "$BUILD_DIR/host.exe" \
     "$EXAMPLE_DIR/host.c" \
+    "$SHELL_DATA_C" \
     "${VM_CORE[@]}" "${HOST_EXTRA[@]}" "${FATFS_SRCS[@]}" \
     -lws2_32
 step "built $BUILD_DIR/host.exe"
