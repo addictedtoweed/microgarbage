@@ -49,6 +49,7 @@ typedef int vm_host_stdio_win32_not_compiled_on_this_platform;
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>      /* getenv */
 #include <io.h>           /* _fileno, _get_osfhandle */
 #include <fcntl.h>
 
@@ -225,34 +226,38 @@ bool vm_host_stdio_win32_disable_raw_mode(void) {
  *  Returns 0 if no data ready.
  * ============================================================ */
 int vm_host_stdio_win32_read_bytes_nonblock(int fd, void *buf, unsigned cap) {
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("VM_HOST_DEBUG_STDIN") ? 1 : 0;
+
     if (fd < 0 || cap == 0) return 0;
     intptr_t raw = _get_osfhandle(fd);
-    if (raw == -1 || raw == -2) return -1;
+    if (raw == -1 || raw == -2) {
+        if (dbg) fprintf(stderr,
+            "[stdin-dbg] _get_osfhandle(fd=%d) invalid (%lld) -> EOF\n",
+            fd, (long long)raw);
+        return -1;
+    }
     HANDLE h = (HANDLE)raw;
 
-    /* Only valid for console handles in our use case. The caller
-     * (vm_host_stdio.c) checks the kind first. */
     DWORD waited = WaitForSingleObject(h, 0);
     if (waited != WAIT_OBJECT_0) {
+        /* WAIT_TIMEOUT = no input ready (normal idle). Anything else
+         * (WAIT_FAILED) we surface as "no data" too, but log it. */
+        if (dbg && waited != WAIT_TIMEOUT) fprintf(stderr,
+            "[stdin-dbg] WaitForSingleObject -> 0x%lx (GetLastError=%lu)\n",
+            (unsigned long)waited, (unsigned long)GetLastError());
         return 0;
     }
 
-    /* There may be non-key events (focus, window resize). They
-     * also signal the wait. Use PeekConsoleInput to filter — if
-     * the next record isn't a key/buffer event with VT bytes,
-     * drain it and return 0 so the caller polls again next
-     * frame. Practical effect: a single ReadFile is enough
-     * because VT input mode delivers character bytes; the rare
-     * resize/focus event drains a slot without producing bytes.
-     *
-     * For simplicity in this initial implementation, just call
-     * ReadFile and trust VT input mode to give us bytes. If we
-     * see this be wrong in practice we'll add the PeekConsoleInput
-     * filtering. */
     DWORD got = 0;
     if (!ReadFile(h, buf, cap, &got, NULL)) {
+        if (dbg) fprintf(stderr,
+            "[stdin-dbg] ReadFile failed (GetLastError=%lu) -> EOF\n",
+            (unsigned long)GetLastError());
         return -1;
     }
+    if (dbg && got > 0) fprintf(stderr,
+        "[stdin-dbg] ReadFile got %lu bytes\n", (unsigned long)got);
     return (int)got;
 }
 
