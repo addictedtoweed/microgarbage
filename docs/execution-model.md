@@ -219,42 +219,102 @@ channel would be. This is the one genuinely new structural piece for
 multi-app audio; the pool, arbiter, and music player below are unchanged.
 
 **Three resource classes, three scarcities, three rejection points** —
-all plain reject-when-full (no priority; see below), all owner-tagged to
-the requesting app, all reclaimed on app exit (or ELF swap-out, when
-that ends the task), all `config.h`-configurable and feeding the
-footprint math (§4):
+all owner-tagged to the requesting app, all reclaimed on app exit (or ELF
+swap-out, when that ends the task), all `config.h`-configurable and
+feeding the footprint math (§4). Voices and streams are priority-
+arbitrated (uniform integer priority, below); resident-SFX *loading* is
+bounded purely by pool RAM:
 
-| resource | scarcity / limit | rejection point | config knob |
+| resource | scarcity / limit | when full | config knob |
 |---|---|---|---|
-| **resident SFX** | audio-pool block RAM | `load` fails when RAM full | pool size (block count) |
-| **playing voices** | mixer track count | `trigger` fails when voice-set full (FCFS) | track count (default 16) |
-| **filesystem music streams** | global stream budget across *all* apps | stream request returns error when budget exhausted | max streams (default 3) |
+| **resident SFX** | audio-pool block RAM | `load` fails (no priority — RAM is RAM) | pool size (block count) |
+| **playing voices** | mixer track count | strict-greater priority evicts lowest, else `trigger` rejects | track count (default 16) |
+| **filesystem music streams** | global stream budget across *all* apps | strict-greater priority evicts lowest, else request errors | max streams (default 3) |
 
 - **Resident SFX** — the audio pool (block-based, non-contiguous, 8 KB
   blocks, refcounted, out-of-band metadata) is exactly the cheap
   add/remove churn an ELF-swapping game needs. No count cap beyond RAM;
   an app loads SFX until blocks run out, then `load` fails. *(Built.)*
 - **Playing voices** — the arbiter places any app's triggered voices on
-  the shared tracks, FCFS, reject-on-full. Owner-tagged; swept per-app.
-  *(Built — unchanged.)*
+  the shared tracks, priority-arbitrated (below): FCFS while slots are
+  free, strict-greater-priority eviction when full. Owner-tagged; swept
+  per-app. *(Arbiter exists; the `priority` field — currently reserved —
+  becomes live for the eviction rule below; that is the one arbiter
+  change.)*
 - **Music streams** — a filesystem PCM stream with primed intro + loop
   heads for seamless looping (built: `prime_intro`/`prime_loop`, pinned
   head buffers, gap-free two-file model). The budget is **global across
   all apps** (not per-app), owner-tracked so an app's streams release on
-  exit. Requesting one when the budget is full returns an error — no
-  priority, no eviction (evicting live music is jarring, and streams are
-  long-lived). The existing `AUDIO_SERVICE_MAX_MUSIC=3` becomes the
-  configurable default; the addition is formalizing it as a global,
-  owner-tracked, swept budget. Each stream slot's buffers scale the
-  streaming-RAM footprint (§4).
+  exit. The existing `AUDIO_SERVICE_MAX_MUSIC=3` becomes the configurable
+  default; the addition is formalizing it as a global, owner-tracked,
+  swept budget. Each stream slot's buffers scale the streaming-RAM
+  footprint (§4). Stream allocation is priority-arbitrated (below).
 
-**Priority is deferred.** SFX could in principle carry priority to cut
-off a lower-priority playing voice when the track set is full (the
-arbiter's `priority` field is reserved for this). It is **not in scope**
-— no current use case justifies the complexity. Everything rejects
-plainly when full. The field stays reserved-and-unused; priority-evict
-is a possible future refinement if a use case (e.g. a system alert that
-must cut through) appears. No code for it now.
+**Uniform priority (streams and voices).** Both streams and SFX voices
+carry a **plain integer `priority` magnitude** (free-form; devs number
+however they like; a baseline default, e.g. 0). On a full pool (streams
+vs the stream budget, voices vs the track count) the allocator finds the
+**lowest-priority occupant**: a newcomer **strictly greater** evicts it
+and takes the slot; **equal-or-lower rejects** (so the no-priority-set
+case — everything at the baseline — behaves exactly like stable
+FCFS-reject, no churn). Comparison is a trivial scan over a tiny set (≤
+budget or ≤ track count) — no performance concern; the magnitude can be
+any integer. Evicting a stream hard-stops the evicted music; this is rare
+by default (equal priorities reject) and intended only for deliberate
+override.
+
+**Two fields, not one.** `priority` is *only* a magnitude. The emergency
+behaviour is a **separate explicit field** `emergency_behavior`
+(`NONE` / `MUTE_HOLD` / `STOP_RESET`), never bit-packed into the priority
+integer — the eviction compare looks only at the plain magnitude; the
+mixer reads the behaviour enum. (Spare priority bits are not a reason to
+couple the two concepts; the self-documenting two-field form is chosen
+for clarity and auditability. If the ecall ABI is ever register-tight,
+the two may be packed/unpacked *only* at the marshal seam as a transport
+detail — the model and logic always see two fields.)
+
+**Emergency tier (the safety override).** The **maximum priority value**
+(the integer ceiling, all-FFs) is the emergency tier — unbeatable by
+construction (nothing exceeds the ceiling). The device's alarm/warning
+sounds use it; the developer sizes the warning-channel budget (§4)
+deliberately to fit their required simultaneous alarms. The guarantee
+holds under a **first-party-trusted-code assumption** (all device code is
+the manufacturer's and respects the convention) — recorded explicitly;
+if untrusted apps ever run, API-boundary clamping of app priorities below
+the ceiling would be the addition. Emergency streams get primed heads
+(seamless) like all streams.
+
+When an emergency-tier source is active, its `emergency_behavior` drives
+a **mixer mute of the other (non-emergency) tracks**:
+
+- **`MUTE_HOLD`** — other tracks are muted but **keep running at zero
+  gain** (the mixer keeps advancing them; position tracking is therefore
+  free — not-stopping *is* the tracking). Audio is restored by an
+  **explicit** developer release/return-to-playback command, resuming at
+  the **correct current position** (as if it had played underneath). The
+  mute is held until explicitly released — never auto-lifted.
+- **`STOP_RESET`** — other tracks are **killed/reset** (positions
+  abandoned). After the emergency, the developer must **explicitly
+  restart** whatever audio they want; nothing is tracked or restored.
+
+**All recovery is explicit developer command** — releasing a `MUTE_HOLD`,
+stopping the (possibly looping) emergency message, restarting
+`STOP_RESET`-killed audio. The system **never auto-resumes or
+auto-releases**: every state change is a privileged developer action.
+This puts all safety-critical recovery choreography in the certified
+device firmware, not the platform — the right boundary for a safety case
+(no implicit transitions to audit). Composed example — the canonical
+latched medical alarm: a **looping** emergency SFX (see SFX loop below)
+raised at the ceiling with `STOP_RESET` gives a continuous dominant alarm
+that silences everything else and stays latched until the device's
+fault-handling logic explicitly stops it and restarts normal audio.
+
+**SFX loop flag.** SFX gain a simple per-trigger **loop** property —
+plain start-to-end repeat until the voice is stopped or evicted; **no**
+intro/chaining (that two-file seam stays music-only). This exposes the
+mixer's existing per-channel loop support through the trigger API. It
+composes with the emergency tier (a looping emergency SFX = a repeating
+alarm tone).
 
 **ELF-swap cleanup.** A game that swaps ELFs for different loads spawns a
 new task per ELF; the old task ends, and its exit sweeps its
@@ -352,10 +412,45 @@ also already has a `SlabLocker` callback abstraction with documented
 single-threaded / ISR / RTOS modes — that is precisely the
 critical-section seam the scheduler needs (§4.5).
 
-### 4.1 `config.h` declares the bin shape
+**Two intents, one source.** This memory model (like the execution model)
+serves both deployment intents from the same source via `config.h`: the
+SNES cartridge build (two-core, hot-path M7, the bulk PSRAM tier) and the
+commercial secure/optimized micro builds (which may have only fast SRAM,
+or a different bulk tier, or none). The tiering and sizing below are all
+config choices, not forks.
+
+**Tiered: L1 + optional L2.** Memory is configured as tiers that map onto
+the board's physical topology:
+
+- **L1** — fast internal micro SRAM. The hot/small working allocations.
+  Always present.
+- **L2** — slower bulk external memory (PSRAM, FMC-attached SDRAM, etc. —
+  the allocator doesn't care which; it's "the big slow region"). For
+  larger or colder allocations. **Optional and `config.h`-gated**: a
+  board with no external memory simply doesn't define an L2 region and
+  the L2 slab compiles out.
+
+Each tier is just **another `SlabAllocator` instance over its region**,
+with its own `SlabConfig` (L2 skews toward larger bins) and its own
+locker — the allocator is already region-agnostic, so this is
+configuration, not new allocator code. The audio sample pool is a
+specialized L2 resident (samples-at-rest in bulk memory), coexisting with
+(partitioned from) any general L2 slab; both count in the L2 footprint.
+**Crossing tiers for hot work is just an app-level `memcpy`** — copy a
+working piece from L2 into L1 scratch, work, copy back — entirely at the
+app's discretion. There is **no transparent caching/paging** between
+tiers, by deliberate design: it would add non-determinism a safety case
+can't easily certify. (A *future* direction, deferred and uncoded: making
+allocator tiers map to distinct VM **virtual address ranges** — e.g.
+reshaping the 1 GB shared region into tier-backed sub-ranges, translation
+routing by address range to the physical tier. Noted for shape so the
+present design stays compatible; not built.)
+
+### 4.1 `config.h` declares the bin shape (per tier)
 
 The allocator has 16 bins, bin *i* of block size `SLAB_MIN_BLOCK << i`
-(32 B … 1 MB). `config.h` declares the **default block count per bin**:
+(32 B … 1 MB). `config.h` declares the **default block count per bin**,
+**per tier** (the L2 set exists only when L2 is configured):
 
 ```c
 /* config.h — default blocks per slab bin (bin i = (32 << i) bytes). */
@@ -369,6 +464,17 @@ The allocator has 16 bins, bin *i* of block size `SLAB_MIN_BLOCK << i`
 
 These feed a `SlabConfig.bucket_counts[]`. Footprint is then **derived**
 from the shape — the developer never hand-tallies bytes.
+
+**No roll-into-the-next-bin (deterministic, by design).** If a bin is
+exhausted, the allocation **fails** (`SLAB_ERR_BIN_EXHAUSTED`) — it does
+*not* satisfy the request from a larger bin. On a micro you do not want a
+5-byte request, finding the 32 B bin empty, burning a 16 KB block in
+desperation. Fail-fast per bin means the developer learns their bin
+sizing is wrong and fixes the config, rather than chasing mysterious
+large-bin exhaustion later. For the safety case this is a *feature*:
+deterministic per-bin failure is auditable; silent cross-bin
+cannibalization would make exhaustion non-deterministic and hard to
+certify. (This is the allocator's existing documented behaviour.)
 
 ### 4.2 The totaling formula (mirrors `slab_required_bytes` exactly)
 
@@ -461,6 +567,30 @@ own internal critical sections are already routed through the same
 mechanism the scheduler will use; the `config.h` exec mode selects which
 locker the allocator is initialized with. No new locking concept is
 introduced — the existing `SlabLocker` is the seam.
+
+**Why interrupt-disable is safe here (the safety-case rationale).** The
+bare-metal locker disables interrupts around the allocator's critical
+section. This is normally a dangerous habit — but it is *optimal* here
+precisely because the protected op is **O(1) and bounded**: alloc/free is
+a free-stack push/pop + a header magic write/check, a fixed handful of
+instructions (tens of nanoseconds on a 480 MHz M7), with **no loop, scan,
+coalesce, or block**. Bin selection is `clz`-based size arithmetic (one
+cycle), touching no shared state, so it needs no lock at all — only the
+push/pop is bracketed. The worst-case interrupt latency introduced is
+therefore those few instructions, far below any deadline that matters
+(audio DMA, the SNES bus). This bounded-O(1) property is also what makes
+the broader "all allocation goes through the slab on preemptible paths"
+invariant (§2.3.2) *safe*: a variable-time allocator could not be
+interrupt-disabled safely. For the safety case the claim is concrete and
+auditable — "the allocator critical section is provably O(1), so disabled-
+interrupt latency is bounded to N instructions" — not a hand-wave.
+
+Header-magic **double-free / foreign-pointer detection** (returns an
+error rather than corrupting the free-stack) is likewise O(1) and lives
+in the same bracket; for a safety build, a detected double-free is
+evidence of a real bug and a product may choose to escalate (log / fault
+/ safe-state) rather than silently return the error code — a policy left
+to the device firmware.
 
 ---
 
