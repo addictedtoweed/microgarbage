@@ -426,3 +426,79 @@ size_t slab_block_size(const SlabAllocator *a, const void *p) {
     return a->bins[bin].block_size;
 }
 
+/* ----------------------------------------------------------------
+ *  slab_realloc — resize an allocation.
+ *
+ *  Semantics (mirrors C realloc, scoped to this block allocator):
+ *    - p == NULL              -> behaves like slab_alloc(new_size).
+ *    - new_size == 0          -> frees p, returns NULL.
+ *    - new_size fits the
+ *      current block's bin     -> returns p unchanged (no copy).
+ *      (covers shrink, and grow that stays in-bin — both in place)
+ *    - new_size needs a
+ *      bigger bin              -> allocate a new block, copy the old
+ *                                 block's payload across, free the old
+ *                                 block, return the new pointer.
+ *
+ *  On allocation failure when growing, the ORIGINAL block is left
+ *  intact and NULL is returned (the C realloc contract — the caller's
+ *  pointer is still valid).
+ *
+ *  Locking / real-time note: slab_alloc and slab_free each take the
+ *  locker internally and are O(1). The memcpy between them runs with
+ *  NO lock held — at that moment this function exclusively owns both
+ *  blocks, and copying touches nothing shared. So realloc never holds
+ *  the critical section across the O(size) copy: on the micro,
+ *  interrupts are disabled only for the two O(1) ops, not the copy.
+ *
+ *  This is a non-real-time convenience (string building, content
+ *  assembly). It moves pointers and has O(size) timing on growth —
+ *  do not use it on real-time paths or for memory whose pointer is
+ *  shared/held elsewhere.
+ *
+ *  Returns the (possibly new) pointer, or NULL on failure/free.
+ *  Copy size is the smaller block's bin capacity (allocations are
+ *  bucket-rounded; we don't track logical length, so we copy the
+ *  whole old payload — never too little).
+ * ---------------------------------------------------------------- */
+void *slab_realloc(SlabAllocator *a, void *p, size_t new_size) {
+    if (!a) return NULL;
+
+    /* realloc(NULL, n) == alloc(n) */
+    if (!p) return slab_alloc(a, new_size);
+
+    /* realloc(p, 0) == free(p), returns NULL */
+    if (new_size == 0) {
+        slab_free(a, p);
+        return NULL;
+    }
+
+    /* Current capacity (also validates p belongs to this allocator
+     * and is live — returns 0 otherwise). */
+    size_t old_cap = slab_block_size(a, p);
+    if (old_cap == 0) {
+        /* p is NULL-checked above, so 0 here means invalid/foreign/
+         * freed pointer. Don't touch it; fail. */
+        return NULL;
+    }
+
+    /* Fits the current bin (grow-in-bin or shrink): keep in place. */
+    if (new_size <= old_cap) {
+        return p;
+    }
+
+    /* Needs a bigger bin: allocate new, copy, free old. */
+    void *np = slab_alloc(a, new_size);
+    if (!np) {
+        /* Failure: original block untouched, still valid. */
+        return NULL;
+    }
+
+    /* Copy the old payload (its full bin capacity — never too little).
+     * No lock held here: we own both p and np exclusively right now. */
+    memcpy(np, p, old_cap);
+
+    /* Release the old block. */
+    slab_free(a, p);
+    return np;
+}

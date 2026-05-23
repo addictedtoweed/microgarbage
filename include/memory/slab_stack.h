@@ -273,6 +273,24 @@ SlabResult slab_free(SlabAllocator *a, void *p);
  * copy the right number of bytes from old to new. */
 size_t slab_block_size(const SlabAllocator *a, const void *p);
 
+/* Resize an allocation (mirrors C realloc, scoped to this allocator).
+ *   - p == NULL        -> slab_alloc(new_size)
+ *   - new_size == 0    -> slab_free(p), returns NULL
+ *   - fits current bin -> returns p unchanged, no copy (shrink or
+ *                         grow-within-bin both stay in place)
+ *   - needs bigger bin -> alloc new, copy old payload, free old
+ *
+ * On grow-allocation failure the ORIGINAL block is left intact and
+ * NULL is returned (the C realloc contract). The internal memcpy runs
+ * with no lock held (the two O(1) alloc/free each lock; the O(size)
+ * copy does not) — so on the micro interrupts are disabled only for
+ * the bounded ops, not the copy.
+ *
+ * NON-REAL-TIME convenience (string building, content assembly): it
+ * moves pointers and is O(size) on growth. Do not use on real-time
+ * paths or for memory whose pointer is held/shared elsewhere. */
+void *slab_realloc(SlabAllocator *a, void *p, size_t new_size);
+
 /* ============================================================
  *  Introspection
  *

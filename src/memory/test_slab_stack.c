@@ -296,6 +296,112 @@ static void test_free_foreign_pointer_rejected(void) {
 #endif
 
 /* ============================================================
+ *  Realloc
+ * ============================================================ */
+
+static void test_realloc_null_is_alloc(void) {
+    SlabConfig cfg = small_config();
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    void *p = slab_realloc(&a, NULL, 20);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ_INT(32, (int)slab_block_size(&a, p));  /* 20 -> 32B bin */
+    slab_destroy(&a);
+}
+
+static void test_realloc_zero_is_free(void) {
+    SlabConfig cfg = small_config();
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    void *p = slab_alloc(&a, 20);
+    ASSERT_NOT_NULL(p);
+    void *q = slab_realloc(&a, p, 0);
+    ASSERT_NULL(q);
+    /* block returned to its bin */
+    ASSERT_EQ_INT(0, (int)a.total_bytes_in_use);
+    slab_destroy(&a);
+}
+
+static void test_realloc_within_bin_keeps_pointer(void) {
+    SlabConfig cfg = small_config();
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    void *p = slab_alloc(&a, 20);          /* 32B bin */
+    memset(p, 0xAB, 20);
+    void *p2 = slab_realloc(&a, p, 30);    /* still <= 32 */
+    ASSERT_EQ_PTR(p, p2);                  /* no move */
+    ASSERT_EQ_INT(0xAB, ((uint8_t *)p2)[0]);
+    ASSERT_EQ_INT(0xAB, ((uint8_t *)p2)[19]);
+    slab_destroy(&a);
+}
+
+static void test_realloc_shrink_keeps_pointer(void) {
+    SlabConfig cfg = small_config();
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    void *p = slab_alloc(&a, 30);          /* 32B bin */
+    void *p2 = slab_realloc(&a, p, 8);     /* shrink, still in 32B bin */
+    ASSERT_EQ_PTR(p, p2);                  /* shrink stays in place */
+    slab_destroy(&a);
+}
+
+static void test_realloc_grow_past_bin_moves_and_copies(void) {
+    SlabConfig cfg = small_config();
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    void *p = slab_alloc(&a, 20);          /* 32B bin */
+    memset(p, 0xAB, 20);
+    void *p2 = slab_realloc(&a, p, 100);   /* needs 128B bin */
+    ASSERT_NOT_NULL(p2);
+    ASSERT(p2 != p);                       /* moved */
+    ASSERT_EQ_INT(128, (int)slab_block_size(&a, p2));
+    /* old payload preserved (copied the old 32B capacity) */
+    ASSERT_EQ_INT(0xAB, ((uint8_t *)p2)[0]);
+    ASSERT_EQ_INT(0xAB, ((uint8_t *)p2)[19]);
+    slab_destroy(&a);
+}
+
+static void test_realloc_grow_failure_leaves_original_intact(void) {
+    /* tiny config: exactly two 128B blocks, so we can exhaust them */
+    SlabConfig cfg = {0};
+    cfg.bucket_counts[1] = 1;   /* one 64B  */
+    cfg.bucket_counts[2] = 2;   /* two 128B */
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    void *x = slab_alloc(&a, 100);   /* take 128B #1 */
+    void *y = slab_alloc(&a, 100);   /* take 128B #2 — bin now full */
+    ASSERT_NOT_NULL(x);
+    ASSERT_NOT_NULL(y);
+
+    void *small = slab_alloc(&a, 50); /* a 64B block */
+    memset(small, 0xCD, 50);
+    void *grown = slab_realloc(&a, small, 100); /* needs 128B: exhausted */
+    ASSERT_NULL(grown);                          /* fails */
+    /* original still valid + data intact */
+    ASSERT_EQ_INT(64, (int)slab_block_size(&a, small));
+    ASSERT_EQ_INT(0xCD, ((uint8_t *)small)[0]);
+    ASSERT_EQ_INT(0xCD, ((uint8_t *)small)[49]);
+    slab_destroy(&a);
+}
+
+static void test_realloc_invalid_pointer_fails(void) {
+    SlabConfig cfg = small_config();
+    SlabAllocator a;
+    slab_init(&a, g_region, sizeof(g_region), &cfg, slab_null_locker);
+
+    int local = 7;
+    void *r = slab_realloc(&a, &local, 64);  /* foreign pointer */
+    ASSERT_NULL(r);
+    slab_destroy(&a);
+}
+
+/* ============================================================
  *  Stats: peak tracking
  * ============================================================ */
 
@@ -579,6 +685,15 @@ int main(void) {
     RUN(test_double_free_detected);
     RUN(test_free_foreign_pointer_rejected);
 #endif
+
+    /* Realloc */
+    RUN(test_realloc_null_is_alloc);
+    RUN(test_realloc_zero_is_free);
+    RUN(test_realloc_within_bin_keeps_pointer);
+    RUN(test_realloc_shrink_keeps_pointer);
+    RUN(test_realloc_grow_past_bin_moves_and_copies);
+    RUN(test_realloc_grow_failure_leaves_original_intact);
+    RUN(test_realloc_invalid_pointer_fails);
 
     /* Stats */
     RUN(test_peak_bytes_in_use);
