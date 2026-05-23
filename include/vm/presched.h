@@ -92,6 +92,28 @@ int presched_add_task(PreSched *s, presched_task_fn fn, void *arg);
  * finished. Returns when the run is complete. */
 void presched_run(PreSched *s);
 
+/* ---- Block / wake / sleep (step 3) ----------------------------
+ * Called from within a task body (the calling task is "self").
+ *
+ * presched_self_id() — id of the calling task (-1 if not in one).
+ *
+ * presched_block() — block the calling task: it leaves the ready set,
+ *   hands the CPU to the next ready task, and does not run again until
+ *   woken. Wakeups are STICKY: a presched_wake(self) issued before this
+ *   block is remembered, so block returns immediately and consumes it —
+ *   no lost-wakeup race even without a caller-side condition loop.
+ *
+ * presched_wake(id) — mark task `id` runnable again. Safe from any task.
+ *   If `id` is blocked it becomes ready; if not yet blocked the wake is
+ *   recorded as pending (sticky).
+ *
+ * presched_sleep(ticks) — block the calling task until at least `ticks`
+ *   systicks have elapsed, then it becomes runnable again. */
+int  presched_self_id(void);
+void presched_block(PreSched *s);
+void presched_wake(PreSched *s, int id);
+void presched_sleep(PreSched *s, uint32_t ticks);
+
 /* Diagnostics (read after presched_run returns). */
 uint64_t presched_total_ticks(const PreSched *s);
 uint64_t presched_switches(const PreSched *s);   /* context switches made */

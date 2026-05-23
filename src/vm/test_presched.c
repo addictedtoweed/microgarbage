@@ -173,6 +173,40 @@ static void test_equal_priority_round_robins(void) {
     presched_destroy(s);
 }
 
+
+/* ---- block / wake / sleep (step 3) ---- */
+static PreSched *g_bw;
+static atomic_int g_sig, g_cons_done, g_prod_done, g_ran_early;
+static void bw_consumer(void *a){ (void)a;
+  while(!atomic_load(&g_sig)) presched_block(g_bw);
+  atomic_store(&g_cons_done,1); }
+static void bw_producer(void *a){ (void)a;
+  volatile unsigned long x=0; for(unsigned long i=0;i<40000000UL;i++)x+=i;
+  if(atomic_load(&g_cons_done)) atomic_store(&g_ran_early,1);
+  atomic_store(&g_sig,1); presched_wake(g_bw,0); atomic_store(&g_prod_done,1); }
+static void test_block_wake(void){
+  atomic_store(&g_sig,0);atomic_store(&g_cons_done,0);atomic_store(&g_prod_done,0);atomic_store(&g_ran_early,0);
+  g_bw=presched_create(1000);
+  presched_add_task(g_bw,bw_consumer,NULL); presched_add_task(g_bw,bw_producer,NULL);
+  presched_run(g_bw);
+  ASSERT(atomic_load(&g_cons_done)); ASSERT(atomic_load(&g_prod_done)); ASSERT(!atomic_load(&g_ran_early));
+  presched_destroy(g_bw); }
+static atomic_int g_sleep_done, g_busy_prog;
+static void sleeper_t(void *a){ (void)a; presched_sleep(g_bw,50); atomic_store(&g_sleep_done,1); }
+static void busy_t(void *a){ (void)a; for(int c=0;c<3;c++){volatile unsigned long x=0;for(unsigned long i=0;i<20000000UL;i++)x+=i;atomic_fetch_add(&g_busy_prog,1);} }
+static void test_sleep(void){
+  atomic_store(&g_sleep_done,0);atomic_store(&g_busy_prog,0);
+  g_bw=presched_create(1000); presched_add_task(g_bw,sleeper_t,NULL); presched_add_task(g_bw,busy_t,NULL);
+  presched_run(g_bw);
+  ASSERT(atomic_load(&g_sleep_done)); ASSERT_EQ_INT(3,atomic_load(&g_busy_prog));
+  presched_destroy(g_bw); }
+static void test_lone_sleeper_wakes(void){
+  atomic_store(&g_sleep_done,0);
+  g_bw=presched_create(1000); presched_add_task(g_bw,sleeper_t,NULL);
+  presched_run(g_bw);
+  ASSERT(atomic_load(&g_sleep_done));   /* the case that deadlocked the old core */
+  presched_destroy(g_bw); }
+
 int main(void) {
     RUN(test_all_tasks_complete);
     RUN(test_preemption_actually_switches);
@@ -181,5 +215,8 @@ int main(void) {
     RUN(test_repeated_runs_no_deadlock);
     RUN(test_strict_priority_starves_lower);
     RUN(test_equal_priority_round_robins);
+    RUN(test_block_wake);
+    RUN(test_sleep);
+    RUN(test_lone_sleeper_wakes);
     return TEST_SUITE_RESULT();
 }
