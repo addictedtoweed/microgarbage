@@ -640,3 +640,191 @@ required for the earlier steps to be useful. The cooperative floor
 This is the same verification split that the audio arc used: the
 sandbox proves structure and logic; hardware-specific timing and
 platform primitives are confirmed on your machine.
+
+---
+
+## 7. Preemptive scheduler: concrete design (grounded in the real code)
+
+§3.2 sketched the Windows simulated-systick. This section pins down the
+*mechanics*, grounded in the existing `vm_sched` (read, not assumed) and
+a proven preemption primitive — the blueprint the implementation builds
+against.
+
+### 7.1 The preemptive scheduler is a NEW scheduler, not a wrap of vm_sched
+
+The cooperative `vm_sched` is a single host thread that calls `vm_step`
+on one VM at a time with an instruction *budget*, and the VM returns
+control when the budget is spent (or it yields/blocks/traps). The
+scheduler decides when to stop a VM.
+
+The preemptive model is fundamentally different: **each task runs in its
+own thread**, running its own loop continuously, and a **systick
+interrupts it from outside**. The task does not return on a budget; it is
+preempted. So the preemptive scheduler is not a modification of
+`vm_sched`'s loop — it is a *separate* scheduler that shares the VM
+*core* (instruction semantics, register file, ecall routing) but has a
+completely different driving loop. The two are the two backends the
+`config.h` mode flag selects between; `vm_sched` stays untouched as the
+cooperative backend (the safety net).
+
+Consequence for the inner loop: because preemption is external, the VM's
+per-thread loop needs **no per-instruction budget check** — so it can be
+**heavily unrolled** (several instructions per iteration, fewer
+branch-backs, better I-cache use). The cooperative loop pays
+per-instruction bookkeeping to know when to return; the preemptive loop
+pays none and is free to be as tight as possible. This is also a
+*performance* path for a hot single VM, not only a fairness mechanism.
+
+### 7.2 Tasks are thread-centric and content-agnostic
+
+A **task** is *a thread the scheduler preempts*, plus its scheduling
+state. What the thread runs is just its entry function:
+
+- a **VM task** runs the unrolled interpreter loop over a `VmCpu`;
+- a **native task** runs plain compiled C (compute work, a
+  passthrough-heavy routine).
+
+From the systick's view they are identical — a thread to suspend and
+resume. The scheduler core is therefore content-agnostic; "schedule both
+VM and native tasks" needs no special machinery, it falls out of the task
+being "a thread," not "a VM". A trivial cycle-burning loop *is* a native
+task — which is why the first test (below) is simultaneously the
+native-task proof.
+
+### 7.3 Three categories that must not be conflated
+
+- **Task** (VM or native): under the scheduler, time-sliced/preempted by
+  the systick. In the preemptible set.
+- **Service** (audio; future graphics/PPU): *outside* the scheduler,
+  paced by a device/event clock, **never** in the preemptible set —
+  structural, not priority-based. The systick has no knowledge of it.
+  (Whether audio is modeled as an outside-the-scheduler service or as a
+  high-priority blocking task à la a FreeRTOS timer task is an open
+  choice, revisited when services are built.)
+- **Transient critical section**: a normally-preemptible task that
+  *temporarily* suppresses its own preemption (enter/exit) to finish
+  something atomically. A momentary task-controlled state, distinct from
+  the permanent service category.
+
+Priority is NOT a non-preemptibility mechanism for services: "highest
+priority" is a *relative, conventional* guarantee (something else could
+reach that priority), whereas a service being outside the preemptible set
+is *structural* (no priority value puts the systick in charge of it).
+Same reasoning as the reserved emergency-audio tier vs honour-system
+priority. Use the category for services; use priority for ordering tasks;
+use critical-section suppression for transient task atomicity.
+
+### 7.4 Fixed-priority preemptive, O(1) selection
+
+The scheduling model is the standard small-RTOS one (as in FreeRTOS):
+**fixed-priority preemptive with round-robin among equals.**
+
+- **One ready queue per priority level** + a **priority bitmap** (bit *p*
+  set iff level *p* has a ready task).
+- **Pick next = find-highest-set-bit(bitmap) → rotate that level's
+  queue.** The highest-set-bit is a single `clz`/`ctz` (one ARM
+  instruction — the same primitive the slab allocator uses for bin
+  selection). The queue rotation is O(1). So the *entire* scheduling
+  decision is constant time regardless of task count or level count — no
+  scanning, no sorting, no priority comparison loop. This bounded
+  constant-time selection is what makes scheduling latency deterministic,
+  which the real-time/safety case needs.
+- **Higher priority always preempts lower**: when a higher-priority task
+  becomes ready, the systick switches to it.
+
+### 7.5 Round-robin within a level: time-sliced or yield/block-based
+
+Among ready tasks at the *same* priority level, two configurable
+behaviours (cf. FreeRTOS `configUSE_TIME_SLICING`):
+
+- **time-sliced**: the systick rotates the level's queue every tick (or
+  N ticks) — fair time-slicing among equal compute tasks.
+- **yield/block-based**: a task at the level runs until it yields or
+  blocks, then the next at that level runs — lower overhead, right for
+  well-behaved tasks that block naturally.
+
+**Critical / high-priority tasks** (the developer's "critical tasks",
+the FreeRTOS-timer-task pattern) are high-priority tasks that **block
+between activations**: they wake (preempting lower work because they are
+high-priority), do their brief periodic work, and block again. The high
+priority gives prompt *latency*; the blocking is what makes them *regular
+and non-starving*. A high-priority task that never blocks will run
+constantly and starve everything below it — which leads to:
+
+### 7.6 Strict priority; starvation is the task designer's responsibility
+
+Strict fixed-priority: the scheduler **always** runs the highest-priority
+ready task. A never-blocking high-priority task **will** starve lower
+ones — by design. We do **not** add priority aging or guaranteed-minimum
+heuristics: they trade away the O(1)/deterministic guarantee and add
+nondeterminism a safety case must then reason about. The discipline
+"high-priority tasks must block between activations" is load-bearing and
+is the *task designer's* responsibility, documented as such. The
+guarantee is one auditable sentence: *the scheduler always runs the
+highest-priority ready task.* (This is the preemptive analogue of the
+cooperative scheduler's existing critical-section-debt fairness
+mechanism.)
+
+### 7.7 Ecalls, blocking, traps run in the task's own thread
+
+Unlike cooperative mode (where `vm_step` returns to the scheduler to
+route an ecall), a preemptive VM task handles these *in its own thread*:
+
+- **ecall** → the loop calls the ecall router inline, in-thread.
+- **blocking ecall** (mailbox recv, sleep) → the thread actually *waits*
+  (condition variable / event) — blocking is just the thread blocking,
+  more natural than the cooperative "set block_reason and return".
+- **trap** → handled in-thread (run the trap handler / self-terminate).
+
+The systick is *not* involved in ecall routing or blocking — those happen
+in the threads. The systick's only job is "stop whoever's running, pick
+next, resume". **Consequence:** ecall handlers now run concurrently
+across task threads, so any shared state they touch needs real
+concurrency safety (the audio channel already is — lock-free SPSC;
+mailboxes and other shared handlers need auditing as they're brought into
+the preemptive model). This is the structural-non-concurrency-replaced-
+by-real-concurrency change §2.3 warned about, made concrete.
+
+### 7.8 The preemption primitive (and the honesty boundary)
+
+- **Windows (the target sim):** `SuspendThread`/`ResumeThread` on the
+  task threads, driven by a timer thread acting as the systick. Truly
+  asynchronous suspend (stops a thread at any instruction). **Compile-
+  checked only in the sandbox; the real async-suspend behaviour and the
+  `SuspendThread` CRT-lock hazard under load are verified by the user on
+  Windows** — same boundary as `channel_win32.c` and waveOut.
+- **POSIX (in-sandbox validation):** a periodic timer (`timer_create` +
+  `SIGEV_SIGNAL`) delivers a systick signal; the handler runs the
+  scheduling decision. *Proven working* (a 1 ms timer reliably interrupts
+  a running busy loop). This validates the scheduling *logic* (preemption
+  happens, the scheduler picks correctly, no deadlock under TSan) but is
+  **not** identical to `SuspendThread`: a POSIX signal runs the handler
+  in the target thread's context at an OS-chosen point, whereas
+  `SuspendThread` is a truly external async stop. The POSIX path proves
+  *logic*; the Windows path is the real async-suspend, user-verified.
+
+This is the same split that worked for audio: the sandbox proves
+structure and logic under TSan; the platform-specific async primitive and
+real-time timing are confirmed on the user's hardware.
+
+### 7.9 Build order for the preemptive scheduler
+
+1. **Bare round-robin skeleton** — N native-loop tasks at a single
+   priority level, a systick that round-robin-preempts them. Proves the
+   preemption mechanism + queue rotation + no deadlock (TSan). This *is*
+   the native-task proof. *(POSIX-validated in-sandbox; Windows
+   SuspendThread twin compile-checked.)*
+2. **Priority dimension** — per-level ready queues + bitmap + `clz`
+   selection + higher-preempts-lower. Critical/high-priority tasks become
+   expressible.
+3. **Block/wake** — what makes high-priority periodic tasks *regular*
+   (and is the natural home for blocking ecalls).
+4. **VM tasks** — drop the unrolled real-`VmCpu` interpreter loop in as a
+   task entry function. No scheduler changes.
+5. **Services + integration** — audio under preemption (service vs
+   high-priority-task decision), the systick/service-exclusion invariant,
+   ecall-handler concurrency audit.
+
+Each step is independently verifiable. The cooperative `vm_sched` and the
+whole working system stay untouched throughout, behind the `config.h`
+mode flag.
