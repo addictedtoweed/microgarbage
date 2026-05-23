@@ -116,14 +116,26 @@ HOST_EXTRA=(
     "$REPO_ROOT/src/storage/trashfs.c"
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c"
     "$REPO_ROOT/src/util/inicfg.c"
-    # NOTE: no audio sources here. The audio worker thread + channel
-    # transport (channel_thread.c) are POSIX/pthreads, so host.c guards
-    # audio out on native Windows (HOST_AUDIO_SUPPORTED undefined). A
-    # native-Windows audio build needs a win32-thread channel backend
-    # (future work). Cygwin builds via build.sh DO get audio — and the
-    # audio_stress harness there links audio_sink_waveout.c (-lwinmm) for
-    # live output. The waveOut backend is ready; only the win32 channel
-    # transport is missing for native-Windows live audio.
+    # Audio: native-Windows build now includes the full audio service.
+    # The channel transport is channel_win32.c (Win32 CreateThread +
+    # CONDITION_VARIABLE) — NOT channel_thread.c (pthreads). host.c uses
+    # CreateThread for the worker and opens the waveOut sink, so a
+    # standalone .exe gets live audio with no pthread/Cygwin dependency.
+    "$REPO_ROOT/src/vm/channel_win32.c"
+    "$REPO_ROOT/src/vm/service_channel.c"
+    "$REPO_ROOT/src/vm/vm_host_audio.c"
+    "$REPO_ROOT/src/containers/spsc_ring.c"
+    "$REPO_ROOT/src/audio/audio_service.c"
+    "$REPO_ROOT/src/audio/audio_arbiter.c"
+    "$REPO_ROOT/src/audio/audio_pool.c"
+    "$REPO_ROOT/src/audio/audio_pool_stream.c"
+    "$REPO_ROOT/src/audio/audio_mixer.c"
+    "$REPO_ROOT/src/audio/music_player.c"
+    "$REPO_ROOT/src/audio/audio_fft.c"
+    "$REPO_ROOT/src/audio/audio_fft_kernel.c"
+    "$REPO_ROOT/src/audio/audio_wav_read.c"
+    "$REPO_ROOT/src/audio/audio_sink_wav.c"
+    "$REPO_ROOT/src/audio/audio_sink_waveout.c"
 )
 FATFS_SRCS=(
     "$FATFS_DIR/ff_wrapped.c"
@@ -194,7 +206,12 @@ step "compiling native host.exe (with FatFs)..."
     "$EXAMPLE_DIR/host.c" \
     "$SHELL_DATA_C" \
     "${VM_CORE[@]}" "${HOST_EXTRA[@]}" "${FATFS_SRCS[@]}" \
-    -lws2_32
+    -static -lws2_32 -lwinmm
+# -static: bundle the mingw runtime so the .exe is a single self-
+#   contained file for testers (no libgcc_s/libwinpthread DLL hunt).
+#   The win32 audio path uses Win32 threads directly (not the pthread
+#   shim), so nothing drags in libwinpthread.
+# -lwinmm: the waveOut audio backend (live output).
 step "built $BUILD_DIR/host.exe"
 
 # Guest ELFs (platform-neutral). The RISC-V cross-compiler may be a

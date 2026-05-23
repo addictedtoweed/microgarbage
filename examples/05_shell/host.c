@@ -69,7 +69,11 @@ typedef SOCKET tcp_sock_t;
 #include "audio/audio_sink.h"
 #include "vm/vm_host_audio.h"
 #include "vm/channel_thread.h"
-#if !defined(_WIN32) || defined(__CYGWIN__)
+#if defined(_WIN32) && !defined(__CYGWIN__)
+#  include <windows.h>
+#  include <process.h>
+#  include <stdatomic.h>
+#else
 #  include <pthread.h>
 #  include <stdatomic.h>
 #endif
@@ -186,13 +190,21 @@ static TrashfsVolume g_trashfs_vol;
 #define AUDIO_CHANNEL_SLOTS     32
 
 /* The audio service runs on its own thread — the desktop stand-in for
- * the H745's M4 core. It's POSIX-only here because channel_thread.c
- * (the transport) uses pthreads; a native-Windows build would need a
- * win32-thread + win32-condvar backend (future work), so on that
- * target audio simply isn't installed and guest audio calls fail
- * gracefully. Cygwin and Linux get full audio. */
-#if !defined(_WIN32) || defined(__CYGWIN__)
+ * the H745's M4 core. The channel transport + worker thread are
+ * provided per platform:
+ *   - POSIX / Cygwin: pthreads (channel_thread.c).
+ *   - native Windows: Win32 CreateThread + CONDITION_VARIABLE
+ *     (channel_win32.c), so a standalone mingw .exe gets audio with
+ *     no pthread/Cygwin dependency.
+ * Audio is therefore supported on all desktop targets now. */
 #define HOST_AUDIO_SUPPORTED 1
+
+/* Tiny worker-thread abstraction so the rest of the audio code is
+ * platform-agnostic. */
+#if defined(_WIN32) && !defined(__CYGWIN__)
+typedef HANDLE   audio_thread_t;
+#else
+typedef pthread_t audio_thread_t;
 #endif
 
 #ifdef HOST_AUDIO_SUPPORTED
@@ -202,7 +214,7 @@ static ChannelMsg       g_audio_req_ring[AUDIO_CHANNEL_SLOTS];
 static ChannelMsg       g_audio_resp_ring[AUDIO_CHANNEL_SLOTS];
 static ServiceChannel   g_audio_channel;
 static AudioService    *g_audio_service;
-static pthread_t        g_audio_thread;
+static audio_thread_t   g_audio_thread;
 static _Atomic int      g_audio_stop;
 static bool             g_audio_running;
 
@@ -223,9 +235,9 @@ static bool audio_should_stop(void *u) {
  * shell never hangs waiting on a device that isn't there. */
 #define AUDIO_RENDER_QUANTUM 512u
 
-static void *audio_worker(void *u) {
-    (void)u;
-
+/* Shared worker body — platform-agnostic. The thread entry wrappers
+ * below adapt this to each OS's thread-function signature. */
+static void audio_worker_body(void) {
     AudioSink sink;
     bool have_sink = false;
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -235,7 +247,7 @@ static void *audio_worker(void *u) {
     if (!have_sink) {
         /* No live device: just service requests (silent). */
         audio_service_run(g_audio_service, audio_should_stop, NULL);
-        return NULL;
+        return;
     }
 
     int16_t buf[AUDIO_RENDER_QUANTUM * 2];
@@ -248,7 +260,41 @@ static void *audio_worker(void *u) {
         if (audio_sink_write(&sink, buf, AUDIO_RENDER_QUANTUM) < 0) break;
     }
     audio_sink_close(&sink);
+}
+
+/* Platform thread entry: native Windows wants DWORD WINAPI(LPVOID);
+ * POSIX/Cygwin want void *(void *). Both just run the shared body. */
+#if defined(_WIN32) && !defined(__CYGWIN__)
+static DWORD WINAPI audio_worker(LPVOID u) {
+    (void)u;
+    audio_worker_body();
+    return 0;
+}
+#else
+static void *audio_worker(void *u) {
+    (void)u;
+    audio_worker_body();
     return NULL;
+}
+#endif
+
+/* Platform thread start/join. Return 0 on success (start) like
+ * pthread_create. */
+static int audio_thread_start(void) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    g_audio_thread = CreateThread(NULL, 0, audio_worker, NULL, 0, NULL);
+    return g_audio_thread ? 0 : -1;
+#else
+    return pthread_create(&g_audio_thread, NULL, audio_worker, NULL);
+#endif
+}
+static void audio_thread_join(void) {
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    WaitForSingleObject(g_audio_thread, INFINITE);
+    CloseHandle(g_audio_thread);
+#else
+    pthread_join(g_audio_thread, NULL);
+#endif
 }
 
 /* Build the channel + service and start the worker. Returns true on
@@ -277,7 +323,7 @@ static bool host_audio_start(VmSystem *sys, const char *host_fs_root) {
         return false;
     }
     atomic_store(&g_audio_stop, 0);
-    if (pthread_create(&g_audio_thread, NULL, audio_worker, NULL) != 0) {
+    if (audio_thread_start() != 0) {
         audio_service_destroy(g_audio_service);
         g_audio_service = NULL;
         service_channel_destroy(&g_audio_channel);
@@ -295,7 +341,7 @@ static bool host_audio_start(VmSystem *sys, const char *host_fs_root) {
     if (!vm_host_install_audio(sys, &hcfg)) {
         /* handlers not installed; stop the worker we started */
         atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
-        pthread_join(g_audio_thread, NULL);
+        audio_thread_join();
         audio_service_destroy(g_audio_service);
         g_audio_service = NULL;
         service_channel_destroy(&g_audio_channel);
@@ -308,7 +354,7 @@ static bool host_audio_start(VmSystem *sys, const char *host_fs_root) {
 static void host_audio_stop(void) {
     if (!g_audio_running) return;
     atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
-    pthread_join(g_audio_thread, NULL);
+    audio_thread_join();
     audio_service_destroy(g_audio_service);
     g_audio_service = NULL;
     service_channel_destroy(&g_audio_channel);

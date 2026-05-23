@@ -148,10 +148,27 @@ $hostExtra = @(
     "src\storage\trashdrive.c",
     "src\storage\trashfs.c",
     "src\storage\trashdrive_fatfs.c",
-    # NOTE: no audio sources. The audio worker + channel transport are
-    # POSIX/pthreads; host.c guards audio out on native Windows. A
-    # win32-thread channel backend is future work. (Cygwin gets audio.)
-    "src\util\inicfg.c"
+    "src\util\inicfg.c",
+    # Audio (native Windows): channel_win32.c is the Win32 transport
+    # (CreateThread + CONDITION_VARIABLE), NOT channel_thread.c (pthreads).
+    # Gives a standalone .exe live audio with no pthread/Cygwin dep.
+    # NOTE: this .ps1 is MIRROR-ONLY of build-win.sh and is UNVERIFIED by
+    # the author's toolchain — the .sh is the verified build path.
+    "src\vm\channel_win32.c",
+    "src\vm\service_channel.c",
+    "src\vm\vm_host_audio.c",
+    "src\containers\spsc_ring.c",
+    "src\audio\audio_service.c",
+    "src\audio\audio_arbiter.c",
+    "src\audio\audio_pool.c",
+    "src\audio\audio_pool_stream.c",
+    "src\audio\audio_mixer.c",
+    "src\audio\music_player.c",
+    "src\audio\audio_fft.c",
+    "src\audio\audio_fft_kernel.c",
+    "src\audio\audio_wav_read.c",
+    "src\audio\audio_sink_wav.c",
+    "src\audio\audio_sink_waveout.c"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
 $fatfs = @(
@@ -189,8 +206,11 @@ if ($Release) {
     $guestOpt = @("-Os")
 }
 
-# Native Windows needs WinSock2 for the TCP transport.
-$libs = @("-lws2_32")
+# Native Windows needs WinSock2 for the TCP transport, winmm for the
+# waveOut audio backend. -static bundles the mingw runtime so the .exe
+# is a single self-contained file for testers (no DLL hunt); the win32
+# audio path uses Win32 threads directly, so nothing pulls libwinpthread.
+$libs = @("-static", "-lws2_32", "-lwinmm")
 
 # ----------------------------------------------------------------
 # Bake the guest shell into host.exe (XIP-executed at runtime). The
