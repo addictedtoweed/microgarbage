@@ -28,7 +28,10 @@ garbage/
 │   │   ├── hashtable.h
 │   │   ├── ring_buffer.h
 │   │   ├── fifo_queue.h
-│   │   └── stack.h
+│   │   ├── stack.h
+│   │   ├── slist.h             ← singly-linked list (lean, node pool)
+│   │   ├── dlist.h             ← doubly-linked list (node pool)
+│   │   └── tree.h              ← ordered tree, BST/AVL (node pool)
 │   ├── math/
 │   │   ├── fixed_point.h
 │   │   └── fast_div.h
@@ -190,6 +193,9 @@ errors:
 | ring_buffer   | (none)                               |
 | fifo_queue    | ring_buffer                          |
 | stack         | (none)                               |
+| slist         | (none)                               |
+| dlist         | (none)                               |
+| tree          | (none)                               |
 | fixed_point   | (none)                               |
 | fast_div      | (none)                               |
 | audio_mixer   | ring_buffer, fixed_point             |
@@ -363,6 +369,58 @@ Fixed-capacity LIFO stack. Caller-provided storage. Reject-on-full.
 
 API: `stack_init`, `stack_reset`, `stack_push`, `stack_pop`,
 `stack_peek`, `stack_count`, `stack_empty`, `stack_full`.
+
+#### slist / dlist
+
+Linked lists over a caller-provided **node pool** (no malloc). You hand
+the list a byte buffer; it carves nodes from it and keeps an internal
+free list, rejecting inserts when the pool is exhausted — the same
+fixed-capacity discipline as the rest of the library. Nodes are
+addressed by 32-bit index, so the structure and the sizing math are
+identical on 32- and 64-bit hosts. Both ship a compile-time size macro
+(`SLIST_POOL_BYTES` / `DLIST_POOL_BYTES`, for static arrays and
+`_Static_assert`) and a matching runtime function (`slist_pool_bytes` /
+`dlist_pool_bytes`, for bump arenas) — they agree.
+
+`slist` is the **lean** one: a single link per node (4 bytes + payload),
+forward-only iteration, O(1) push/pop at the front and O(1) push at the
+back (`pop_back` is O(n)). Use it where memory is tight — e.g. the
+VM/guest side.
+
+`dlist` is the **richer** one: two links per node, push/pop at both ends
+all O(1), and both forward (`begin`/`next`) and backward
+(`rbegin`/`prev`) iteration. Use it on the host or when you need those
+operations.
+
+API (slist): `slist_init`, `slist_clear`, `slist_push_front/back`,
+`slist_pop_front/back`, `slist_front/back`, `slist_count/empty/full`,
+`slist_begin/next/get`.
+API (dlist): the same shape plus `dlist_rbegin`/`dlist_prev`.
+
+#### tree
+
+An **ordered binary tree** over a node pool, with a balancing discipline
+chosen at init: `TREE_BST` (plain unbalanced — smallest per-insert work,
+but O(n) worst case on sorted input) or `TREE_AVL` (height-balanced —
+O(log n) guaranteed regardless of insertion order, no sorted-input
+footgun). One instance uses one discipline for its life; you don't mix.
+
+The key property: **the same walk works for every discipline.**
+`tree_begin`/`tree_next` is one shared in-order traversal that yields
+elements in sorted order whether the tree is a BST or an AVL —
+`tree_rbegin`/`tree_prev` walk descending. `tree_find`/`tree_contains`
+are likewise shared. So a developer learns one iteration idiom and one
+lookup, and picks the insertion algorithm independently.
+
+You supply a comparator at init; duplicate keys are rejected (set
+semantics). Same node-pool sizing pair as the lists
+(`TREE_POOL_BYTES` macro + `tree_pool_bytes()`), plus
+`tree_pool_bytes_for_depth()` which returns the worst-case bytes to hold
+*any* tree up to a given depth (a full tree — a bound, not exact).
+
+API: `tree_init`, `tree_clear`, `tree_insert`, `tree_remove`,
+`tree_find`, `tree_contains`, `tree_count/empty/full`,
+`tree_begin/rbegin/next/prev/get`.
 
 ### math
 

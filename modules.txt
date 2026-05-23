@@ -2,6 +2,9 @@ hashtable	containers	-	String-keyed hashtable with auto-resize and pluggable all
 ring_buffer	containers	-	Fixed-capacity circular buffer with memcpy elements
 fifo_queue	containers	ring_buffer	Bounded FIFO queue, reject-on-full
 stack	containers	-	Fixed-capacity LIFO stack with memcpy elements
+slist	containers	-	Singly-linked list over a caller-provided node pool (lean: one link/node; forward-only walk; for memory-constrained/guest use)
+dlist	containers	-	Doubly-linked list over a caller-provided node pool (push/pop both ends, forward+backward walk)
+tree	containers	-	Ordered binary tree (BST or AVL, discipline chosen at init) over a node pool; one shared in-order walk across disciplines
 fixed_point	math	-	Q-format fixed-point arithmetic (Q15, Q31, Q16.16, Q32.32, Q48.16)
 fast_div	math	-	Fast integer division by a runtime-known divisor (u32/s32/u64/s64)
 audio_mixer	audio	ring_buffer,fixed_point	Multi-channel audio mixer with resampling, pan, looping, sync (v2)
