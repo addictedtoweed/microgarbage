@@ -23,6 +23,22 @@
 #define AUDIO_GAIN_UNITY   32767
 #define AUDIO_PAN_CENTER   0
 
+/* Largest plausible meter band count; anything above this from a
+ * GET_LEVELS call is a negative errno (audio unavailable), not a real
+ * count. (The service uses 16 bands; allow headroom.) */
+#define AUDIO_FFT_BANDS_MAX 64
+
+/* A syscall return is a failure if it's a small negative errno code.
+ * The host writes negative errno (e.g. -ENOSYS = -38 = 0xFFFFFFDA) for
+ * unknown/failed syscalls. We must NOT mistake a valid music handle —
+ * which is high-bit *tagged* (0x80……) and so also "negative" as
+ * int32 — for an error. Linux errnos are small (1..4095), so only
+ * returns in the top 4096 codes (0xFFFFF001..0xFFFFFFFF, i.e. -1..-4095)
+ * count as failures; tagged handles (0x80000001..0xBFFFFFFF) do not. */
+static inline int _audio_failed(uint32_t r) {
+    return r >= 0xFFFFF001u;     /* -1 .. -4095 */
+}
+
 typedef uint32_t audio_object;   /* durable loaded sample/music */
 typedef uint32_t audio_voice;    /* transient playing instance  */
 
@@ -34,8 +50,8 @@ typedef uint32_t audio_voice;    /* transient playing instance  */
  * mono in this build). Returns an object handle, or AUDIO_OBJECT_NONE
  * on failure (out of audio memory, too big for the staging buffer). */
 static inline audio_object audio_load_sample(const void *pcm, uint32_t size) {
-    return (audio_object)_vm_sys2(SYS_AUDIO_LOAD_SAMPLE,
-                                  (uint32_t)pcm, size);
+    uint32_t r = _vm_sys2(SYS_AUDIO_LOAD_SAMPLE, (uint32_t)pcm, size);
+    return _audio_failed(r) ? AUDIO_OBJECT_NONE : (audio_object)r;
 }
 
 /* Release the caller's reference to an object. The object survives
@@ -49,8 +65,9 @@ static inline void audio_free(audio_object obj) {
  * if all tracks are busy (REJECTED) or the object is invalid. */
 static inline audio_voice audio_trigger(audio_object obj,
                                         int32_t gain_q15, int32_t pan_q15) {
-    return (audio_voice)_vm_sys3(SYS_AUDIO_TRIGGER_SFX, obj,
-                                 (uint32_t)gain_q15, (uint32_t)pan_q15);
+    uint32_t r = _vm_sys3(SYS_AUDIO_TRIGGER_SFX, obj,
+                          (uint32_t)gain_q15, (uint32_t)pan_q15);
+    return _audio_failed(r) ? AUDIO_VOICE_NONE : (audio_voice)r;
 }
 
 /* Pair two already-loaded sample objects (intro + loop) into a music
@@ -60,13 +77,15 @@ static inline audio_voice audio_trigger(audio_object obj,
  * own refs to them afterward. */
 static inline audio_object audio_load_music(audio_object intro,
                                             audio_object loop) {
-    return (audio_object)_vm_sys2(SYS_AUDIO_LOAD_MUSIC, intro, loop);
+    uint32_t r = _vm_sys2(SYS_AUDIO_LOAD_MUSIC, intro, loop);
+    return _audio_failed(r) ? AUDIO_OBJECT_NONE : (audio_object)r;
 }
 
 /* Play a music object (intro+loop). Returns a voice handle or
  * AUDIO_VOICE_NONE (REJECTED if no music stream slot is free). */
 static inline audio_voice audio_play_music(audio_object music, uint32_t flags) {
-    return (audio_voice)_vm_sys2(SYS_AUDIO_PLAY_MUSIC, music, flags);
+    uint32_t r = _vm_sys2(SYS_AUDIO_PLAY_MUSIC, music, flags);
+    return _audio_failed(r) ? AUDIO_VOICE_NONE : (audio_voice)r;
 }
 
 /* Stop a playing voice. Returns 0 or a negative errno. */
@@ -86,10 +105,25 @@ static inline void audio_fft_enable(int enable) {
 }
 
 /* Fill `out` with up to `n_bands` FFT band levels (0..255) for the
- * meters. Returns the number written (0 if the meter is disabled).
- * Enable the meter first with audio_fft_enable(1). */
+ * meters. Returns the number written (0 if the meter is disabled or
+ * audio is unavailable). Enable the meter first with
+ * audio_fft_enable(1). Guards against the host returning a negative
+ * errno (e.g. -ENOSYS when audio isn't installed): such a value, read
+ * as unsigned, would be a huge bogus count — clamp it to 0. */
 static inline uint32_t audio_get_levels(uint8_t *out, uint32_t n_bands) {
-    return _vm_sys2(SYS_AUDIO_GET_LEVELS, (uint32_t)out, n_bands);
+    uint32_t r = _vm_sys2(SYS_AUDIO_GET_LEVELS, (uint32_t)out, n_bands);
+    if (r > n_bands) return 0;   /* negative errno or impossible count */
+    return r;
+}
+
+/* True if the audio service is actually wired up on this host. Probes
+ * with a harmless call; if it returns a negative errno (-ENOSYS, read
+ * as a huge unsigned), audio isn't available (e.g. native-Windows
+ * builds without the win32 channel transport). Apps should check this
+ * before relying on audio. */
+static inline int audio_available(void) {
+    uint32_t r = _vm_sys2(SYS_AUDIO_GET_LEVELS, 0, 0);
+    return !_audio_failed(r) && r <= AUDIO_FFT_BANDS_MAX;
 }
 
 /* ============================================================
@@ -106,7 +140,8 @@ static inline uint32_t audio_get_levels(uint8_t *out, uint32_t n_bands) {
  *  (missing file, not PCM, too big for the host staging buffer).
  * ============================================================ */
 static inline audio_object audio_load_wav(const char *path) {
-    return (audio_object)_vm_sys1(SYS_AUDIO_LOAD_WAV, (uint32_t)path);
+    uint32_t r = _vm_sys1(SYS_AUDIO_LOAD_WAV, (uint32_t)path);
+    return _audio_failed(r) ? AUDIO_OBJECT_NONE : (audio_object)r;
 }
 
 #endif /* GUEST_AUDIO_H */
