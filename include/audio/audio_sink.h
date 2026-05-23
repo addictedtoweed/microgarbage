@@ -77,7 +77,7 @@ void audio_sink_close(AudioSink *sink);
 
 /* ---- backends (exposed so tests can use them directly) ---- */
 extern const AudioSinkBackend audio_sink_wav;       /* always available */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__CYGWIN__)
 extern const AudioSinkBackend audio_sink_waveout;   /* Windows only     */
 #endif
 

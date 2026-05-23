@@ -93,6 +93,13 @@ int main(int argc, char **argv) {
     const char *asset = (argc > 3) ? argv[3] : NULL;
     if (seconds == 0) seconds = 6;
 
+    /* Backend: default "wav" (dump to out_path). Set AUDIO_STRESS_OUT=wave
+     * (Windows only) for live waveOut output — out_path is then ignored.
+     * Kept as an env var so the positional args stay simple. */
+    const char *backend = getenv("AUDIO_STRESS_OUT");
+    if (!backend) backend = "wav";
+    int live = (strcmp(backend, "wav") != 0);
+
     int fails = 0;
     #define EXPECT(cond, msg) do { if (!(cond)) { \
         printf("  CHECK FAIL: %s\n", msg); fails++; } } while (0)
@@ -161,10 +168,13 @@ int main(int argc, char **argv) {
 
     /* ---- open the output sink ---- */
     AudioSink sink;
-    if (!audio_sink_open(&sink, "wav", out_path, SR)) {
-        printf("FATAL: could not open sink %s\n", out_path);
+    if (!audio_sink_open(&sink, backend, out_path, SR)) {
+        printf("FATAL: could not open sink (backend=%s, path=%s)\n",
+               backend, out_path);
         return 2;
     }
+    if (live) printf("live output via '%s' backend\n", backend);
+    else      printf("rendering to %s\n", out_path);
 
     /* ---- the stress loop ---- */
     /* Start both music streams. */

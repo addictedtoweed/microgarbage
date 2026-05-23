@@ -227,10 +227,23 @@ echo "  Type 'help' once inside the shell for a command list."
 # Optional: build the standalone audio stress harness (POSIX only — it
 # uses the pthread channel transport). Renders the engine under load to
 # a .wav you can listen to: "$BUILD_DIR/audio_stress out.wav 6".
+# On Cygwin it ALSO links the waveOut backend (-lwinmm) so you can get
+# LIVE output: AUDIO_STRESS_OUT=wave "$BUILD_DIR/audio_stress".
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) : ;;   # native Windows: needs the win32 transport (future)
     *)
         echo "05_shell: building audio_stress harness..."
+        STRESS_EXTRA_SRCS=()
+        STRESS_EXTRA_LIBS=()
+        case "$(uname -s 2>/dev/null)" in
+            CYGWIN*)
+                # Cygwin has pthreads (channel works) AND can call Win32
+                # waveOut directly — the live-output path that works today.
+                STRESS_EXTRA_SRCS+=("$REPO_ROOT/src/audio/audio_sink_waveout.c")
+                STRESS_EXTRA_LIBS+=(-lwinmm)
+                echo "05_shell:   (Cygwin: linking waveOut for live output)"
+                ;;
+        esac
         "$CC" -std=c11 -O2 -I"$REPO_ROOT/include" \
             -o "$BUILD_DIR/audio_stress" \
             "$EXAMPLE_DIR/audio_stress.c" \
@@ -244,12 +257,13 @@ case "$(uname -s 2>/dev/null)" in
             "$REPO_ROOT/src/audio/audio_fft_kernel.c" \
             "$REPO_ROOT/src/audio/audio_sink_wav.c" \
             "$REPO_ROOT/src/audio/audio_wav_read.c" \
+            "${STRESS_EXTRA_SRCS[@]}" \
             "$REPO_ROOT/src/containers/ring_buffer.c" \
             "$REPO_ROOT/src/containers/spsc_ring.c" \
             "$REPO_ROOT/src/vm/service_channel.c" \
             "$REPO_ROOT/src/vm/channel_thread.c" \
-            -lpthread \
-        && echo "    $BUILD_DIR/audio_stress  (render the engine under load to a .wav)"
+            -lpthread "${STRESS_EXTRA_LIBS[@]}" \
+        && echo "    $BUILD_DIR/audio_stress  (render under load to .wav; AUDIO_STRESS_OUT=wave for live on Cygwin)"
         ;;
 esac
 

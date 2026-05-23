@@ -120,7 +120,10 @@ HOST_EXTRA=(
     # transport (channel_thread.c) are POSIX/pthreads, so host.c guards
     # audio out on native Windows (HOST_AUDIO_SUPPORTED undefined). A
     # native-Windows audio build needs a win32-thread channel backend
-    # (future work). Cygwin builds via build.sh DO get audio.
+    # (future work). Cygwin builds via build.sh DO get audio — and the
+    # audio_stress harness there links audio_sink_waveout.c (-lwinmm) for
+    # live output. The waveOut backend is ready; only the win32 channel
+    # transport is missing for native-Windows live audio.
 )
 FATFS_SRCS=(
     "$FATFS_DIR/ff_wrapped.c"
