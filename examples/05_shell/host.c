@@ -66,6 +66,7 @@ typedef SOCKET tcp_sock_t;
 #include "storage/trashdrive_fatfs.h"
 #include "storage/trashfs.h"
 #include "audio/audio_service.h"
+#include "audio/audio_sink.h"
 #include "vm/vm_host_audio.h"
 #include "vm/channel_thread.h"
 #if !defined(_WIN32) || defined(__CYGWIN__)
@@ -209,9 +210,44 @@ static bool audio_should_stop(void *u) {
     (void)u;
     return atomic_load_explicit(&g_audio_stop, memory_order_acquire) != 0;
 }
+
+/* The audio worker is the desktop stand-in for the M4's SAI+DMA loop:
+ * it continuously renders the mixed output to a live sound device and,
+ * between renders, drains channel requests + pumps music. The sink's
+ * write() is device-paced (it blocks until the device wants more), so
+ * this loop runs at the audio clock — no separate timer needed.
+ *
+ * On Cygwin/Windows the sink is waveOut (live sound). If that can't be
+ * opened (no device, or a platform without it), we fall back to the
+ * request-only loop (audio still works logically, just silent) so the
+ * shell never hangs waiting on a device that isn't there. */
+#define AUDIO_RENDER_QUANTUM 512u
+
 static void *audio_worker(void *u) {
     (void)u;
-    audio_service_run(g_audio_service, audio_should_stop, NULL);
+
+    AudioSink sink;
+    bool have_sink = false;
+#if defined(_WIN32) || defined(__CYGWIN__)
+    have_sink = audio_sink_open(&sink, "waveout", NULL, 44100);
+#endif
+
+    if (!have_sink) {
+        /* No live device: just service requests (silent). */
+        audio_service_run(g_audio_service, audio_should_stop, NULL);
+        return NULL;
+    }
+
+    int16_t buf[AUDIO_RENDER_QUANTUM * 2];
+    while (!audio_should_stop(NULL)) {
+        /* drain pending audio requests + pump music (non-RT work) */
+        audio_service_process(g_audio_service, 64);
+        /* render a block of mixed audio and push it to the device;
+         * the write blocks until the device drains a buffer, pacing us */
+        audio_service_render(g_audio_service, buf, AUDIO_RENDER_QUANTUM);
+        if (audio_sink_write(&sink, buf, AUDIO_RENDER_QUANTUM) < 0) break;
+    }
+    audio_sink_close(&sink);
     return NULL;
 }
 

@@ -118,7 +118,8 @@ echo "05_shell: compiling host (with FatFs)..."
 HOST_LIBS=()
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) HOST_LIBS+=(-lws2_32) ;;
-    *)            HOST_LIBS+=(-lpthread) ;;   # audio worker thread
+    CYGWIN*)      HOST_LIBS+=(-lpthread -lwinmm) ;;  # worker + waveOut (live audio)
+    *)            HOST_LIBS+=(-lpthread) ;;          # audio worker thread
 esac
 # The host is almost all cold code (FatFs, setup, transports, the
 # shell waits on I/O), so build it for size with -Os. The one hot
@@ -146,6 +147,8 @@ esac
     "$REPO_ROOT/src/audio/audio_fft.c" \
     "$REPO_ROOT/src/audio/audio_fft_kernel.c" \
     "$REPO_ROOT/src/audio/audio_wav_read.c" \
+    "$REPO_ROOT/src/audio/audio_sink_wav.c" \
+    "$REPO_ROOT/src/audio/audio_sink_waveout.c" \
     "$REPO_ROOT/src/containers/spsc_ring.c" \
     "$REPO_ROOT/src/vm/service_channel.c" \
     "$REPO_ROOT/src/vm/channel_thread.c" \
