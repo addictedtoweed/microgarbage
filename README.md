@@ -34,10 +34,17 @@ garbage/
 │   │   └── fast_div.h
 │   ├── audio/
 │   │   ├── audio_mixer.h
-│   │   └── music_player.h
+│   │   ├── music_player.h
+│   │   ├── audio_pool.h          ← block pool for samples-at-rest
+│   │   ├── audio_pool_stream.h   ← pool → music_player stream adapter
+│   │   ├── audio_arbiter.h       ← track arbitration (FCFS / priority)
+│   │   ├── audio_service.h       ← mixer/pool/arbiter behind a channel
+│   │   ├── audio_fft.h           ← FFT band meter (fixed-point, no libm)
+│   │   └── audio_sink.h          ← output-backend seam + WAV parse
 │   ├── storage/
 │   │   ├── trashdrive.h
-│   │   └── trashdrive_fatfs.h    ← FatFs bridge (needs third_party/fatfs)
+│   │   ├── trashdrive_fatfs.h    ← FatFs bridge (needs third_party/fatfs)
+│   │   └── trashfs.h             ← tiny built-in read/write filesystem
 │   ├── memory/
 │   │   ├── bump.h
 │   │   └── slab_stack.h
@@ -46,9 +53,12 @@ garbage/
 │       ├── vm_ecall.h
 │       ├── vm_host_stdio.h
 │       ├── vm_host_fs.h        ← optional file syscalls (needs FatFs)
+│       ├── vm_host_audio.h     ← guest SYS_AUDIO_* → audio service
 │       ├── vm_loader.h
 │       ├── vm_mailbox.h
 │       ├── vm_sched.h
+│       ├── service_channel.h   ← SPSC request/response channel
+│       ├── channel_thread.h    ← desktop (pthread) channel transport
 │       └── vm_system.h
 │
 └── src/                        ← implementation + tests, mirrors include/
@@ -65,12 +75,23 @@ garbage/
     ├── audio/
     │   ├── audio_mixer.c
     │   ├── music_player.c
+    │   ├── audio_pool.c          ← refcounted block pool
+    │   ├── audio_pool_stream.c
+    │   ├── audio_arbiter.c
+    │   ├── audio_service.c       ← the service worker
+    │   ├── audio_fft.c           ← band meter
+    │   ├── audio_fft_kernel.c    ← fixed-point radix-2 FFT
+    │   ├── audio_wav_read.c      ← RIFF/WAVE parser
+    │   ├── audio_sink_wav.c      ← WAV-dump output backend
+    │   ├── audio_sink_waveout.c  ← live Win32 waveOut backend
     │   └── test_*.c
     ├── storage/
     │   ├── trashdrive.c
     │   ├── trashdrive_fatfs.c    ← FatFs diskio shim
+    │   ├── trashfs.c             ← built-in filesystem
     │   ├── test_trashdrive.c
-    │   └── test_trashdrive_fatfs.c
+    │   ├── test_trashdrive_fatfs.c
+    │   └── test_trashfs.c
     ├── memory/
     │   ├── bump.c
     │   ├── slab_stack.c
@@ -87,7 +108,11 @@ garbage/
         ├── vm_system.c           ← top-level composition
         ├── vm_host_stdio.c       ← optional host stdin/stdout bridge
         ├── vm_host_fs.c          ← optional host file syscalls (FatFs)
-        └── test_vm_*.c           ← 14 test suites
+        ├── vm_host_audio.c       ← guest audio syscalls → service
+        ├── service_channel.c     ← SPSC request/response channel
+        ├── channel_thread.c      ← pthread channel transport (POSIX/Cygwin)
+        ├── channel_win32.c       ← Win32 channel transport (native Windows)
+        └── test_vm_*.c           ← VM test suites
 ```
 
 A separate `examples/` directory contains runnable demos that
@@ -102,8 +127,19 @@ examples/
 ├── 01_hello/                     ← minimal "print and exit" guest
 ├── 02_counter/                   ← scheduling demo (SYS_YIELD)
 ├── 03_mailbox/                   ← two guests talking via mailbox
-└── 04_keydump/                   ← raw-mode terminal input
+├── 04_keydump/                   ← raw-mode terminal input
+└── 05_shell/                     ← the interactive host (the main
+                                   ←  deliverable): a shell that spawns
+                                   ←  guest ELFs, with stdio, files,
+                                   ←  TUI, and live audio
 ```
+
+Design notes for the larger subsystems live under `docs/`:
+`audio-architecture.md` (the audio engine + inter-core channel),
+`intercore-channel.md` / `transports.md` (the channel + its
+transports), `trashfs-format.md` (the built-in filesystem on-disk
+format), and `execution-model.md` (the planned cooperative/preemptive
+RTOS configuration + tiered-memory design — a spec, not yet built).
 
 A `third_party/` directory holds vendored code that uses a
 different license from the rest of the repo:
@@ -158,10 +194,20 @@ errors:
 | fast_div      | (none)                               |
 | audio_mixer   | ring_buffer, fixed_point             |
 | music_player  | audio_mixer (and its deps)           |
+| audio_pool    | (none)                               |
+| audio_pool_stream | audio_pool, music_player         |
+| audio_arbiter | audio_pool                           |
+| audio_fft     | (none — fixed-point, no libm)        |
+| audio_sink    | (none — WAV dump; waveout needs -lwinmm) |
+| audio_service | audio_mixer, audio_pool, audio_arbiter, music_player, service_channel |
 | trashdrive    | (none)                               |
 | trashdrive_fatfs | trashdrive, FatFs (third_party)   |
+| trashfs       | (none)                               |
 | bump          | slab_stack (only if using slab path) |
 | slab_stack    | (none)                               |
+| service_channel | spsc_ring                          |
+| channel_thread | service_channel (POSIX/Cygwin: pthreads) |
+| channel_win32 | service_channel (native Windows)     |
 | vm_core       | (none)                               |
 | vm_loader     | vm_core, bump                        |
 | vm_ecall      | vm_core                              |
@@ -170,6 +216,7 @@ errors:
 | vm_system     | all of the above + slab_stack        |
 | vm_host_stdio | vm_system (optional host bridge)     |
 | vm_host_fs    | vm_system, vm_host_stdio, trashdrive_fatfs |
+| vm_host_audio | vm_system, audio_service, service_channel |
 
 So for example, to use `music_player`, copy and build:
 `music_player.c`, `audio_mixer.c`, `ring_buffer.c`, and the
@@ -423,6 +470,77 @@ task). The mixer's real-time render path is unaffected.
 API: `music_create`, `music_create_with_allocator`, `music_destroy`,
 `music_prime_intro`, `music_prime_loop`, `music_play`, `music_stop`,
 `music_pause`, `music_resume`, `music_update`, `music_state`.
+
+#### audio_pool
+
+A block-based pool for sound effects held resident in RAM. Carves a
+caller-provided region into fixed-size blocks; allocations are
+refcounted handles, so a sample shared by several playing voices stays
+alive until the last reference is released. Block-based (not
+contiguous) so loading and unloading samples is cheap and
+fragmentation-free — suited to a game that swaps effects in and out as
+it changes levels. Designed to live in bulk memory (e.g. PSRAM) while
+the mixer's working set stays in fast SRAM.
+
+API: `audio_pool_init`, `audio_pool_alloc`, `audio_pool_retain`,
+`audio_pool_release`, `audio_pool_sweep_vm` (reclaim everything one
+owner allocated).
+
+#### audio_pool_stream
+
+Adapts a pooled (or any in-RAM) sample to the `music_player` stream
+callback shape, so the same intro/loop machinery can play a
+RAM-resident source, not just a file.
+
+#### audio_arbiter
+
+Places triggered voices onto a fixed set of mixer tracks. First-come
+while tracks are free; tracks are owner-tagged so one VM's voices can
+be swept when it exits. (A uniform integer-priority eviction policy is
+specified in `docs/execution-model.md` for the multi-app configuration.)
+
+API: `audio_arbiter_init`, `audio_arbiter_trigger`,
+`audio_arbiter_stop`, `audio_arbiter_sweep_vm`.
+
+#### audio_fft
+
+A band meter over the mixed output: a 256-point FFT reduced to a small
+number of log-spaced bands with 0–255 levels, for spectrum displays.
+**Fixed-point, no libm** — a Q15 polynomial sine precomputes the
+twiddle and Hann tables, the transform is integer radix-2, and the
+level map is an integer log2. The capture is a cheap append on the
+real-time render path; the (non-real-time) FFT update runs from the
+service's process loop, never inside `mixer_render`.
+
+API: `audio_fft_init`, `audio_fft_capture`, `audio_fft_update`,
+`audio_fft_levels`.
+
+#### audio_sink
+
+The output-backend seam: a small vtable (`open`/`write`/`close`) that
+lets the same rendered audio go to different destinations. Two backends
+ship: a **WAV dumper** (hand-rolled 44-byte RIFF/WAVE PCM16 header,
+zero dependencies) for writing renders to a `.wav` file, and a live
+**Win32 waveOut** backend (`-lwinmm`, no other deps) whose blocking
+write *is* the audio clock. This header also carries a small RIFF/WAVE
+**parser** (`wav_parse`, `wav_to_mono_pcm16`) for loading drop-in `.wav`
+assets.
+
+API: `audio_sink_open`, `audio_sink_write`, `audio_sink_close`;
+`wav_parse`, `wav_to_mono_pcm16`.
+
+#### audio_service
+
+Ties the mixer, pool, arbiter, FFT meter, and an output sink together
+behind a `service_channel`, so it can run as a worker (a stand-in for a
+dedicated audio core/coprocessor) while guest programs post
+`SYS_AUDIO_*` requests to it over the channel. This is what the
+`05_shell` host runs to give guests live sound. The render path stays
+real-time; request handling and music streaming run from a separate
+non-real-time pump.
+
+API: `audio_service_create`, `audio_service_destroy`,
+`audio_service_process`, `audio_service_render`, `audio_service_run`.
 
 ### storage
 
