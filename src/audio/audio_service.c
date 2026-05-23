@@ -28,6 +28,10 @@ struct AudioService {
     uint32_t        sample_rate;
     uint32_t        track_count;
 
+    /* shared staging buffer for staged loads */
+    uint8_t        *staging;
+    size_t          staging_cap;
+
     /* Scratch buffer for moving PCM from the pool into a mixer
      * channel on SFX start. Sized to one block. */
     uint8_t         scratch[AUDIO_POOL_BLOCK_SIZE];
@@ -101,6 +105,8 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
     svc->channel     = cfg->channel;
     svc->sample_rate = cfg->sample_rate ? cfg->sample_rate : 44100u;
     svc->track_count = tracks;
+    svc->staging     = (uint8_t *)cfg->staging_buffer;
+    svc->staging_cap = cfg->staging_capacity;
 
     if (audio_pool_init(&svc->pool, cfg->pool_region, cfg->pool_region_size)
             != AUDIO_POOL_OK) {
@@ -207,6 +213,38 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
                                               AUDIO_VOICE_MUSIC, &p,
                                               (uint16_t)m->a3, &v);
         respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
+        break;
+    }
+    case REQ_AUDIO_LOAD_STAGED: {
+        /* a0 = byte size, a1 = owner_vm. PCM is already in the shared
+         * staging buffer (the requester put it there). Alloc a pool
+         * object and copy staging->pool, service-side (no race). */
+        uint32_t size = m->a0;
+        if (!svc->staging || size == 0 || size > svc->staging_cap) {
+            respond(svc, m, (uint32_t)AUDIO_POOL_ERR_INVALID_ARG, 0);
+            break;
+        }
+        AudioObjHandle h;
+        AudioPoolResult r = audio_pool_alloc(&svc->pool, size,
+                                             (uint16_t)m->a1, &h);
+        if (r != AUDIO_POOL_OK) { respond(svc, m, (uint32_t)r, 0); break; }
+        uint32_t wrote = 0;
+        audio_pool_write(&svc->pool, h, 0, svc->staging, size, &wrote);
+        respond(svc, m, (uint32_t)AUDIO_POOL_OK, h);
+        break;
+    }
+    case REQ_AUDIO_SET_GAIN: {
+        /* a0 = voice handle, a1 = gain q15. Map voice -> track, set
+         * the mixer channel volume. */
+        AudioObjHandle dummy = audio_arbiter_voice_object(&svc->arbiter, m->a0);
+        if (dummy == AUDIO_POOL_HANDLE_NONE) {
+            respond(svc, m, (uint32_t)AUDIO_ARB_BAD_VOICE, 0);
+            break;
+        }
+        /* voice handle low 16 bits = track+1 (see arbiter packing) */
+        uint32_t track = (m->a0 & 0xFFFFu) - 1u;
+        mixer_set_volume(svc->mixer, track, (q15_t)m->a1);
+        respond(svc, m, (uint32_t)AUDIO_ARB_OK, 0);
         break;
     }
     case REQ_AUDIO_VOICE_STOP:

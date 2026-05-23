@@ -85,6 +85,16 @@
 #define SYS_RAND                    1112
 #define SYS_TIMING_DEADLINE_REMAINING 1113
 
+/* Audio (must match host vm_ecall.h 1160..1167) */
+#define SYS_AUDIO_LOAD_SAMPLE       1160
+#define SYS_AUDIO_LOAD_MUSIC        1161
+#define SYS_AUDIO_FREE              1162
+#define SYS_AUDIO_TRIGGER_SFX       1163
+#define SYS_AUDIO_PLAY_MUSIC        1164
+#define SYS_AUDIO_STOP             1165
+#define SYS_AUDIO_SET_GAIN          1166
+#define SYS_AUDIO_GET_LEVELS        1167
+
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
  * Clobber a0 (return), preserve a1..a6 (they're used as inputs).

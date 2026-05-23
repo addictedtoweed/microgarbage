@@ -68,6 +68,14 @@ typedef struct {
     size_t          pool_region_size;
     uint32_t        sample_rate;   /* e.g. 44100                      */
     uint32_t        track_count;   /* arbiter tracks (<= 16)          */
+    /* Shared staging buffer for loading PCM into pool objects. The
+     * requester (VM-side ecall handler) copies guest PCM here, then
+     * posts REQ_AUDIO_LOAD_STAGED; the service copies staging->pool.
+     * Must outlive the service and be reachable by both endpoints
+     * (shared SRAM on the H745, shared heap on the desktop). If NULL,
+     * staged loads are rejected. */
+    void           *staging_buffer;
+    size_t          staging_capacity;
 } AudioServiceConfig;
 
 /* Create / destroy. create returns NULL on bad config or alloc

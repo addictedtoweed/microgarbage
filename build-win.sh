@@ -116,6 +116,11 @@ HOST_EXTRA=(
     "$REPO_ROOT/src/storage/trashfs.c"
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c"
     "$REPO_ROOT/src/util/inicfg.c"
+    # NOTE: no audio sources here. The audio worker thread + channel
+    # transport (channel_thread.c) are POSIX/pthreads, so host.c guards
+    # audio out on native Windows (HOST_AUDIO_SUPPORTED undefined). A
+    # native-Windows audio build needs a win32-thread channel backend
+    # (future work). Cygwin builds via build.sh DO get audio.
 )
 FATFS_SRCS=(
     "$FATFS_DIR/ff_wrapped.c"

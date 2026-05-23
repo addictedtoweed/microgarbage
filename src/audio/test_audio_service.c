@@ -57,11 +57,39 @@ static void test_single_threaded(void) {
     service_channel_init(&ch, rqs, rss, SLOTS, &tr);
 
     uint8_t *region = malloc(POOL_BYTES);
+    static uint8_t staging[8192];
     AudioServiceConfig cfg = { .channel = &ch, .pool_region = region,
                                .pool_region_size = POOL_BYTES,
-                               .sample_rate = 44100, .track_count = 4 };
+                               .sample_rate = 44100, .track_count = 4,
+                               .staging_buffer = staging,
+                               .staging_capacity = sizeof(staging) };
     AudioService *svc = audio_service_create(&cfg);
     CHECK(svc != NULL, "service created");
+
+    /* STAGED LOAD: put a known pattern in staging, post LOAD_STAGED,
+     * verify the returned object holds it. */
+    {
+        uint32_t n = 1024;
+        for (uint32_t i = 0; i < n; i++) staging[i] = (uint8_t)(i * 7 + 3);
+        ChannelMsg lm = req(REQ_AUDIO_LOAD_STAGED, n, 1, 0, 0);
+        lm.seq = service_channel_next_seq(&ch);
+        channel_request_post(&ch, &lm);
+        audio_service_process(svc, 8);
+        ChannelMsg lr;
+        channel_response_poll(&ch, &lr);
+        CHECK(lr.a3 == AUDIO_POOL_OK, "staged load OK");
+        AudioObjHandle lh = lr.a4;
+        CHECK(lh != 0, "staged load returned a handle");
+        /* read it back from the pool and compare */
+        uint8_t back[1024];
+        uint32_t got = 0;
+        audio_pool_read(audio_service_pool(svc), lh, 0, back, n, &got);
+        CHECK(got == n, "loaded object full size");
+        int ok = 1;
+        for (uint32_t i = 0; i < n; i++) if (back[i] != (uint8_t)(i*7+3)) ok = 0;
+        CHECK(ok, "staged PCM copied into pool object intact");
+        audio_pool_unref(audio_service_pool(svc), lh, NULL);
+    }
 
     /* helper: post a request, process it, pop the response */
     #define ROUNDTRIP(M, RESP) do {                                       \

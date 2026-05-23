@@ -148,6 +148,9 @@ $hostExtra = @(
     "src\storage\trashdrive.c",
     "src\storage\trashfs.c",
     "src\storage\trashdrive_fatfs.c",
+    # NOTE: no audio sources. The audio worker + channel transport are
+    # POSIX/pthreads; host.c guards audio out on native Windows. A
+    # win32-thread channel backend is future work. (Cygwin gets audio.)
     "src\util\inicfg.c"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 

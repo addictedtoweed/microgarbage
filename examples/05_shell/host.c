@@ -65,6 +65,13 @@ typedef SOCKET tcp_sock_t;
 #include "storage/trashdrive.h"
 #include "storage/trashdrive_fatfs.h"
 #include "storage/trashfs.h"
+#include "audio/audio_service.h"
+#include "vm/vm_host_audio.h"
+#include "vm/channel_thread.h"
+#if !defined(_WIN32) || defined(__CYGWIN__)
+#  include <pthread.h>
+#  include <stdatomic.h>
+#endif
 #include "util/inicfg.h"
 #include "ff.h"
 
@@ -171,6 +178,106 @@ static FATFS g_fs;
 #define TRASHFS_REGION_BYTES (128 * 1024)
 static uint8_t g_trashfs_region[TRASHFS_REGION_BYTES];
 static TrashfsVolume g_trashfs_vol;
+
+/* ---- audio service (runs on a worker thread = the "M4") ---- */
+#define AUDIO_POOL_REGION_BYTES (1024 * 1024)   /* 1 MB stand-in for PSRAM */
+#define AUDIO_STAGING_BYTES     (64 * 1024)
+#define AUDIO_CHANNEL_SLOTS     32
+
+/* The audio service runs on its own thread — the desktop stand-in for
+ * the H745's M4 core. It's POSIX-only here because channel_thread.c
+ * (the transport) uses pthreads; a native-Windows build would need a
+ * win32-thread + win32-condvar backend (future work), so on that
+ * target audio simply isn't installed and guest audio calls fail
+ * gracefully. Cygwin and Linux get full audio. */
+#if !defined(_WIN32) || defined(__CYGWIN__)
+#define HOST_AUDIO_SUPPORTED 1
+#endif
+
+#ifdef HOST_AUDIO_SUPPORTED
+static uint8_t          g_audio_pool_region[AUDIO_POOL_REGION_BYTES];
+static uint8_t          g_audio_staging[AUDIO_STAGING_BYTES];
+static ChannelMsg       g_audio_req_ring[AUDIO_CHANNEL_SLOTS];
+static ChannelMsg       g_audio_resp_ring[AUDIO_CHANNEL_SLOTS];
+static ServiceChannel   g_audio_channel;
+static AudioService    *g_audio_service;
+static pthread_t        g_audio_thread;
+static _Atomic int      g_audio_stop;
+static bool             g_audio_running;
+
+static bool audio_should_stop(void *u) {
+    (void)u;
+    return atomic_load_explicit(&g_audio_stop, memory_order_acquire) != 0;
+}
+static void *audio_worker(void *u) {
+    (void)u;
+    audio_service_run(g_audio_service, audio_should_stop, NULL);
+    return NULL;
+}
+
+/* Build the channel + service and start the worker. Returns true on
+ * success; on failure leaves audio uninstalled (non-fatal — the shell
+ * still runs, guests' audio calls just fail). */
+static bool host_audio_start(VmSystem *sys) {
+    ChannelTransport tr;
+    if (!channel_thread_transport_make(&tr)) return false;
+    if (!service_channel_init(&g_audio_channel, g_audio_req_ring,
+                              g_audio_resp_ring, AUDIO_CHANNEL_SLOTS, &tr)) {
+        tr.destroy(tr.ctx);
+        return false;
+    }
+    AudioServiceConfig acfg = {
+        .channel          = &g_audio_channel,
+        .pool_region      = g_audio_pool_region,
+        .pool_region_size = sizeof(g_audio_pool_region),
+        .sample_rate      = 44100,
+        .track_count      = 16,
+        .staging_buffer   = g_audio_staging,
+        .staging_capacity = sizeof(g_audio_staging),
+    };
+    g_audio_service = audio_service_create(&acfg);
+    if (!g_audio_service) {
+        service_channel_destroy(&g_audio_channel);
+        return false;
+    }
+    atomic_store(&g_audio_stop, 0);
+    if (pthread_create(&g_audio_thread, NULL, audio_worker, NULL) != 0) {
+        audio_service_destroy(g_audio_service);
+        g_audio_service = NULL;
+        service_channel_destroy(&g_audio_channel);
+        return false;
+    }
+    g_audio_running = true;
+
+    VmHostAudioConfig hcfg = {
+        .channel          = &g_audio_channel,
+        .staging_buffer   = g_audio_staging,
+        .staging_capacity = sizeof(g_audio_staging),
+        .call_timeout_ms  = 1000,
+    };
+    if (!vm_host_install_audio(sys, &hcfg)) {
+        /* handlers not installed; stop the worker we started */
+        atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
+        pthread_join(g_audio_thread, NULL);
+        audio_service_destroy(g_audio_service);
+        g_audio_service = NULL;
+        service_channel_destroy(&g_audio_channel);
+        g_audio_running = false;
+        return false;
+    }
+    return true;
+}
+
+static void host_audio_stop(void) {
+    if (!g_audio_running) return;
+    atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
+    pthread_join(g_audio_thread, NULL);
+    audio_service_destroy(g_audio_service);
+    g_audio_service = NULL;
+    service_channel_destroy(&g_audio_channel);
+    g_audio_running = false;
+}
+#endif /* HOST_AUDIO_SUPPORTED */
 
 /* ---------------------------------------------------------------
  * Host configuration (vm.cfg + CLI overrides).
@@ -1689,6 +1796,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* 6e. Audio service (the desktop "M4"): a worker thread runs the
+     * mixer/pool/arbiter behind the service channel; guest SYS_AUDIO_*
+     * calls post to it. Non-fatal if it fails to start — the shell
+     * still runs, guests' audio calls just return failure. Not
+     * available on native Windows yet (needs a win32 channel backend).
+     * NOTE: this gets audio flowing to the service's output ring; an
+     * actual sound-device backend (ring -> speakers) is separate and
+     * platform-specific. */
+#ifdef HOST_AUDIO_SUPPORTED
+    if (!host_audio_start(&sys)) {
+        fprintf(stderr, "host: audio service not started "
+                        "(continuing without audio)\n");
+    }
+#endif
+
     /* 6b. Mounts.
      *
      * If vm.cfg's [mount.<name>] sections were used, hc.mount_count
@@ -1964,6 +2086,9 @@ int main(int argc, char **argv) {
         if (g_wsa_started) { WSACleanup(); g_wsa_started = false; }
 #endif
 
+#ifdef HOST_AUDIO_SUPPORTED
+        host_audio_stop();
+#endif
         vm_system_destroy(&sys);
         f_mount(NULL, "0:", 0);
         free(elf_owned);   /* NULL for the embedded/XIP image — safe */
@@ -2004,6 +2129,9 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef HOST_AUDIO_SUPPORTED
+    host_audio_stop();
+#endif
     vm_system_destroy(&sys);
     f_mount(NULL, "0:", 0);
     free(elf_owned);   /* NULL for the embedded/XIP image — safe */

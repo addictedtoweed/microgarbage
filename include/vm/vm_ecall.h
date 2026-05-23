@@ -277,6 +277,28 @@
 #define SYS_TUI_TILE_DIMS             1146  /* (handle) → (rows<<16)|cols or -EBADF */
 /* 1147 reserved */
 
+/* --- Audio (1160..1175) ---
+ *
+ * Guests reach the audio co-processor service through these. On the
+ * host side each posts a REQ_AUDIO_* message over the service channel
+ * to the audio service (which on the H745 runs on the M4); calls that
+ * return a handle wait for the response. Two handle kinds (see
+ * docs/audio-architecture.md): durable OBJECT handles (loaded
+ * samples/music) and transient VOICE handles (a playing instance).
+ *
+ * Audio is a shared global service; handles are system-wide. The
+ * host stamps the calling VM's id as owner so a dying VM's objects
+ * and voices are swept automatically. */
+#define SYS_AUDIO_LOAD_SAMPLE  1160  /* (buf, size) → object handle or 0 (fail)   */
+#define SYS_AUDIO_LOAD_MUSIC   1161  /* (intro_buf,intro_sz,loop_buf,loop_sz)→obj */
+#define SYS_AUDIO_FREE         1162  /* (object) → 0; drops the VM's ref          */
+#define SYS_AUDIO_TRIGGER_SFX  1163  /* (object, gain_q15, pan_q15) → voice or 0  */
+#define SYS_AUDIO_PLAY_MUSIC   1164  /* (object, flags) → voice or 0 (REJECTED)   */
+#define SYS_AUDIO_STOP         1165  /* (voice) → 0 or -errno                     */
+#define SYS_AUDIO_SET_GAIN     1166  /* (voice, gain_q15) → 0 or -errno           */
+#define SYS_AUDIO_GET_LEVELS   1167  /* (out_buf, n_bands) → bands written (meters)*/
+/* 1168..1175 reserved for audio */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

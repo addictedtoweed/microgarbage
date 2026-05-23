@@ -62,6 +62,13 @@ enum {
     REQ_AUDIO_PLAY_MUSIC   = 0x0105,
     REQ_AUDIO_VOICE_STOP   = 0x0106,
     REQ_AUDIO_STOP_MUSIC   = 0x0107,
+    /* Load PCM from the shared staging buffer into a new pool object.
+     * a0 = byte size, a1 = owner_vm. The requester copies PCM into the
+     * service's staging buffer (set at create time) before posting;
+     * the service copies staging->pool (service-side, no race) and
+     * returns the object handle. Size must be <= staging capacity. */
+    REQ_AUDIO_LOAD_STAGED  = 0x0108,
+    REQ_AUDIO_SET_GAIN     = 0x0109,  /* a0 = voice, a1 = gain q15 */
 
     /* file (0x02xx) — reserved for the M4-owns-SD proxy */
     REQ_FILE_OPEN   = 0x0200,

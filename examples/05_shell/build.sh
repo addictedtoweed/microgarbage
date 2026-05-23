@@ -118,6 +118,7 @@ echo "05_shell: compiling host (with FatFs)..."
 HOST_LIBS=()
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) HOST_LIBS+=(-lws2_32) ;;
+    *)            HOST_LIBS+=(-lpthread) ;;   # audio worker thread
 esac
 # The host is almost all cold code (FatFs, setup, transports, the
 # shell waits on I/O), so build it for size with -Os. The one hot
@@ -136,6 +137,16 @@ esac
     "$REPO_ROOT/src/storage/trashdrive.c" \
     "$REPO_ROOT/src/storage/trashfs.c" \
     "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \
+    "$REPO_ROOT/src/audio/audio_service.c" \
+    "$REPO_ROOT/src/audio/audio_arbiter.c" \
+    "$REPO_ROOT/src/audio/audio_pool.c" \
+    "$REPO_ROOT/src/audio/audio_pool_stream.c" \
+    "$REPO_ROOT/src/audio/audio_mixer.c" \
+    "$REPO_ROOT/src/audio/music_player.c" \
+    "$REPO_ROOT/src/containers/spsc_ring.c" \
+    "$REPO_ROOT/src/vm/service_channel.c" \
+    "$REPO_ROOT/src/vm/channel_thread.c" \
+    "$REPO_ROOT/src/vm/vm_host_audio.c" \
     "$REPO_ROOT/src/util/inicfg.c" \
     "$FATFS_DIR/ff_wrapped.c" \
     "$FATFS_SOURCE/ffsystem.c" \
