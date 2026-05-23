@@ -16,6 +16,7 @@
  * ============================================================ */
 
 #include "audio/audio_service.h"
+#include "audio/audio_fft.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,9 @@ struct AudioService {
      * Valid only across a single play call (single-context). */
     AudioObjHandle  pend_intro;
     AudioObjHandle  pend_loop;
+
+    /* FFT band meter over the final mixed output (enable-gated). */
+    AudioFft        fft;
 
     /* Scratch buffer for moving PCM from the pool into a mixer
      * channel on SFX start. Sized to one block. */
@@ -302,6 +306,9 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
     /* Music object table generations start at 1. */
     for (int i = 0; i < MUSIC_MAX_OBJECTS; i++) svc->music_gen[i] = 1;
 
+    /* FFT band meter (starts disabled — zero cost until enabled). */
+    audio_fft_init(&svc->fft, svc->sample_rate);
+
     /* Allocate per-music-stream buffers (contiguous SRAM staging — NOT
      * block pool). One streaming buffer + two pinned heads per slot. */
     for (int i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
@@ -499,6 +506,33 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         respond(svc, m, (uint32_t)AUDIO_ARB_OK, 0);
         break;
     }
+    case REQ_AUDIO_FFT_ENABLE: {
+        /* a0 = 1 enable, 0 disable */
+        audio_fft_set_enabled(&svc->fft, m->a0 != 0);
+        respond(svc, m, (uint32_t)AUDIO_ARB_OK, 0);
+        break;
+    }
+    case REQ_AUDIO_GET_LEVELS: {
+        /* Pack up to 16 band bytes into the response a0..a3 (4 bytes
+         * each), a4 = band count. */
+        if (!(m->flags & CHANNEL_FLAG_EXPECTS_RESPONSE)) break;
+        uint8_t bands[AUDIO_FFT_BANDS];
+        uint32_t got = audio_fft_get_bands(&svc->fft, bands,
+                                           AUDIO_FFT_BANDS);
+        ChannelMsg resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.type = m->type;
+        resp.seq  = m->seq;
+        uint32_t words[4] = {0,0,0,0};
+        for (uint32_t i = 0; i < got && i < 16; i++)
+            words[i >> 2] |= (uint32_t)bands[i] << ((i & 3) * 8);
+        resp.a0 = words[0]; resp.a1 = words[1];
+        resp.a2 = words[2]; resp.a3 = words[3];
+        resp.a4 = got;
+        while (!channel_response_post(svc->channel, &resp))
+            channel_provider_wait(svc->channel, 1);
+        break;
+    }
     case REQ_AUDIO_VOICE_STOP:
     case REQ_AUDIO_STOP_MUSIC: {
         /* a0 = voice handle */
@@ -532,12 +566,19 @@ uint32_t audio_service_process(AudioService *svc, uint32_t max) {
     }
     /* Keep music streaming buffers fed (non-RT). */
     pump_music(svc);
+    /* Refresh the band meter (non-RT; no-op unless enabled + a fresh
+     * window has accumulated). The FFT runs HERE, not in render. */
+    audio_fft_update(&svc->fft);
     return n;
 }
 
 void audio_service_render(AudioService *svc, int16_t *out, uint32_t frames) {
     if (!svc || !out) return;
     mixer_render(svc->mixer, out, frames);
+    /* RT-safe: append the mixed output to the FFT capture window.
+     * No-op when meters are disabled. The FFT itself runs in the
+     * non-RT process loop (audio_fft_update), never here. */
+    audio_fft_capture(&svc->fft, out, frames);
 }
 
 void audio_service_run(AudioService *svc,

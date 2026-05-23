@@ -88,6 +88,19 @@ int main(void) {
         return 1;
     }
     puts_("audiotest: music playing, voice = "); putu(mv); puts_("\n");
+
+    /* enable the band meter and read it a few times while music plays */
+    audio_fft_enable(1);
+    for (int t = 0; t < 3; t++) {
+        (void)_vm_sys1(SYS_SLEEP_TICKS, 4);
+        uint8_t bands[16];
+        uint32_t nb = audio_get_levels(bands, 16);
+        puts_("audiotest: meter bands="); putu(nb); puts_(" [");
+        for (uint32_t i = 0; i < nb; i++) { putu(bands[i]); puts_(i+1<nb?" ":""); }
+        puts_("]\n");
+    }
+    audio_fft_enable(0);
+
     (void)_vm_sys1(SYS_SLEEP_TICKS, 10);
     audio_stop(mv);
     audio_free(music);

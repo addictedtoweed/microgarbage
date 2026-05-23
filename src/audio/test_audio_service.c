@@ -235,6 +235,38 @@ static void test_single_threaded(void) {
         ROUNDTRIP(req(REQ_AUDIO_POOL_FREE, loop, 0, 0, 0), t);
     }
 
+    /* ---- FFT band meter plumbing ---- */
+    {
+        /* Disabled by default: GET_LEVELS returns 0 bands. */
+        ChannelMsg rg0;
+        ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), rg0);
+        CHECK(rg0.a4 == 0, "GET_LEVELS returns 0 bands while disabled");
+
+        /* Enable. */
+        ChannelMsg re;
+        ROUNDTRIP(req(REQ_AUDIO_FFT_ENABLE, 1, 0, 0, 0), re);
+        CHECK(re.a3 == AUDIO_ARB_OK, "FFT enable OK");
+
+        /* Render enough output to fill a window, processing between
+         * renders so update() runs. Output is silence here (no voice),
+         * so bands should be ~0 but the count should be the full set. */
+        int16_t out[256 * 2];
+        for (int i = 0; i < 4; i++) {
+            audio_service_render(svc, out, 256);   /* captures */
+            audio_service_process(svc, 1);         /* updates  */
+        }
+        ChannelMsg rg;
+        ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), rg);
+        CHECK(rg.a4 == 16, "GET_LEVELS returns 16 bands when enabled");
+
+        /* Disable again. */
+        ChannelMsg rd;
+        ROUNDTRIP(req(REQ_AUDIO_FFT_ENABLE, 0, 0, 0, 0), rd);
+        ChannelMsg rg2;
+        ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), rg2);
+        CHECK(rg2.a4 == 0, "GET_LEVELS returns 0 bands after disable");
+    }
+
     #undef ROUNDTRIP
     audio_service_destroy(svc);
     service_channel_destroy(&ch);   /* frees the transport ctx */

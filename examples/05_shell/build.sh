@@ -143,6 +143,8 @@ esac
     "$REPO_ROOT/src/audio/audio_pool_stream.c" \
     "$REPO_ROOT/src/audio/audio_mixer.c" \
     "$REPO_ROOT/src/audio/music_player.c" \
+    "$REPO_ROOT/src/audio/audio_fft.c" \
+    "$REPO_ROOT/src/audio/audio_fft_kernel.c" \
     "$REPO_ROOT/src/containers/spsc_ring.c" \
     "$REPO_ROOT/src/vm/service_channel.c" \
     "$REPO_ROOT/src/vm/channel_thread.c" \

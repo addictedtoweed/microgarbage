@@ -79,8 +79,15 @@ static inline int audio_set_gain(audio_voice v, int32_t gain_q15) {
     return (int)_vm_sys2(SYS_AUDIO_SET_GAIN, v, (uint32_t)gain_q15);
 }
 
-/* Fill `out` with up to `n_bands` FFT band levels for the meters.
- * Returns the number written (0 until the meter feature lands). */
+/* Enable or disable the band meter (the FFT over the mixed output).
+ * Disabled by default; enable before reading levels. */
+static inline void audio_fft_enable(int enable) {
+    (void)_vm_sys1(SYS_AUDIO_FFT_ENABLE, enable ? 1u : 0u);
+}
+
+/* Fill `out` with up to `n_bands` FFT band levels (0..255) for the
+ * meters. Returns the number written (0 if the meter is disabled).
+ * Enable the meter first with audio_fft_enable(1). */
 static inline uint32_t audio_get_levels(uint8_t *out, uint32_t n_bands) {
     return _vm_sys2(SYS_AUDIO_GET_LEVELS, (uint32_t)out, n_bands);
 }

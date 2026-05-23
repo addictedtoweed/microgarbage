@@ -133,9 +133,40 @@ static void handle_load_music(VmCpu *cpu, void *system) {
     }
     cpu->regs[VM_REG_A0] = (status == 0) ? handle : 0;
 }
+/* ---- SYS_AUDIO_GET_LEVELS (out_buf, n_bands) -> bands written ----
+ * Round-trips REQ_AUDIO_GET_LEVELS; the response packs up to 16 band
+ * bytes into a0..a3 and the count in a4. Unpack into the guest buffer. */
 static void handle_get_levels(VmCpu *cpu, void *system) {
     (void)system;
-    /* FFT band meters land with the audio-lab app; no data yet. */
+    uint32_t guest_buf = cpu->regs[VM_REG_A0];
+    uint32_t want      = cpu->regs[VM_REG_A1];
+    if (want > 16) want = 16;
+
+    ChannelMsg m;
+    memset(&m, 0, sizeof(m));
+    m.type = REQ_AUDIO_GET_LEVELS;
+    if (!channel_request_call(g_channel, &m, g_timeout_ms, NULL, NULL)) {
+        cpu->regs[VM_REG_A0] = 0; return;
+    }
+    uint32_t got = m.a4;
+    if (got > want) got = want;
+    if (got == 0) { cpu->regs[VM_REG_A0] = 0; return; }
+
+    uint8_t *dst = (uint8_t *)vm_translate_write(cpu, guest_buf, got);
+    if (!dst) { cpu->regs[VM_REG_A0] = 0; return; }
+
+    uint32_t words[4] = { m.a0, m.a1, m.a2, m.a3 };
+    for (uint32_t i = 0; i < got; i++)
+        dst[i] = (uint8_t)((words[i >> 2] >> ((i & 3) * 8)) & 0xFFu);
+    cpu->regs[VM_REG_A0] = got;
+}
+
+/* ---- SYS_AUDIO_FFT_ENABLE (enable) -> 0 ---- */
+static void handle_fft_enable(VmCpu *cpu, void *system) {
+    (void)system;
+    uint32_t en = cpu->regs[VM_REG_A0];
+    uint32_t status = 0, h = 0;
+    audio_call(REQ_AUDIO_FFT_ENABLE, en ? 1u : 0u, 0, 0, 0, &status, &h);
     cpu->regs[VM_REG_A0] = 0;
 }
 
@@ -164,8 +195,11 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
                            handle_set_gain)) goto f6;
     if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_GET_LEVELS,
                            handle_get_levels)) goto f7;
+    if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_FFT_ENABLE,
+                           handle_fft_enable)) goto f8;
     return true;
 
+f8: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_GET_LEVELS);
 f7: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_SET_GAIN);
 f6: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_STOP);
 f5: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_PLAY_MUSIC);
