@@ -297,6 +297,56 @@ static void audio_thread_join(void) {
 #endif
 }
 
+/* ----------------------------------------------------------------
+ * Resolve paths relative to the executable, not the current working
+ * directory. This lets `./build/host.exe` find its `host_files`
+ * sibling whether you launch from the repo root or from build/.
+ *
+ * host_exe_dir() fills `out` with the directory containing this
+ * executable (no trailing separator). Returns true on success;
+ * on any failure leaves `out` empty and returns false, so callers
+ * fall back to the plain relative path (CWD behaviour — no worse
+ * than before).
+ * ---------------------------------------------------------------- */
+static bool host_exe_dir(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return false;
+    out[0] = '\0';
+
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    /* Native Windows: ask the OS for our own module path. */
+    char path[1024];
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)sizeof(path));
+    if (n == 0 || n >= sizeof(path)) return false;
+    /* Strip the filename: cut at the last '\' or '/'. */
+    char *sep = NULL;
+    for (char *p = path; *p; p++)
+        if (*p == '\\' || *p == '/') sep = p;
+    if (!sep) return false;
+    *sep = '\0';
+    if (strlen(path) + 1 > out_sz) return false;
+    strcpy(out, path);
+    return true;
+#elif defined(__linux__)
+    /* Linux: read the symlink to our own executable. */
+    char path[1024];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return false;
+    path[n] = '\0';
+    char *sep = strrchr(path, '/');
+    if (!sep) return false;
+    *sep = '\0';
+    if (strlen(path) + 1 > out_sz) return false;
+    strcpy(out, path);
+    return true;
+#else
+    /* Cygwin / other POSIX: no portable self-exe path used here.
+     * Fall back to CWD-relative (previous behaviour). On Cygwin the
+     * shell scripts run from build/ anyway, so this is fine. */
+    (void)out_sz;
+    return false;
+#endif
+}
+
 /* Build the channel + service and start the worker. Returns true on
  * success; on failure leaves audio uninstalled (non-fatal — the shell
  * still runs, guests' audio calls just fail). */
@@ -1481,6 +1531,7 @@ int main(int argc, char **argv) {
      */
     const char *elf_path     = NULL;
     const char *host_fs_root = "host_files";   /* default — created if missing */
+    bool host_fs_root_explicit = false;        /* set by CLI/config? */
     bool host_fs_writable    = false;
     bool host_fs_disabled    = false;
     const char *pipe_name    = NULL;
@@ -1529,6 +1580,7 @@ int main(int argc, char **argv) {
             }
         } else if (strncmp(argv[i], "--host-fs=", 10) == 0) {
             host_fs_root = argv[i] + 10;
+            host_fs_root_explicit = true;
         } else if (strcmp(argv[i], "--host-fs-rw") == 0) {
             host_fs_writable = true;
         } else if (strcmp(argv[i], "--no-host-fs") == 0) {
@@ -1877,6 +1929,29 @@ int main(int argc, char **argv) {
     if (!vm_host_install_tui(&sys)) {
         fprintf(stderr, "host: vm_host_install_tui failed\n");
         return 1;
+    }
+
+    /* If host_fs_root is still the built-in default (the user didn't
+     * pass --host-fs=), resolve "host_files" next to the EXECUTABLE
+     * rather than the current working directory. This makes
+     * `./build/host.exe` find `build/host_files` whether you launch
+     * from the repo root or from inside build/. An explicit --host-fs=
+     * path is always honoured as given. If we can't determine the exe
+     * directory, we leave the plain relative default (old behaviour).
+     *
+     * Static storage: host_fs_root is a const char* held for the life
+     * of the program, so the buffer must outlive this scope. */
+    static char host_fs_root_buf[1056];
+    if (!host_fs_root_explicit) {
+        char exedir[1024];
+        if (host_exe_dir(exedir, sizeof(exedir))) {
+            int w = snprintf(host_fs_root_buf, sizeof(host_fs_root_buf),
+                             "%s/%s", exedir, host_fs_root);
+            if (w > 0 && (size_t)w < sizeof(host_fs_root_buf)) {
+                host_fs_root = host_fs_root_buf;
+            }
+            /* else: path too long — keep the plain default, no harm */
+        }
     }
 
     /* 6e. Audio service (the desktop "M4"): a worker thread runs the
