@@ -92,4 +92,21 @@ static inline uint32_t audio_get_levels(uint8_t *out, uint32_t n_bands) {
     return _vm_sys2(SYS_AUDIO_GET_LEVELS, (uint32_t)out, n_bands);
 }
 
+/* ============================================================
+ *  Drop-in .wav asset loader (host-side parse)
+ *
+ *  Load a PCM .wav file (e.g. dropped into /host) as an audio object.
+ *  The HOST opens + parses the file and stages the PCM — the guest
+ *  only passes a path. This keeps the work out of the guest's small
+ *  (64 KB) data region: the host has megabytes and already has the
+ *  WAV parser. Accepts 8/16-bit, mono/stereo PCM WAV; downmixed to
+ *  mono PCM16 (the current SFX format).
+ *
+ *  Returns an object handle, or AUDIO_OBJECT_NONE on any error
+ *  (missing file, not PCM, too big for the host staging buffer).
+ * ============================================================ */
+static inline audio_object audio_load_wav(const char *path) {
+    return (audio_object)_vm_sys1(SYS_AUDIO_LOAD_WAV, (uint32_t)path);
+}
+
 #endif /* GUEST_AUDIO_H */

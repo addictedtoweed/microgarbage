@@ -218,7 +218,7 @@ static void *audio_worker(void *u) {
 /* Build the channel + service and start the worker. Returns true on
  * success; on failure leaves audio uninstalled (non-fatal — the shell
  * still runs, guests' audio calls just fail). */
-static bool host_audio_start(VmSystem *sys) {
+static bool host_audio_start(VmSystem *sys, const char *host_fs_root) {
     ChannelTransport tr;
     if (!channel_thread_transport_make(&tr)) return false;
     if (!service_channel_init(&g_audio_channel, g_audio_req_ring,
@@ -254,6 +254,7 @@ static bool host_audio_start(VmSystem *sys) {
         .staging_buffer   = g_audio_staging,
         .staging_capacity = sizeof(g_audio_staging),
         .call_timeout_ms  = 1000,
+        .host_fs_root     = host_fs_root,
     };
     if (!vm_host_install_audio(sys, &hcfg)) {
         /* handlers not installed; stop the worker we started */
@@ -1805,7 +1806,7 @@ int main(int argc, char **argv) {
      * actual sound-device backend (ring -> speakers) is separate and
      * platform-specific. */
 #ifdef HOST_AUDIO_SUPPORTED
-    if (!host_audio_start(&sys)) {
+    if (!host_audio_start(&sys, host_fs_root)) {
         fprintf(stderr, "host: audio service not started "
                         "(continuing without audio)\n");
     }

@@ -81,4 +81,44 @@ extern const AudioSinkBackend audio_sink_wav;       /* always available */
 extern const AudioSinkBackend audio_sink_waveout;   /* Windows only     */
 #endif
 
+/* ============================================================
+ *  WAV reader (for drop-in assets)
+ *
+ *  Parses a canonical PCM WAV from a memory buffer (the bytes read
+ *  the bytes read from a /host *.wav file). Zero-dep; the mirror of
+ *  Accepts 8- or 16-bit PCM, mono or stereo, any sample rate. The
+ *  caller converts to the format the audio pool/mixer want (the asset
+ *  loader downmixes stereo->mono and 8->16 bit for the current SFX
+ *  path).
+ * ============================================================ */
+
+typedef struct {
+    uint16_t  format;        /* 1 = PCM (only PCM supported)        */
+    uint16_t  channels;      /* 1 or 2                              */
+    uint32_t  sample_rate;
+    uint16_t  bits;          /* 8 or 16                             */
+    const uint8_t *data;     /* points into the source buffer       */
+    uint32_t  data_bytes;    /* size of the data chunk              */
+} WavInfo;
+
+typedef enum {
+    WAV_OK = 0,
+    WAV_ERR_TOO_SMALL,       /* buffer too small for a header       */
+    WAV_ERR_BAD_MAGIC,       /* not RIFF/WAVE                       */
+    WAV_ERR_NOT_PCM,         /* compressed / non-PCM format         */
+    WAV_ERR_NO_DATA,         /* no data chunk found                 */
+    WAV_ERR_UNSUPPORTED,     /* bits/channels we don't handle       */
+} WavResult;
+
+/* Parse a WAV from `buf` (`len` bytes). On success fills *out (its
+ * `data` pointer aliases into `buf`, so keep `buf` alive). Walks the
+ * chunk list to find fmt + data (tolerates extra chunks like LIST). */
+WavResult wav_parse(const uint8_t *buf, size_t len, WavInfo *out);
+
+/* Convert parsed WAV PCM into mono PCM16 (the current SFX format) in
+ * `dst` (caller-allocated, room for `max_frames` int16). Downmixes
+ * stereo->mono and promotes 8-bit->16-bit. Returns frames written. */
+uint32_t wav_to_mono_pcm16(const WavInfo *info, int16_t *dst,
+                           uint32_t max_frames);
+
 #endif /* AUDIO_SINK_H */

@@ -298,7 +298,8 @@
 #define SYS_AUDIO_SET_GAIN     1166  /* (voice, gain_q15) → 0 or -errno           */
 #define SYS_AUDIO_GET_LEVELS   1167  /* (out_buf, n_bands) → bands written (meters)*/
 #define SYS_AUDIO_FFT_ENABLE   1168  /* (enable) → 0; turn band meters on/off      */
-/* 1169..1175 reserved for audio */
+#define SYS_AUDIO_LOAD_WAV     1169  /* (path) → object handle; host parses a .wav */
+/* 1170..1175 reserved for audio */
 
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */

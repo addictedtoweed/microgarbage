@@ -11,7 +11,10 @@
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
 #include "vm/channel_msg.h"
+#include "audio/audio_sink.h"   /* WAV parser (wav_parse/wav_to_mono_pcm16) */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Module state (single audio service per host). */
@@ -19,6 +22,7 @@ static ServiceChannel *g_channel;
 static uint8_t        *g_staging;
 static size_t          g_staging_cap;
 static uint32_t        g_timeout_ms;
+static const char     *g_host_fs_root;
 
 /* Post a request and wait for its response; returns the response's
  * status (a3) and handle (a4) via out params. Returns false on
@@ -161,7 +165,65 @@ static void handle_get_levels(VmCpu *cpu, void *system) {
     cpu->regs[VM_REG_A0] = got;
 }
 
-/* ---- SYS_AUDIO_FFT_ENABLE (enable) -> 0 ---- */
+/* ---- SYS_AUDIO_LOAD_WAV (path) -> object handle ----
+ * The guest passes a "/host/<name>.wav" path; the host resolves it to
+ * <host_fs_root>/<name>, reads + parses the WAV, downmixes to mono
+ * PCM16 directly into the shared staging buffer, and posts
+ * REQ_AUDIO_LOAD_STAGED. Host-side parse keeps the work out of the
+ * guest's small data region and reuses the host WAV parser. */
+static void copy_guest_str(VmCpu *cpu, uint32_t addr, char *dst, size_t cap) {
+    size_t i = 0;
+    for (; i + 1 < cap; i++) {
+        const uint8_t *b = vm_translate_read(cpu, addr + (uint32_t)i, 1);
+        if (!b || *b == 0) break;
+        dst[i] = (char)*b;
+    }
+    dst[i] = 0;
+}
+
+static void handle_load_wav(VmCpu *cpu, void *system) {
+    (void)system;
+    uint32_t path_addr = cpu->regs[VM_REG_A0];   /* read arg BEFORE clearing */
+    cpu->regs[VM_REG_A0] = 0;                     /* default: failure */
+    if (!g_host_fs_root || !g_staging) return;
+
+    char gpath[256];
+    copy_guest_str(cpu, path_addr, gpath, sizeof(gpath));
+
+    /* Resolve "/host/<rest>" -> "<root>/<rest>". Only the /host mount
+     * is served this way; reject anything else. */
+    const char *rest = NULL;
+    if (strncmp(gpath, "/host/", 6) == 0) rest = gpath + 6;
+    else return;
+
+    char hostpath[512];
+    snprintf(hostpath, sizeof(hostpath), "%s/%s", g_host_fs_root, rest);
+
+    FILE *fp = fopen(hostpath, "rb");
+    if (!fp) return;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return; }
+    uint8_t *filebuf = malloc((size_t)sz);
+    if (!filebuf) { fclose(fp); return; }
+    size_t rd = fread(filebuf, 1, (size_t)sz, fp);
+    fclose(fp);
+
+    WavInfo info;
+    if (wav_parse(filebuf, rd, &info) != WAV_OK) { free(filebuf); return; }
+
+    /* downmix straight into the staging buffer (mono int16) */
+    uint32_t max_frames = (uint32_t)(g_staging_cap / sizeof(int16_t));
+    uint32_t frames = wav_to_mono_pcm16(&info, (int16_t *)g_staging, max_frames);
+    free(filebuf);
+    if (frames == 0) return;
+
+    uint32_t status = 0, handle = 0;
+    if (!audio_call(REQ_AUDIO_LOAD_STAGED, frames * sizeof(int16_t),
+                    cpu->vm_id, 0, 0, &status, &handle)) return;
+    cpu->regs[VM_REG_A0] = (status == 0) ? handle : 0;
+}
 static void handle_fft_enable(VmCpu *cpu, void *system) {
     (void)system;
     uint32_t en = cpu->regs[VM_REG_A0];
@@ -178,6 +240,7 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
     g_staging     = (uint8_t *)cfg->staging_buffer;
     g_staging_cap = cfg->staging_capacity;
     g_timeout_ms  = cfg->call_timeout_ms ? cfg->call_timeout_ms : 1000u;
+    g_host_fs_root = cfg->host_fs_root;
 
     if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_LOAD_SAMPLE,
                            handle_load_sample)) goto fail;
@@ -197,8 +260,11 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
                            handle_get_levels)) goto f7;
     if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_FFT_ENABLE,
                            handle_fft_enable)) goto f8;
+    if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_LOAD_WAV,
+                           handle_load_wav)) goto f9;
     return true;
 
+f9: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_FFT_ENABLE);
 f8: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_GET_LEVELS);
 f7: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_SET_GAIN);
 f6: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_STOP);

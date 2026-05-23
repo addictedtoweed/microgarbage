@@ -39,6 +39,12 @@ typedef struct {
     /* Timeout (ms) for synchronous channel round-trips (load/trigger
      * that return a handle). 0 -> a sensible default. */
     uint32_t        call_timeout_ms;
+
+    /* Host filesystem root that the guest's "/host" maps to (e.g.
+     * "host_files"). Used by SYS_AUDIO_LOAD_WAV to resolve a guest
+     * "/host/foo.wav" path to a real host file the host reads +
+     * parses. If NULL, LOAD_WAV is unavailable (returns 0). */
+    const char     *host_fs_root;
 } VmHostAudioConfig;
 
 /* Register the SYS_AUDIO_* handlers on sys->ecall_router. Returns

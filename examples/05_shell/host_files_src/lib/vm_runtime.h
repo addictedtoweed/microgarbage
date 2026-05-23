@@ -95,6 +95,7 @@
 #define SYS_AUDIO_SET_GAIN          1166
 #define SYS_AUDIO_GET_LEVELS        1167
 #define SYS_AUDIO_FFT_ENABLE        1168
+#define SYS_AUDIO_LOAD_WAV          1169
 
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.

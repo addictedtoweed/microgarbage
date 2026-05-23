@@ -101,6 +101,23 @@ int main(void) {
     }
     audio_fft_enable(0);
 
+    /* ---- drop-in .wav asset playback ---- */
+    puts_("audiotest: trying /host/asset.wav ...\n");
+    {
+        audio_object wav = audio_load_wav("/host/asset.wav");
+        if (wav == AUDIO_OBJECT_NONE) {
+            puts_("audiotest: no asset.wav (drop one in host dir to test)\n");
+        } else {
+            puts_("audiotest: loaded asset.wav, object = "); putu(wav); puts_("\n");
+            audio_voice av = audio_trigger(wav, AUDIO_GAIN_UNITY, AUDIO_PAN_CENTER);
+            puts_("audiotest: asset playing, voice = "); putu(av); puts_("\n");
+            (void)_vm_sys1(SYS_SLEEP_TICKS, 8);
+            audio_stop(av);
+            audio_free(wav);
+            puts_("audiotest: asset stopped + freed.\n");
+        }
+    }
+
     (void)_vm_sys1(SYS_SLEEP_TICKS, 10);
     audio_stop(mv);
     audio_free(music);
