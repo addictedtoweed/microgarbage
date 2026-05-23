@@ -19,8 +19,13 @@ the preemptive backend; see `docs/execution-model.md` §7):
    avoiding starvation of low-priority work is the task designer's job
    (here the high task simply finishes).
 
-Block/wake/sleep (Step 3) is **not** in this demo — it awaits the
-scheduler-thread rework described in `docs/scheduler-step3-rework.md`.
+3. **Block / wake / sleep** — a consumer task blocks until a producer
+   signals it (`presched_block` / `presched_wake`), and a third task
+   sleeps for a fixed number of systicks (`presched_sleep`) and wakes on
+   time. Demonstrates tasks leaving and re-entering the ready set.
+
+This is the full preemptive backend through Step 3 (see
+`docs/execution-model.md` §7 and `docs/scheduler-step3-rework.md`).
 
 ## Build & run
 

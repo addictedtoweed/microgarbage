@@ -90,11 +90,50 @@ static void demo_priority(void) {
     presched_destroy(s);
 }
 
+/* ---- Demo 3: block/wake + sleep ---- */
+static PreSched *g_d3;
+static atomic_int g_ready_flag;
+
+static void producer_task(void *arg) {
+    (void)arg;
+    burn(30000000UL);
+    printf("  producer: work done, signaling consumer\n"); fflush(stdout);
+    atomic_store(&g_ready_flag, 1);
+    presched_wake(g_d3, 0);     /* wake the consumer (task id 0) */
+}
+static void consumer_task(void *arg) {
+    (void)arg;
+    printf("  consumer: waiting for producer (blocking)...\n"); fflush(stdout);
+    while (!atomic_load(&g_ready_flag))
+        presched_block(g_d3);   /* parked until the producer wakes us */
+    printf("  consumer: woke up and proceeding\n"); fflush(stdout);
+}
+static void sleeper_task(void *arg) {
+    (void)arg;
+    printf("  sleeper: sleeping 100 ticks\n"); fflush(stdout);
+    presched_sleep(g_d3, 100);
+    printf("  sleeper: woke after its sleep deadline\n"); fflush(stdout);
+}
+
+static void demo_block_wake(void) {
+    printf("\n=== Demo 3: block / wake / sleep ===\n");
+    printf("Expect: consumer blocks until producer signals; sleeper wakes on time.\n");
+    atomic_store(&g_ready_flag, 0);
+    g_d3 = presched_create(1000);
+    presched_add_task(g_d3, consumer_task, NULL);   /* id 0 */
+    presched_add_task(g_d3, producer_task, NULL);   /* id 1 */
+    presched_add_task(g_d3, sleeper_task, NULL);    /* id 2 */
+    presched_run(g_d3);
+    printf("  -> all three completed: blocking, waking, and timed sleep work.\n");
+    presched_destroy(g_d3);
+}
+
 int main(void) {
     printf("microgarbage — preemptive scheduler demo (native tasks)\n");
     printf("(host/POSIX backend; same core targets the MCU via the port hooks)\n");
     demo_round_robin();
     demo_priority();
+    demo_block_wake();
     printf("\nDone.\n");
     return 0;
 }
