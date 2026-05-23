@@ -63,5 +63,34 @@ int main(void) {
     audio_stop(v);
     audio_free(obj);
     puts_("audiotest: stopped + freed. OK.\n");
+
+    /* ---- music path: pair two samples, play, stop ---- */
+    puts_("audiotest: loading music (intro+loop)...\n");
+    audio_object intro = audio_load_sample(g_tone, sizeof(g_tone));
+    audio_object loop  = audio_load_sample(g_tone, sizeof(g_tone));
+    if (intro == AUDIO_OBJECT_NONE || loop == AUDIO_OBJECT_NONE) {
+        puts_("audiotest: music sample load failed\n");
+        return 1;
+    }
+    audio_object music = audio_load_music(intro, loop);
+    /* the music object holds its own refs; drop ours */
+    audio_free(intro);
+    audio_free(loop);
+    if (music == AUDIO_OBJECT_NONE) {
+        puts_("audiotest: load_music failed\n");
+        return 1;
+    }
+    puts_("audiotest: music handle = "); putu(music); puts_("\n");
+    audio_voice mv = audio_play_music(music, 0);
+    if (mv == AUDIO_VOICE_NONE) {
+        puts_("audiotest: play_music REJECTED\n");
+        audio_free(music);
+        return 1;
+    }
+    puts_("audiotest: music playing, voice = "); putu(mv); puts_("\n");
+    (void)_vm_sys1(SYS_SLEEP_TICKS, 10);
+    audio_stop(mv);
+    audio_free(music);
+    puts_("audiotest: music stopped + freed. OK.\n");
     return 0;
 }

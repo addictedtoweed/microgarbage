@@ -20,6 +20,38 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Per-music-player buffer sizes (frames). The streaming buffer must
+ * be comfortably larger than one render quantum; the pinned heads
+ * cover the intro->loop and loop->loop seams. Mono16 here. */
+#define MUSIC_STREAM_FRAMES   8192
+#define MUSIC_HEAD_FRAMES     1024
+
+/* A music object pairs an intro pool object with a loop pool object
+ * (the two-file model). Music handles are tagged (high bit set) to
+ * distinguish them from sample object handles at the ABI. */
+#define MUSIC_HANDLE_TAG   0x80000000u
+#define MUSIC_MAX_OBJECTS  16
+
+typedef struct {
+    bool           in_use;
+    AudioObjHandle intro;     /* pool object (refcounted) */
+    AudioObjHandle loop;      /* pool object, or NONE for intro-only */
+    uint16_t       owner_vm;
+} MusicObject;
+
+/* A music_player instance bound to a mixer channel, used while a
+ * music voice is playing. One per concurrent music stream. */
+typedef struct {
+    bool                in_use;
+    uint32_t            track;       /* mixer channel it feeds */
+    MusicPlayer        *player;
+    AudioPoolStreamCtx  stream_ctx;  /* binds pool objects -> player */
+    /* per-instance buffers (contiguous SRAM staging, NOT block pool) */
+    int16_t            *streaming_buf;
+    int16_t            *intro_head;
+    int16_t            *loop_head;
+} MusicSlot;
+
 struct AudioService {
     ServiceChannel *channel;
     AudioPool       pool;
@@ -32,10 +64,69 @@ struct AudioService {
     uint8_t        *staging;
     size_t          staging_cap;
 
+    /* music object table (handle -> intro/loop pool object pair) */
+    MusicObject     music_objs[MUSIC_MAX_OBJECTS];
+    uint16_t        music_gen[MUSIC_MAX_OBJECTS];
+
+    /* music player instances (one per concurrent music stream) */
+    MusicSlot       music_slots[AUDIO_SERVICE_MAX_MUSIC];
+
+    /* "pending music play" — set by handle_one before calling
+     * audio_arbiter_play(kind=MUSIC) so the sink (which only gets the
+     * arbiter `object`) can reach the intro/loop pair + music handle.
+     * Valid only across a single play call (single-context). */
+    AudioObjHandle  pend_intro;
+    AudioObjHandle  pend_loop;
+
     /* Scratch buffer for moving PCM from the pool into a mixer
      * channel on SFX start. Sized to one block. */
     uint8_t         scratch[AUDIO_POOL_BLOCK_SIZE];
 };
+
+/* ---- music object handle pack/unpack (tagged, generation) ---- */
+
+static AudioObjHandle pack_music(uint32_t slot, uint16_t gen) {
+    return MUSIC_HANDLE_TAG
+         | (((AudioObjHandle)(gen & 0x7FFFu)) << 16)
+         | ((slot + 1u) & 0x7FFFu);
+}
+static bool is_music_handle(AudioObjHandle h) {
+    return (h & MUSIC_HANDLE_TAG) != 0;
+}
+static bool unpack_music(AudioObjHandle h, uint32_t *slot, uint16_t *gen) {
+    if (!(h & MUSIC_HANDLE_TAG)) return false;
+    uint32_t s = (h & 0x7FFFu);
+    if (s == 0) return false;
+    *slot = s - 1u;
+    *gen  = (uint16_t)((h >> 16) & 0x7FFFu);
+    return true;
+}
+
+/* Resolve a music handle to its table entry, or NULL. */
+static MusicObject *resolve_music(AudioService *svc, AudioObjHandle h) {
+    uint32_t slot; uint16_t gen;
+    if (!unpack_music(h, &slot, &gen)) return NULL;
+    if (slot >= MUSIC_MAX_OBJECTS) return NULL;
+    MusicObject *mo = &svc->music_objs[slot];
+    if (!mo->in_use) return NULL;
+    if ((svc->music_gen[slot] & 0x7FFFu) != gen) return NULL;
+    return mo;
+}
+
+/* Find a free music_player slot (one per concurrent stream). */
+static MusicSlot *find_free_music_slot(AudioService *svc) {
+    for (uint32_t i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
+        if (!svc->music_slots[i].in_use) return &svc->music_slots[i];
+    }
+    return NULL;
+}
+static MusicSlot *music_slot_for_track(AudioService *svc, uint32_t track) {
+    for (uint32_t i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
+        if (svc->music_slots[i].in_use && svc->music_slots[i].track == track)
+            return &svc->music_slots[i];
+    }
+    return NULL;
+}
 
 /* ---- arbiter sink: start/stop drive the mixer ---- */
 
@@ -47,10 +138,69 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
     AudioService *svc = (AudioService *)ctx;
 
     if (kind == AUDIO_VOICE_MUSIC) {
-        /* MUSIC PATH — not yet wired (needs a music_player instance
-         * bound to this track via the pool adapter). Decline for now
-         * so play() returns REJECTED rather than silently lying. */
-        return false;
+        /* `object` is the INTRO pool object (the arbiter reffed it).
+         * The loop object is in svc->pend_loop (handle_one set it).
+         * Grab a free music_player slot, bind intro/loop via the pool
+         * adapter, create the player on this mixer channel, prime,
+         * play. We take an extra ref on the loop object here (intro is
+         * already held by the arbiter); both released on stop. */
+        AudioObjHandle intro = object;
+        AudioObjHandle loop  = svc->pend_loop;
+
+        MusicSlot *ms = find_free_music_slot(svc);
+        if (!ms) return false;     /* no free music stream slot */
+
+        /* hold the loop object alive for the duration */
+        if (loop != AUDIO_POOL_HANDLE_NONE) {
+            if (audio_pool_ref(&svc->pool, loop) != AUDIO_POOL_OK) return false;
+        }
+
+        /* adapter: stream_id 0 = intro, 1 = loop */
+        if (!audio_pool_stream_init(&ms->stream_ctx, &svc->pool,
+                                    MIXER_SRC_PCM16_MONO)) {
+            if (loop != AUDIO_POOL_HANDLE_NONE)
+                audio_pool_unref(&svc->pool, loop, NULL);
+            return false;
+        }
+        audio_pool_stream_bind(&ms->stream_ctx, 0, intro);
+        if (loop != AUDIO_POOL_HANDLE_NONE)
+            audio_pool_stream_bind(&ms->stream_ctx, 1, loop);
+
+        if (p) {
+            mixer_set_volume(svc->mixer, track, (q15_t)p->gain);
+            mixer_set_pan(svc->mixer, track, (q15_t)p->pan);
+        }
+        mixer_channel_reset(svc->mixer, track);
+
+        MusicPlayerConfig mpc = {
+            .mixer            = svc->mixer,
+            .mixer_channel    = track,
+            .format           = MIXER_SRC_PCM16_MONO,
+            .stream_fn        = audio_pool_stream_read,
+            .stream_user_data = &ms->stream_ctx,
+            .intro_stream_id  = 0,
+            .loop_stream_id   = (loop != AUDIO_POOL_HANDLE_NONE) ? 1
+                                                                 : MUSIC_STREAM_NONE,
+            .streaming_buffer = ms->streaming_buf,
+            .streaming_buffer_samples = MUSIC_STREAM_FRAMES,
+            .intro_head_buffer = ms->intro_head,
+            .intro_head_samples = MUSIC_HEAD_FRAMES,
+            .loop_head_buffer = ms->loop_head,
+            .loop_head_samples = MUSIC_HEAD_FRAMES,
+        };
+        ms->player = music_create(&mpc);
+        if (!ms->player) {
+            if (loop != AUDIO_POOL_HANDLE_NONE)
+                audio_pool_unref(&svc->pool, loop, NULL);
+            return false;
+        }
+        ms->track  = track;
+        ms->in_use = true;
+
+        music_prime_intro(ms->player);
+        if (loop != AUDIO_POOL_HANDLE_NONE) music_prime_loop(ms->player);
+        music_play(ms->player);
+        return true;
     }
 
     /* SFX: feed the whole sample into the mixer channel. The object
@@ -89,6 +239,18 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
 
 static void svc_sink_stop(void *ctx, uint32_t track) {
     AudioService *svc = (AudioService *)ctx;
+
+    /* If a music player drives this track, tear it down and release
+     * its loop ref. (The arbiter releases the intro/object ref.) */
+    MusicSlot *ms = music_slot_for_track(svc, track);
+    if (ms) {
+        if (ms->player) { music_destroy(ms->player); ms->player = NULL; }
+        AudioObjHandle loop = ms->stream_ctx.handle[1];
+        if (loop != AUDIO_POOL_HANDLE_NONE)
+            audio_pool_unref(&svc->pool, loop, NULL);
+        ms->in_use = false;
+    }
+
     mixer_channel_stop(svc->mixer, track);
     mixer_channel_reset(svc->mixer, track);
 }
@@ -136,11 +298,43 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
         free(svc);
         return NULL;
     }
+
+    /* Music object table generations start at 1. */
+    for (int i = 0; i < MUSIC_MAX_OBJECTS; i++) svc->music_gen[i] = 1;
+
+    /* Allocate per-music-stream buffers (contiguous SRAM staging — NOT
+     * block pool). One streaming buffer + two pinned heads per slot. */
+    for (int i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
+        MusicSlot *ms = &svc->music_slots[i];
+        ms->streaming_buf = malloc(MUSIC_STREAM_FRAMES * sizeof(int16_t));
+        ms->intro_head    = malloc(MUSIC_HEAD_FRAMES   * sizeof(int16_t));
+        ms->loop_head     = malloc(MUSIC_HEAD_FRAMES   * sizeof(int16_t));
+        if (!ms->streaming_buf || !ms->intro_head || !ms->loop_head) {
+            /* roll back everything */
+            for (int j = 0; j <= i; j++) {
+                free(svc->music_slots[j].streaming_buf);
+                free(svc->music_slots[j].intro_head);
+                free(svc->music_slots[j].loop_head);
+            }
+            mixer_destroy(svc->mixer);
+            audio_pool_destroy(&svc->pool);
+            free(svc);
+            return NULL;
+        }
+    }
     return svc;
 }
 
 void audio_service_destroy(AudioService *svc) {
     if (!svc) return;
+    /* tear down any live music players + their buffers */
+    for (int i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
+        MusicSlot *ms = &svc->music_slots[i];
+        if (ms->player) { music_destroy(ms->player); ms->player = NULL; }
+        free(ms->streaming_buf);
+        free(ms->intro_head);
+        free(ms->loop_head);
+    }
     if (svc->mixer) mixer_destroy(svc->mixer);
     audio_pool_destroy(&svc->pool);
     free(svc);
@@ -175,9 +369,25 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         break;
     }
     case REQ_AUDIO_POOL_FREE: {
-        /* a0 = object handle */
+        /* a0 = object handle (sample) OR a tagged music handle. */
+        AudioObjHandle h = m->a0;
+        if (is_music_handle(h)) {
+            MusicObject *mo = resolve_music(svc, h);
+            if (!mo) { respond(svc, m, (uint32_t)AUDIO_POOL_ERR_BAD_HANDLE, 0); break; }
+            uint32_t slot = 0; uint16_t gen = 0; unpack_music(h, &slot, &gen);
+            /* drop the music object's refs on its underlying pool objects */
+            audio_pool_unref(&svc->pool, mo->intro, NULL);
+            if (mo->loop != AUDIO_POOL_HANDLE_NONE)
+                audio_pool_unref(&svc->pool, mo->loop, NULL);
+            mo->in_use = false;
+            /* bump gen so stale music handles are rejected */
+            svc->music_gen[slot] = (uint16_t)((svc->music_gen[slot] + 1u) & 0x7FFFu);
+            if (svc->music_gen[slot] == 0) svc->music_gen[slot] = 1;
+            respond(svc, m, (uint32_t)AUDIO_POOL_OK, 1);
+            break;
+        }
         bool freed = false;
-        AudioPoolResult r = audio_pool_unref(&svc->pool, m->a0, &freed);
+        AudioPoolResult r = audio_pool_unref(&svc->pool, h, &freed);
         respond(svc, m, (uint32_t)r, freed ? 1u : 0u);
         break;
     }
@@ -204,14 +414,56 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
         break;
     }
+    case REQ_AUDIO_LOAD_MUSIC: {
+        /* a0 = intro pool object, a1 = loop pool object (or 0/NONE for
+         * intro-only), a2 = owner_vm. Both must already be loaded
+         * (via REQ_AUDIO_LOAD_STAGED). We take a ref on each so the
+         * music object owns them, find a free music-table slot, and
+         * return a tagged music handle. */
+        AudioObjHandle intro = m->a0;
+        AudioObjHandle loop  = m->a1;
+        if (!audio_pool_handle_valid(&svc->pool, intro)) {
+            respond(svc, m, (uint32_t)AUDIO_POOL_ERR_BAD_HANDLE, 0);
+            break;
+        }
+        if (loop != AUDIO_POOL_HANDLE_NONE &&
+            !audio_pool_handle_valid(&svc->pool, loop)) {
+            respond(svc, m, (uint32_t)AUDIO_POOL_ERR_BAD_HANDLE, 0);
+            break;
+        }
+        int slot = -1;
+        for (int i = 0; i < MUSIC_MAX_OBJECTS; i++)
+            if (!svc->music_objs[i].in_use) { slot = i; break; }
+        if (slot < 0) { respond(svc, m, (uint32_t)AUDIO_POOL_ERR_NO_OBJECTS, 0); break; }
+
+        /* the music object holds a ref on each underlying pool object */
+        audio_pool_ref(&svc->pool, intro);
+        if (loop != AUDIO_POOL_HANDLE_NONE) audio_pool_ref(&svc->pool, loop);
+
+        MusicObject *mo = &svc->music_objs[slot];
+        mo->in_use   = true;
+        mo->intro    = intro;
+        mo->loop     = loop;
+        mo->owner_vm = (uint16_t)m->a2;
+        respond(svc, m, (uint32_t)AUDIO_POOL_OK,
+                pack_music((uint32_t)slot, svc->music_gen[slot]));
+        break;
+    }
     case REQ_AUDIO_PLAY_MUSIC: {
-        /* a0 = music object, a3 = owner_vm. (Music path declines in
-         * the sink for now -> REJECTED.) */
+        /* a0 = music handle (tagged), a3 = owner_vm. Resolve to its
+         * intro/loop pair; stash loop in pend_loop; play the intro as
+         * the arbiter's object with kind=MUSIC. */
+        MusicObject *mo = resolve_music(svc, m->a0);
+        if (!mo) { respond(svc, m, (uint32_t)AUDIO_ARB_BAD_OBJECT, 0); break; }
+        svc->pend_intro = mo->intro;
+        svc->pend_loop  = mo->loop;
         AudioVoiceParams p = { .gain = Q15_ONE, .pan = 0, .priority = 0, .loop = 0 };
         AudioVoiceHandle v;
-        AudioArbResult r = audio_arbiter_play(&svc->arbiter, m->a0,
+        AudioArbResult r = audio_arbiter_play(&svc->arbiter, mo->intro,
                                               AUDIO_VOICE_MUSIC, &p,
                                               (uint16_t)m->a3, &v);
+        svc->pend_loop = AUDIO_POOL_HANDLE_NONE;
+        svc->pend_intro = AUDIO_POOL_HANDLE_NONE;
         respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
         break;
     }
@@ -260,6 +512,16 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
     }
 }
 
+/* Pump all active music players (non-RT: refills their streaming
+ * buffers from the pool). Called from the service loop, NOT from
+ * render. */
+static void pump_music(AudioService *svc) {
+    for (int i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
+        MusicSlot *ms = &svc->music_slots[i];
+        if (ms->in_use && ms->player) music_update(ms->player);
+    }
+}
+
 uint32_t audio_service_process(AudioService *svc, uint32_t max) {
     if (!svc) return 0;
     uint32_t n = 0;
@@ -268,6 +530,8 @@ uint32_t audio_service_process(AudioService *svc, uint32_t max) {
         handle_one(svc, &m);
         n++;
     }
+    /* Keep music streaming buffers fed (non-RT). */
+    pump_music(svc);
     return n;
 }
 

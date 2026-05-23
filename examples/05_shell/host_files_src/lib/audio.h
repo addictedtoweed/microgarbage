@@ -53,11 +53,20 @@ static inline audio_voice audio_trigger(audio_object obj,
                                  (uint32_t)gain_q15, (uint32_t)pan_q15);
 }
 
+/* Pair two already-loaded sample objects (intro + loop) into a music
+ * object. Pass AUDIO_OBJECT_NONE for loop for an intro-only object.
+ * Returns a (tagged) music handle, or AUDIO_OBJECT_NONE. The music
+ * object holds its own refs on intro/loop, so the caller may free its
+ * own refs to them afterward. */
+static inline audio_object audio_load_music(audio_object intro,
+                                            audio_object loop) {
+    return (audio_object)_vm_sys2(SYS_AUDIO_LOAD_MUSIC, intro, loop);
+}
+
 /* Play a music object (intro+loop). Returns a voice handle or
- * AUDIO_VOICE_NONE. (Music path lands with the next slice; for now
- * this returns NONE.) */
-static inline audio_voice audio_play_music(audio_object obj, uint32_t flags) {
-    return (audio_voice)_vm_sys2(SYS_AUDIO_PLAY_MUSIC, obj, flags);
+ * AUDIO_VOICE_NONE (REJECTED if no music stream slot is free). */
+static inline audio_voice audio_play_music(audio_object music, uint32_t flags) {
+    return (audio_voice)_vm_sys2(SYS_AUDIO_PLAY_MUSIC, music, flags);
 }
 
 /* Stop a playing voice. Returns 0 or a negative errno. */

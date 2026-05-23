@@ -139,15 +139,23 @@ static void test_single_threaded(void) {
     /* Fill all 4 tracks, then the 5th trigger is REJECTED. */
     AudioObjHandle o2; ChannelMsg ra;
     ROUNDTRIP(req(REQ_AUDIO_POOL_ALLOC, 500, 1, 0, 0), ra); o2 = ra.a4;
+    AudioVoiceHandle fillv[4];
     for (int i = 0; i < 4; i++) {
         ChannelMsg rt;
         ROUNDTRIP(req(REQ_AUDIO_TRIGGER_SFX, o2, 32767, 0, 1), rt);
         CHECK(rt.a3 == AUDIO_ARB_OK, "fill track via trigger");
+        fillv[i] = rt.a4;
     }
     ChannelMsg rrej;
     ROUNDTRIP(req(REQ_AUDIO_TRIGGER_SFX, o2, 32767, 0, 1), rrej);
     CHECK(rrej.a3 == AUDIO_ARB_REJECTED, "5th trigger REJECTED (4 tracks)");
     CHECK(rrej.a4 == 0, "rejected -> no voice");
+
+    /* Free the filled tracks again so later sections have room. */
+    for (int i = 0; i < 4; i++) {
+        ChannelMsg rt; ROUNDTRIP(req(REQ_AUDIO_VOICE_STOP, fillv[i], 0, 0, 0), rt);
+    }
+    { ChannelMsg t; ROUNDTRIP(req(REQ_AUDIO_POOL_FREE, o2, 0, 0, 0), t); }
 
     /* FREE the original object (creator drops its ref). */
     ChannelMsg rf;
@@ -159,6 +167,73 @@ static void test_single_threaded(void) {
     ChannelMsg rbad;
     ROUNDTRIP(req(REQ_AUDIO_TRIGGER_SFX, 0xDEADBEEF, 32767, 0, 1), rbad);
     CHECK(rbad.a3 == AUDIO_ARB_BAD_OBJECT, "trigger bad object -> BAD_OBJECT");
+
+    /* ---- MUSIC PATH ---- */
+    {
+        /* Load two sample objects (intro + loop) via staged load. */
+        uint32_t n = 2048;
+        for (uint32_t i = 0; i < n; i++) staging[i] = (uint8_t)(i & 0xFF);
+        ChannelMsg ri; ROUNDTRIP(req(REQ_AUDIO_LOAD_STAGED, n, 1, 0, 0), ri);
+        AudioObjHandle intro = ri.a4;
+        ChannelMsg rl; ROUNDTRIP(req(REQ_AUDIO_LOAD_STAGED, n, 1, 0, 0), rl);
+        AudioObjHandle loop = rl.a4;
+        CHECK(intro != 0 && loop != 0, "loaded intro + loop sample objects");
+
+        /* Pair them into a music object. */
+        ChannelMsg rm;
+        ROUNDTRIP(req(REQ_AUDIO_LOAD_MUSIC, intro, loop, 1, 0), rm);
+        CHECK(rm.a3 == AUDIO_POOL_OK, "LOAD_MUSIC OK");
+        AudioObjHandle music = rm.a4;
+        CHECK(music != 0, "got a music handle");
+        CHECK((music & 0x80000000u) != 0, "music handle is tagged");
+
+        /* intro+loop now each have 2 refs (creator + music object). */
+        CHECK(audio_pool_refcount(audio_service_pool(svc), intro) == 2,
+              "music object holds a ref on intro");
+        CHECK(audio_pool_refcount(audio_service_pool(svc), loop) == 2,
+              "music object holds a ref on loop");
+
+        /* Play the music object -> a voice on a music-capable track. */
+        ChannelMsg rp;
+        ROUNDTRIP(req(REQ_AUDIO_PLAY_MUSIC, music, 0, 0, 1), rp);
+        CHECK(rp.a3 == AUDIO_ARB_OK, "PLAY_MUSIC OK (no longer rejected)");
+        AudioVoiceHandle mvoice = rp.a4;
+        CHECK(mvoice != 0, "music play returned a voice");
+        CHECK(audio_arbiter_active_count(audio_service_arbiter(svc)) == 1,
+              "one active music voice");
+
+        /* Pump + render: the music player should have fed its mixer
+         * channel, so render produces output. */
+        int16_t out[256 * 2];
+        memset(out, 0, sizeof(out));
+        audio_service_process(svc, 1);   /* pumps music */
+        audio_service_render(svc, out, 256);
+        int nz = 0; for (int i = 0; i < 256*2; i++) if (out[i] != 0) nz++;
+        CHECK(nz > 0, "music reached the mixer output (non-silent)");
+
+        /* Stop the music voice -> releases the player + loop ref. */
+        ChannelMsg rs2;
+        ROUNDTRIP(req(REQ_AUDIO_STOP_MUSIC, mvoice, 0, 0, 0), rs2);
+        CHECK(rs2.a3 == AUDIO_ARB_OK, "stop music OK");
+        CHECK(audio_arbiter_active_count(audio_service_arbiter(svc)) == 0,
+              "music voice gone after stop");
+        /* loop ref dropped back to 2 (the playing ref is gone). The
+         * arbiter held intro; that's also dropped. So both back to the
+         * music object's single ref + the creator's. */
+        CHECK(audio_pool_refcount(audio_service_pool(svc), loop) == 2,
+              "loop play-ref released on stop");
+
+        /* Free the music object -> drops its refs on intro/loop. */
+        ChannelMsg rmf;
+        ROUNDTRIP(req(REQ_AUDIO_POOL_FREE, music, 0, 0, 0), rmf);
+        CHECK(rmf.a3 == AUDIO_POOL_OK, "free music object OK");
+        CHECK(audio_pool_refcount(audio_service_pool(svc), intro) == 1,
+              "intro back to creator ref after music freed");
+        /* clean up the creator refs */
+        ChannelMsg t;
+        ROUNDTRIP(req(REQ_AUDIO_POOL_FREE, intro, 0, 0, 0), t);
+        ROUNDTRIP(req(REQ_AUDIO_POOL_FREE, loop, 0, 0, 0), t);
+    }
 
     #undef ROUNDTRIP
     audio_service_destroy(svc);

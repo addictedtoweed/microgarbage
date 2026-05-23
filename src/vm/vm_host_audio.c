@@ -118,12 +118,20 @@ static void handle_set_gain(VmCpu *cpu, void *system) {
     cpu->regs[VM_REG_A0] = (status == 0) ? 0u : (uint32_t)(-VM_EINVAL);
 }
 
-/* ---- SYS_AUDIO_LOAD_MUSIC / GET_LEVELS: stubs for now ---- */
+/* ---- SYS_AUDIO_LOAD_MUSIC (intro_obj, loop_obj) -> music handle ----
+ * The guest loads two samples via SYS_AUDIO_LOAD_SAMPLE, then pairs
+ * them here into a single music object. (loop_obj may be 0 for an
+ * intro-only object.) */
 static void handle_load_music(VmCpu *cpu, void *system) {
     (void)system;
-    /* Music path not yet wired in the service; report failure (0)
-     * rather than pretend. */
-    cpu->regs[VM_REG_A0] = 0;
+    uint32_t intro = cpu->regs[VM_REG_A0];
+    uint32_t loop  = cpu->regs[VM_REG_A1];
+    uint32_t status = 0, handle = 0;
+    if (!audio_call(REQ_AUDIO_LOAD_MUSIC, intro, loop, cpu->vm_id, 0,
+                    &status, &handle)) {
+        cpu->regs[VM_REG_A0] = 0; return;
+    }
+    cpu->regs[VM_REG_A0] = (status == 0) ? handle : 0;
 }
 static void handle_get_levels(VmCpu *cpu, void *system) {
     (void)system;
