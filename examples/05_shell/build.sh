@@ -224,6 +224,35 @@ echo "    $BUILD_DIR/host"
 echo ""
 echo "  Type 'help' once inside the shell for a command list."
 
+# Optional: build the standalone audio stress harness (POSIX only — it
+# uses the pthread channel transport). Renders the engine under load to
+# a .wav you can listen to: "$BUILD_DIR/audio_stress out.wav 6".
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*) : ;;   # native Windows: needs the win32 transport (future)
+    *)
+        echo "05_shell: building audio_stress harness..."
+        "$CC" -std=c11 -O2 -I"$REPO_ROOT/include" \
+            -o "$BUILD_DIR/audio_stress" \
+            "$EXAMPLE_DIR/audio_stress.c" \
+            "$REPO_ROOT/src/audio/audio_service.c" \
+            "$REPO_ROOT/src/audio/audio_arbiter.c" \
+            "$REPO_ROOT/src/audio/audio_pool.c" \
+            "$REPO_ROOT/src/audio/audio_pool_stream.c" \
+            "$REPO_ROOT/src/audio/audio_mixer.c" \
+            "$REPO_ROOT/src/audio/music_player.c" \
+            "$REPO_ROOT/src/audio/audio_fft.c" \
+            "$REPO_ROOT/src/audio/audio_fft_kernel.c" \
+            "$REPO_ROOT/src/audio/audio_sink_wav.c" \
+            "$REPO_ROOT/src/audio/audio_wav_read.c" \
+            "$REPO_ROOT/src/containers/ring_buffer.c" \
+            "$REPO_ROOT/src/containers/spsc_ring.c" \
+            "$REPO_ROOT/src/vm/service_channel.c" \
+            "$REPO_ROOT/src/vm/channel_thread.c" \
+            -lpthread \
+        && echo "    $BUILD_DIR/audio_stress  (render the engine under load to a .wav)"
+        ;;
+esac
+
 if [ "${1:-}" = "run" ]; then
     echo ""
     echo "05_shell: ===== running ====="
