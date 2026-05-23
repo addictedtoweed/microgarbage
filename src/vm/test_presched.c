@@ -109,11 +109,77 @@ static void test_repeated_runs_no_deadlock(void) {
     }
 }
 
+/* ---- priority (step 2) ----------------------------------------
+ * A high-priority task and a low-priority task. Strict priority means
+ * the HIGH task runs to completion before the LOW task makes more than
+ * negligible progress — the low task is starved until the high is done.
+ * We record, at the moment the HIGH task finishes, how far the LOW
+ * task got; it should be ~0. */
+static atomic_int g_low_progress_at_high_done;
+static atomic_int g_high_done;
+
+static void high_task(void *arg) {
+    (void)arg;
+    for (int c = 0; c < CHUNKS; c++) {
+        volatile unsigned long x = 0;
+        for (unsigned long i = 0; i < 20000000UL; i++) x += i;
+    }
+    /* snapshot the low task's progress the instant high finishes */
+    atomic_store(&g_low_progress_at_high_done, atomic_load(&g_progress[1]));
+    atomic_store(&g_high_done, 1);
+}
+static void low_task(void *arg) {
+    (void)arg;
+    for (int c = 0; c < CHUNKS; c++) {
+        volatile unsigned long x = 0;
+        for (unsigned long i = 0; i < 20000000UL; i++) x += i;
+        atomic_fetch_add(&g_progress[1], 1);   /* reuse slot 1 */
+    }
+}
+
+static void test_strict_priority_starves_lower(void) {
+    reset_state();
+    atomic_store(&g_low_progress_at_high_done, -1);
+    atomic_store(&g_high_done, 0);
+
+    PreSched *s = presched_create(1000);
+    /* high at a higher level than low */
+    presched_add_task_prio(s, high_task, NULL, PRESCHED_PRIO_MAX);
+    presched_add_task_prio(s, low_task,  NULL, PRESCHED_PRIO_MIN);
+    presched_run(s);
+
+    ASSERT(atomic_load(&g_high_done) == 1);
+    /* low made no progress while high was running (strict priority) */
+    ASSERT_EQ_INT(0, atomic_load(&g_low_progress_at_high_done));
+    /* but low DID complete once high was gone */
+    ASSERT_EQ_INT(CHUNKS, atomic_load(&g_progress[1]));
+    presched_destroy(s);
+}
+
+/* Equal-priority tasks still round-robin (interleave), even at a
+ * non-default level. */
+static void test_equal_priority_round_robins(void) {
+    reset_state();
+    PreSched *s = presched_create(1000);
+    for (long i = 0; i < NTASKS; i++)
+        presched_add_task_prio(s, worker, (void *)i, PRESCHED_PRIO_MAX);
+    presched_run(s);
+    int n = atomic_load(&g_order_n), changes = 0;
+    for (int i = 1; i < n && i < 256; i++)
+        if (atomic_load(&g_order[i]) != atomic_load(&g_order[i - 1])) changes++;
+    ASSERT(changes > NTASKS);   /* interleaved, not serial */
+    for (int i = 0; i < NTASKS; i++)
+        ASSERT_EQ_INT(CHUNKS, atomic_load(&g_progress[i]));
+    presched_destroy(s);
+}
+
 int main(void) {
     RUN(test_all_tasks_complete);
     RUN(test_preemption_actually_switches);
     RUN(test_work_interleaves);
     RUN(test_single_task_runs);
     RUN(test_repeated_runs_no_deadlock);
+    RUN(test_strict_priority_starves_lower);
+    RUN(test_equal_priority_round_robins);
     return TEST_SUITE_RESULT();
 }

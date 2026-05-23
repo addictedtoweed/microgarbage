@@ -56,6 +56,15 @@ typedef void (*presched_task_fn)(void *arg);
 
 typedef struct PreSched PreSched;
 
+/* Number of priority levels. Level 0 is lowest, PRESCHED_PRIO_LEVELS-1
+ * is highest. Kept small and <= 32 so the ready bitmap is one uint32
+ * and "highest ready level" is a single clz. */
+#ifndef PRESCHED_PRIO_LEVELS
+#define PRESCHED_PRIO_LEVELS  8
+#endif
+#define PRESCHED_PRIO_MIN  0
+#define PRESCHED_PRIO_MAX  (PRESCHED_PRIO_LEVELS - 1)
+
 /* Create a scheduler with a given systick period. tick_us is the
  * systick period in microseconds (e.g. 1000 = 1ms). Returns NULL on
  * failure. */
@@ -64,10 +73,18 @@ PreSched *presched_create(unsigned tick_us);
 /* Destroy the scheduler (must be stopped first). */
 void presched_destroy(PreSched *s);
 
-/* Register a task. Its thread is created but parked until the
- * scheduler runs. Returns the task id (>=0) or -1 on failure (too many
- * tasks / bad args). All tasks here share one priority level
- * (round-robin) — priority is a later step. */
+/* Register a task at a given priority level (0..PRESCHED_PRIO_MAX;
+ * clamped into range). The scheduler always runs a task from the
+ * highest priority level that has a ready task; tasks at the SAME level
+ * round-robin. Strict priority: a never-blocking high-priority task
+ * starves lower levels by design (the task designer's responsibility).
+ * Returns the task id (>=0) or -1 on failure. */
+int presched_add_task_prio(PreSched *s, presched_task_fn fn, void *arg,
+                           int priority);
+
+/* Convenience: register at a default mid priority. (Back-compatible
+ * with the step-1 single-level usage — all default-priority tasks
+ * round-robin together.) */
 int presched_add_task(PreSched *s, presched_task_fn fn, void *arg);
 
 /* Run the scheduler until all tasks have returned. Starts the systick,

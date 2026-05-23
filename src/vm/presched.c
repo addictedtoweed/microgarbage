@@ -48,6 +48,7 @@ typedef struct {
     _Atomic int      state;
     PreSched        *sched;
     int              id;
+    int              priority;    /* 0..PRESCHED_PRIO_MAX */
 } Task;
 
 struct PreSched {
@@ -62,11 +63,36 @@ struct PreSched {
     HANDLE   systick_thread;
 };
 
+/* Highest priority level that currently has a ready/running task, or
+ * -1 if none. (Small task count: a direct scan; the bitmap+clz form is
+ * the micro optimization, equivalent result.) */
+static int highest_ready_level(PreSched *s) {
+    int best = -1;
+    for (int i = 0; i < s->n_tasks; i++) {
+        int st = atomic_load(&s->tasks[i].state);
+        if (st == TASK_READY || st == TASK_RUNNING)
+            if (s->tasks[i].priority > best) best = s->tasks[i].priority;
+    }
+    return best;
+}
+
+/* Pick the next runnable task: the highest occupied priority level,
+ * round-robin among tasks AT that level starting after `from`. Returns
+ * a task id or -1. Strict priority: lower levels are never chosen while
+ * a higher level has a ready task. */
 static int next_ready(PreSched *s, int from) {
+    int lvl = highest_ready_level(s);
+    if (lvl < 0) return -1;
     for (int i = 1; i <= s->n_tasks; i++) {
         int idx = (from + i) % s->n_tasks;
+        if (s->tasks[idx].priority != lvl) continue;
         int st = atomic_load(&s->tasks[idx].state);
         if (st == TASK_READY || st == TASK_RUNNING) return idx;
+    }
+    /* `from` itself might be the only one at this level */
+    if (s->tasks[from % s->n_tasks].priority == lvl) {
+        int st = atomic_load(&s->tasks[from % s->n_tasks].state);
+        if (st == TASK_READY || st == TASK_RUNNING) return from % s->n_tasks;
     }
     return -1;
 }
@@ -119,15 +145,20 @@ PreSched *presched_create(unsigned tick_us) {
     atomic_store(&s->current, -1);
     return s;
 }
-int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
+int presched_add_task_prio(PreSched *s, presched_task_fn fn, void *arg, int priority) {
     if (!s || !fn || s->n_tasks >= PRESCHED_MAX_TASKS) return -1;
+    if (priority < PRESCHED_PRIO_MIN) priority = PRESCHED_PRIO_MIN;
+    if (priority > PRESCHED_PRIO_MAX) priority = PRESCHED_PRIO_MAX;
     int id = s->n_tasks++;
     Task *t = &s->tasks[id];
-    t->fn = fn; t->arg = arg; t->sched = s; t->id = id;
+    t->fn = fn; t->arg = arg; t->sched = s; t->id = id; t->priority = priority;
     atomic_store(&t->state, TASK_READY);
     t->gate = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (!t->gate) { s->n_tasks--; return -1; }
     return id;
+}
+int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
+    return presched_add_task_prio(s, fn, arg, PRESCHED_PRIO_LEVELS / 2);
 }
 void presched_run(PreSched *s) {
     if (!s || s->n_tasks == 0) return;
@@ -171,6 +202,7 @@ typedef struct {
     _Atomic int      state;
     PreSched        *sched;
     int              id;
+    int              priority;    /* 0..PRESCHED_PRIO_MAX */
 } Task;
 
 struct PreSched {
@@ -189,11 +221,32 @@ struct PreSched {
 static _Thread_local Task *tls_self = NULL;
 static PreSched *g_active = NULL;    /* single active scheduler (skeleton) */
 
+/* Highest priority level with a ready/running task, or -1. */
+static int highest_ready_level(PreSched *s) {
+    int best = -1;
+    for (int i = 0; i < s->n_tasks; i++) {
+        int st = atomic_load(&s->tasks[i].state);
+        if (st == TASK_READY || st == TASK_RUNNING)
+            if (s->tasks[i].priority > best) best = s->tasks[i].priority;
+    }
+    return best;
+}
+
+/* Highest occupied priority level, round-robin among tasks at that
+ * level after `from`. Strict priority: lower levels never chosen while
+ * a higher level has a ready task. */
 static int next_ready(PreSched *s, int from) {
+    int lvl = highest_ready_level(s);
+    if (lvl < 0) return -1;
     for (int i = 1; i <= s->n_tasks; i++) {
         int idx = (from + i) % s->n_tasks;
+        if (s->tasks[idx].priority != lvl) continue;
         int st = atomic_load(&s->tasks[idx].state);
         if (st == TASK_READY || st == TASK_RUNNING) return idx;
+    }
+    if (s->tasks[from % s->n_tasks].priority == lvl) {
+        int st = atomic_load(&s->tasks[from % s->n_tasks].state);
+        if (st == TASK_READY || st == TASK_RUNNING) return from % s->n_tasks;
     }
     return -1;
 }
@@ -260,14 +313,19 @@ PreSched *presched_create(unsigned tick_us) {
     return s;
 }
 
-int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
+int presched_add_task_prio(PreSched *s, presched_task_fn fn, void *arg, int priority) {
     if (!s || !fn || s->n_tasks >= PRESCHED_MAX_TASKS) return -1;
+    if (priority < PRESCHED_PRIO_MIN) priority = PRESCHED_PRIO_MIN;
+    if (priority > PRESCHED_PRIO_MAX) priority = PRESCHED_PRIO_MAX;
     int id = s->n_tasks++;
     Task *t = &s->tasks[id];
-    t->fn = fn; t->arg = arg; t->sched = s; t->id = id;
+    t->fn = fn; t->arg = arg; t->sched = s; t->id = id; t->priority = priority;
     atomic_store(&t->state, TASK_READY);
     if (sem_init(&t->gate, 0, 0) != 0) { s->n_tasks--; return -1; }
     return id;
+}
+int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
+    return presched_add_task_prio(s, fn, arg, PRESCHED_PRIO_LEVELS / 2);
 }
 
 void presched_run(PreSched *s) {
