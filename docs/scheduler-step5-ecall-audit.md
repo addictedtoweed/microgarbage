@@ -108,8 +108,11 @@ not.
 
 1. **Mailbox locker seam** (mirror `SlabLocker`); cooperative path uses
    the null locker (zero change). Verify cooperative tests still pass.
+   **[DONE — commit "mailbox locker seam"; see
+   docs/reference/vm_mailbox_locker_tsan_proof.c]**
 2. **Preemptive block/wake recv** wired into `handle_recv`/`handle_send`
    under the preemptive config.
+   **[SCOPE CORRECTION — bigger than first estimated; see below.]**
 3. **Slab locker** under the preemptive config.
 4. **A VM-IPC-under-preemption example/test** (two VM tasks exchanging
    messages) — the proof, analogous to 07_vm_task.
@@ -121,6 +124,57 @@ Each step keeps the cooperative `vm_sched` path unchanged (it uses null
 lockers / `block_reason` as today). The honesty boundary is unchanged:
 POSIX validates the logic in-sandbox under TSan; the MCU lockers (PRIMASK)
 and real-time behavior are user-verified.
+
+## Scope correction for item #2 (found while building item #1)
+
+The build order above first described item #2 as "wire two handlers to
+`presched_block`/`wake`." Tracing the code shows it is larger: the entire
+`vm_system` layer is built around the cooperative `VmSched`, not just
+those two handlers. Concretely, `src/vm/vm_system.c` has ~7 direct
+`sys->sched->...` field accesses, calls 7 distinct `vm_sched_*` functions
+(`init`/`register`/`run`/`step`/`unregister`/`wake_child`/`wake_mailbox`),
+uses the cooperative `block_reason`/`block_deadline` protocol in ~19
+places, and `VmSystem` *embeds* a `VmSched _sched` by value
+(include/vm/vm_system.h). The blocking-recv handlers
+(`handle_recv`/`handle_send`) are just the visible tip:
+
+- `handle_recv` on an empty mailbox sets `cpu->block_reason =
+  BLOCK_MAILBOX_RECV` + `block_deadline` and saves the dest pointer in
+  `_internal[0]`. The cooperative scheduler reads `block_reason` between
+  quanta. The preemptive backend does not read it at all.
+- `handle_send` has a **synchronous fast path** that, when the target is
+  `BLOCK_MAILBOX_RECV`, writes the payload *directly into the target VM's
+  memory* via `vm_translate_write(target_cpu, …)` and calls
+  `vm_sched_wake_mailbox`. Under preemption this violates the VmCpu
+  single-thread-ownership invariant (one thread writing another running
+  VM's memory).
+
+So item #2 really means: **make `vm_system` scheduler-agnostic** (or
+provide a parallel preemptive system layer), then re-express blocking recv
+on the preemptive primitives. The correct preemptive protocol (respecting
+single-thread ownership):
+
+- `handle_recv` empty + timeout: the calling VM task calls
+  `presched_block` (it runs in that task's own thread, inside vm_step, so
+  parking the thread is exactly right). On wake it retries
+  `vm_mailbox_recv` from the (locked) queue **in its own thread**.
+- `handle_send`: always enqueue via the locked `vm_mailbox_send` (item #1
+  made this thread-safe), then `presched_wake(target_task)`. **Drop the
+  synchronous direct-write fast path under preemption** — the woken
+  receiver does its own recv, so no cross-VM memory write occurs. (Keep
+  the fast path only on the cooperative build, where it is safe and
+  saves a copy.)
+
+Design options for the scheduler-agnostic step, to decide before coding:
+(a) a small block/wake/now indirection (function pointers or a config
+gate) that `vm_system` calls instead of `vm_sched_*` directly, with
+cooperative and preemptive implementations; or (b) a separate preemptive
+system layer that reuses the handlers but owns its own scheduler wiring.
+Option (a) keeps one code path and is probably right, but touches every
+`sched->` site, so it wants the prove-in-isolation treatment. This is a
+deliberate, non-trivial change — not a tail-of-session patch — because
+`vm_system` is the syscall-routing core that the working cooperative
+system and all examples 01–05 depend on.
 
 ## Status
 
