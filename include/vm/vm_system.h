@@ -260,6 +260,11 @@ typedef struct {
      * per-mailbox mutexes). ops.ctx points here under preemption.
      * Absent in the cooperative build. */
     VmPreCtx      _pre;
+
+    /* Mutex backing the shared/local slab locker under preemption.
+     * Lives here (not in _pre) because slab_init takes its locker by
+     * value before _pre is set up. */
+    pthread_mutex_t _slab_mtx;
 #endif
 
     /* === Per-VM state ===

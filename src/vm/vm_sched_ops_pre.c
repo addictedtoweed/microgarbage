@@ -156,6 +156,13 @@ VmMailboxLocker vm_pre_mailbox_locker(VmPreCtx *pc, uint16_t vm_id) {
     return lk;
 }
 
+/* The SlabLocker has the same lock/unlock/ctx shape as VmMailboxLocker,
+ * so the same mutex callbacks back both. */
+SlabLocker vm_pre_slab_locker(pthread_mutex_t *mtx) {
+    SlabLocker lk = { pre_mtx_lock, pre_mtx_unlock, mtx };
+    return lk;
+}
+
 /* ---- context lifecycle ---------------------------------------- */
 
 bool vm_pre_ctx_init(VmPreCtx *pc, void *sys, unsigned tick_us,

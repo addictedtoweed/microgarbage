@@ -34,6 +34,7 @@
 #include "vm/vm_sched_ops.h"    /* VmSchedOps */
 #include "vm/vm_mailbox.h"      /* VmMailboxLocker */
 #include "vm/presched.h"        /* PreSched */
+#include "memory/slab_stack.h"  /* SlabLocker */
 
 typedef struct {
     PreSched *sched;
@@ -62,6 +63,12 @@ const VmSchedOps *vm_sched_ops_preemptive(void);
 /* The real (mutex) mailbox locker for a given vm_id's mailbox.
  * Install on each mailbox under preemption via vm_mailbox_set_locker. */
 VmMailboxLocker vm_pre_mailbox_locker(VmPreCtx *pc, uint16_t vm_id);
+
+/* A real (mutex) slab locker backed by the caller-owned mutex. The
+ * slab takes its locker by value at slab_init, before the VmPreCtx
+ * exists, so the mutex lives in the VmSystem and is passed in here.
+ * Guards SYS_ALLOC/SYS_FREE against concurrent VM task threads. */
+SlabLocker vm_pre_slab_locker(pthread_mutex_t *mtx);
 
 #endif /* GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE */
 #endif /* VM_PRE_H */

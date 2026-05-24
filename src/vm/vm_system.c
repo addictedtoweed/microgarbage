@@ -931,12 +931,22 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
     sys->shared_slab  = &sys->_shared_slab;
     sys->local_slab   = &sys->_local_slab;
 
+    /* The slab locker: a real mutex under preemption (SYS_ALLOC/FREE
+     * race across VM task threads), the zero-cost null locker for the
+     * cooperative build. slab_init takes it by value, so build it now. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    pthread_mutex_init(&sys->_slab_mtx, NULL);
+    SlabLocker slab_lk = vm_pre_slab_locker(&sys->_slab_mtx);
+#else
+    SlabLocker slab_lk = slab_null_locker;
+#endif
+
     /* 1. Initialize the shared slab. */
     SlabResult sr = slab_init(sys->shared_slab,
                                sys->config.shared_storage,
                                sys->config.shared_storage_size,
                                &sys->config.slab_config,
-                               slab_null_locker);
+                               slab_lk);
     if (sr != SLAB_OK) {
         return false;
     }
@@ -996,7 +1006,7 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
                    sys->config.local_storage,
                    sys->config.local_storage_size,
                    &local_cfg,
-                   slab_null_locker);
+                   slab_lk);
     if (sr != SLAB_OK) {
         return false;
     }

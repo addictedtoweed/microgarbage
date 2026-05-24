@@ -28,6 +28,12 @@ the integration gap the audit (`scheduler-step5-ecall-audit.md`) describes.
 - **Real mailbox locker.** Under preemption each mailbox gets a pthread
   mutex via `vm_mailbox_set_locker` (the seam from item #1); the
   cooperative build keeps the zero-cost null locker.
+- **Real slab locker (audit item #3).** Under preemption the shared/local
+  slabs are initialized with a real mutex `SlabLocker` (a `VmSystem`-owned
+  `pthread_mutex_t`, since `slab_init` takes the locker by value) so
+  concurrent `SYS_ALLOC`/`SYS_FREE` across VM task threads is safe; the
+  cooperative build keeps `slab_null_locker`. Same mutex-seam pattern as
+  the mailbox; reuses the same lock/unlock callbacks.
 - **`presched_block_timeout` (new primitive).** A *sticky*, deadline-bounded
   park — `presched_block` (no lost wake) plus a wake deadline. Needed
   because a blocking recv-with-timeout must neither lose a racing send
@@ -37,11 +43,13 @@ the integration gap the audit (`scheduler-step5-ecall-audit.md`) describes.
 All preemptive code is behind `#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE`
 (see `config.h`); the cooperative (default) build links none of it.
 
-Known caps/out-of-scope (unchanged from the audit): one task per VM, so at
-most `PRESCHED_MAX_TASKS` live VMs; slab locker (#3), spawn-and-wait, and FS
-concurrency are not yet preemption-safe. The MCU copy seam (DMA between
-QSPI PSRAM and AXI SRAM, non-cached regions) for the IPC payload copy is
-noted for the MCU port — the copy is still a plain `memcpy` today.
+Known caps / still deferred (per the audit): one task per VM, so at most
+`PRESCHED_MAX_TASKS` live VMs. **Spawn-and-wait** is not preemption-safe —
+`presched` adds all tasks before `presched_run`, so runtime VM spawn needs a
+`presched` extension (dynamic task creation); `pre_wake_child` is a stub.
+**FS concurrency** (`SYS_OPENAT`/`READ`/`WRITE` against the host FS) is not
+guarded and is documented not-yet-concurrent-safe (also gated on FatFs,
+which isn't vendored). Both are the audit's lower-priority items.
 
 ## The proof (build & run)
 
@@ -82,3 +90,7 @@ gcc -std=c11 -Wall -Wextra -pedantic -DGARBAGE_SCHED_MODE=1 -I include \
   `vm_mailbox_locker_tsan_proof.c`) and should be confirmed under TSan in
   the POSIX sandbox — the project's standard honesty boundary: POSIX/TSan
   validates the logic, Windows/MCU are user-verified.
+- **Slab locker:** installed and exercised by the `03_mailbox` run, but
+  those guests don't `SYS_ALLOC`, so concurrent allocation is not *stressed*
+  here. It is the same mutex seam as the mailbox locker; a concurrent-alloc
+  guest under TSan (POSIX sandbox) would be the direct proof.
