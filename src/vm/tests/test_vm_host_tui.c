@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "test_runner.h"
+#include "test_portable.h"
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_tui.h"
@@ -74,12 +75,12 @@ static int32_t invoke_syscall(uint32_t num, uint32_t a0, uint32_t a1, uint32_t a
 typedef struct {
     int saved_fd;
     int tmp_fd;
-    char path[64];
+    char path[260];
 } Capture;
 
 static bool cap_begin(Capture *c) {
     fflush(stdout); fflush(stderr);
-    strcpy(c->path, "/tmp/microgarbage_tui_XXXXXX");
+    snprintf(c->path, sizeof c->path, "%s/microgarbage_tui_XXXXXX", tp_tmpdir());
     c->tmp_fd = mkstemp(c->path);
     if (c->tmp_fd < 0) return false;
     c->saved_fd = dup(1);
@@ -93,7 +94,7 @@ static bool cap_begin(Capture *c) {
 
 static char *cap_end(Capture *c, size_t *out_len) {
     fflush(stdout);
-    fsync(1);
+    tp_fsync(1);
     dup2(c->saved_fd, 1);
     close(c->saved_fd);
     lseek(c->tmp_fd, 0, SEEK_SET);

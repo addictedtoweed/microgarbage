@@ -11,6 +11,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "test_runner.h"
+#include "test_portable.h"
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_platform.h"
@@ -132,7 +133,7 @@ static int32_t invoke_syscall(uint32_t sys_num,
 typedef struct {
     int saved_fd;
     int tmp_fd;
-    char path[64];
+    char path[260];
 } FdCapture;
 
 static bool capture_begin(FdCapture *c, int target_fd) {
@@ -142,7 +143,8 @@ static bool capture_begin(FdCapture *c, int target_fd) {
      * output. */
     fflush(stdout);
     fflush(stderr);
-    strcpy(c->path, "/tmp/microgarbage_platform_test_XXXXXX");
+    snprintf(c->path, sizeof c->path,
+             "%s/microgarbage_platform_test_XXXXXX", tp_tmpdir());
     c->tmp_fd = mkstemp(c->path);
     if (c->tmp_fd < 0) return false;
     c->saved_fd = dup(target_fd);
@@ -156,7 +158,7 @@ static bool capture_begin(FdCapture *c, int target_fd) {
 
 static char *capture_end(FdCapture *c, int target_fd, size_t *out_len) {
     fflush(stdout);
-    fsync(target_fd);
+    tp_fsync(target_fd);
     dup2(c->saved_fd, target_fd);
     close(c->saved_fd);
 

@@ -76,11 +76,7 @@ run slab_stack       memory  src/memory/slab_stack.c
 run bump_on_slab     memory  src/memory/bump.c src/memory/slab_stack.c
 
 # ---- util ----
-if [ "$NATIVE_WIN" = 1 ]; then
-    skip inicfg "hardcoded /tmp path — Cygwin/POSIX cc only"
-else
-    run inicfg       util  src/util/inicfg.c
-fi
+run inicfg           util  src/util/inicfg.c
 
 # ---- storage ----
 run trashdrive       storage  src/storage/trashdrive.c
@@ -106,17 +102,13 @@ run audio_pool_stream_integration audio src/audio/audio_pool_stream.c src/audio/
 run audio_fft        audio  src/audio/audio_fft.c src/audio/audio_fft_kernel.c
 run audio_wav_read   audio  src/audio/audio_wav_read.c
 run audio_file_stream audio src/audio/audio_file_stream.c src/audio/audio_wav_read.c
-# audio_sink_wav writes to a hardcoded /tmp path (absent on native Win).
-# The sink dispatcher also references the waveOut backend whenever
-# _WIN32 || __CYGWIN__, so Cygwin must link it (+winmm); Linux need not.
-if [ "$NATIVE_WIN" = 1 ]; then
-    skip audio_sink_wav "/tmp output path — Cygwin/POSIX cc only"
-else
-    case "$MACHINE" in
-        *cygwin*) run audio_sink_wav audio src/audio/audio_sink_wav.c src/audio/audio_sink_waveout.c -lwinmm ;;
-        *)        run audio_sink_wav audio src/audio/audio_sink_wav.c ;;
-    esac
-fi
+# The sink dispatcher references the waveOut backend whenever
+# _WIN32 || __CYGWIN__ (native Windows + Cygwin), so those link it
+# (+winmm); a pure POSIX/Linux build does not.
+case "$MACHINE" in
+    *mingw*|*cygwin*) run audio_sink_wav audio src/audio/audio_sink_wav.c src/audio/audio_sink_waveout.c -lwinmm ;;
+    *)               run audio_sink_wav audio src/audio/audio_sink_wav.c ;;
+esac
 run audio_service    audio  src/audio/audio_service.c src/audio/audio_arbiter.c src/audio/audio_pool.c \
     src/audio/audio_pool_stream.c src/audio/audio_mixer.c src/audio/music_player.c src/audio/audio_fft.c \
     src/audio/audio_fft_kernel.c src/audio/audio_wav_read.c src/audio/audio_file_stream.c \
@@ -144,26 +136,17 @@ run presched_spawn   vm  -DGARBAGE_SCHED_MODE=1 $VM_CORE src/vm/presched.c -lpth
 
 # Host-shim suites that use POSIX pipe()/fsync() in the TEST itself —
 # build under Cygwin/POSIX, not native mingw.
-if [ "$NATIVE_WIN" = 1 ]; then
-    skip vm_host_stdio    "POSIX pipe() — Cygwin/POSIX cc only"
-    skip vm_host_platform "POSIX fsync() — Cygwin/POSIX cc only"
-    skip vm_host_tui      "POSIX fsync() — Cygwin/POSIX cc only"
+run vm_host_platform vm $VM_CORE
+run vm_host_tui      vm $VM_CORE
+# vm_host_stdio drives real guest ELFs.
+if [ -f examples/02_counter/build/guest.elf ] && [ -f examples/04_keydump/build/guest.elf ]; then
+    run vm_host_stdio vm $VM_CORE
 else
-    run vm_host_platform vm $VM_CORE
-    run vm_host_tui      vm $VM_CORE
-    # vm_host_stdio drives real guest ELFs (counter + keydump).
-    if [ -f examples/02_counter/build/counter.elf ] && [ -f examples/04_keydump/build/keydump.elf ]; then
-        run vm_host_stdio vm $VM_CORE
-    else
-        skip vm_host_stdio "needs examples/02_counter + 04_keydump ELFs (run their build.sh)"
-    fi
+    skip vm_host_stdio "needs examples/02_counter + 04_keydump guest.elf (run their build.sh)"
 fi
 
 # vm_host_fs pulls in FatFs (ff.h) + the trashfs/trashdrive backends.
-# The test uses POSIX mkdir(2)/paths, so it builds under Cygwin/POSIX.
-if [ "$NATIVE_WIN" = 1 ]; then
-    skip vm_host_fs "POSIX mkdir(2)/paths — Cygwin/POSIX cc only"
-elif [ -f "$FATFS_SRC/ff.c" ]; then
+if [ -f "$FATFS_SRC/ff.c" ]; then
     run vm_host_fs   vm  -DHAVE_FATFS -I"$FATFS_DIR" -I"$FATFS_SRC" $VM_CORE \
         src/vm/vm_host_fs.c src/storage/trashfs.c src/storage/trashdrive.c \
         src/storage/trashdrive_fatfs.c "$FATFS_DIR/ff_wrapped.c" "$FATFS_SRC/ffsystem.c"
@@ -171,11 +154,11 @@ else
     skip vm_host_fs "needs FatFs at $FATFS_SRC/ff.c"
 fi
 
-# vm_real_elf needs prebuilt guest ELFs from examples/*/build/.
-if [ -f examples/01_hello/build/hello.elf ]; then
+# vm_real_elf needs prebuilt guest ELFs from examples/01_hello/build/.
+if [ -f examples/01_hello/build/guest_minimal.elf ]; then
     run vm_real_elf  vm  $VM_CORE
 else
-    skip vm_real_elf "needs examples/01_hello/build/hello.elf (run its build.sh first)"
+    skip vm_real_elf "needs examples/01_hello/build/guest_minimal.elf (run its build.sh first)"
 fi
 
 echo "-----------------------------------------------"

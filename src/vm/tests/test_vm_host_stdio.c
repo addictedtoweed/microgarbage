@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "test_runner.h"
+#include "test_portable.h"
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 
@@ -65,9 +66,9 @@ static int run_with_captured_stdout(const char *elf_path,
     int saved_stdout = dup(1);
     if (saved_stdout < 0) { free(elf); return -1; }
 
-    char tmp_path[64];
+    char tmp_path[260];
     snprintf(tmp_path, sizeof(tmp_path),
-             "/tmp/vm_runner_test_%d.out", (int)getpid());
+             "%s/vm_runner_test_%d.out", tp_tmpdir(), (int)getpid());
     FILE *tmp = fopen(tmp_path, "w+");
     if (!tmp) {
         close(saved_stdout);
@@ -191,7 +192,7 @@ static int run_keydump_with_input(const char *input, size_t input_len,
     /* Build a stdin pipe: we'll write `input` to the write end,
      * the VM reads from the read end. */
     int in_pipe[2];
-    if (pipe(in_pipe) != 0) { free(elf); return -1; }
+    if (tp_pipe(in_pipe) != 0) { free(elf); return -1; }
     if (write(in_pipe[1], input, input_len) != (ssize_t)input_len) {
         close(in_pipe[0]); close(in_pipe[1]);
         free(elf); return -1;
@@ -210,9 +211,9 @@ static int run_keydump_with_input(const char *input, size_t input_len,
     if (saved_stdout < 0) {
         fclose(stdin_file); free(elf); return -1;
     }
-    char tmp_path[64];
+    char tmp_path[260];
     snprintf(tmp_path, sizeof(tmp_path),
-             "/tmp/vm_keydump_test_%d.out", (int)getpid());
+             "%s/vm_keydump_test_%d.out", tp_tmpdir(), (int)getpid());
     FILE *tmp = fopen(tmp_path, "w+");
     if (!tmp) {
         close(saved_stdout); fclose(stdin_file); free(elf); return -1;

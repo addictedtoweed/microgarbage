@@ -7,6 +7,7 @@
 
 #include "util/inicfg.h"
 #include "test_runner.h"
+#include "test_portable.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -266,7 +267,8 @@ static void test_get_bool_rejects_garbage(void) {
 
 static void test_parse_file_roundtrip(void) {
     /* Write a temp file, parse it back, verify. */
-    const char *path = "/tmp/inicfg_test_001.ini";
+    char pathbuf[256];
+    const char *path = tp_path(pathbuf, sizeof pathbuf, "inicfg_test_001.ini");
     FILE *f = fopen(path, "wb");
     ASSERT_NOT_NULL(f);
     fputs("[mem]\nkb = 64\n", f);
@@ -286,7 +288,9 @@ static void test_parse_file_roundtrip(void) {
 static void test_parse_file_missing_reports_error(void) {
     IniCfg cfg;
     IniCfgError err;
-    ASSERT(!inicfg_parse_file("/tmp/inicfg_test_does_not_exist.ini",
+    char nbuf[256];
+    ASSERT(!inicfg_parse_file(tp_path(nbuf, sizeof nbuf,
+                                      "inicfg_test_does_not_exist.ini"),
                               &cfg, &err));
     /* Doesn't matter what the message says exactly, just that
      * line==0 (it's a file-level error, not a parse error). */

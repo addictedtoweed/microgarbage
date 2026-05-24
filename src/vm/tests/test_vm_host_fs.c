@@ -33,6 +33,7 @@
  */
 
 #include "test_runner.h"
+#include "test_portable.h"
 
 #ifndef HAVE_FATFS
 
@@ -616,8 +617,9 @@ static void test_mount_host_basic(void) {
     ASSERT(fixture_init());
 
     /* Create a host directory and a file in it. */
-    const char *root = "/tmp/microgarbage_mount_test";
-    mkdir(root, 0755);
+    char rootbuf[256];
+    const char *root = tp_path(rootbuf, sizeof rootbuf, "microgarbage_mount_test");
+    tp_mkdir(root);
     {
         char path[256];
         snprintf(path, sizeof(path), "%s/hello.txt", root);
@@ -660,8 +662,9 @@ static void test_mount_host_basic(void) {
 static void test_mount_host_writable(void) {
     ASSERT(fixture_init());
 
-    const char *root = "/tmp/microgarbage_mount_test_rw";
-    mkdir(root, 0755);
+    char rootbuf[256];
+    const char *root = tp_path(rootbuf, sizeof rootbuf, "microgarbage_mount_test_rw");
+    tp_mkdir(root);
     ASSERT(vm_host_fs_mount_host("h0", root, true));
 
     /* Write a file. */
@@ -694,8 +697,9 @@ static void test_mount_host_writable(void) {
 static void test_mount_dotdot_rejected(void) {
     ASSERT(fixture_init());
 
-    const char *root = "/tmp/microgarbage_mount_test_esc";
-    mkdir(root, 0755);
+    char rootbuf[256];
+    const char *root = tp_path(rootbuf, sizeof rootbuf, "microgarbage_mount_test_esc");
+    tp_mkdir(root);
     ASSERT(vm_host_fs_mount_host("h0", root, false));
 
     /* Try to escape with ../. Always EPERM, regardless of whether

@@ -278,14 +278,15 @@ dependencies. It drops binaries + logs in `build/tests/` and exits
 non-zero if any suite fails.
 
 The canonical test compiler is Cygwin/POSIX `cc` (links `cygwin1.dll`,
-exercises the POSIX host paths). A native mingw-w64 `cc` builds the
-platform-neutral majority too: the runner detects the toolchain, adds
-the Windows-only shim sources (`vm_host_stdio_win32.c`, the waveOut
-backend) and **skips** the few POSIX-only suites (those using
-`pipe`/`fsync`/`/tmp`) with a printed reason. FatFs suites and the
-ELF-driven integration suites (`vm_real_elf`, `vm_host_stdio` — which
-load guest ELFs from `examples/*/build/`) skip themselves when their
-prerequisites are absent; build those examples first for full coverage.
+exercises the POSIX host paths), but every suite also builds with a
+native mingw-w64 `cc`: the runner detects the toolchain and adds the
+Windows-only shim sources (`vm_host_stdio_win32.c`, the waveOut
+backend), and a small `include/test_portable.h` shim papers over the
+temp-file / `fsync` / `pipe` / `mkdir` differences for the host-shim
+suites. FatFs suites and the ELF-driven integration suites
+(`vm_real_elf`, `vm_host_stdio` — which load guest ELFs from
+`examples/*/build/`) skip themselves when their prerequisites are
+absent; build those examples first for full coverage.
 
 To build one suite by hand, copy its dependency line from
 `run_tests.sh`, e.g.:

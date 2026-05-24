@@ -12,6 +12,7 @@
  * ============================================================ */
 
 #include "audio/audio_sink.h"
+#include "test_portable.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,8 @@ static uint16_t rd_u16le(const uint8_t *p) {
 }
 
 int main(void) {
-    const char *path = "/tmp/test_sink_out.wav";
+    char pathbuf[256];
+    const char *path = tp_path(pathbuf, sizeof pathbuf, "test_sink_out.wav");
     const uint32_t rate = 44100;
     const uint32_t frames = 1000;
 
