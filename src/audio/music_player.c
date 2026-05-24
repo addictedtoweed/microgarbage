@@ -410,9 +410,20 @@ void music_update(MusicPlayer *mp) {
      * stops accepting (mixer's overwrite-on-full prevents the call
      * from failing, but for safety we use a finite per-call cap). */
 
-    /* A reasonable per-call cap is the streaming buffer's size; that
-     * way we transfer at most one buffer's worth per update tick. */
-    size_t target = mp->cfg.streaming_buffer_samples;
+    /* Pump only as much as the mixer channel can actually hold without
+     * overwriting unplayed audio. mixer_write_channel returns `count`
+     * regardless of the ring's free space (it overwrites when full), so
+     * a blind per-call target would advance the source far faster than
+     * the channel drains — the music races (plays many seconds of source
+     * per render quantum). Tie the pump to the channel's free space so
+     * the source advances at the render/drain rate. Capped to the
+     * streaming buffer too. */
+    size_t cap  = mixer_channel_capacity(mp->cfg.mixer, mp->cfg.mixer_channel);
+    size_t fill = mixer_channel_buffered(mp->cfg.mixer, mp->cfg.mixer_channel);
+    size_t target = (cap > fill) ? (cap - fill) : 0;
+    if (target > mp->cfg.streaming_buffer_samples)
+        target = mp->cfg.streaming_buffer_samples;
+    if (target == 0) return;   /* channel full this tick — nothing to do */
 
     /* Loop: refill streaming buffer as needed, pump to mixer, detect
      * segment-end, transition. We iterate up to a few times to allow

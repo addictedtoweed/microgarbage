@@ -4,10 +4,11 @@
  *  Run from the shell:  run /host/musicplayer.elf
  *
  *  Demonstrates the full audio path end-to-end through the VM:
- *    - long streaming PCM: loads /host/music.wav (host-parsed, no
- *      guest-memory limit) and loops it; falls back to a synthesized
- *      chord if no wav is present, so the demo always runs. Music
- *      plays at reduced gain so triggered SFX clearly cut through.
+ *    - long streaming PCM: streams /host/music.wav incrementally (host/
+ *      SD reads it as it plays — no pool-size limit), in full stereo,
+ *      and loops it; falls back to a synthesized chord if no wav is
+ *      present, so the demo always runs. Music plays at reduced gain so
+ *      triggered SFX clearly cut through.
  *    - SFX mixing: keys [1][2][3] and left-click trigger short blips
  *      that mix over the music (click pans by column).
  *    - real-time FFT equalizer: 16 bands (0..255) from the mixed
@@ -119,20 +120,23 @@ int main(void) {
     int from_wav = 0;
 
     if (have_audio) {
-        audio_object samp = audio_load_wav("/host/music.wav");
-        from_wav = (samp != AUDIO_OBJECT_NONE);
-        if (samp == AUDIO_OBJECT_NONE) {
+        /* Prefer true streaming: plays an arbitrarily long song straight
+         * off /host (or SD) with no pool-size limit, in full stereo. */
+        mv = audio_stream_wav("/host/music.wav");
+        from_wav = (mv != AUDIO_VOICE_NONE);
+        if (!from_wav) {
+            /* No song file (or unstreamable): synthesize a chord into the
+             * pool and loop it as music instead. */
             gen_chord(g_chord, CHORD_LEN);
-            samp = audio_load_sample(g_chord, sizeof g_chord);
-        }
-        if (samp != AUDIO_OBJECT_NONE) {
-            music = audio_load_music(samp, samp);
-            audio_free(samp);
-            if (music != AUDIO_OBJECT_NONE) {
-                mv = audio_play_music(music, 0);
-                if (mv) audio_set_gain(mv, MUSIC_GAIN);  /* leave room for SFX */
+            audio_object samp = audio_load_sample(g_chord, sizeof g_chord);
+            if (samp != AUDIO_OBJECT_NONE) {
+                music = audio_load_music(samp, samp);
+                audio_free(samp);
+                if (music != AUDIO_OBJECT_NONE)
+                    mv = audio_play_music(music, 0);
             }
         }
+        if (mv) audio_set_gain(mv, MUSIC_GAIN);  /* leave room for SFX */
         gen_blip(g_sfx[0], SFX_LEN, 120);            /* low  */
         gen_blip(g_sfx[1], SFX_LEN,  80);            /* mid  */
         gen_blip(g_sfx[2], SFX_LEN,  56);            /* high */

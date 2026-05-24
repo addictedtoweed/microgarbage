@@ -926,6 +926,11 @@ size_t mixer_channel_buffered(const AudioMixer *m, size_t channel) {
     return rb_count(&m->channels[channel].rb);
 }
 
+size_t mixer_channel_capacity(const AudioMixer *m, size_t channel) {
+    if (channel >= m->channel_count) return 0;
+    return m->channels[channel].rb.capacity;
+}
+
 /* ============================================================
  *  Sync (v2) — observation and reset
  *

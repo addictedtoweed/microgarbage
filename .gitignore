@@ -57,6 +57,12 @@ meson-info/
 *.uf2
 *.dfu
 
+# Audio assets dropped into host_files for local testing (e.g. a song
+# streamed via /host/music.wav). These are user-supplied and often
+# copyrighted — never commit them. The engine hand-rolls test WAVs at
+# runtime, so the repo tracks no .wav of its own.
+*.wav
+
 # Linker garbage
 *.su
 *.idb

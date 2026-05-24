@@ -224,6 +224,43 @@ static void handle_load_wav(VmCpu *cpu, void *system) {
                     cpu->vm_id, 0, 0, &status, &handle)) return;
     cpu->regs[VM_REG_A0] = (status == 0) ? handle : 0;
 }
+/* ---- SYS_AUDIO_STREAM_WAV (path) -> voice handle or 0 ----
+ * Unlike LOAD_WAV (which decodes the whole file into the pool), this
+ * streams an arbitrarily long WAV: the host only RESOLVES the guest
+ * mount path to a native path the service's file_reader understands,
+ * stages that path string, and posts REQ_AUDIO_STREAM_WAV. The service
+ * opens + reads the file incrementally (on the desktop worker, or the
+ * H745 M4 off SD). "/host/x" -> "<root>/x" (stdio); "/td0/x" -> "0:/x"
+ * (FatFs). */
+static void handle_stream_wav(VmCpu *cpu, void *system) {
+    (void)system;
+    uint32_t path_addr = cpu->regs[VM_REG_A0];   /* read BEFORE clearing */
+    cpu->regs[VM_REG_A0] = 0;                     /* default: failure */
+    if (!g_staging) return;
+
+    char gpath[256];
+    copy_guest_str(cpu, path_addr, gpath, sizeof(gpath));
+
+    char native[512];
+    if (strncmp(gpath, "/host/", 6) == 0) {
+        if (!g_host_fs_root) return;
+        snprintf(native, sizeof(native), "%s/%s", g_host_fs_root, gpath + 6);
+    } else if (strncmp(gpath, "/td0/", 5) == 0) {
+        snprintf(native, sizeof(native), "0:/%s", gpath + 5);  /* FatFs vol 0 */
+    } else {
+        return;   /* only /host and /td0 are streamable */
+    }
+
+    size_t plen = strlen(native) + 1;             /* include the NUL */
+    if (plen > g_staging_cap) return;
+    memcpy(g_staging, native, plen);
+
+    uint32_t status = 0, voice = 0;
+    if (!audio_call(REQ_AUDIO_STREAM_WAV, (uint32_t)plen, cpu->vm_id, 0, 0,
+                    &status, &voice)) return;
+    cpu->regs[VM_REG_A0] = (status == 0) ? voice : 0;
+}
+
 static void handle_fft_enable(VmCpu *cpu, void *system) {
     (void)system;
     uint32_t en = cpu->regs[VM_REG_A0];
@@ -262,8 +299,11 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
                            handle_fft_enable)) goto f8;
     if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_LOAD_WAV,
                            handle_load_wav)) goto f9;
+    if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_STREAM_WAV,
+                           handle_stream_wav)) goto f10;
     return true;
 
+f10: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_LOAD_WAV);
 f9: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_FFT_ENABLE);
 f8: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_GET_LEVELS);
 f7: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_SET_GAIN);

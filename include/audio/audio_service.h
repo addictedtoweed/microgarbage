@@ -43,6 +43,7 @@
 #include "audio/audio_pool.h"
 #include "audio/audio_arbiter.h"
 #include "audio/audio_pool_stream.h"
+#include "audio/audio_file_stream.h"
 #include "audio/audio_mixer.h"
 #include "audio/music_player.h"
 
@@ -76,6 +77,13 @@ typedef struct {
      * staged loads are rejected. */
     void           *staging_buffer;
     size_t          staging_capacity;
+    /* File-reader seam for streaming long WAVs (REQ_AUDIO_STREAM_WAV).
+     * The platform supplies it: desktop binds stdio (/host) + FatFs
+     * (/td0); the H745 binds FatFs over SD. A single reader whose
+     * open() dispatches on the resolved native path is expected (e.g.
+     * "0:/x" -> FatFs, otherwise stdio). If reader.open is NULL,
+     * stream requests are rejected. The service stays FS-agnostic. */
+    AudioFileReader file_reader;
 } AudioServiceConfig;
 
 /* Create / destroy. create returns NULL on bad config or alloc

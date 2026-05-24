@@ -74,6 +74,15 @@ enum {
     /* Get band levels. The response packs up to 16 band bytes (0..255)
      * into a0..a3 (4 bytes each, little-endian); a4 = band count. */
     REQ_AUDIO_GET_LEVELS   = 0x010B,
+    /* Stream a long WAV from a file rather than loading it into the
+     * pool. The resolved native path sits NUL-terminated in the shared
+     * staging buffer; a0 = path length (incl. NUL), a1 = owner_vm. The
+     * service opens it via its AudioFileReader, builds a looping
+     * file-stream music voice, and returns the voice handle. No pool
+     * object is involved (the file is read incrementally, service-side).
+     * This is how arbitrarily long songs play on desktop (stdio/FatFs)
+     * and on the H745 (FatFs over SD). */
+    REQ_AUDIO_STREAM_WAV   = 0x010C,
 
     /* file (0x02xx) — reserved for the M4-owns-SD proxy */
     REQ_FILE_OPEN   = 0x0200,

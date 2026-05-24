@@ -33,6 +33,25 @@
  *  currently unused by the FCFS policy.
  *
  *  ---------------------------------------------------------------
+ *  WIP: priority admission/eviction + mute states (safety equipment)
+ *  ---------------------------------------------------------------
+ *  This OS is intended to run in safety equipment, where the audio
+ *  policy must GUARANTEE a warning can sound. None of the following is
+ *  implemented yet — today it is strictly FCFS reject-on-full and
+ *  `priority` is ignored — but it is the planned model:
+ *    - Priority admission: when all tracks are busy, a higher-priority
+ *      voice evicts the lowest-priority active voice instead of being
+ *      blanket-REJECTED.
+ *    - A highest-priority "warning/alarm" voice that always claims a
+ *      track (preempting if needed), playable once or on repeat, and
+ *      never reaped/ducked/muted by lower-priority audio.
+ *    - Mute states: TEMPORARY mute (silence or duck, then resume the
+ *      prior voices) and PERMANENT mute — with the warning priority
+ *      overriding a temporary mute so alarms still play.
+ *  When this lands, wire it into audio_arbiter_play (admission) and a
+ *  new "play warning" entry point, plus mixer mute/duck control.
+ *
+ *  ---------------------------------------------------------------
  *  Refcount integration (lifetime safety)
  *  ---------------------------------------------------------------
  *  A live voice holds a reference on its pool object (audio_pool_ref
@@ -96,7 +115,9 @@ typedef enum {
 typedef struct {
     int32_t  gain;             /* q15 volume (Q15_ONE = unity)           */
     int32_t  pan;              /* q15 pan (-1..+1)                       */
-    uint8_t  priority;         /* reserved for future eviction; unused   */
+    uint8_t  priority;         /* WIP: reserved for priority admission/
+                                * eviction (see policy note above);
+                                * IGNORED by today's FCFS policy         */
     uint8_t  loop;             /* SFX: loop forever (music loops via its
                                 * own intro/loop machinery)              */
 } AudioVoiceParams;
@@ -159,6 +180,17 @@ AudioArbResult audio_arbiter_play(AudioArbiter *a,
                                   const AudioVoiceParams *params,
                                   uint16_t owner_vm,
                                   AudioVoiceHandle *out_voice);
+
+/* Play a voice that has NO backing pool object — the service drives
+ * the audio itself (e.g. a file-stream music voice reading off SD).
+ * Claims a free track (FCFS) and calls sink.start with
+ * object = AUDIO_POOL_HANDLE_NONE; takes no pool ref. `kind` is forced
+ * to MUSIC so reap never touches it (it loops until stopped/swept).
+ * Returns AUDIO_ARB_REJECTED if all tracks are busy. */
+AudioArbResult audio_arbiter_play_external(AudioArbiter *a,
+                                           const AudioVoiceParams *params,
+                                           uint16_t owner_vm,
+                                           AudioVoiceHandle *out_voice);
 
 /* Stop a voice: calls sink.stop, drops the pool ref, frees the track
  * (bumps its generation so the voice handle goes stale). Returns

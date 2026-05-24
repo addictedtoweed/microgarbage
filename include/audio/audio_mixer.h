@@ -412,4 +412,9 @@ void mixer_reset_sync(AudioMixer *m);
  * (mono) or frames (stereo). */
 size_t mixer_channel_buffered(const AudioMixer *m, size_t channel);
 
+/* Returns the channel's source buffer capacity (max fill), in the same
+ * units as mixer_channel_buffered. Lets a feeder pump only the free
+ * space (capacity - buffered) so it never overwrites unplayed audio. */
+size_t mixer_channel_capacity(const AudioMixer *m, size_t channel);
+
 #endif /* AUDIO_MIXER_H */

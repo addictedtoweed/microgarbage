@@ -47,6 +47,108 @@ static ChannelMsg req(uint16_t type, uint32_t a0, uint32_t a1,
     return m;
 }
 
+/* ---- mock file reader + synthetic WAV (for the streaming voice) ---- */
+typedef struct { const uint8_t *buf; uint32_t len; uint32_t pos; } SvcMemFile;
+static void *svc_mf_open(void *ctx, const char *path) {
+    (void)path; SvcMemFile *mf = (SvcMemFile *)ctx; mf->pos = 0; return mf;
+}
+static uint32_t svc_mf_read(void *ctx, void *fh, void *dst, uint32_t bytes) {
+    (void)ctx; SvcMemFile *mf = (SvcMemFile *)fh;
+    uint32_t avail = mf->len - mf->pos, n = bytes < avail ? bytes : avail;
+    memcpy(dst, mf->buf + mf->pos, n); mf->pos += n; return n;
+}
+static bool svc_mf_seek(void *ctx, void *fh, uint32_t off) {
+    (void)ctx; SvcMemFile *mf = (SvcMemFile *)fh;
+    if (off > mf->len) return false;
+    mf->pos = off;
+    return true;
+}
+static void svc_mf_close(void *ctx, void *fh) { (void)ctx; (void)fh; }
+
+static uint32_t put32(uint8_t *p, uint32_t v) {
+    p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);p[2]=(uint8_t)(v>>16);p[3]=(uint8_t)(v>>24);return 4;
+}
+static uint32_t put16(uint8_t *p, uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);return 2;}
+
+/* ============================================================
+ *  Part C — file-stream music voice (REQ_AUDIO_STREAM_WAV)
+ *
+ *  End-to-end through the service: a mock AudioFileReader serves a
+ *  synthetic STEREO wav from memory, the service opens it on STREAM_WAV
+ *  and renders non-silent stereo output (L != R proves stereo is
+ *  preserved, not downmixed). The desktop stdio/FatFs readers feed this
+ *  exact path — only the reader differs.
+ * ============================================================ */
+static void test_stream_wav(void) {
+    static uint8_t wav[64 * 1024];
+    const uint32_t nf = 4000, rate = 44100; const int ch = 2;
+    uint32_t data = nf * (uint32_t)ch * 2u, p = 0;
+    memcpy(wav+p,"RIFF",4);p+=4;p+=put32(wav+p,36+data);memcpy(wav+p,"WAVE",4);p+=4;
+    memcpy(wav+p,"fmt ",4);p+=4;p+=put32(wav+p,16);p+=put16(wav+p,1);
+    p+=put16(wav+p,(uint16_t)ch);p+=put32(wav+p,rate);
+    p+=put32(wav+p,rate*(uint32_t)ch*2u);p+=put16(wav+p,(uint16_t)(ch*2));p+=put16(wav+p,16);
+    memcpy(wav+p,"data",4);p+=4;p+=put32(wav+p,data);
+    for (uint32_t i = 0; i < nf; i++) {           /* distinct L/R ramps */
+        int16_t l = (int16_t)(8000 - (int)(i % 2000));
+        int16_t r = (int16_t)((int)(i % 2000) - 8000);
+        p += put16(wav+p,(uint16_t)l); p += put16(wav+p,(uint16_t)r);
+    }
+    SvcMemFile mf = { wav, p, 0 };
+
+    ChannelMsg rqs[SLOTS], rss[SLOTS];
+    ChannelTransport tr; channel_thread_transport_make(&tr);
+    ServiceChannel ch2; service_channel_init(&ch2, rqs, rss, SLOTS, &tr);
+    uint8_t *region = malloc(POOL_BYTES);
+    static uint8_t staging[8192];
+    AudioServiceConfig cfg = {
+        .channel = &ch2, .pool_region = region, .pool_region_size = POOL_BYTES,
+        .sample_rate = 44100, .track_count = 4,
+        .staging_buffer = staging, .staging_capacity = sizeof(staging),
+        .file_reader = { svc_mf_open, svc_mf_read, svc_mf_seek, svc_mf_close, &mf },
+    };
+    AudioService *svc = audio_service_create(&cfg);
+    CHECK(svc != NULL, "service (stream) created");
+
+    /* stage a path (the mock reader ignores it) and post STREAM_WAV */
+    const char *path = "0:/song.wav"; uint32_t plen = (uint32_t)strlen(path) + 1;
+    memcpy(staging, path, plen);
+    ChannelMsg sm = req(REQ_AUDIO_STREAM_WAV, plen, /*vm*/1, 0, 0);
+    sm.seq = service_channel_next_seq(&ch2);
+    CHECK(channel_request_post(&ch2, &sm), "post STREAM_WAV");
+    CHECK(audio_service_process(svc, 8) == 1, "service handled STREAM_WAV");
+    ChannelMsg sr; CHECK(channel_response_poll(&ch2, &sr), "STREAM_WAV response");
+    CHECK(sr.a3 == AUDIO_ARB_OK, "STREAM_WAV OK");
+    AudioVoiceHandle v = sr.a4;
+    CHECK(v != 0, "stream returned a voice");
+    CHECK(audio_arbiter_active_count(audio_service_arbiter(svc)) == 1,
+          "one active stream voice");
+
+    int16_t out[256 * 2]; memset(out, 0, sizeof out);
+    for (int k = 0; k < 3; k++) {
+        audio_service_process(svc, 1);          /* pumps the stream */
+        audio_service_render(svc, out, 256);
+    }
+    int nz = 0, lr_diff = 0;
+    for (int i = 0; i < 256; i++) {
+        if (out[i*2] || out[i*2+1]) nz++;
+        if (out[i*2] != out[i*2+1]) lr_diff++;
+    }
+    CHECK(nz > 0, "streamed wav reached the output (non-silent)");
+    CHECK(lr_diff > 0, "stereo preserved through the stream (L != R)");
+
+    ChannelMsg st, stop = req(REQ_AUDIO_STOP_MUSIC, v, 0, 0, 0);
+    stop.seq = service_channel_next_seq(&ch2);
+    channel_request_post(&ch2, &stop); audio_service_process(svc, 8);
+    channel_response_poll(&ch2, &st);
+    CHECK(st.a3 == AUDIO_ARB_OK, "stop stream voice OK");
+    CHECK(audio_arbiter_active_count(audio_service_arbiter(svc)) == 0,
+          "stream voice gone after stop");
+
+    audio_service_destroy(svc);
+    service_channel_destroy(&ch2);
+    free(region);
+}
+
 /* ============================================================
  *  Part A — single-threaded, deterministic
  * ============================================================ */
@@ -331,6 +433,7 @@ static void test_threaded(void) {
 
 int main(void) {
     test_single_threaded();
+    test_stream_wav();
     test_threaded();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -121,4 +121,11 @@ WavResult wav_parse(const uint8_t *buf, size_t len, WavInfo *out);
 uint32_t wav_to_mono_pcm16(const WavInfo *info, int16_t *dst,
                            uint32_t max_frames);
 
+/* Convert parsed WAV PCM into INTERLEAVED STEREO PCM16 in `dst`
+ * (caller-allocated, room for `max_frames * 2` int16). Stereo is
+ * preserved as-is; mono is promoted to L==R (no downmix); 8-bit is
+ * promoted to 16-bit. Returns frames written. */
+uint32_t wav_to_stereo_pcm16(const WavInfo *info, int16_t *dst,
+                             uint32_t max_frames);
+
 #endif /* AUDIO_SINK_H */

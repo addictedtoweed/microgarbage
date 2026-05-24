@@ -90,6 +90,20 @@ if ($Clean) {
 # Verify the host compiler exists and IS native (mingw).
 # ----------------------------------------------------------------
 $ccPath = Get-Command $Cc -ErrorAction SilentlyContinue
+if (-not $ccPath -and $Cc -eq "x86_64-w64-mingw32-gcc") {
+    # The prefixed name isn't installed, but MSYS2's mingw-w64-x86_64-gcc
+    # also provides a plain 'gcc' that targets x86_64-w64-mingw32. Fall
+    # back to it for the DEFAULT only (an explicit -Cc is honoured as-is).
+    $alt = Get-Command "gcc" -ErrorAction SilentlyContinue
+    if ($alt) {
+        $altMachine = (& gcc -dumpmachine 2>$null)
+        if ($altMachine -match "mingw|w64.*windows") {
+            Write-Step "host compiler '$Cc' not found; using native 'gcc' (target $altMachine)"
+            $Cc = "gcc"
+            $ccPath = $alt
+        }
+    }
+}
 if (-not $ccPath) {
     Die ("host compiler '$Cc' not found on PATH.`n" +
          "      Install mingw-w64 (e.g. via MSYS2: 'pacman -S " +
@@ -169,6 +183,7 @@ $hostExtra = @(
     "src\audio\audio_fft.c",
     "src\audio\audio_fft_kernel.c",
     "src\audio\audio_wav_read.c",
+    "src\audio\audio_file_stream.c",
     "src\audio\audio_sink_wav.c",
     "src\audio\audio_sink_waveout.c"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }

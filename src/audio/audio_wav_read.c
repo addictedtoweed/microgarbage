@@ -90,3 +90,30 @@ uint32_t wav_to_mono_pcm16(const WavInfo *info, int16_t *dst,
     }
     return n;
 }
+
+uint32_t wav_to_stereo_pcm16(const WavInfo *info, int16_t *dst,
+                             uint32_t max_frames) {
+    if (!info || !dst || !info->data) return 0;
+    uint32_t ch    = info->channels;
+    uint32_t bps   = info->bits / 8u;          /* bytes per sample     */
+    uint32_t fb    = ch * bps;                 /* bytes per frame      */
+    if (fb == 0) return 0;
+    uint32_t avail = info->data_bytes / fb;     /* source frames        */
+    uint32_t n = (avail < max_frames) ? avail : max_frames;
+
+    const uint8_t *d = info->data;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *s = d + (size_t)i * fb;
+        int16_t l, r;
+        if (info->bits == 16) {
+            l = (int16_t)rd_u16le(s);
+            r = (ch == 2) ? (int16_t)rd_u16le(s + 2) : l;   /* mono -> L=R */
+        } else {                                            /* 8-bit -> 16 */
+            l = (int16_t)(((int32_t)s[0] - 128) * 256);
+            r = (ch == 2) ? (int16_t)(((int32_t)s[1] - 128) * 256) : l;
+        }
+        dst[i * 2]     = l;
+        dst[i * 2 + 1] = r;
+    }
+    return n;
+}

@@ -299,7 +299,8 @@
 #define SYS_AUDIO_GET_LEVELS   1167  /* (out_buf, n_bands) → bands written (meters)*/
 #define SYS_AUDIO_FFT_ENABLE   1168  /* (enable) → 0; turn band meters on/off      */
 #define SYS_AUDIO_LOAD_WAV     1169  /* (path) → object handle; host parses a .wav */
-/* 1170..1175 reserved for audio */
+#define SYS_AUDIO_STREAM_WAV   1170  /* (path) → voice; host streams a long .wav   */
+/* 1171..1175 reserved for audio */
 
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */

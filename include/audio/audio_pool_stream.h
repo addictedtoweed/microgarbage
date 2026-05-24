@@ -43,7 +43,12 @@ typedef struct {
      * unused (handle == AUDIO_POOL_HANDLE_NONE). */
     int               stream_id[2];
     AudioObjHandle    handle[2];
-    size_t            bytes_per_frame;   /* from the source format */
+    size_t            bytes_per_frame;   /* of the SOURCE (pool) data  */
+    /* When set, the pool holds mono16 but the player/channel is
+     * stereo16: each mono frame is promoted in place to L==R after the
+     * read (no downmix — a lossless duplication). bytes_per_frame stays
+     * the source's (2); `destination` must hold 2x the int16. */
+    bool              promote_stereo;
 } AudioPoolStreamCtx;
 
 /* Initialize a context. `format` sets bytes-per-frame (must match the
@@ -51,6 +56,11 @@ typedef struct {
  * audio_pool_stream_bind. Returns false on bad args. */
 bool audio_pool_stream_init(AudioPoolStreamCtx *ctx, AudioPool *pool,
                             MixerSourceFormat format);
+
+/* Enable mono16-source -> stereo16-output promotion (L==R). Use when
+ * the pool data is mono16 but the player/channel format is stereo16
+ * (the "full stereo mixer" path). Off by default. */
+void audio_pool_stream_set_promote_stereo(AudioPoolStreamCtx *ctx, bool on);
 
 /* Bind a stream_id to a pool object handle (e.g. the player's
  * intro_stream_id -> the intro sample's handle). Up to two bindings.

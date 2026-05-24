@@ -136,6 +136,7 @@ HOST_EXTRA=(
     "$REPO_ROOT/src/audio/audio_fft.c"
     "$REPO_ROOT/src/audio/audio_fft_kernel.c"
     "$REPO_ROOT/src/audio/audio_wav_read.c"
+    "$REPO_ROOT/src/audio/audio_file_stream.c"
     "$REPO_ROOT/src/audio/audio_sink_wav.c"
     "$REPO_ROOT/src/audio/audio_sink_waveout.c"
 )

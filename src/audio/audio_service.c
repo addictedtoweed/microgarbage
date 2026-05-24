@@ -23,7 +23,8 @@
 
 /* Per-music-player buffer sizes (frames). The streaming buffer must
  * be comfortably larger than one render quantum; the pinned heads
- * cover the intro->loop and loop->loop seams. Mono16 here. */
+ * cover the intro->loop and loop->loop seams. Stereo16 (the buffers
+ * are allocated at 2 int16/frame). */
 #define MUSIC_STREAM_FRAMES   8192
 #define MUSIC_HEAD_FRAMES     1024
 
@@ -46,8 +47,11 @@ typedef struct {
     bool                in_use;
     uint32_t            track;       /* mixer channel it feeds */
     MusicPlayer        *player;
+    bool                is_file;     /* true: file_ctx source; else stream_ctx */
     AudioPoolStreamCtx  stream_ctx;  /* binds pool objects -> player */
-    /* per-instance buffers (contiguous SRAM staging, NOT block pool) */
+    AudioFileStreamCtx  file_ctx;    /* file-backed stream source (is_file) */
+    /* per-instance buffers (contiguous SRAM staging, NOT block pool).
+     * Sized for stereo16 (2 int16/frame) — the mixer is full stereo. */
     int16_t            *streaming_buf;
     int16_t            *intro_head;
     int16_t            *loop_head;
@@ -78,6 +82,14 @@ struct AudioService {
      * Valid only across a single play call (single-context). */
     AudioObjHandle  pend_intro;
     AudioObjHandle  pend_loop;
+
+    /* File-reader seam + "pending stream" handoff: handle_one stashes
+     * the resolved path here before calling audio_arbiter_play_external
+     * so the sink (which gets no object) can open the file. Valid only
+     * across that single play call (single-context). */
+    AudioFileReader file_reader;
+    const char     *pend_stream_path;
+    bool            pend_is_stream;
 
     /* FFT band meter over the final mixed output (enable-gated). */
     AudioFft        fft;
@@ -142,17 +154,67 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
     AudioService *svc = (AudioService *)ctx;
 
     if (kind == AUDIO_VOICE_MUSIC) {
-        /* `object` is the INTRO pool object (the arbiter reffed it).
-         * The loop object is in svc->pend_loop (handle_one set it).
-         * Grab a free music_player slot, bind intro/loop via the pool
-         * adapter, create the player on this mixer channel, prime,
-         * play. We take an extra ref on the loop object here (intro is
-         * already held by the arbiter); both released on stop. */
-        AudioObjHandle intro = object;
-        AudioObjHandle loop  = svc->pend_loop;
-
         MusicSlot *ms = find_free_music_slot(svc);
         if (!ms) return false;     /* no free music stream slot */
+
+        /* --- file-backed streaming voice (long WAV; no pool object) ---
+         * handle_one stashed the resolved path + pend_is_stream. The
+         * source reads the file incrementally through svc->file_reader
+         * and emits stereo16 (stereo preserved, mono promoted L==R). */
+        if (svc->pend_is_stream) {
+            if (!svc->file_reader.open || !svc->pend_stream_path) return false;
+            if (!audio_file_stream_open(&ms->file_ctx, &svc->file_reader,
+                                        svc->pend_stream_path))
+                return false;
+            ms->is_file = true;
+
+            if (p) {
+                mixer_set_volume(svc->mixer, track, (q15_t)p->gain);
+                mixer_set_pan(svc->mixer, track, (q15_t)p->pan);
+            }
+            mixer_channel_reset(svc->mixer, track);
+
+            MusicPlayerConfig fpc = {
+                .mixer            = svc->mixer,
+                .mixer_channel    = track,
+                .format           = MIXER_SRC_PCM16_STEREO,
+                .stream_fn        = audio_file_stream_read,
+                .stream_user_data = &ms->file_ctx,
+                /* The file source ignores stream_id; serve the file as
+                 * both intro and loop so the whole song plays, then
+                 * repeats forever. */
+                .intro_stream_id  = 0,
+                .loop_stream_id   = 1,
+                .streaming_buffer = ms->streaming_buf,
+                .streaming_buffer_samples = MUSIC_STREAM_FRAMES,
+                .intro_head_buffer  = ms->intro_head,
+                .intro_head_samples = MUSIC_HEAD_FRAMES,
+                .loop_head_buffer   = ms->loop_head,
+                .loop_head_samples  = MUSIC_HEAD_FRAMES,
+            };
+            ms->player = music_create(&fpc);
+            if (!ms->player) {
+                audio_file_stream_close(&ms->file_ctx);
+                ms->is_file = false;
+                return false;
+            }
+            ms->track  = track;
+            ms->in_use = true;
+            music_prime_intro(ms->player);
+            music_prime_loop(ms->player);
+            music_play(ms->player);
+            return true;
+        }
+
+        /* --- pool-backed music voice (intro + optional loop object) ---
+         * `object` is the INTRO pool object (the arbiter reffed it); the
+         * loop object is in svc->pend_loop. We take an extra ref on the
+         * loop (intro is already held by the arbiter); both released on
+         * stop. The pool holds mono16; promote to stereo16 (L==R) so it
+         * feeds the full-stereo mixer without a downmix. */
+        ms->is_file = false;
+        AudioObjHandle intro = object;
+        AudioObjHandle loop  = svc->pend_loop;
 
         /* hold the loop object alive for the duration */
         if (loop != AUDIO_POOL_HANDLE_NONE) {
@@ -166,6 +228,7 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
                 audio_pool_unref(&svc->pool, loop, NULL);
             return false;
         }
+        audio_pool_stream_set_promote_stereo(&ms->stream_ctx, true);
         audio_pool_stream_bind(&ms->stream_ctx, 0, intro);
         if (loop != AUDIO_POOL_HANDLE_NONE)
             audio_pool_stream_bind(&ms->stream_ctx, 1, loop);
@@ -179,7 +242,7 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
         MusicPlayerConfig mpc = {
             .mixer            = svc->mixer,
             .mixer_channel    = track,
-            .format           = MIXER_SRC_PCM16_MONO,
+            .format           = MIXER_SRC_PCM16_STEREO,
             .stream_fn        = audio_pool_stream_read,
             .stream_user_data = &ms->stream_ctx,
             .intro_stream_id  = 0,
@@ -219,6 +282,11 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
     }
     mixer_channel_reset(svc->mixer, track);
 
+    /* SFX pool data is mono16; the mixer channel is stereo16. Promote
+     * each chunk to L==R (a lossless duplication, not a downmix) and
+     * feed it as frames. Expansion runs through a small stack buffer so
+     * the footprint stays bounded regardless of block size. */
+    int16_t st[512 * 2];
     uint32_t off = 0;
     while (off < size) {
         uint32_t want = size - off;
@@ -228,12 +296,21 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
                 != AUDIO_POOL_OK || got == 0) {
             break;
         }
-        /* mixer_write_channel counts in samples/frames, not bytes.
-         * The mixer channel for SFX is configured PCM16_MONO in this
-         * service, so 2 bytes/sample. (A fuller version would track
-         * per-object format.) */
-        size_t samples = got / 2u;
-        mixer_write_channel(svc->mixer, track, svc->scratch, samples);
+        const int16_t *mono = (const int16_t *)svc->scratch;
+        uint32_t mono_n = got / 2u;             /* mono samples this chunk */
+        uint32_t done = 0;
+        while (done < mono_n) {
+            uint32_t sub = mono_n - done;
+            if (sub > 512u) sub = 512u;
+            for (uint32_t i = 0; i < sub; i++) {
+                int16_t m = mono[done + i];
+                st[i * 2]     = m;
+                st[i * 2 + 1] = m;
+            }
+            /* stereo: count is FRAMES */
+            mixer_write_channel(svc->mixer, track, st, sub);
+            done += sub;
+        }
         off += got;
     }
 
@@ -249,9 +326,16 @@ static void svc_sink_stop(void *ctx, uint32_t track) {
     MusicSlot *ms = music_slot_for_track(svc, track);
     if (ms) {
         if (ms->player) { music_destroy(ms->player); ms->player = NULL; }
-        AudioObjHandle loop = ms->stream_ctx.handle[1];
-        if (loop != AUDIO_POOL_HANDLE_NONE)
-            audio_pool_unref(&svc->pool, loop, NULL);
+        if (ms->is_file) {
+            audio_file_stream_close(&ms->file_ctx);
+            ms->is_file = false;
+        } else {
+            /* pool-backed: release the loop ref we took on start (the
+             * arbiter releases the intro/object ref). */
+            AudioObjHandle loop = ms->stream_ctx.handle[1];
+            if (loop != AUDIO_POOL_HANDLE_NONE)
+                audio_pool_unref(&svc->pool, loop, NULL);
+        }
         ms->in_use = false;
     }
 
@@ -282,6 +366,7 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
     svc->track_count = tracks;
     svc->staging     = (uint8_t *)cfg->staging_buffer;
     svc->staging_cap = cfg->staging_capacity;
+    svc->file_reader = cfg->file_reader;
 
     if (audio_pool_init(&svc->pool, cfg->pool_region, cfg->pool_region_size)
             != AUDIO_POOL_OK) {
@@ -289,12 +374,13 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
         return NULL;
     }
 
-    /* Build a mixer with `tracks` channels, all PCM16_MONO for SFX,
-     * stereo q15 output. */
+    /* Build a mixer with `tracks` channels. Full stereo: every channel
+     * is PCM16_STEREO so stereo songs stream intact and mono sources are
+     * promoted to L==R (never downmixed). Stereo q15 output. */
     MixerChannelConfig *chans = calloc(tracks, sizeof(MixerChannelConfig));
     if (!chans) { audio_pool_destroy(&svc->pool); free(svc); return NULL; }
     for (uint32_t i = 0; i < tracks; i++) {
-        chans[i].format         = MIXER_SRC_PCM16_MONO;
+        chans[i].format         = MIXER_SRC_PCM16_STEREO;
         chans[i].buffer_samples = 4096;          /* per-channel ring */
         chans[i].volume         = Q15_ONE;
     }
@@ -322,9 +408,10 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
      * block pool). One streaming buffer + two pinned heads per slot. */
     for (int i = 0; i < AUDIO_SERVICE_MAX_MUSIC; i++) {
         MusicSlot *ms = &svc->music_slots[i];
-        ms->streaming_buf = malloc(MUSIC_STREAM_FRAMES * sizeof(int16_t));
-        ms->intro_head    = malloc(MUSIC_HEAD_FRAMES   * sizeof(int16_t));
-        ms->loop_head     = malloc(MUSIC_HEAD_FRAMES   * sizeof(int16_t));
+        /* stereo16: 2 int16 per frame */
+        ms->streaming_buf = malloc(MUSIC_STREAM_FRAMES * 2u * sizeof(int16_t));
+        ms->intro_head    = malloc(MUSIC_HEAD_FRAMES   * 2u * sizeof(int16_t));
+        ms->loop_head     = malloc(MUSIC_HEAD_FRAMES   * 2u * sizeof(int16_t));
         if (!ms->streaming_buf || !ms->intro_head || !ms->loop_head) {
             /* roll back everything */
             for (int j = 0; j <= i; j++) {
@@ -480,6 +567,30 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
                                               (uint16_t)m->a3, &v);
         svc->pend_loop = AUDIO_POOL_HANDLE_NONE;
         svc->pend_intro = AUDIO_POOL_HANDLE_NONE;
+        respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
+        break;
+    }
+    case REQ_AUDIO_STREAM_WAV: {
+        /* a0 = path length (incl. NUL) staged, a1 = owner_vm. The
+         * resolved native path sits NUL-terminated in the staging
+         * buffer. Build a file-backed, looping music voice (no pool
+         * object — the file is read incrementally, service-side). */
+        uint32_t len = m->a0;
+        if (!svc->staging || !svc->file_reader.open ||
+            len == 0 || len > svc->staging_cap) {
+            respond(svc, m, (uint32_t)AUDIO_ARB_INVALID_ARG, 0);
+            break;
+        }
+        svc->staging[len - 1] = 0;            /* guarantee termination */
+        svc->pend_stream_path = (const char *)svc->staging;
+        svc->pend_is_stream   = true;
+        AudioVoiceParams p = { .gain = Q15_ONE, .pan = 0,
+                               .priority = 0, .loop = 0 };
+        AudioVoiceHandle v;
+        AudioArbResult r = audio_arbiter_play_external(&svc->arbiter, &p,
+                                                       (uint16_t)m->a1, &v);
+        svc->pend_is_stream   = false;
+        svc->pend_stream_path = NULL;
         respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
         break;
     }

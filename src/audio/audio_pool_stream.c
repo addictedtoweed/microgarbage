@@ -33,7 +33,12 @@ bool audio_pool_stream_init(AudioPoolStreamCtx *ctx, AudioPool *pool,
     ctx->stream_id[1]    = MUSIC_STREAM_NONE;
     ctx->handle[0]       = AUDIO_POOL_HANDLE_NONE;
     ctx->handle[1]       = AUDIO_POOL_HANDLE_NONE;
+    ctx->promote_stereo  = false;
     return true;
+}
+
+void audio_pool_stream_set_promote_stereo(AudioPoolStreamCtx *ctx, bool on) {
+    if (ctx) ctx->promote_stereo = on;
 }
 
 bool audio_pool_stream_bind(AudioPoolStreamCtx *ctx,
@@ -99,5 +104,20 @@ size_t audio_pool_stream_read(void *user_data, int stream_id,
     /* bytes -> frames. Pool reads clamp to object size; if the object
      * size isn't a whole number of frames (it should be), any partial
      * trailing frame is dropped from the count. */
-    return copied / ctx->bytes_per_frame;
+    uint32_t frames = (uint32_t)(copied / ctx->bytes_per_frame);
+
+    /* mono16 source -> stereo16 output: duplicate each sample to L==R
+     * (no downmix). We read the mono frames into the front of the
+     * destination above; expand in place, back to front, so the source
+     * sample at [i] is consumed before stereo writes at [2i],[2i+1]
+     * (2i >= i, and lower indices aren't yet overwritten). */
+    if (ctx->promote_stereo) {
+        int16_t *d = (int16_t *)destination;
+        for (int32_t i = (int32_t)frames - 1; i >= 0; i--) {
+            int16_t m = d[i];
+            d[i * 2]     = m;
+            d[i * 2 + 1] = m;
+        }
+    }
+    return frames;
 }

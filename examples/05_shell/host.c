@@ -347,6 +347,61 @@ static bool host_exe_dir(char *out, size_t out_sz) {
 #endif
 }
 
+/* ---- streaming WAV file reader (the service's AudioFileReader) ----
+ * One composite reader bound into the service: a native path of the
+ * form "0:/x" goes to FatFs (the trashdrive volume here; the SD card on
+ * the H745 — the SAME f_open/f_read/f_lseek calls), anything else goes
+ * to stdio (a /host file). The audio service stays filesystem-agnostic;
+ * it just calls open/read/seek/close. Reads happen on the audio worker
+ * thread (the M4 in the deployment), which is why the file I/O lives
+ * here and not on the VM side. */
+typedef struct {
+    bool  is_fat;
+    FILE *fp;        /* stdio backing (is_fat == false) */
+    FIL   fil;       /* FatFs backing (is_fat == true)  */
+} StreamFile;
+
+static void *afr_open(void *ctx, const char *path) {
+    (void)ctx;
+    if (!path) return NULL;
+    StreamFile *sf = calloc(1, sizeof *sf);
+    if (!sf) return NULL;
+    if (strncmp(path, "0:/", 3) == 0) {
+        sf->is_fat = true;
+        if (f_open(&sf->fil, path, FA_READ) != FR_OK) { free(sf); return NULL; }
+    } else {
+        sf->fp = fopen(path, "rb");
+        if (!sf->fp) { free(sf); return NULL; }
+    }
+    return sf;
+}
+static uint32_t afr_read(void *ctx, void *fh, void *dst, uint32_t bytes) {
+    (void)ctx;
+    StreamFile *sf = (StreamFile *)fh;
+    if (!sf) return 0;
+    if (sf->is_fat) {
+        UINT br = 0;
+        if (f_read(&sf->fil, dst, bytes, &br) != FR_OK) return 0;
+        return (uint32_t)br;
+    }
+    return (uint32_t)fread(dst, 1, bytes, sf->fp);
+}
+static bool afr_seek(void *ctx, void *fh, uint32_t off) {
+    (void)ctx;
+    StreamFile *sf = (StreamFile *)fh;
+    if (!sf) return false;
+    if (sf->is_fat) return f_lseek(&sf->fil, (FSIZE_t)off) == FR_OK;
+    return fseek(sf->fp, (long)off, SEEK_SET) == 0;
+}
+static void afr_close(void *ctx, void *fh) {
+    (void)ctx;
+    StreamFile *sf = (StreamFile *)fh;
+    if (!sf) return;
+    if (sf->is_fat) f_close(&sf->fil);
+    else if (sf->fp) fclose(sf->fp);
+    free(sf);
+}
+
 /* Build the channel + service and start the worker. Returns true on
  * success; on failure leaves audio uninstalled (non-fatal — the shell
  * still runs, guests' audio calls just fail). */
@@ -366,6 +421,7 @@ static bool host_audio_start(VmSystem *sys, const char *host_fs_root) {
         .track_count      = 16,
         .staging_buffer   = g_audio_staging,
         .staging_capacity = sizeof(g_audio_staging),
+        .file_reader      = { afr_open, afr_read, afr_seek, afr_close, NULL },
     };
     g_audio_service = audio_service_create(&acfg);
     if (!g_audio_service) {
@@ -1963,7 +2019,23 @@ int main(int argc, char **argv) {
      * actual sound-device backend (ring -> speakers) is separate and
      * platform-specific. */
 #ifdef HOST_AUDIO_SUPPORTED
-    if (!host_audio_start(&sys, host_fs_root)) {
+    /* Audio resolves "/host/x" to a native path itself (the service reads
+     * the file directly off disk/SD), so it MUST use the same root as the
+     * real /host mount. When vm.cfg remaps /host via a [mount.host]
+     * section, honor that path; otherwise use the resolved default.
+     * Without this, a config that points /host elsewhere leaves audio
+     * looking in the wrong directory (e.g. an empty build/host_files) and
+     * every stream/load of a /host wav silently fails. */
+    const char *audio_host_root = host_fs_root;
+    for (unsigned i = 0; i < hc.mount_count; i++) {
+        if (hc.mounts[i].kind == HOST_MOUNT_HOST &&
+            strcmp(hc.mounts[i].name, "host") == 0 &&
+            hc.mounts[i].path[0]) {
+            audio_host_root = hc.mounts[i].path;
+            break;
+        }
+    }
+    if (!host_audio_start(&sys, audio_host_root)) {
         fprintf(stderr, "host: audio service not started "
                         "(continuing without audio)\n");
     }

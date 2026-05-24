@@ -144,4 +144,23 @@ static inline audio_object audio_load_wav(const char *path) {
     return _audio_failed(r) ? AUDIO_OBJECT_NONE : (audio_object)r;
 }
 
+/* ============================================================
+ *  Streaming .wav playback (host/SD reads the file incrementally)
+ *
+ *  Stream an arbitrarily long PCM .wav as a looping music voice. Unlike
+ *  audio_load_wav, the file is NOT loaded into the audio pool — the
+ *  host (desktop worker, or the H745 M4 off SD) reads it in chunks as
+ *  it plays, so a multi-MB song works despite the ~1 MB pool. Stereo is
+ *  preserved; mono is promoted to L==R (no downmix). The voice loops
+ *  until stopped. `path` is a mount path: "/host/song.wav" (host files)
+ *  or "/td0/song.wav" (the trashdrive FatFs volume).
+ *
+ *  Returns a voice handle, or AUDIO_VOICE_NONE on error (missing file,
+ *  not PCM, no free music stream slot, unstreamable path).
+ * ============================================================ */
+static inline audio_voice audio_stream_wav(const char *path) {
+    uint32_t r = _vm_sys1(SYS_AUDIO_STREAM_WAV, (uint32_t)path);
+    return _audio_failed(r) ? AUDIO_VOICE_NONE : (audio_voice)r;
+}
+
 #endif /* GUEST_AUDIO_H */

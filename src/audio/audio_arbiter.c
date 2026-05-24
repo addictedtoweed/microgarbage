@@ -111,6 +111,38 @@ AudioArbResult audio_arbiter_play(AudioArbiter *a,
     return AUDIO_ARB_OK;
 }
 
+AudioArbResult audio_arbiter_play_external(AudioArbiter *a,
+                                           const AudioVoiceParams *params,
+                                           uint16_t owner_vm,
+                                           AudioVoiceHandle *out_voice) {
+    if (!a || !out_voice) return AUDIO_ARB_INVALID_ARG;
+    *out_voice = AUDIO_VOICE_NONE;
+
+    uint32_t track = find_free_track(a);
+    if (track >= a->track_count)
+        return AUDIO_ARB_REJECTED;     /* FCFS, reject-on-full */
+
+    AudioVoiceParams p = params ? *params
+                                : (AudioVoiceParams){ .gain = 0, .pan = 0,
+                                                      .priority = 0, .loop = 0 };
+
+    /* No pool object: the sink owns the audio source itself. */
+    if (!a->sink.start(a->sink.ctx, track, AUDIO_VOICE_MUSIC,
+                       AUDIO_POOL_HANDLE_NONE, &p))
+        return AUDIO_ARB_REJECTED;
+
+    AudioTrack *t = &a->tracks[track];
+    t->active     = true;
+    t->object     = AUDIO_POOL_HANDLE_NONE;
+    t->kind       = AUDIO_VOICE_MUSIC;
+    t->owner_vm   = owner_vm;
+    t->generation = a->generations[track];
+    a->active_count++;
+
+    *out_voice = pack_voice(track, t->generation);
+    return AUDIO_ARB_OK;
+}
+
 /* ---- internal stop (shared by stop / finished / sweep) ---- */
 
 static void stop_track(AudioArbiter *a, uint32_t track) {
@@ -118,7 +150,9 @@ static void stop_track(AudioArbiter *a, uint32_t track) {
     if (!t->active) return;
 
     a->sink.stop(a->sink.ctx, track);
-    audio_pool_unref(a->pool, t->object, NULL);
+    /* External (file-stream) voices carry no pool object. */
+    if (t->object != AUDIO_POOL_HANDLE_NONE)
+        audio_pool_unref(a->pool, t->object, NULL);
 
     /* bump generation so outstanding voice handles go stale */
     a->generations[track] = (uint16_t)(a->generations[track] + 1u);
