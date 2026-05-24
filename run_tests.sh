@@ -106,11 +106,16 @@ run audio_pool_stream_integration audio src/audio/audio_pool_stream.c src/audio/
 run audio_fft        audio  src/audio/audio_fft.c src/audio/audio_fft_kernel.c
 run audio_wav_read   audio  src/audio/audio_wav_read.c
 run audio_file_stream audio src/audio/audio_file_stream.c src/audio/audio_wav_read.c
-# audio_sink_wav writes to a hardcoded /tmp path in the test.
+# audio_sink_wav writes to a hardcoded /tmp path (absent on native Win).
+# The sink dispatcher also references the waveOut backend whenever
+# _WIN32 || __CYGWIN__, so Cygwin must link it (+winmm); Linux need not.
 if [ "$NATIVE_WIN" = 1 ]; then
     skip audio_sink_wav "/tmp output path — Cygwin/POSIX cc only"
 else
-    run audio_sink_wav audio src/audio/audio_sink_wav.c
+    case "$MACHINE" in
+        *cygwin*) run audio_sink_wav audio src/audio/audio_sink_wav.c src/audio/audio_sink_waveout.c -lwinmm ;;
+        *)        run audio_sink_wav audio src/audio/audio_sink_wav.c ;;
+    esac
 fi
 run audio_service    audio  src/audio/audio_service.c src/audio/audio_arbiter.c src/audio/audio_pool.c \
     src/audio/audio_pool_stream.c src/audio/audio_mixer.c src/audio/music_player.c src/audio/audio_fft.c \
@@ -144,9 +149,14 @@ if [ "$NATIVE_WIN" = 1 ]; then
     skip vm_host_platform "POSIX fsync() — Cygwin/POSIX cc only"
     skip vm_host_tui      "POSIX fsync() — Cygwin/POSIX cc only"
 else
-    run vm_host_stdio    vm $VM_CORE
     run vm_host_platform vm $VM_CORE
     run vm_host_tui      vm $VM_CORE
+    # vm_host_stdio drives real guest ELFs (counter + keydump).
+    if [ -f examples/02_counter/build/counter.elf ] && [ -f examples/04_keydump/build/keydump.elf ]; then
+        run vm_host_stdio vm $VM_CORE
+    else
+        skip vm_host_stdio "needs examples/02_counter + 04_keydump ELFs (run their build.sh)"
+    fi
 fi
 
 # vm_host_fs pulls in FatFs (ff.h) + the trashfs/trashdrive backends.
