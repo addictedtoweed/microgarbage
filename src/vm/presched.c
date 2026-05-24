@@ -197,6 +197,16 @@ void presched_sleep(PreSched *s, uint32_t ticks) {
     atomic_store(&s->current, -1);
     SuspendThread(GetCurrentThread());   /* systick re-readies us, then resumes */
 }
+void presched_block_timeout(PreSched *s, uint32_t ticks) {
+    Task *self = win_tls_self;
+    if (!s || !self || ticks == 0) return;
+    int expect = 1;
+    if (atomic_compare_exchange_strong(&self->pending_wake, &expect, 0)) return;
+    atomic_store(&self->wake_deadline, atomic_load(&s->ticks) + ticks);
+    atomic_store(&self->state, TASK_BLOCKED);
+    atomic_store(&s->current, -1);
+    SuspendThread(GetCurrentThread());   /* woken by a presched_wake OR the deadline */
+}
 
 PreSched *presched_create(unsigned tick_us) {
     PreSched *s = (PreSched *)calloc(1, sizeof *s);
@@ -443,6 +453,18 @@ void presched_sleep(PreSched *s, uint32_t ticks) {
     atomic_store(&self->state, TASK_BLOCKED);
     hand_off_from(s, self);
     while (sem_wait(&self->gate) != 0) ;     /* scheduler re-readies us */
+}
+
+void presched_block_timeout(PreSched *s, uint32_t ticks) {
+    Task *self = tls_self;
+    if (!s || !self || ticks == 0) return;
+    int expect = 1;
+    if (atomic_compare_exchange_strong(&self->pending_wake, &expect, 0))
+        return;                              /* sticky wake consumed */
+    atomic_store(&self->wake_deadline, atomic_load(&s->ticks) + ticks);
+    atomic_store(&self->state, TASK_BLOCKED);
+    hand_off_from(s, self);
+    while (sem_wait(&self->gate) != 0) ;     /* woken by a wake OR the deadline */
 }
 
 PreSched *presched_create(unsigned tick_us) {

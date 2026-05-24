@@ -296,8 +296,14 @@ static void handle_send(VmCpu *cpu, void *system_p) {
         return;
     }
 
-    /* Synchronous-delivery fast path: target is blocked on RECV.
-     * Resolve their saved dest pointer through their region map,
+    /* Synchronous-delivery fast path — COOPERATIVE ONLY. It writes
+     * the payload directly into the target VM's memory, which is safe
+     * only when one VM runs at a time. Under preemption the target may
+     * be running concurrently, so we must not touch its memory; the
+     * preemptive path enqueues and wakes the receiver, which pulls from
+     * the locked queue in its own thread (below). */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_COOPERATIVE
+    /* Resolve their saved dest pointer through their region map,
      * copy the payload directly into it, set their a0 to our
      * vm_id, and unblock them. */
     if (target_cpu->block_reason == BLOCK_MAILBOX_RECV) {
@@ -327,12 +333,20 @@ static void handle_send(VmCpu *cpu, void *system_p) {
             return;
         }
     }
+#endif /* GARBAGE_SCHED_MODE == GARBAGE_SCHED_COOPERATIVE */
 
-    /* Normal path: queue the message. */
+    /* Normal path: queue the message. Under preemption this is the
+     * ONLY path — enqueue under the mailbox lock, then wake the
+     * receiver's task so it pulls the message in its own thread. */
     VmMailboxResult r = vm_mailbox_send(target_mbox,
                                          cpu->vm_id,
                                          host_payload,
                                          (uint16_t)payload_size);
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    if (r == VM_MBOX_OK) {
+        sys->ops.wake_mailbox(sys->ops.ctx, (uint16_t)target_id, 0);
+    }
+#endif
     switch (r) {
     case VM_MBOX_OK:
         cpu->regs[VM_REG_A0] = 0;
@@ -410,9 +424,52 @@ static void handle_recv(VmCpu *cpu, void *system_p) {
         return;
     }
 
-    /* Block. Save the guest dest pointer in _internal[0] so the
-     * next SYS_SEND can deliver synchronously into it. _internal
-     * is opaque to user code; the system layer owns its meaning. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* Preemptive: this handler runs in the VM's OWN task thread. Park
+     * the thread; on each wake, retry the (locked) recv and deliver
+     * into our own dest — never a cross-VM write. The sender wakes us
+     * after enqueueing (presched wakeups are sticky, so a send racing
+     * our park is not lost). */
+    {
+        VmPreCtx *pc = (VmPreCtx *)sys->ops.ctx;
+        uint32_t deadline = (timeout == UINT32_MAX)
+                          ? 0u
+                          : sys->ops.now(sys->ops.ctx) + timeout;
+        for (;;) {
+            /* Check the queue FIRST each iteration, so a message that
+             * arrived while we were waking (or right at the deadline)
+             * is delivered before we ever report a timeout. */
+            uint16_t woke_sender = 0;
+            VmMailboxResult rr = vm_mailbox_recv(my_mbox, host_dest,
+                                                 &woke_sender);
+            if (rr == VM_MBOX_OK) {
+                cpu->regs[VM_REG_A0] = (uint32_t)woke_sender;
+                return;
+            }
+            if (timeout == UINT32_MAX) {
+                /* Wait indefinitely until a send wakes us. Sticky, so a
+                 * send that races this park is not lost. We are truly
+                 * BLOCKED (not polling), so the sender's task runs. */
+                presched_block(pc->sched);
+            } else {
+                uint32_t cur = sys->ops.now(sys->ops.ctx);
+                if ((int32_t)(cur - deadline) >= 0) {
+                    cpu->regs[VM_REG_A0] =
+                        (uint32_t)-((int32_t)VM_ETIMEDOUT);
+                    return;
+                }
+                /* Block until a send wakes us or the deadline passes —
+                 * sticky (no lost wake) and BLOCKED (no busy-poll, so we
+                 * don't starve the sender). */
+                presched_block_timeout(pc->sched, deadline - cur);
+            }
+        }
+    }
+#else
+    /* Cooperative: save the guest dest in _internal[0] and set
+     * block_reason. The scheduler parks us; the next SYS_SEND's fast
+     * path delivers straight into the saved dest (or the timeout path
+     * fires), writing a0 on resume. */
     cpu->_internal[0] = guest_dest;
     cpu->block_reason = BLOCK_MAILBOX_RECV;
     if (timeout == UINT32_MAX) {
@@ -421,6 +478,7 @@ static void handle_recv(VmCpu *cpu, void *system_p) {
         cpu->block_deadline = sys->ops.now(sys->ops.ctx) + timeout;
     }
     /* a0 will be written when we resume (by send or by timeout). */
+#endif
 }
 
 /* SYS_MAILBOX_INFO (a7 = 1074)
@@ -966,12 +1024,20 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
     };
     vm_sched_init(sys->sched, &sched_cfg);
 
-    /* Install the scheduler seam: cooperative ops bound to this
-     * system's scheduler. All later scheduler use in vm_system goes
-     * through sys->ops, so the backend can be swapped here without
-     * touching the handlers. */
+    /* Install the scheduler seam. All later scheduler use in
+     * vm_system goes through sys->ops, so the backend is chosen here
+     * without touching the handlers. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    if (!vm_pre_ctx_init(&sys->_pre, sys, /*tick_us*/1000,
+                         sys->config.ticks_per_second)) {
+        return false;
+    }
+    sys->ops     = *vm_sched_ops_preemptive();
+    sys->ops.ctx = &sys->_pre;
+#else
     sys->ops     = *vm_sched_ops_cooperative();
     sys->ops.ctx = sys->sched;
+#endif
 
     return true;
 }
@@ -1077,6 +1143,14 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
         result.code = VM_SYS_ERR_INVALID_ARG;
         goto fail;
     }
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* Under preemption, send/recv touch this mailbox from different
+     * task threads — install the real mutex locker. (Cooperative
+     * keeps the default null locker: one thread, no contention.) */
+    vm_mailbox_set_locker(&sys->mailboxes[assigned],
+                          vm_pre_mailbox_locker(&sys->_pre,
+                                                (uint16_t)assigned));
+#endif
 
     /* 4. Load the ELF. Any allocations vm_load made (text/rodata
      *    in COPY_RAM mode + the data region) get freed in the

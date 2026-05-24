@@ -132,6 +132,7 @@ $vmCore = @(
     "src\vm\vm_mailbox.c",
     "src\vm\vm_sched.c",
     "src\vm\vm_sched_ops_coop.c",
+    "src\vm\vm_sched_ops_pre.c",
     "src\vm\vm_system.c",
     "src\vm\vm_host_stdio.c",
     "src\vm\vm_host_stdio_win32.c",

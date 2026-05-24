@@ -107,6 +107,7 @@
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
 #include "vm/vm_sched_ops.h"
+#include "vm/vm_pre.h"   /* VmPreCtx (empty unless GARBAGE_SCHED_PREEMPTIVE) */
 #include "memory/slab_stack.h"
 
 /* ============================================================
@@ -253,6 +254,13 @@ typedef struct {
      * (sys->ops.fn(sys->ops.ctx, ...)) rather than vm_sched_*
      * directly, so the syscall core is scheduler-agnostic. */
     VmSchedOps    ops;
+
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* The preemptive backend's context (PreSched, vm<->task map,
+     * per-mailbox mutexes). ops.ctx points here under preemption.
+     * Absent in the cooperative build. */
+    VmPreCtx      _pre;
+#endif
 
     /* === Per-VM state ===
      *
