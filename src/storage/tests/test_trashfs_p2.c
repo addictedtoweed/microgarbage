@@ -3,7 +3,7 @@
  *
  * Build and run:
  *   cc -std=c11 -Wall -Wextra -Wpedantic -Iinclude -Isrc/storage \
- *      -o test_trashfs_p2 src/storage/test_trashfs_p2.c src/storage/trashfs.c
+ *      -o test_trashfs_p2 src/storage/tests/test_trashfs_p2.c src/storage/trashfs.c
  *   ./test_trashfs_p2
  *
  * NOTE: file *creation* is Phase 3. To test reading, this file plants

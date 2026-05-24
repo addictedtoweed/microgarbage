@@ -73,6 +73,9 @@ the source.
 
 ## Testing
 
-Build the example ELFs first, then run the suites — several VM tests
-load real guest ELFs from `examples/*/build/`, so a fresh checkout
-shows spurious failures until those are built. See `README.md`.
+Tests live next to the code they cover, under `src/<module>/tests/`.
+Build + run every suite with `./run_tests.sh` (see `README.md` for
+toolchain notes and per-suite manual builds). The runner skips the
+real-ELF integration suite until the example ELFs exist, so build those
+first (`examples/*/build.sh`) for full coverage — several VM tests load
+real guest ELFs from `examples/*/build/`.

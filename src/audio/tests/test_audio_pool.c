@@ -8,7 +8,7 @@
  *  Build:
  *    cc -std=c11 -DAUDIO_POOL_BLOCK_SIZE=64 -DAUDIO_POOL_MAX_OBJECTS=8 \
  *       -Iinclude -o t \
- *       src/audio/test_audio_pool.c src/audio/audio_pool.c
+ *       src/audio/tests/test_audio_pool.c src/audio/audio_pool.c
  * ============================================================ */
 
 #include "audio/audio_pool.h"

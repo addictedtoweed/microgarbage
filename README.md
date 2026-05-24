@@ -70,11 +70,11 @@ garbage/
     │   ├── ring_buffer.c
     │   ├── fifo_queue.c
     │   ├── stack.c
-    │   └── test_*.c
+    │   └── tests/                ← unit-test suites (test_*.c)
     ├── math/
     │   ├── fixed_point.c
     │   ├── fast_div.c
-    │   └── test_*.c
+    │   └── tests/                ← unit-test suites (test_*.c)
     ├── audio/
     │   ├── audio_mixer.c
     │   ├── music_player.c
@@ -87,20 +87,16 @@ garbage/
     │   ├── audio_wav_read.c      ← RIFF/WAVE parser
     │   ├── audio_sink_wav.c      ← WAV-dump output backend
     │   ├── audio_sink_waveout.c  ← live Win32 waveOut backend
-    │   └── test_*.c
+    │   └── tests/                ← unit-test suites (test_*.c)
     ├── storage/
     │   ├── trashdrive.c
     │   ├── trashdrive_fatfs.c    ← FatFs diskio shim
     │   ├── trashfs.c             ← built-in filesystem
-    │   ├── test_trashdrive.c
-    │   ├── test_trashdrive_fatfs.c
-    │   └── test_trashfs.c
+    │   └── tests/                ← unit-test suites (test_*.c)
     ├── memory/
     │   ├── bump.c
     │   ├── slab_stack.c
-    │   ├── test_bump.c
-    │   ├── test_slab_stack.c
-    │   └── test_bump_on_slab.c
+    │   └── tests/                ← unit-test suites (test_*.c)
     └── vm/                       ← RV32IMC interpreter + scheduler
         ├── vm_core.c             ← dispatcher (the instruction loop)
         ├── vm_loader.c           ← ELF32 loader
@@ -115,7 +111,7 @@ garbage/
         ├── service_channel.c     ← SPSC request/response channel
         ├── channel_thread.c      ← pthread channel transport (POSIX/Cygwin)
         ├── channel_win32.c       ← Win32 channel transport (native Windows)
-        └── test_vm_*.c           ← VM test suites
+        └── tests/                ← VM unit-test suites (test_vm_*.c)
 ```
 
 A separate `examples/` directory contains runnable demos that
@@ -268,65 +264,35 @@ against for fast local iteration. Use `build.sh` for tests;
 
 ## Building the tests
 
-From the `garbage/` directory:
+Tests live next to the code they cover, under `src/<module>/tests/`.
+Build and run them all from the `garbage/` directory:
 
 ```sh
-# containers
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_hashtable src/containers/test_hashtable.c src/containers/hashtable.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_ring_buffer src/containers/test_ring_buffer.c src/containers/ring_buffer.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_fifo_queue src/containers/test_fifo_queue.c \
-   src/containers/fifo_queue.c src/containers/ring_buffer.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_stack src/containers/test_stack.c src/containers/stack.c
+./run_tests.sh            # build + run every suite
+./run_tests.sh audio      # only suites whose name matches "audio"
+CC=gcc ./run_tests.sh     # override the compiler (default: cc)
+```
 
-# math
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_fixed_point src/math/test_fixed_point.c src/math/fixed_point.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_fast_div src/math/test_fast_div.c src/math/fast_div.c
+`run_tests.sh` is the single source of truth for each suite's link
+dependencies. It drops binaries + logs in `build/tests/` and exits
+non-zero if any suite fails.
 
-# audio
+The canonical test compiler is Cygwin/POSIX `cc` (links `cygwin1.dll`,
+exercises the POSIX host paths). A native mingw-w64 `cc` builds the
+platform-neutral majority too: the runner detects the toolchain, adds
+the Windows-only shim sources (`vm_host_stdio_win32.c`, the waveOut
+backend) and **skips** the few POSIX-only suites (those using
+`pipe`/`fsync`/`/tmp`) with a printed reason. FatFs suites and the
+real-ELF integration suite (which needs ELFs from `examples/*/build/`)
+skip themselves when their prerequisites are absent.
+
+To build one suite by hand, copy its dependency line from
+`run_tests.sh`, e.g.:
+
+```sh
 cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_audio_mixer src/audio/test_audio_mixer.c \
+   -o build/tests/audio_mixer src/audio/tests/test_audio_mixer.c \
    src/audio/audio_mixer.c src/containers/ring_buffer.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_music_player src/audio/test_music_player.c \
-   src/audio/music_player.c src/audio/audio_mixer.c src/containers/ring_buffer.c
-
-# storage
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_trashdrive src/storage/test_trashdrive.c src/storage/trashdrive.c
-
-# memory
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_bump src/memory/test_bump.c src/memory/bump.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_slab_stack src/memory/test_slab_stack.c src/memory/slab_stack.c
-cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-   -o test_bump_on_slab src/memory/test_bump_on_slab.c \
-   src/memory/bump.c src/memory/slab_stack.c
-
-# vm — many small suites plus a real-ELF integration test
-# (the integration tests need ELFs from examples/01_hello/build/,
-#  02_counter/build/, and 04_keydump/build/ — build those first
-#  via examples/01_hello/build.sh, examples/02_counter/build.sh,
-#  and examples/04_keydump/build.sh; or skip those two suites)
-
-VM_SRCS="src/vm/vm_core.c src/vm/vm_loader.c src/vm/vm_ecall.c \
-         src/vm/vm_ecall_handlers.c src/vm/vm_mailbox.c \
-         src/vm/vm_sched.c src/vm/vm_system.c src/vm/vm_host_stdio.c \
-         src/memory/bump.c src/memory/slab_stack.c \
-         src/containers/fifo_queue.c src/containers/ring_buffer.c"
-
-for suite in vm_core vm_core_alu vm_core_c vm_core_m vm_core_memctl \
-             vm_core_system vm_ecall vm_ecall_handlers vm_host_stdio \
-             vm_loader vm_mailbox vm_real_elf vm_sched vm_system; do
-    cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
-       -o test_$suite src/vm/test_$suite.c $VM_SRCS
-done
 ```
 
 ## Modules

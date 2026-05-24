@@ -10,7 +10,7 @@
  *
  *  Build:
  *    cc -std=c11 -lm -Iinclude -o t \
- *       src/audio/test_audio_fft.c src/audio/audio_fft.c \
+ *       src/audio/tests/test_audio_fft.c src/audio/audio_fft.c \
  *       src/audio/audio_fft_kernel.c
  * ============================================================ */
 

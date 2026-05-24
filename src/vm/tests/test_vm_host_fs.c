@@ -19,7 +19,7 @@
  *      -Iinclude -DHAVE_FATFS \
  *      -Ithird_party/fatfs/source -Ithird_party/fatfs \
  *      -o test_vm_host_fs \
- *      src/vm/test_vm_host_fs.c \
+ *      src/vm/tests/test_vm_host_fs.c \
  *      src/vm/vm_host_fs.c \
  *      src/storage/trashdrive_fatfs.c src/storage/trashdrive.c \
  *      src/vm/vm_host_stdio.c src/vm/vm_system.c src/vm/vm_sched.c \

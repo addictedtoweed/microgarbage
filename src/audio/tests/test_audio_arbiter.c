@@ -8,7 +8,7 @@
  *  Build:
  *    cc -std=c11 -DAUDIO_POOL_BLOCK_SIZE=64 -DAUDIO_ARBITER_MAX_TRACKS=4 \
  *       -Iinclude -o t \
- *       src/audio/test_audio_arbiter.c src/audio/audio_arbiter.c \
+ *       src/audio/tests/test_audio_arbiter.c src/audio/audio_arbiter.c \
  *       src/audio/audio_pool.c
  * ============================================================ */
 

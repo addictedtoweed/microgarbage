@@ -3,7 +3,7 @@
  *
  * Build and run:
  *   cc -std=c11 -Wall -Wextra -Wpedantic -Iinclude -Isrc/storage \
- *      -o test_trashfs_p3 src/storage/test_trashfs_p3.c src/storage/trashfs.c
+ *      -o test_trashfs_p3 src/storage/tests/test_trashfs_p3.c src/storage/trashfs.c
  *   ./test_trashfs_p3
  *
  * Unlike Phase 2, these use the REAL library to create and write

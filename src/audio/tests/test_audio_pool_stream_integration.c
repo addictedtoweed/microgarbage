@@ -14,7 +14,7 @@
  *
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
- *       src/audio/test_audio_pool_stream_integration.c \
+ *       src/audio/tests/test_audio_pool_stream_integration.c \
  *       src/audio/audio_pool_stream.c src/audio/audio_pool.c \
  *       src/audio/music_player.c src/audio/audio_mixer.c \
  *       src/containers/ring_buffer.c

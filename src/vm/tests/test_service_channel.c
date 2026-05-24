@@ -19,12 +19,12 @@
  *  mutable state beyond the rings (SPSC, already proven) and the
  *  transport's own mutex/condvar, so it should be race-clean:
  *    cc -std=c11 -fsanitize=thread -Iinclude -o t \
- *       src/vm/test_service_channel.c src/vm/service_channel.c \
+ *       src/vm/tests/test_service_channel.c src/vm/service_channel.c \
  *       src/vm/channel_thread.c src/containers/spsc_ring.c -lpthread
  *
  *  Build (plain):
  *    cc -std=c11 -Iinclude -o t \
- *       src/vm/test_service_channel.c src/vm/service_channel.c \
+ *       src/vm/tests/test_service_channel.c src/vm/service_channel.c \
  *       src/vm/channel_thread.c src/containers/spsc_ring.c -lpthread
  * ============================================================ */
 

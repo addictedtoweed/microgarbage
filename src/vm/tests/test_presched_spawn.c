@@ -12,7 +12,7 @@
  *
  * Build (Windows/mingw):
  *   gcc -std=c11 -I include -o build/t_spawn.exe \
- *       src/vm/test_presched_spawn.c src/vm/presched.c -lpthread
+ *       src/vm/tests/test_presched_spawn.c src/vm/presched.c -lpthread
  */
 
 #include "vm/presched.h"

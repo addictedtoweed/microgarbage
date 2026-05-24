@@ -2,7 +2,7 @@
  *
  * Standalone unit test (like test_trashdrive.c). Build and run:
  *   cc -std=c11 -Wall -Wextra -Wpedantic -Iinclude -Isrc/storage \
- *      -o test_trashfs src/storage/test_trashfs.c src/storage/trashfs.c
+ *      -o test_trashfs src/storage/tests/test_trashfs.c src/storage/trashfs.c
  *   ./test_trashfs
  */
 

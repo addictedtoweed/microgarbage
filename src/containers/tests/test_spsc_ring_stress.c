@@ -16,7 +16,7 @@
  *
  *    2. RACE-FREEDOM: run under ThreadSanitizer:
  *         cc -std=c11 -fsanitize=thread -Iinclude -o t \
- *            src/containers/test_spsc_ring_stress.c \
+ *            src/containers/tests/test_spsc_ring_stress.c \
  *            src/containers/spsc_ring.c -lpthread
  *       TSan flags any data race on the ring's memory. A correct
  *       SPSC ring (single writer per index, acquire/release) is

@@ -6,7 +6,7 @@
  *      -Iinclude -DHAVE_FATFS \
  *      -Ithird_party/fatfs/source -Ithird_party/fatfs \
  *      -o test_trashdrive_fatfs \
- *      src/storage/test_trashdrive_fatfs.c \
+ *      src/storage/tests/test_trashdrive_fatfs.c \
  *      src/storage/trashdrive_fatfs.c \
  *      src/storage/trashdrive.c \
  *      third_party/fatfs/ff_wrapped.c \

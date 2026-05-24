@@ -8,7 +8,7 @@
  *
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
- *       src/audio/test_audio_file_stream.c src/audio/audio_file_stream.c \
+ *       src/audio/tests/test_audio_file_stream.c src/audio/audio_file_stream.c \
  *       src/audio/audio_wav_read.c
  * ============================================================ */
 

@@ -10,7 +10,7 @@
  *
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
- *       src/audio/test_audio_wav_read.c src/audio/audio_wav_read.c
+ *       src/audio/tests/test_audio_wav_read.c src/audio/audio_wav_read.c
  * ============================================================ */
 
 #include "audio/audio_sink.h"

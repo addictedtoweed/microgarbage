@@ -8,7 +8,7 @@
  *
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
- *       src/audio/test_audio_sink_wav.c src/audio/audio_sink_wav.c
+ *       src/audio/tests/test_audio_sink_wav.c src/audio/audio_sink_wav.c
  * ============================================================ */
 
 #include "audio/audio_sink.h"

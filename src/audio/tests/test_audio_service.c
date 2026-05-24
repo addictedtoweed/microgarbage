@@ -11,7 +11,7 @@
  *
  *  Build (single + threaded both need pthread for B):
  *    cc -std=c11 -Iinclude -o t \
- *       src/audio/test_audio_service.c src/audio/audio_service.c \
+ *       src/audio/tests/test_audio_service.c src/audio/audio_service.c \
  *       src/audio/audio_arbiter.c src/audio/audio_pool.c \
  *       src/audio/audio_pool_stream.c src/audio/audio_mixer.c \
  *       src/audio/music_player.c src/containers/ring_buffer.c \

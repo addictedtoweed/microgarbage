@@ -9,7 +9,7 @@
  *
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
- *       src/containers/test_spsc_ring.c src/containers/spsc_ring.c
+ *       src/containers/tests/test_spsc_ring.c src/containers/spsc_ring.c
  * ============================================================ */
 
 #include "containers/spsc_ring.h"
