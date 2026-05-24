@@ -70,7 +70,7 @@ enum {
     REQ_AUDIO_LOAD_STAGED  = 0x0108,
     REQ_AUDIO_SET_GAIN     = 0x0109,  /* a0 = voice, a1 = gain q15 */
     /* FFT band meter over the final mixed output. */
-    REQ_AUDIO_FFT_ENABLE   = 0x010A,  /* a0 = enable(1)/disable(0)        */
+    REQ_AUDIO_FFT_ENABLE   = 0x010A,  /* a0 = enable(1)/0, a1 = owner_vm  */
     /* Get band levels. The response packs up to 16 band bytes (0..255)
      * into a0..a3 (4 bytes each, little-endian); a4 = band count. */
     REQ_AUDIO_GET_LEVELS   = 0x010B,

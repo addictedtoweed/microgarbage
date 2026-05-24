@@ -28,6 +28,13 @@
 #define MUSIC_STREAM_FRAMES   8192
 #define MUSIC_HEAD_FRAMES     1024
 
+/* Per-VM FFT-enable tracking range (matches the scheduler's VM id
+ * space). VMs with ids beyond this still get a working meter, but their
+ * enable is released only by an explicit disable, not by sweep. */
+#ifndef AUDIO_SERVICE_FFT_MAX_VMS
+#define AUDIO_SERVICE_FFT_MAX_VMS  64
+#endif
+
 /* A music object pairs an intro pool object with a loop pool object
  * (the two-file model). Music handles are tagged (high bit set) to
  * distinguish them from sample object handles at the ABI. */
@@ -91,8 +98,14 @@ struct AudioService {
     const char     *pend_stream_path;
     bool            pend_is_stream;
 
-    /* FFT band meter over the final mixed output (enable-gated). */
+    /* FFT band meter over the final mixed output (enable-gated). The
+     * enable is REFCOUNTED across consumers so one app disabling it (on
+     * quit) doesn't kill the equalizer for every other app. fft_vm_on[]
+     * tracks each VM's hold so a VM that dies without disabling (sweep)
+     * still releases it. */
     AudioFft        fft;
+    uint32_t        fft_enable_count;
+    uint8_t         fft_vm_on[AUDIO_SERVICE_FFT_MAX_VMS];
 
     /* Scratch buffer for moving PCM from the pool into a mixer
      * channel on SFX start. Sized to one block. */
@@ -627,8 +640,28 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         break;
     }
     case REQ_AUDIO_FFT_ENABLE: {
-        /* a0 = 1 enable, 0 disable */
-        audio_fft_set_enabled(&svc->fft, m->a0 != 0);
+        /* a0 = 1 enable / 0 disable, a1 = owner_vm. Refcounted: the
+         * meter stays on while ANY consumer wants it, so one app
+         * disabling it on quit doesn't blank every other app's
+         * equalizer. Per-VM flag keeps enable/disable idempotent and
+         * lets sweep release a dead VM's hold. */
+        uint32_t vm   = m->a1;
+        bool     want = (m->a0 != 0);
+        if (vm < AUDIO_SERVICE_FFT_MAX_VMS) {
+            if (want && !svc->fft_vm_on[vm]) {
+                svc->fft_vm_on[vm] = 1;
+                svc->fft_enable_count++;
+            } else if (!want && svc->fft_vm_on[vm]) {
+                svc->fft_vm_on[vm] = 0;
+                if (svc->fft_enable_count) svc->fft_enable_count--;
+            }
+        } else {
+            /* id beyond tracking range: still works, but only an
+             * explicit disable releases it (not sweep). */
+            if (want) svc->fft_enable_count++;
+            else if (svc->fft_enable_count) svc->fft_enable_count--;
+        }
+        audio_fft_set_enabled(&svc->fft, svc->fft_enable_count > 0);
         respond(svc, m, (uint32_t)AUDIO_ARB_OK, 0);
         break;
     }
@@ -727,6 +760,13 @@ void audio_service_sweep_vm(AudioService *svc, uint16_t vm_id) {
      * the VM's object-creation refs. */
     audio_arbiter_sweep_vm(&svc->arbiter, vm_id, NULL);
     audio_pool_sweep_vm(&svc->pool, vm_id, NULL);
+    /* Release any FFT enable the dying VM held, so a crash/disconnect
+     * (which never sends an explicit disable) doesn't pin the meter on. */
+    if (vm_id < AUDIO_SERVICE_FFT_MAX_VMS && svc->fft_vm_on[vm_id]) {
+        svc->fft_vm_on[vm_id] = 0;
+        if (svc->fft_enable_count) svc->fft_enable_count--;
+        audio_fft_set_enabled(&svc->fft, svc->fft_enable_count > 0);
+    }
 }
 
 AudioPool    *audio_service_pool(AudioService *svc)    { return svc ? &svc->pool : NULL; }

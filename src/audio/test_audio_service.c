@@ -369,6 +369,35 @@ static void test_single_threaded(void) {
         CHECK(rg2.a4 == 0, "GET_LEVELS returns 0 bands after disable");
     }
 
+    /* ---- FFT enable is refcounted across consumers (multi-app) ---- */
+    {
+        int16_t out[256 * 2];
+        #define PUMP() do { for (int i = 0; i < 4; i++) {                  \
+            audio_service_render(svc, out, 256);                           \
+            audio_service_process(svc, 1); } } while (0)
+
+        ChannelMsg r;
+        ROUNDTRIP(req(REQ_AUDIO_FFT_ENABLE, 1, /*vm*/1, 0, 0), r);  /* app 1 on */
+        ROUNDTRIP(req(REQ_AUDIO_FFT_ENABLE, 1, /*vm*/2, 0, 0), r);  /* app 2 on */
+        PUMP();
+        ChannelMsg g1; ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), g1);
+        CHECK(g1.a4 == 16, "two consumers -> meter on");
+
+        /* app 1 quits (disables). The meter MUST stay on for app 2 — this
+         * is the bug fix (a global toggle would blank app 2's equalizer). */
+        ROUNDTRIP(req(REQ_AUDIO_FFT_ENABLE, 0, /*vm*/1, 0, 0), r);
+        PUMP();
+        ChannelMsg g2; ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), g2);
+        CHECK(g2.a4 == 16, "one consumer leaves -> meter stays on for the other");
+
+        /* app 2 dies without disabling (disconnect). Sweep releases its
+         * hold so the meter doesn't leak on forever. */
+        audio_service_sweep_vm(svc, 2);
+        ChannelMsg g3; ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), g3);
+        CHECK(g3.a4 == 0, "last consumer swept -> meter off (no leak)");
+        #undef PUMP
+    }
+
     #undef ROUNDTRIP
     audio_service_destroy(svc);
     service_channel_destroy(&ch);   /* frees the transport ctx */

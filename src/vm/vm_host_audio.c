@@ -265,7 +265,9 @@ static void handle_fft_enable(VmCpu *cpu, void *system) {
     (void)system;
     uint32_t en = cpu->regs[VM_REG_A0];
     uint32_t status = 0, h = 0;
-    audio_call(REQ_AUDIO_FFT_ENABLE, en ? 1u : 0u, 0, 0, 0, &status, &h);
+    /* a1 = owner_vm so the service can refcount the meter per consumer
+     * and release this VM's hold on sweep. */
+    audio_call(REQ_AUDIO_FFT_ENABLE, en ? 1u : 0u, cpu->vm_id, 0, 0, &status, &h);
     cpu->regs[VM_REG_A0] = 0;
 }
 
