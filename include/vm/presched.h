@@ -108,11 +108,20 @@ void presched_run(PreSched *s);
  *   recorded as pending (sticky).
  *
  * presched_sleep(ticks) — block the calling task until at least `ticks`
- *   systicks have elapsed, then it becomes runnable again. */
+ *   systicks have elapsed, then it becomes runnable again.
+ *
+ * presched_block_timeout(ticks) — like presched_block (STICKY: a wake
+ *   racing the park is not lost), but also wakes on its own after at
+ *   most `ticks` systicks. The "wait for an event, but give up after a
+ *   deadline" primitive: a blocking recv-with-timeout parks here, and
+ *   either a presched_wake (message arrived) or the deadline returns
+ *   it. Unlike presched_sleep this consumes a sticky pending wake, so
+ *   it is safe for event waits; use presched_sleep for a pure delay. */
 int  presched_self_id(void);
 void presched_block(PreSched *s);
 void presched_wake(PreSched *s, int id);
 void presched_sleep(PreSched *s, uint32_t ticks);
+void presched_block_timeout(PreSched *s, uint32_t ticks);
 
 /* Diagnostics (read after presched_run returns). */
 uint64_t presched_total_ticks(const PreSched *s);

@@ -106,6 +106,8 @@
 #include "vm/vm_mailbox.h"
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
+#include "vm/vm_sched_ops.h"
+#include "vm/vm_pre.h"   /* VmPreCtx (empty unless GARBAGE_SCHED_PREEMPTIVE) */
 #include "memory/slab_stack.h"
 
 /* ============================================================
@@ -245,6 +247,25 @@ typedef struct {
     VmSched       _sched;
     SlabAllocator _shared_slab;
     SlabAllocator _local_slab;
+
+    /* The scheduler seam. A by-value copy of the chosen backend's
+     * VmSchedOps with .ctx bound to this system's scheduler, set in
+     * vm_system_init. vm_system calls scheduler ops through this
+     * (sys->ops.fn(sys->ops.ctx, ...)) rather than vm_sched_*
+     * directly, so the syscall core is scheduler-agnostic. */
+    VmSchedOps    ops;
+
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* The preemptive backend's context (PreSched, vm<->task map,
+     * per-mailbox mutexes). ops.ctx points here under preemption.
+     * Absent in the cooperative build. */
+    VmPreCtx      _pre;
+
+    /* Mutex backing the shared/local slab locker under preemption.
+     * Lives here (not in _pre) because slab_init takes its locker by
+     * value before _pre is set up. */
+    pthread_mutex_t _slab_mtx;
+#endif
 
     /* === Per-VM state ===
      *

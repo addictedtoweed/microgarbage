@@ -15,7 +15,14 @@
  *      and a different task proceeds. Validated in-sandbox: tasks
  *      interleave with fair progress, no deadlock, TSan-clean.
  *    - Windows: a timer thread Suspend/Resume-s task threads directly
- *      (the real async stop). Compile-checked; user-verified.
+ *      (the real async stop). ONE mechanism for the CPU grant: a task is
+ *      "running" iff its thread is resumed; "not running" iff suspended.
+ *      Task threads are created CREATE_SUSPENDED and the scheduler resumes
+ *      exactly the current one and suspends the rest — startup, preemption,
+ *      block, and wake all funnel through Suspend/Resume, so there is no
+ *      second (event-gate) path to fall out of sync with. Blocking is a
+ *      task suspending itself; waking marks it READY and the next systick
+ *      resumes it when it becomes current.
  *
  *  Single core: exactly one task runs at a time, enforced by the gates.
  * ============================================================ */
@@ -44,7 +51,6 @@ typedef struct {
     presched_task_fn fn;
     void            *arg;
     HANDLE           thread;
-    HANDLE           gate;        /* auto-reset event */
     _Atomic int      state;
     PreSched        *sched;
     int              id;
@@ -134,7 +140,8 @@ static DWORD WINAPI task_trampoline(LPVOID arg) {
     Task *t = (Task *)arg;
     PreSched *s = t->sched;
     win_tls_self = t;
-    WaitForSingleObject(t->gate, INFINITE);     /* wait for first grant */
+    /* Created CREATE_SUSPENDED: the body begins to run the moment the
+     * scheduler first ResumeThread()s us as the current task. */
     if (!atomic_load(&s->stop)) t->fn(t->arg);
     atomic_store(&t->state, TASK_DONE);
     /* hand off if I was current */
@@ -152,9 +159,12 @@ static DWORD WINAPI task_trampoline(LPVOID arg) {
     return 0;
 }
 
-/* ---- block / wake / sleep (Windows; compile-checked, user-verified) ----
- * The systick thread drives time-wakes and preemption, so a blocking task
- * sets its state and waits its gate; the systick thread re-dispatches.
+/* ---- block / wake / sleep (Windows) ----
+ * The systick thread drives time-wakes and preemption. A blocking task
+ * sets its state to BLOCKED, drops `current`, and suspends its own thread;
+ * the systick thread re-dispatches. Waking marks the task READY and the
+ * next systick ResumeThread()s it when it becomes current — the same CPU
+ * grant used everywhere else, so there is no separate park/unpark path.
  * (Mechanism mirrors the POSIX path; SuspendThread/ResumeThread is the
  * Windows preemption primitive.) */
 int presched_self_id(void) { return win_tls_self ? win_tls_self->id : -1; }
@@ -166,7 +176,7 @@ void presched_block(PreSched *s) {
     if (atomic_compare_exchange_strong(&self->pending_wake, &expect, 0)) return;
     atomic_store(&self->state, TASK_BLOCKED);
     atomic_store(&s->current, -1);
-    WaitForSingleObject(self->gate, INFINITE);   /* parked; systick re-dispatches */
+    SuspendThread(GetCurrentThread());   /* parked; systick resumes us when READY+current */
 }
 void presched_wake(PreSched *s, int id) {
     if (!s || id < 0 || id >= s->n_tasks) return;
@@ -176,7 +186,8 @@ void presched_wake(PreSched *s, int id) {
         atomic_store(&t->wake_deadline, 0);
     else
         atomic_store(&t->pending_wake, 1);
-    SetEvent(t->gate);
+    /* No event to set: the woken task is now READY, and the next systick
+     * ResumeThread()s it when it becomes current. */
 }
 void presched_sleep(PreSched *s, uint32_t ticks) {
     Task *self = win_tls_self;
@@ -184,7 +195,17 @@ void presched_sleep(PreSched *s, uint32_t ticks) {
     atomic_store(&self->wake_deadline, atomic_load(&s->ticks) + ticks);
     atomic_store(&self->state, TASK_BLOCKED);
     atomic_store(&s->current, -1);
-    WaitForSingleObject(self->gate, INFINITE);   /* systick wakes us */
+    SuspendThread(GetCurrentThread());   /* systick re-readies us, then resumes */
+}
+void presched_block_timeout(PreSched *s, uint32_t ticks) {
+    Task *self = win_tls_self;
+    if (!s || !self || ticks == 0) return;
+    int expect = 1;
+    if (atomic_compare_exchange_strong(&self->pending_wake, &expect, 0)) return;
+    atomic_store(&self->wake_deadline, atomic_load(&s->ticks) + ticks);
+    atomic_store(&self->state, TASK_BLOCKED);
+    atomic_store(&s->current, -1);
+    SuspendThread(GetCurrentThread());   /* woken by a presched_wake OR the deadline */
 }
 
 PreSched *presched_create(unsigned tick_us) {
@@ -202,8 +223,6 @@ int presched_add_task_prio(PreSched *s, presched_task_fn fn, void *arg, int prio
     Task *t = &s->tasks[id];
     t->fn = fn; t->arg = arg; t->sched = s; t->id = id; t->priority = priority;
     atomic_store(&t->state, TASK_READY);
-    t->gate = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (!t->gate) { s->n_tasks--; return -1; }
     return id;
 }
 int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
@@ -213,13 +232,16 @@ void presched_run(PreSched *s) {
     if (!s || s->n_tasks == 0) return;
     atomic_store(&s->running_count, s->n_tasks);
     atomic_store(&s->stop, false);
+    /* Create every task thread SUSPENDED — "not running" is exactly
+     * "suspended". The scheduler resumes only the current task. */
     for (int i = 0; i < s->n_tasks; i++)
-        s->tasks[i].thread = CreateThread(NULL, 0, task_trampoline, &s->tasks[i], 0, NULL);
+        s->tasks[i].thread = CreateThread(NULL, 0, task_trampoline, &s->tasks[i],
+                                          CREATE_SUSPENDED, NULL);
     int first = next_ready(s, 0);
     if (first >= 0) {
         atomic_store(&s->current, first);
         atomic_store(&s->tasks[first].state, TASK_RUNNING);
-        SetEvent(s->tasks[first].gate);
+        ResumeThread(s->tasks[first].thread);   /* grant the CPU to the first task */
     }
     s->systick_thread = CreateThread(NULL, 0, systick_main, s, 0, NULL);
     for (int i = 0; i < s->n_tasks; i++) {
@@ -232,7 +254,6 @@ void presched_run(PreSched *s) {
 }
 void presched_destroy(PreSched *s) {
     if (!s) return;
-    for (int i = 0; i < s->n_tasks; i++) if (s->tasks[i].gate) CloseHandle(s->tasks[i].gate);
     free(s);
 }
 
@@ -432,6 +453,18 @@ void presched_sleep(PreSched *s, uint32_t ticks) {
     atomic_store(&self->state, TASK_BLOCKED);
     hand_off_from(s, self);
     while (sem_wait(&self->gate) != 0) ;     /* scheduler re-readies us */
+}
+
+void presched_block_timeout(PreSched *s, uint32_t ticks) {
+    Task *self = tls_self;
+    if (!s || !self || ticks == 0) return;
+    int expect = 1;
+    if (atomic_compare_exchange_strong(&self->pending_wake, &expect, 0))
+        return;                              /* sticky wake consumed */
+    atomic_store(&self->wake_deadline, atomic_load(&s->ticks) + ticks);
+    atomic_store(&self->state, TASK_BLOCKED);
+    hand_off_from(s, self);
+    while (sem_wait(&self->gate) != 0) ;     /* woken by a wake OR the deadline */
 }
 
 PreSched *presched_create(unsigned tick_us) {

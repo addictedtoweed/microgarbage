@@ -296,8 +296,14 @@ static void handle_send(VmCpu *cpu, void *system_p) {
         return;
     }
 
-    /* Synchronous-delivery fast path: target is blocked on RECV.
-     * Resolve their saved dest pointer through their region map,
+    /* Synchronous-delivery fast path — COOPERATIVE ONLY. It writes
+     * the payload directly into the target VM's memory, which is safe
+     * only when one VM runs at a time. Under preemption the target may
+     * be running concurrently, so we must not touch its memory; the
+     * preemptive path enqueues and wakes the receiver, which pulls from
+     * the locked queue in its own thread (below). */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_COOPERATIVE
+    /* Resolve their saved dest pointer through their region map,
      * copy the payload directly into it, set their a0 to our
      * vm_id, and unblock them. */
     if (target_cpu->block_reason == BLOCK_MAILBOX_RECV) {
@@ -314,7 +320,7 @@ static void handle_send(VmCpu *cpu, void *system_p) {
              * set on a successful call (it doesn't, but defensively). */
             target_cpu->trap_cause = TRAP_NONE;
             /* Unblock with the sender id as their a0 result. */
-            vm_sched_wake_mailbox(sys->sched, (uint16_t)target_id,
+            sys->ops.wake_mailbox(sys->ops.ctx, (uint16_t)target_id,
                                   (int32_t)cpu->vm_id);
             /* Clear the saved dest so it's not stale. */
             target_cpu->_internal[0] = 0;
@@ -327,12 +333,20 @@ static void handle_send(VmCpu *cpu, void *system_p) {
             return;
         }
     }
+#endif /* GARBAGE_SCHED_MODE == GARBAGE_SCHED_COOPERATIVE */
 
-    /* Normal path: queue the message. */
+    /* Normal path: queue the message. Under preemption this is the
+     * ONLY path — enqueue under the mailbox lock, then wake the
+     * receiver's task so it pulls the message in its own thread. */
     VmMailboxResult r = vm_mailbox_send(target_mbox,
                                          cpu->vm_id,
                                          host_payload,
                                          (uint16_t)payload_size);
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    if (r == VM_MBOX_OK) {
+        sys->ops.wake_mailbox(sys->ops.ctx, (uint16_t)target_id, 0);
+    }
+#endif
     switch (r) {
     case VM_MBOX_OK:
         cpu->regs[VM_REG_A0] = 0;
@@ -410,17 +424,61 @@ static void handle_recv(VmCpu *cpu, void *system_p) {
         return;
     }
 
-    /* Block. Save the guest dest pointer in _internal[0] so the
-     * next SYS_SEND can deliver synchronously into it. _internal
-     * is opaque to user code; the system layer owns its meaning. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* Preemptive: this handler runs in the VM's OWN task thread. Park
+     * the thread; on each wake, retry the (locked) recv and deliver
+     * into our own dest — never a cross-VM write. The sender wakes us
+     * after enqueueing (presched wakeups are sticky, so a send racing
+     * our park is not lost). */
+    {
+        VmPreCtx *pc = (VmPreCtx *)sys->ops.ctx;
+        uint32_t deadline = (timeout == UINT32_MAX)
+                          ? 0u
+                          : sys->ops.now(sys->ops.ctx) + timeout;
+        for (;;) {
+            /* Check the queue FIRST each iteration, so a message that
+             * arrived while we were waking (or right at the deadline)
+             * is delivered before we ever report a timeout. */
+            uint16_t woke_sender = 0;
+            VmMailboxResult rr = vm_mailbox_recv(my_mbox, host_dest,
+                                                 &woke_sender);
+            if (rr == VM_MBOX_OK) {
+                cpu->regs[VM_REG_A0] = (uint32_t)woke_sender;
+                return;
+            }
+            if (timeout == UINT32_MAX) {
+                /* Wait indefinitely until a send wakes us. Sticky, so a
+                 * send that races this park is not lost. We are truly
+                 * BLOCKED (not polling), so the sender's task runs. */
+                presched_block(pc->sched);
+            } else {
+                uint32_t cur = sys->ops.now(sys->ops.ctx);
+                if ((int32_t)(cur - deadline) >= 0) {
+                    cpu->regs[VM_REG_A0] =
+                        (uint32_t)-((int32_t)VM_ETIMEDOUT);
+                    return;
+                }
+                /* Block until a send wakes us or the deadline passes —
+                 * sticky (no lost wake) and BLOCKED (no busy-poll, so we
+                 * don't starve the sender). */
+                presched_block_timeout(pc->sched, deadline - cur);
+            }
+        }
+    }
+#else
+    /* Cooperative: save the guest dest in _internal[0] and set
+     * block_reason. The scheduler parks us; the next SYS_SEND's fast
+     * path delivers straight into the saved dest (or the timeout path
+     * fires), writing a0 on resume. */
     cpu->_internal[0] = guest_dest;
     cpu->block_reason = BLOCK_MAILBOX_RECV;
     if (timeout == UINT32_MAX) {
         cpu->block_deadline = 0;   /* wait forever */
     } else {
-        cpu->block_deadline = sys->sched->global_tick + timeout;
+        cpu->block_deadline = sys->ops.now(sys->ops.ctx) + timeout;
     }
     /* a0 will be written when we resume (by send or by timeout). */
+#endif
 }
 
 /* SYS_MAILBOX_INFO (a7 = 1074)
@@ -507,7 +565,7 @@ static void handle_whitelist_remove(VmCpu *cpu, void *system_p) {
 static void handle_ticks_now(VmCpu *cpu, void *system_p) {
     VmSystem *sys = (VmSystem *)system_p;
     if (!cpu || !sys || !sys->sched) return;
-    cpu->regs[VM_REG_A0] = sys->sched->global_tick;
+    cpu->regs[VM_REG_A0] = sys->ops.now(sys->ops.ctx);
 }
 
 /* SYS_TICK_HZ (1044)
@@ -516,7 +574,7 @@ static void handle_ticks_now(VmCpu *cpu, void *system_p) {
 static void handle_tick_hz(VmCpu *cpu, void *system_p) {
     VmSystem *sys = (VmSystem *)system_p;
     if (!cpu || !sys || !sys->sched) return;
-    cpu->regs[VM_REG_A0] = sys->sched->config.ticks_per_second;
+    cpu->regs[VM_REG_A0] = sys->ops.ticks_hz(sys->ops.ctx);
 }
 
 /* SYS_SLEEP_TICKS (1045)
@@ -538,7 +596,7 @@ static void handle_sleep_ticks(VmCpu *cpu, void *system_p) {
     }
 
     cpu->block_reason = BLOCK_SLEEP;
-    cpu->block_deadline = sys->sched->global_tick + n;
+    cpu->block_deadline = sys->ops.now(sys->ops.ctx) + n;
     /* a0 will be set to 0 by the scheduler on wake. */
 }
 
@@ -554,7 +612,7 @@ static void handle_sleep_until(VmCpu *cpu, void *system_p) {
     if (!cpu || !sys || !sys->sched) return;
 
     uint32_t deadline = cpu->regs[VM_REG_A0];
-    uint32_t now      = sys->sched->global_tick;
+    uint32_t now      = sys->ops.now(sys->ops.ctx);
 
     if ((int32_t)(now - deadline) >= 0) {
         cpu->regs[VM_REG_A0] = 0;
@@ -588,7 +646,7 @@ static void handle_set_reload_period(VmCpu *cpu, void *system_p) {
     if (p == 0) {
         cpu->reload_next_deadline = 0;
     } else {
-        cpu->reload_next_deadline = sys->sched->global_tick + p;
+        cpu->reload_next_deadline = sys->ops.now(sys->ops.ctx) + p;
     }
 
     cpu->regs[VM_REG_A0] = 0;
@@ -620,7 +678,7 @@ static void handle_yield_until_reload(VmCpu *cpu, void *system_p) {
         return;
     }
 
-    uint32_t now      = sys->sched->global_tick;
+    uint32_t now      = sys->ops.now(sys->ops.ctx);
     uint32_t deadline = cpu->reload_next_deadline;
     uint32_t period   = cpu->reload_period;
 
@@ -873,12 +931,22 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
     sys->shared_slab  = &sys->_shared_slab;
     sys->local_slab   = &sys->_local_slab;
 
+    /* The slab locker: a real mutex under preemption (SYS_ALLOC/FREE
+     * race across VM task threads), the zero-cost null locker for the
+     * cooperative build. slab_init takes it by value, so build it now. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    pthread_mutex_init(&sys->_slab_mtx, NULL);
+    SlabLocker slab_lk = vm_pre_slab_locker(&sys->_slab_mtx);
+#else
+    SlabLocker slab_lk = slab_null_locker;
+#endif
+
     /* 1. Initialize the shared slab. */
     SlabResult sr = slab_init(sys->shared_slab,
                                sys->config.shared_storage,
                                sys->config.shared_storage_size,
                                &sys->config.slab_config,
-                               slab_null_locker);
+                               slab_lk);
     if (sr != SLAB_OK) {
         return false;
     }
@@ -938,7 +1006,7 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
                    sys->config.local_storage,
                    sys->config.local_storage_size,
                    &local_cfg,
-                   slab_null_locker);
+                   slab_lk);
     if (sr != SLAB_OK) {
         return false;
     }
@@ -965,6 +1033,21 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
         .ticks_per_second     = sys->config.ticks_per_second,
     };
     vm_sched_init(sys->sched, &sched_cfg);
+
+    /* Install the scheduler seam. All later scheduler use in
+     * vm_system goes through sys->ops, so the backend is chosen here
+     * without touching the handlers. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    if (!vm_pre_ctx_init(&sys->_pre, sys, /*tick_us*/1000,
+                         sys->config.ticks_per_second)) {
+        return false;
+    }
+    sys->ops     = *vm_sched_ops_preemptive();
+    sys->ops.ctx = &sys->_pre;
+#else
+    sys->ops     = *vm_sched_ops_cooperative();
+    sys->ops.ctx = sys->sched;
+#endif
 
     return true;
 }
@@ -1037,7 +1120,7 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
     /* 3. Allocate mailbox storage and initialize the mailbox at
      *    a known slot in sys->mailboxes[]. We register with the
      *    scheduler first to get the id assigned. */
-    assigned = vm_sched_register(sys->sched, cpu);
+    assigned = sys->ops.register_vm(sys->ops.ctx, cpu);
     if (assigned < 0) {
         result.code = VM_SYS_ERR_FULL;
         goto fail;
@@ -1070,6 +1153,14 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
         result.code = VM_SYS_ERR_INVALID_ARG;
         goto fail;
     }
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* Under preemption, send/recv touch this mailbox from different
+     * task threads — install the real mutex locker. (Cooperative
+     * keeps the default null locker: one thread, no contention.) */
+    vm_mailbox_set_locker(&sys->mailboxes[assigned],
+                          vm_pre_mailbox_locker(&sys->_pre,
+                                                (uint16_t)assigned));
+#endif
 
     /* 4. Load the ELF. Any allocations vm_load made (text/rodata
      *    in COPY_RAM mode + the data region) get freed in the
@@ -1112,7 +1203,7 @@ fail:
         }
     }
     if (assigned >= 0) {
-        vm_sched_unregister(sys->sched, (uint16_t)assigned);
+        sys->ops.unregister_vm(sys->ops.ctx, (uint16_t)assigned);
         sys->vms[assigned] = NULL;
     }
     if (mbox_storage) slab_free(sys->local_slab, mbox_storage);
@@ -1213,7 +1304,7 @@ bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id) {
     slab_free(sys->local_slab, cpu);
 
     /* Unregister from scheduler and clear the slot. */
-    vm_sched_unregister(sys->sched, vm_id);
+    sys->ops.unregister_vm(sys->ops.ctx, vm_id);
     sys->vms[vm_id] = NULL;
 
     /* Zero the mailbox so a future load gets a clean slot. */
@@ -1258,7 +1349,7 @@ size_t vm_system_local_required(uint16_t max_vms, uint32_t spawn_data_kb) {
 
 bool vm_system_run(VmSystem *sys, uint64_t max_cycles) {
     if (!sys) return false;
-    return vm_sched_run(sys->sched, max_cycles);
+    return sys->ops.run(sys->ops.ctx, max_cycles);
 }
 
 /* Reap halted child VMs and wake any parent blocked on them.
@@ -1277,7 +1368,6 @@ bool vm_system_run(VmSystem *sys, uint64_t max_cycles) {
  * Called once per vm_system_step, after the scheduler advances.
  */
 static void vm_system_reap_halted_children(VmSystem *sys) {
-    VmSched *sched = sys->sched;
     for (uint16_t cid = 0; cid < VM_SCHED_MAX_VMS; cid++) {
         VmCpu *child = sys->vms[cid];
         if (!child || !child->halted) continue;
@@ -1309,7 +1399,7 @@ static void vm_system_reap_halted_children(VmSystem *sys) {
             } else {
                 a0 = (int32_t)(child->regs[VM_REG_A0] & 0xff);
             }
-            vm_sched_wake_child(sched, parent_id, a0);
+            sys->ops.wake_child(sys->ops.ctx, parent_id, a0);
         }
 
         /* Reclaim the child. Unload hooks (TUI session release, tile
@@ -1320,7 +1410,7 @@ static void vm_system_reap_halted_children(VmSystem *sys) {
 
 VmSchedStepResult vm_system_step(VmSystem *sys) {
     if (!sys) return VM_SCHED_ALL_HALTED;
-    VmSchedStepResult r = vm_sched_step(sys->sched);
+    VmSchedStepResult r = sys->ops.step(sys->ops.ctx);
     vm_system_reap_halted_children(sys);
     return r;
 }
