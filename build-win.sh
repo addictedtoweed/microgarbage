@@ -99,6 +99,7 @@ VM_CORE=(
     "$REPO_ROOT/src/vm/vm_ecall_handlers.c"
     "$REPO_ROOT/src/vm/vm_mailbox.c"
     "$REPO_ROOT/src/vm/vm_sched.c"
+    "$REPO_ROOT/src/vm/vm_sched_ops_coop.c"
     "$REPO_ROOT/src/vm/vm_system.c"
     "$REPO_ROOT/src/vm/vm_host_stdio.c"
     "$REPO_ROOT/src/vm/vm_host_stdio_win32.c"

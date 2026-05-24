@@ -314,7 +314,7 @@ static void handle_send(VmCpu *cpu, void *system_p) {
              * set on a successful call (it doesn't, but defensively). */
             target_cpu->trap_cause = TRAP_NONE;
             /* Unblock with the sender id as their a0 result. */
-            vm_sched_wake_mailbox(sys->sched, (uint16_t)target_id,
+            sys->ops.wake_mailbox(sys->ops.ctx, (uint16_t)target_id,
                                   (int32_t)cpu->vm_id);
             /* Clear the saved dest so it's not stale. */
             target_cpu->_internal[0] = 0;
@@ -418,7 +418,7 @@ static void handle_recv(VmCpu *cpu, void *system_p) {
     if (timeout == UINT32_MAX) {
         cpu->block_deadline = 0;   /* wait forever */
     } else {
-        cpu->block_deadline = sys->sched->global_tick + timeout;
+        cpu->block_deadline = sys->ops.now(sys->ops.ctx) + timeout;
     }
     /* a0 will be written when we resume (by send or by timeout). */
 }
@@ -507,7 +507,7 @@ static void handle_whitelist_remove(VmCpu *cpu, void *system_p) {
 static void handle_ticks_now(VmCpu *cpu, void *system_p) {
     VmSystem *sys = (VmSystem *)system_p;
     if (!cpu || !sys || !sys->sched) return;
-    cpu->regs[VM_REG_A0] = sys->sched->global_tick;
+    cpu->regs[VM_REG_A0] = sys->ops.now(sys->ops.ctx);
 }
 
 /* SYS_TICK_HZ (1044)
@@ -516,7 +516,7 @@ static void handle_ticks_now(VmCpu *cpu, void *system_p) {
 static void handle_tick_hz(VmCpu *cpu, void *system_p) {
     VmSystem *sys = (VmSystem *)system_p;
     if (!cpu || !sys || !sys->sched) return;
-    cpu->regs[VM_REG_A0] = sys->sched->config.ticks_per_second;
+    cpu->regs[VM_REG_A0] = sys->ops.ticks_hz(sys->ops.ctx);
 }
 
 /* SYS_SLEEP_TICKS (1045)
@@ -538,7 +538,7 @@ static void handle_sleep_ticks(VmCpu *cpu, void *system_p) {
     }
 
     cpu->block_reason = BLOCK_SLEEP;
-    cpu->block_deadline = sys->sched->global_tick + n;
+    cpu->block_deadline = sys->ops.now(sys->ops.ctx) + n;
     /* a0 will be set to 0 by the scheduler on wake. */
 }
 
@@ -554,7 +554,7 @@ static void handle_sleep_until(VmCpu *cpu, void *system_p) {
     if (!cpu || !sys || !sys->sched) return;
 
     uint32_t deadline = cpu->regs[VM_REG_A0];
-    uint32_t now      = sys->sched->global_tick;
+    uint32_t now      = sys->ops.now(sys->ops.ctx);
 
     if ((int32_t)(now - deadline) >= 0) {
         cpu->regs[VM_REG_A0] = 0;
@@ -588,7 +588,7 @@ static void handle_set_reload_period(VmCpu *cpu, void *system_p) {
     if (p == 0) {
         cpu->reload_next_deadline = 0;
     } else {
-        cpu->reload_next_deadline = sys->sched->global_tick + p;
+        cpu->reload_next_deadline = sys->ops.now(sys->ops.ctx) + p;
     }
 
     cpu->regs[VM_REG_A0] = 0;
@@ -620,7 +620,7 @@ static void handle_yield_until_reload(VmCpu *cpu, void *system_p) {
         return;
     }
 
-    uint32_t now      = sys->sched->global_tick;
+    uint32_t now      = sys->ops.now(sys->ops.ctx);
     uint32_t deadline = cpu->reload_next_deadline;
     uint32_t period   = cpu->reload_period;
 
@@ -966,6 +966,13 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
     };
     vm_sched_init(sys->sched, &sched_cfg);
 
+    /* Install the scheduler seam: cooperative ops bound to this
+     * system's scheduler. All later scheduler use in vm_system goes
+     * through sys->ops, so the backend can be swapped here without
+     * touching the handlers. */
+    sys->ops     = *vm_sched_ops_cooperative();
+    sys->ops.ctx = sys->sched;
+
     return true;
 }
 
@@ -1037,7 +1044,7 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
     /* 3. Allocate mailbox storage and initialize the mailbox at
      *    a known slot in sys->mailboxes[]. We register with the
      *    scheduler first to get the id assigned. */
-    assigned = vm_sched_register(sys->sched, cpu);
+    assigned = sys->ops.register_vm(sys->ops.ctx, cpu);
     if (assigned < 0) {
         result.code = VM_SYS_ERR_FULL;
         goto fail;
@@ -1112,7 +1119,7 @@ fail:
         }
     }
     if (assigned >= 0) {
-        vm_sched_unregister(sys->sched, (uint16_t)assigned);
+        sys->ops.unregister_vm(sys->ops.ctx, (uint16_t)assigned);
         sys->vms[assigned] = NULL;
     }
     if (mbox_storage) slab_free(sys->local_slab, mbox_storage);
@@ -1213,7 +1220,7 @@ bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id) {
     slab_free(sys->local_slab, cpu);
 
     /* Unregister from scheduler and clear the slot. */
-    vm_sched_unregister(sys->sched, vm_id);
+    sys->ops.unregister_vm(sys->ops.ctx, vm_id);
     sys->vms[vm_id] = NULL;
 
     /* Zero the mailbox so a future load gets a clean slot. */
@@ -1258,7 +1265,7 @@ size_t vm_system_local_required(uint16_t max_vms, uint32_t spawn_data_kb) {
 
 bool vm_system_run(VmSystem *sys, uint64_t max_cycles) {
     if (!sys) return false;
-    return vm_sched_run(sys->sched, max_cycles);
+    return sys->ops.run(sys->ops.ctx, max_cycles);
 }
 
 /* Reap halted child VMs and wake any parent blocked on them.
@@ -1277,7 +1284,6 @@ bool vm_system_run(VmSystem *sys, uint64_t max_cycles) {
  * Called once per vm_system_step, after the scheduler advances.
  */
 static void vm_system_reap_halted_children(VmSystem *sys) {
-    VmSched *sched = sys->sched;
     for (uint16_t cid = 0; cid < VM_SCHED_MAX_VMS; cid++) {
         VmCpu *child = sys->vms[cid];
         if (!child || !child->halted) continue;
@@ -1309,7 +1315,7 @@ static void vm_system_reap_halted_children(VmSystem *sys) {
             } else {
                 a0 = (int32_t)(child->regs[VM_REG_A0] & 0xff);
             }
-            vm_sched_wake_child(sched, parent_id, a0);
+            sys->ops.wake_child(sys->ops.ctx, parent_id, a0);
         }
 
         /* Reclaim the child. Unload hooks (TUI session release, tile
@@ -1320,7 +1326,7 @@ static void vm_system_reap_halted_children(VmSystem *sys) {
 
 VmSchedStepResult vm_system_step(VmSystem *sys) {
     if (!sys) return VM_SCHED_ALL_HALTED;
-    VmSchedStepResult r = vm_sched_step(sys->sched);
+    VmSchedStepResult r = sys->ops.step(sys->ops.ctx);
     vm_system_reap_halted_children(sys);
     return r;
 }

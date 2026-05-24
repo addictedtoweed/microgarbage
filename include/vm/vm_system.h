@@ -106,6 +106,7 @@
 #include "vm/vm_mailbox.h"
 #include "vm/vm_loader.h"
 #include "vm/vm_sched.h"
+#include "vm/vm_sched_ops.h"
 #include "memory/slab_stack.h"
 
 /* ============================================================
@@ -245,6 +246,13 @@ typedef struct {
     VmSched       _sched;
     SlabAllocator _shared_slab;
     SlabAllocator _local_slab;
+
+    /* The scheduler seam. A by-value copy of the chosen backend's
+     * VmSchedOps with .ctx bound to this system's scheduler, set in
+     * vm_system_init. vm_system calls scheduler ops through this
+     * (sys->ops.fn(sys->ops.ctx, ...)) rather than vm_sched_*
+     * directly, so the syscall core is scheduler-agnostic. */
+    VmSchedOps    ops;
 
     /* === Per-VM state ===
      *
