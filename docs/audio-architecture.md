@@ -5,11 +5,46 @@ and on the desktop host. This locks the design before building.
 Companion to `intercore-channel.md` (the M7↔M4 / main↔worker
 transport this rides on).
 
-Status: **design draft, not yet implemented.** The DSP core (mixer +
-music player) already EXISTS and is tested (`src/audio/`, 48 mixer +
-22 music-player tests passing). This note covers the *new* layers
-that turn it into a multi-VM, handle-based, block-pool-backed,
-cross-core audio service.
+Status: **largely implemented on the desktop host** (the M4-side
+service runs on a worker thread; the STM32 SD diskio + PSRAM DMA copy
+seam remain hardware follow-ups). The DSP core (mixer + music player)
+plus the multi-VM service, block pool, arbiter, and FFT meter exist
+and are tested under `src/audio/`. See "Implementation status" below
+for what concretely landed vs. what's still design intent.
+
+## Implementation status (updated 2026-05)
+
+Built and tested (desktop, native-Windows + Cygwin/POSIX):
+
+- **Service / channel / pool / arbiter / mixer / music player** — the
+  full path in `audio_service.c`, behind the service channel.
+- **Streaming long WAVs** — `audio_file_stream.{c,h}` is a
+  `music_stream_fn` source over a platform `AudioFileReader` vtable
+  (open/read/seek/close); `SYS_AUDIO_STREAM_WAV` builds a looping
+  file-stream voice that reads incrementally, so a song far larger than
+  the pool plays without loading into it. Desktop binds stdio (`/host`)
+  + FatFs (`/td0`); the H745 binds FatFs over SD — same source, only
+  the reader differs. (Source-rate≠output-rate resampling is still a
+  TODO — author WAVs at the output rate, 44.1 kHz.)
+- **Full-stereo mixer** — every channel is `PCM16_STEREO`. Stereo is
+  preserved; mono sources are promoted to L==R (no downmix) in the SFX
+  feed, the pool→player adapter (`audio_pool_stream`, promote flag),
+  and `wav_to_stereo_pcm16`. Samples still rest in the pool as mono16,
+  so this added no PSRAM cost.
+- **FFT band meter** — enable is **refcounted** across consumers (one
+  app disabling it doesn't blank another's equalizer); a VM's hold is
+  released on sweep. It captures the whole mix.
+- **Music feeder back-pressure** — `music_update` pumps only the mixer
+  channel's free space (`mixer_channel_capacity`), so the source
+  advances at the render/drain rate rather than racing ahead.
+- **Cross-VM** — one shared service; spawn is asynchronous, so multiple
+  sessions' apps run concurrently and mix through the one mixer.
+
+Still design intent / not done: priority admission/eviction + mute
+states (the arbiter is FCFS reject-on-full today; `priority` reserved),
+the STM32 SD diskio driver, and the PSRAM↔SRAM DMA copy seam.
+
+The rest of this note is the original design rationale.
 
 ## Output target
 

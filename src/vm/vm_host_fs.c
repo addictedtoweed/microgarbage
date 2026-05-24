@@ -1413,14 +1413,15 @@ static uint8_t *slurp_file(const char *path, PathBackend backend,
  *   → a0 = exit code of spawned VM (0..255 from its SYS_EXIT),
  *          or -errno on failure
  *
- * Loads the file at `path` as a new VM in the same VmSystem and
- * pumps the dispatcher until that VM halts. The parent VM (the
- * one that called this) is paused for the duration — the spawn
- * handler doesn't return until the child halts.
- *
- * Other VMs in the system are NOT scheduled during the spawn.
- * This keeps the model simple: spawn is fully synchronous.
- * Background spawns / multi-VM concurrency are future work.
+ * Loads the file at `path` as a new VM in the same VmSystem, then
+ * BLOCKS the parent on the child and returns to the scheduler — the
+ * spawn is ASYNCHRONOUS (see "Round V" below). The host's main
+ * vm_system_step loop runs the child alongside every other VM, so
+ * spawning a long-lived program in one session does NOT freeze the
+ * others (this is what makes concurrent multi-session apps work). The
+ * parent resumes with the child's exit code when the child is reaped
+ * (vm_system_reap_halted_children). From the parent guest's view the
+ * call still looks synchronous: it returns only once the child exits.
  */
 static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     VmSystem *sys = (VmSystem *)system;

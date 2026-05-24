@@ -84,12 +84,14 @@ extern const AudioSinkBackend audio_sink_waveout;   /* Windows only     */
 /* ============================================================
  *  WAV reader (for drop-in assets)
  *
- *  Parses a canonical PCM WAV from a memory buffer (the bytes read
- *  the bytes read from a /host *.wav file). Zero-dep; the mirror of
- *  Accepts 8- or 16-bit PCM, mono or stereo, any sample rate. The
- *  caller converts to the format the audio pool/mixer want (the asset
- *  loader downmixes stereo->mono and 8->16 bit for the current SFX
- *  path).
+ *  Parses a canonical PCM WAV from a memory buffer (e.g. the bytes read
+ *  from a /host *.wav file). Zero-dep; the mirror of the RIFF writer
+ *  above. Accepts 8- or 16-bit PCM, mono or stereo, any sample rate.
+ *  The caller converts to the format the audio pool wants: samples are
+ *  stored mono16 in the pool (wav_to_mono_pcm16) and the mixer promotes
+ *  them to L==R stereo at playback (the mixer is full-stereo). For
+ *  long streamed music the file-stream source emits stereo16 directly
+ *  (wav_to_stereo_pcm16) — see audio_file_stream.h.
  * ============================================================ */
 
 typedef struct {
@@ -115,9 +117,11 @@ typedef enum {
  * chunk list to find fmt + data (tolerates extra chunks like LIST). */
 WavResult wav_parse(const uint8_t *buf, size_t len, WavInfo *out);
 
-/* Convert parsed WAV PCM into mono PCM16 (the current SFX format) in
+/* Convert parsed WAV PCM into mono PCM16 (the pool sample format) in
  * `dst` (caller-allocated, room for `max_frames` int16). Downmixes
- * stereo->mono and promotes 8-bit->16-bit. Returns frames written. */
+ * stereo->mono and promotes 8-bit->16-bit. Used by audio_load_wav to
+ * stage a sample into the pool; the mixer promotes it to stereo at
+ * playback. Returns frames written. */
 uint32_t wav_to_mono_pcm16(const WavInfo *info, int16_t *dst,
                            uint32_t max_frames);
 

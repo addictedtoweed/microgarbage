@@ -2013,11 +2013,11 @@ int main(int argc, char **argv) {
     /* 6e. Audio service (the desktop "M4"): a worker thread runs the
      * mixer/pool/arbiter behind the service channel; guest SYS_AUDIO_*
      * calls post to it. Non-fatal if it fails to start — the shell
-     * still runs, guests' audio calls just return failure. Not
-     * available on native Windows yet (needs a win32 channel backend).
-     * NOTE: this gets audio flowing to the service's output ring; an
-     * actual sound-device backend (ring -> speakers) is separate and
-     * platform-specific. */
+     * still runs, guests' audio calls just return failure. Available on
+     * native Windows (channel_win32.c transport + waveOut sink) as well
+     * as Cygwin/POSIX. NOTE: this gets audio flowing to the service's
+     * output ring; an actual sound-device backend (ring -> speakers) is
+     * separate and platform-specific. */
 #ifdef HOST_AUDIO_SUPPORTED
     /* Audio resolves "/host/x" to a native path itself (the service reads
      * the file directly off disk/SD), so it MUST use the same root as the

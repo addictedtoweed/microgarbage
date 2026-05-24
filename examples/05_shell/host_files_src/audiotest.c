@@ -33,13 +33,11 @@ static void putu(uint32_t v) {
 static int16_t g_tone[TONE_FRAMES];
 
 int main(void) {
-    /* Bail cleanly if the host has no audio service wired up (e.g. a
-     * native-Windows build without the win32 channel transport).
-     * Otherwise every call returns -ENOSYS and looks like garbage. */
+    /* Bail cleanly if the host has no audio service wired up (some
+     * minimal/headless host builds omit it). Otherwise every call
+     * returns -ENOSYS and looks like garbage. */
     if (!audio_available()) {
         puts_("audiotest: audio service not available on this host build.\n");
-        puts_("  (native-Windows builds have no audio yet; use a Cygwin\n");
-        puts_("   or Linux build, where the audio service is wired in.)\n");
         return 1;
     }
 
