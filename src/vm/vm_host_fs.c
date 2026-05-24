@@ -1489,11 +1489,47 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         vm_host_set_transport_for_vm((uint16_t)lr.assigned_vm_id, parent_t);
     }
 
-    /* Park the parent on the child. The scheduler moves the parent
-     * out of the ready set; the reap path wakes it with the exit
-     * code in a0. We do NOT set a0 here — it's delivered at wake. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* Preemptive: the child is its own scheduler task (registered at
+     * runtime by vm_system_load_vm). Wait for it HERE, in the parent's
+     * own task thread. Set block_child_vm first, then the marker, so the
+     * child's halt-reap sees a consistent pair. Check the child's halted
+     * flag before each park — a child that exits before we park is still
+     * reaped (no lost wake); sticky presched_block covers the park/wake
+     * race. The parent reads the exit code from the child, then unloads
+     * it (the child touches nothing after waking us). */
+    cpu->block_child_vm = (uint16_t)lr.assigned_vm_id;
+    cpu->block_reason   = BLOCK_ON_CHILD;
+    {
+        VmPreCtx *pc = (VmPreCtx *)sys->ops.ctx;
+        for (;;) {
+            VmCpu *kid = sys->vms[lr.assigned_vm_id];
+            if (!kid || kid->halted) {
+                int32_t code;
+                if (!kid) {
+                    code = -(int32_t)VM_EIO;
+                } else {
+                    bool crashed = (kid->trap_cause >= TRAP_ILLEGAL_INSTR &&
+                                    kid->trap_cause <= TRAP_INSTR_MISALIGNED);
+                    code = crashed ? -(int32_t)VM_EIO
+                                   : (int32_t)(kid->regs[VM_REG_A0] & 0xff);
+                }
+                cpu->regs[VM_REG_A0] = (uint32_t)code;
+                break;
+            }
+            presched_block(pc->sched);
+        }
+    }
+    cpu->block_reason   = BLOCK_NONE;
+    cpu->block_child_vm = UINT16_MAX;
+    vm_system_unload_vm(sys, (uint16_t)lr.assigned_vm_id);
+#else
+    /* Cooperative: park the parent on the child. The scheduler moves the
+     * parent out of the ready set; the reap path (vm_system_step) wakes
+     * it with the exit code in a0. We do NOT set a0 here. */
     cpu->block_reason   = BLOCK_ON_CHILD;
     cpu->block_child_vm = (uint16_t)lr.assigned_vm_id;
+#endif
 }
 
 

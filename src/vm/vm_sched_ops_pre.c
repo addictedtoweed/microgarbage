@@ -51,13 +51,30 @@ static void vm_pre_task_body(void *arg) {
     for (;;) {
         uint32_t steps = 0;
         VmStepResult r = vm_step(cpu, VM_PRE_STEP_BUDGET, &steps);
-        if (r == VM_STEP_HALTED || r == VM_STEP_TRAPPED) return;
+        if (r == VM_STEP_HALTED || r == VM_STEP_TRAPPED) break;
         if (r == VM_STEP_ECALL) {
             vm_ecall_dispatch(sys->ecall_router, cpu, sys);
-            if (cpu->halted) return;
+            if (cpu->halted) break;
         }
         /* VM_STEP_QUANTUM_EXPIRED (or resumed ECALL): keep going;
          * the systick preempts this thread between/within steps. */
+    }
+
+    /* Halted. If a parent is in SYS_SPAWN_AND_WAIT on us, wake it so it
+     * can reap our exit code. (The parent reads our state then unloads
+     * us; we touch nothing after this wake.) The wake is sticky, and the
+     * parent also checks our halted flag before it parks, so this is not
+     * a lost-wake even if we finished before it parked. */
+    {
+        VmPreCtx *pc = (VmPreCtx *)sys->ops.ctx;
+        for (uint16_t pid = 0; pid < VM_SCHED_MAX_VMS; pid++) {
+            VmCpu *p = sys->vms[pid];
+            if (p && p->block_reason == BLOCK_ON_CHILD &&
+                p->block_child_vm == ta->vm_id) {
+                presched_wake(pc->sched, pc->task_for_vm[pid]);
+                break;
+            }
+        }
     }
 }
 

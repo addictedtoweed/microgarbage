@@ -44,12 +44,40 @@ All preemptive code is behind `#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIV
 (see `config.h`); the cooperative (default) build links none of it.
 
 Known caps / still deferred (per the audit): one task per VM, so at most
-`PRESCHED_MAX_TASKS` live VMs. **Spawn-and-wait** is not preemption-safe —
-`presched` adds all tasks before `presched_run`, so runtime VM spawn needs a
-`presched` extension (dynamic task creation); `pre_wake_child` is a stub.
-**FS concurrency** (`SYS_OPENAT`/`READ`/`WRITE` against the host FS) is not
-guarded and is documented not-yet-concurrent-safe (also gated on FatFs,
-which isn't vendored). Both are the audit's lower-priority items.
+`PRESCHED_MAX_TASKS` live VMs. **FS concurrency** (`SYS_OPENAT`/`READ`/`WRITE`
+against the host FS) is not yet guarded by a host-FS lock — the audit's last
+lower-priority item.
+
+## Spawn-and-wait under preemption (audit spawn item)
+
+`SYS_SPAWN_AND_WAIT` (in `vm_host_fs.c`) loads a child ELF and, since "Round
+V", runs it *asynchronously*: the cooperative path registers the child as a
+scheduler VM, parks the parent (`BLOCK_ON_CHILD`), and the reap loop in
+`vm_system_step` wakes the parent with the child's exit code. Three things
+made that not work under preemption, now addressed:
+
+1. **Runtime task creation.** `presched` only built task threads in
+   `presched_run`, so a child registered mid-run never started. `presched`
+   now supports adding a task while running (atomic `n_tasks` + a `running`
+   flag; `presched_add_task` creates+integrates the thread itself and
+   publishes `n_tasks` last). Proven in isolation by `test_presched_spawn.c`.
+2. **Parent actually waits.** Under preemption the spawn handler (in the
+   parent's own task thread) sets the `block_child_vm` marker, then loops:
+   check the child's `halted` flag, else `presched_block`. It reads the
+   child's exit code from the child and unloads it. Checking `halted` before
+   each park + sticky `presched_block` closes the race where a fast child
+   exits before the parent parks (no lost wake, no deadlock).
+3. **Child wakes the parent.** `vm_pre_task_body`, when its VM halts, finds a
+   parent waiting on it (`block_child_vm`) and `presched_wake`s that task.
+
+**Validated** end-to-end on native Windows: a parent guest spawning
+`/host/hello.elf` under the preemptive backend — the child runs as its own
+dynamically-created task, prints, exits; the parent reaps the exit code and
+resumes; clean shutdown, no deadlock. Reproduce with the preemptive shell
+(`GARBAGE_PREEMPTIVE=1 ./build-win.sh`, then `run /host/hello.elf` from a real
+terminal) or a minimal host that mounts `host_files/` and loads a spawning
+parent guest. (`test_vm_host_fs.c`'s spawn test drives the syscall directly
+without a running scheduler, so it covers the cooperative path only.)
 
 ## The proof (build & run)
 
