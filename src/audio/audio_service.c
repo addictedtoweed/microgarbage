@@ -259,6 +259,15 @@ static void svc_sink_stop(void *ctx, uint32_t track) {
     mixer_channel_reset(svc->mixer, track);
 }
 
+/* Arbiter reap query: a one-shot SFX track is finished once its mixer
+ * channel has drained (the whole sample is fed at start and nothing
+ * refills it). Music tracks are excluded by the arbiter (kind check),
+ * so this is only ever asked about SFX. */
+static bool svc_sink_is_done(void *ctx, uint32_t track) {
+    AudioService *svc = (AudioService *)ctx;
+    return mixer_channel_buffered(svc->mixer, track) == 0;
+}
+
 /* ---- create / destroy ---- */
 
 AudioService *audio_service_create(const AudioServiceConfig *cfg) {
@@ -295,7 +304,7 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
     free(chans);
     if (!svc->mixer) { audio_pool_destroy(&svc->pool); free(svc); return NULL; }
 
-    AudioArbiterSink sink = { svc_sink_start, svc_sink_stop, svc };
+    AudioArbiterSink sink = { svc_sink_start, svc_sink_stop, svc, svc_sink_is_done };
     if (!audio_arbiter_init(&svc->arbiter, tracks, &svc->pool, &sink)) {
         mixer_destroy(svc->mixer);
         audio_pool_destroy(&svc->pool);
@@ -566,6 +575,9 @@ uint32_t audio_service_process(AudioService *svc, uint32_t max) {
     }
     /* Keep music streaming buffers fed (non-RT). */
     pump_music(svc);
+    /* Reclaim one-shot SFX tracks whose channel has drained, so the
+     * arbiter doesn't fill up and start rejecting new triggers. */
+    audio_arbiter_reap(&svc->arbiter);
     /* Refresh the band meter (non-RT; no-op unless enabled + a fresh
      * window has accumulated). The FFT runs HERE, not in render. */
     audio_fft_update(&svc->fft);

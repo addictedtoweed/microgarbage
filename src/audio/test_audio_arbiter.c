@@ -36,6 +36,8 @@ typedef struct {
     bool decline_next_start;   /* simulate a sink that can't start */
     /* which tracks the sink currently believes are playing */
     bool playing[AUDIO_ARBITER_MAX_TRACKS];
+    /* which tracks the sink reports as finished (for reap tests) */
+    bool done[AUDIO_ARBITER_MAX_TRACKS];
 } StubSink;
 
 static bool stub_start(void *ctx, uint32_t track, AudioVoiceKind kind,
@@ -54,6 +56,10 @@ static void stub_stop(void *ctx, uint32_t track) {
     s->last_stop_track = (int)track;
     s->playing[track] = false;
 }
+static bool stub_is_done(void *ctx, uint32_t track) {
+    StubSink *s = (StubSink *)ctx;
+    return s->done[track];
+}
 
 /* ---- fixture ---- */
 static AudioPool     g_pool;
@@ -65,7 +71,7 @@ static void setup(uint32_t tracks) {
     g_region = malloc(REGION_BYTES);
     audio_pool_init(&g_pool, g_region, REGION_BYTES);
     memset(&g_sink, 0, sizeof(g_sink));
-    AudioArbiterSink sink = { stub_start, stub_stop, &g_sink };
+    AudioArbiterSink sink = { stub_start, stub_stop, &g_sink, stub_is_done };
     audio_arbiter_init(&g_arb, tracks, &g_pool, &sink);
 }
 static void teardown(void) {
@@ -242,9 +248,63 @@ static void test_bad_object(void) {
     teardown();
 }
 
+/* ---- reap frees finished one-shot SFX so triggers don't leak ---- */
+static void test_reap_frees_finished_sfx(void) {
+    setup(4);
+    AudioVoiceHandle v[4];
+    for (int i = 0; i < 4; i++)
+        audio_arbiter_play(&g_arb, obj(1), AUDIO_VOICE_SFX,
+                           &(AudioVoiceParams){0}, 1, &v[i]);   /* tracks 0..3 */
+    CHECK(audio_arbiter_free_tracks(&g_arb) == 0, "all 4 tracks busy");
+
+    /* with everything busy a new trigger is rejected (the reported bug) */
+    AudioVoiceHandle vr;
+    CHECK(audio_arbiter_play(&g_arb, obj(1), AUDIO_VOICE_SFX,
+                             &(AudioVoiceParams){0}, 1, &vr) == AUDIO_ARB_REJECTED,
+          "trigger rejected while full");
+
+    /* mark tracks 0 and 1 finished; reap should free exactly those two */
+    g_sink.done[0] = true;
+    g_sink.done[1] = true;
+    uint32_t reaped = audio_arbiter_reap(&g_arb);
+    CHECK(reaped == 2, "reap freed the 2 finished SFX");
+    CHECK(audio_arbiter_free_tracks(&g_arb) == 2, "2 tracks now free");
+    CHECK(audio_arbiter_active_count(&g_arb) == 2, "2 voices still active");
+    CHECK(!audio_arbiter_voice_valid(&g_arb, v[0]), "reaped voice 0 now stale");
+    CHECK(!audio_arbiter_voice_valid(&g_arb, v[1]), "reaped voice 1 now stale");
+    CHECK(audio_arbiter_voice_valid(&g_arb, v[2]), "unfinished voice 2 still valid");
+    CHECK(g_sink.stop_calls == 2, "sink.stop called for each reaped track");
+
+    /* and now a fresh trigger succeeds again */
+    CHECK(audio_arbiter_play(&g_arb, obj(1), AUDIO_VOICE_SFX,
+                             &(AudioVoiceParams){0}, 1, &vr) == AUDIO_ARB_OK,
+          "trigger OK after reap reclaimed a track");
+    teardown();
+}
+
+/* ---- reap never touches looping music voices ---- */
+static void test_reap_skips_music(void) {
+    setup(4);
+    AudioVoiceHandle vm, vs;
+    audio_arbiter_play(&g_arb, obj(1), AUDIO_VOICE_MUSIC,
+                       &(AudioVoiceParams){0}, 1, &vm);   /* track 0 = music */
+    audio_arbiter_play(&g_arb, obj(1), AUDIO_VOICE_SFX,
+                       &(AudioVoiceParams){0}, 1, &vs);   /* track 1 = sfx  */
+    /* sink claims BOTH are finished — reap must still spare the music. */
+    g_sink.done[0] = true;
+    g_sink.done[1] = true;
+    uint32_t reaped = audio_arbiter_reap(&g_arb);
+    CHECK(reaped == 1, "only the SFX voice reaped");
+    CHECK(audio_arbiter_voice_valid(&g_arb, vm), "music voice kept");
+    CHECK(!audio_arbiter_voice_valid(&g_arb, vs), "sfx voice reaped");
+    teardown();
+}
+
 int main(void) {
     test_play_returns_voice();
     test_fcfs_reject_on_full();
+    test_reap_frees_finished_sfx();
+    test_reap_skips_music();
     test_stop_frees_track();
     test_stale_voice_handle();
     test_playing_keeps_object_alive();

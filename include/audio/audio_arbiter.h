@@ -111,6 +111,13 @@ typedef struct {
                   AudioObjHandle object, const AudioVoiceParams *params);
     void (*stop)(void *ctx, uint32_t track);
     void *ctx;
+    /* Optional. Returns true if the one-shot voice playing on `track`
+     * has finished (e.g. its mixer channel drained). Lets
+     * audio_arbiter_reap() free finished SFX tracks. May be NULL — then
+     * the arbiter never auto-reaps and SFX voices free only via stop /
+     * sweep. Placed after ctx so existing positional sink initializers
+     * (start, stop, ctx) keep compiling with is_done == NULL. */
+    bool (*is_done)(void *ctx, uint32_t track);
 } AudioArbiterSink;
 
 /* One track's state. */
@@ -164,6 +171,14 @@ AudioArbResult audio_arbiter_stop(AudioArbiter *a, AudioVoiceHandle voice);
  * The sink's stop is still invoked (idempotent cleanup). */
 AudioArbResult audio_arbiter_voice_finished(AudioArbiter *a,
                                             AudioVoiceHandle voice);
+
+/* Free any one-shot (SFX) voices whose playback has finished, as
+ * reported by sink.is_done. Music voices are NEVER reaped here (they
+ * loop until explicitly stopped/swept). Returns the count reaped. Call
+ * this each service cycle — without it, one-shot SFX tracks are never
+ * reclaimed and the arbiter fills up (every new trigger REJECTED).
+ * No-op if the sink provides no is_done callback. */
+uint32_t audio_arbiter_reap(AudioArbiter *a);
 
 /* Stop all voices owned by a dying VM (drops their pool refs, frees
  * their tracks). Returns the number stopped via *out_stopped (may be

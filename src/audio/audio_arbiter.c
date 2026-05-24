@@ -146,6 +146,22 @@ AudioArbResult audio_arbiter_voice_finished(AudioArbiter *a,
     return audio_arbiter_stop(a, voice);
 }
 
+uint32_t audio_arbiter_reap(AudioArbiter *a) {
+    if (!a || !a->sink.is_done) return 0;
+    uint32_t reaped = 0;
+    for (uint32_t t = 0; t < a->track_count; t++) {
+        AudioTrack *tr = &a->tracks[t];
+        /* Only one-shot SFX. Music loops forever and is freed explicitly
+         * (stop / VM sweep), so never reap it here. */
+        if (!tr->active || tr->kind != AUDIO_VOICE_SFX) continue;
+        if (a->sink.is_done(a->sink.ctx, t)) {
+            stop_track(a, t);
+            reaped++;
+        }
+    }
+    return reaped;
+}
+
 AudioArbResult audio_arbiter_sweep_vm(AudioArbiter *a, uint16_t owner_vm,
                                       uint32_t *out_stopped) {
     if (!a) return AUDIO_ARB_INVALID_ARG;
