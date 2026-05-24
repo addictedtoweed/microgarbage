@@ -40,6 +40,31 @@
 #include <time.h>
 
 /* ============================================================
+ *  FS serialization (preemptive backend)
+ *
+ *  This module keeps process-global state: the fd table (g_fds),
+ *  the mount table, and FatFs's own internals. Under the cooperative
+ *  scheduler one host thread touches all of it, so no locking is
+ *  needed. Under the preemptive scheduler, peer VM tasks run in
+ *  separate threads and can issue file syscalls concurrently — so we
+ *  serialize every FS entry point with one coarse mutex (FS is not a
+ *  hot path; correctness over parallelism). Cooperative builds compile
+ *  these to nothing and pull in no pthread dependency.
+ *
+ *  NOTE: SYS_SPAWN_AND_WAIT must NOT hold this lock across its wait
+ *  for the child — it locks only the child-ELF load (see the handler).
+ * ============================================================ */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+#include <pthread.h>
+static pthread_mutex_t g_fs_mtx = PTHREAD_MUTEX_INITIALIZER;
+static inline void fs_lock(void)   { pthread_mutex_lock(&g_fs_mtx); }
+static inline void fs_unlock(void) { pthread_mutex_unlock(&g_fs_mtx); }
+#else
+static inline void fs_lock(void)   { }
+static inline void fs_unlock(void) { }
+#endif
+
+/* ============================================================
  *  File descriptor table
  *
  *  Slots 0,1,2 are reserved for stdin/stdout/stderr (managed by
@@ -1405,9 +1430,15 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     PathBackend backend;
     bool writable;
     const Mount *mnt = NULL;
+
+    /* Lock the FS only for the path resolve + ELF load. We must drop
+     * it before parking on the child (below), or the child — which
+     * may itself do file I/O — would deadlock waiting for this lock. */
+    fs_lock();
     int rp = resolve_guest_path(cpu, path_addr, buf, sizeof(buf),
                                  &backend, &writable, &mnt);
     if (rp < 0) {
+        fs_unlock();
         cpu->regs[VM_REG_A0] = (uint32_t)rp;
         return;
     }
@@ -1416,6 +1447,7 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
     size_t elf_size = 0;
     int32_t err = 0;
     uint8_t *elf = slurp_file(buf, backend, mnt, &elf_size, &err);
+    fs_unlock();
     if (!elf) {
         cpu->regs[VM_REG_A0] = (uint32_t)(-err);
         return;
@@ -1489,11 +1521,47 @@ static void handle_spawn_and_wait(VmCpu *cpu, void *system) {
         vm_host_set_transport_for_vm((uint16_t)lr.assigned_vm_id, parent_t);
     }
 
-    /* Park the parent on the child. The scheduler moves the parent
-     * out of the ready set; the reap path wakes it with the exit
-     * code in a0. We do NOT set a0 here — it's delivered at wake. */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+    /* Preemptive: the child is its own scheduler task (registered at
+     * runtime by vm_system_load_vm). Wait for it HERE, in the parent's
+     * own task thread. Set block_child_vm first, then the marker, so the
+     * child's halt-reap sees a consistent pair. Check the child's halted
+     * flag before each park — a child that exits before we park is still
+     * reaped (no lost wake); sticky presched_block covers the park/wake
+     * race. The parent reads the exit code from the child, then unloads
+     * it (the child touches nothing after waking us). */
+    cpu->block_child_vm = (uint16_t)lr.assigned_vm_id;
+    cpu->block_reason   = BLOCK_ON_CHILD;
+    {
+        VmPreCtx *pc = (VmPreCtx *)sys->ops.ctx;
+        for (;;) {
+            VmCpu *kid = sys->vms[lr.assigned_vm_id];
+            if (!kid || kid->halted) {
+                int32_t code;
+                if (!kid) {
+                    code = -(int32_t)VM_EIO;
+                } else {
+                    bool crashed = (kid->trap_cause >= TRAP_ILLEGAL_INSTR &&
+                                    kid->trap_cause <= TRAP_INSTR_MISALIGNED);
+                    code = crashed ? -(int32_t)VM_EIO
+                                   : (int32_t)(kid->regs[VM_REG_A0] & 0xff);
+                }
+                cpu->regs[VM_REG_A0] = (uint32_t)code;
+                break;
+            }
+            presched_block(pc->sched);
+        }
+    }
+    cpu->block_reason   = BLOCK_NONE;
+    cpu->block_child_vm = UINT16_MAX;
+    vm_system_unload_vm(sys, (uint16_t)lr.assigned_vm_id);
+#else
+    /* Cooperative: park the parent on the child. The scheduler moves the
+     * parent out of the ready set; the reap path (vm_system_step) wakes
+     * it with the exit code in a0. We do NOT set a0 here. */
     cpu->block_reason   = BLOCK_ON_CHILD;
     cpu->block_child_vm = (uint16_t)lr.assigned_vm_id;
+#endif
 }
 
 
@@ -1591,23 +1659,51 @@ void vm_host_fs_reset(void) {
     vm_host_stdio_set_fs_hooks(NULL, NULL, NULL);
 }
 
+/* Locking trampolines: serialize each FS entry point under the
+ * preemptive backend (no-op under cooperative). The handlers and the
+ * fs_*_fd hooks are left untouched — wrapping them here keeps their
+ * many early-returns simple and the lock scope obviously correct.
+ * SYS_SPAWN_AND_WAIT and SYS_TTY_SET_RAW are deliberately NOT wrapped:
+ * spawn locks only its load (it parks waiting for the child, which must
+ * be able to take the FS lock), and tty_set_raw touches no FS state. */
+#define FS_LK(name) static void lk_##name(VmCpu *c, void *s) { \
+    fs_lock(); name(c, s); fs_unlock(); }
+FS_LK(handle_openat)
+FS_LK(handle_close)
+FS_LK(handle_lseek)
+FS_LK(handle_mkdirat)
+FS_LK(handle_unlinkat)
+FS_LK(handle_readdir)
+#undef FS_LK
+
+static int32_t lk_fs_read_fd(int fd, void *buf, uint32_t n) {
+    fs_lock(); int32_t r = fs_read_fd(fd, buf, n); fs_unlock(); return r;
+}
+static int32_t lk_fs_write_fd(int fd, const void *buf, uint32_t n) {
+    fs_lock(); int32_t r = fs_write_fd(fd, buf, n); fs_unlock(); return r;
+}
+static int32_t lk_fs_close_fd(int fd) {
+    fs_lock(); int32_t r = fs_close_fd(fd); fs_unlock(); return r;
+}
+
 bool vm_host_install_fs(VmSystem *sys) {
     if (!sys || !sys->ecall_router) return false;
 
-    /* Register all the fs syscalls. If any fails, roll back. */
-    if (!vm_ecall_register(sys->ecall_router, SYS_OPENAT,   handle_openat))   goto fail;
-    if (!vm_ecall_register(sys->ecall_router, SYS_CLOSE,    handle_close))    goto fail_openat;
-    if (!vm_ecall_register(sys->ecall_router, SYS_LSEEK,    handle_lseek))    goto fail_close;
-    if (!vm_ecall_register(sys->ecall_router, SYS_MKDIRAT,  handle_mkdirat))  goto fail_lseek;
-    if (!vm_ecall_register(sys->ecall_router, SYS_UNLINKAT, handle_unlinkat)) goto fail_mkdirat;
-    if (!vm_ecall_register(sys->ecall_router, SYS_READDIR,  handle_readdir))  goto fail_unlinkat;
+    /* Register all the fs syscalls (via locking trampolines). If any
+     * fails, roll back. */
+    if (!vm_ecall_register(sys->ecall_router, SYS_OPENAT,   lk_handle_openat))   goto fail;
+    if (!vm_ecall_register(sys->ecall_router, SYS_CLOSE,    lk_handle_close))    goto fail_openat;
+    if (!vm_ecall_register(sys->ecall_router, SYS_LSEEK,    lk_handle_lseek))    goto fail_close;
+    if (!vm_ecall_register(sys->ecall_router, SYS_MKDIRAT,  lk_handle_mkdirat))  goto fail_lseek;
+    if (!vm_ecall_register(sys->ecall_router, SYS_UNLINKAT, lk_handle_unlinkat)) goto fail_mkdirat;
+    if (!vm_ecall_register(sys->ecall_router, SYS_READDIR,  lk_handle_readdir))  goto fail_unlinkat;
     if (!vm_ecall_register(sys->ecall_router, SYS_SPAWN_AND_WAIT,
                                                             handle_spawn_and_wait)) goto fail_readdir;
     if (!vm_ecall_register(sys->ecall_router, SYS_TTY_SET_RAW,
                                                             handle_tty_set_raw))   goto fail_spawn;
 
-    /* Wire up stdio's hooks so fd >= 3 routes here. */
-    vm_host_stdio_set_fs_hooks(fs_read_fd, fs_write_fd, fs_close_fd);
+    /* Wire up stdio's hooks so fd >= 3 routes here (also locked). */
+    vm_host_stdio_set_fs_hooks(lk_fs_read_fd, lk_fs_write_fd, lk_fs_close_fd);
 
     return true;
 
@@ -1661,13 +1757,13 @@ unsigned vm_host_fs_max_files(void) {
  * ============================================================ */
 
 int32_t vm_host_fs_route_read(int fd, void *buf, uint32_t n) {
-    return fs_read_fd(fd, buf, n);
+    fs_lock(); int32_t r = fs_read_fd(fd, buf, n); fs_unlock(); return r;
 }
 
 int32_t vm_host_fs_route_write(int fd, const void *buf, uint32_t n) {
-    return fs_write_fd(fd, buf, n);
+    fs_lock(); int32_t r = fs_write_fd(fd, buf, n); fs_unlock(); return r;
 }
 
 int32_t vm_host_fs_route_close(int fd) {
-    return fs_close_fd(fd);
+    fs_lock(); int32_t r = fs_close_fd(fd); fs_unlock(); return r;
 }

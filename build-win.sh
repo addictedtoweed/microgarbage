@@ -194,6 +194,19 @@ if [ "$_baked" != "1" ]; then
         > "$SHELL_DATA_C"
 fi
 
+# Preemptive scheduler build (opt-in): GARBAGE_PREEMPTIVE=1 selects the
+# preemptive backend — adds the mode define, links presched.c, and pulls
+# in pthreads for the mailbox/slab mutex lockers. Default is cooperative.
+PREEMPT_CFLAGS=()
+PREEMPT_SRCS=()
+PREEMPT_LIBS=()
+if [ "${GARBAGE_PREEMPTIVE:-0}" = "1" ]; then
+    step "PREEMPTIVE backend (GARBAGE_SCHED_MODE=1, +presched.c +pthread)"
+    PREEMPT_CFLAGS=(-DGARBAGE_SCHED_MODE=1)
+    PREEMPT_SRCS=("$REPO_ROOT/src/vm/presched.c")
+    PREEMPT_LIBS=(-lpthread)
+fi
+
 step "compiling native host.exe (with FatFs)..."
 # -D__USE_MINGW_ANSI_STDIO=1: msvcrt's printf doesn't understand C99
 # %z/%ll length modifiers, so mingw warns on every %zu (size_t). This
@@ -202,13 +215,14 @@ step "compiling native host.exe (with FatFs)..."
 # native msvcrt-linked build needs this.)
 "$CC" -Wall -Wextra -Wpedantic -std=c11 -Os -DHAVE_FATFS \
     -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" "${HOST_STRIP[@]}" \
+    "${PREEMPT_CFLAGS[@]}" \
     -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
     -I"$EXAMPLE_DIR" \
     -o "$BUILD_DIR/host.exe" \
     "$EXAMPLE_DIR/host.c" \
     "$SHELL_DATA_C" \
-    "${VM_CORE[@]}" "${HOST_EXTRA[@]}" "${FATFS_SRCS[@]}" \
-    -static -lws2_32 -lwinmm
+    "${VM_CORE[@]}" "${HOST_EXTRA[@]}" "${FATFS_SRCS[@]}" "${PREEMPT_SRCS[@]}" \
+    -static -lws2_32 -lwinmm "${PREEMPT_LIBS[@]}"
 # -static: bundle the mingw runtime so the .exe is a single self-
 #   contained file for testers (no libgcc_s/libwinpthread DLL hunt).
 #   The win32 audio path uses Win32 threads directly (not the pthread

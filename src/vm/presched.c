@@ -61,13 +61,14 @@ typedef struct {
 
 struct PreSched {
     Task     tasks[PRESCHED_MAX_TASKS];
-    int      n_tasks;
+    _Atomic int      n_tasks;       /* atomic: tasks may be added at runtime */
     unsigned tick_us;
     _Atomic int      current;
     _Atomic int      running_count;
     _Atomic uint64_t ticks;
     _Atomic uint64_t switches;
     _Atomic bool     stop;
+    _Atomic bool     running;       /* true between presched_run start/end */
     HANDLE   systick_thread;
 };
 
@@ -216,27 +217,48 @@ PreSched *presched_create(unsigned tick_us) {
     return s;
 }
 int presched_add_task_prio(PreSched *s, presched_task_fn fn, void *arg, int priority) {
-    if (!s || !fn || s->n_tasks >= PRESCHED_MAX_TASKS) return -1;
+    if (!s || !fn) return -1;
     if (priority < PRESCHED_PRIO_MIN) priority = PRESCHED_PRIO_MIN;
     if (priority > PRESCHED_PRIO_MAX) priority = PRESCHED_PRIO_MAX;
-    int id = s->n_tasks++;
+    int id = atomic_load(&s->n_tasks);   /* next free slot = new index */
+    if (id >= PRESCHED_MAX_TASKS) return -1;
     Task *t = &s->tasks[id];
     t->fn = fn; t->arg = arg; t->sched = s; t->id = id; t->priority = priority;
+    atomic_store(&t->pending_wake, 0);
+    atomic_store(&t->wake_deadline, 0);
     atomic_store(&t->state, TASK_READY);
+    if (atomic_load(&s->running)) {
+        /* Added while the scheduler is running (a runtime spawn). Create
+         * and integrate the thread now — the systick will schedule it
+         * once it sees the published n_tasks. Mirrors presched_run's
+         * CREATE_SUSPENDED model. */
+        atomic_fetch_add(&s->running_count, 1);
+        t->thread = CreateThread(NULL, 0, task_trampoline, t,
+                                 CREATE_SUSPENDED, NULL);
+        if (!t->thread) { atomic_fetch_sub(&s->running_count, 1); return -1; }
+    }
+    /* Publish LAST: the slot (and its thread, if running) is fully set up
+     * before the systick can observe the higher count. */
+    atomic_store(&s->n_tasks, id + 1);
     return id;
 }
 int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
     return presched_add_task_prio(s, fn, arg, PRESCHED_PRIO_LEVELS / 2);
 }
 void presched_run(PreSched *s) {
-    if (!s || s->n_tasks == 0) return;
-    atomic_store(&s->running_count, s->n_tasks);
+    if (!s || atomic_load(&s->n_tasks) == 0) return;
+    atomic_store(&s->running_count, atomic_load(&s->n_tasks));
     atomic_store(&s->stop, false);
     /* Create every task thread SUSPENDED — "not running" is exactly
      * "suspended". The scheduler resumes only the current task. */
-    for (int i = 0; i < s->n_tasks; i++)
+    int n0 = atomic_load(&s->n_tasks);
+    for (int i = 0; i < n0; i++)
         s->tasks[i].thread = CreateThread(NULL, 0, task_trampoline, &s->tasks[i],
                                           CREATE_SUSPENDED, NULL);
+    /* Open the gate for runtime spawns (presched_add_task creates its own
+     * thread once this is set). Must precede resuming the first task, since
+     * that task may spawn immediately. */
+    atomic_store(&s->running, true);
     int first = next_ready(s, 0);
     if (first >= 0) {
         atomic_store(&s->current, first);
@@ -244,10 +266,15 @@ void presched_run(PreSched *s) {
         ResumeThread(s->tasks[first].thread);   /* grant the CPU to the first task */
     }
     s->systick_thread = CreateThread(NULL, 0, systick_main, s, 0, NULL);
-    for (int i = 0; i < s->n_tasks; i++) {
+    /* Join every task, including ones spawned at runtime — re-read n_tasks
+     * each iteration so the loop extends to cover them. A parent that
+     * spawn-waits is at a lower index than its child and blocks here until
+     * it finishes, by which point the child (higher index) has been added. */
+    for (int i = 0; i < atomic_load(&s->n_tasks); i++) {
         WaitForSingleObject(s->tasks[i].thread, INFINITE);
         CloseHandle(s->tasks[i].thread);
     }
+    atomic_store(&s->running, false);
     atomic_store(&s->stop, true);
     WaitForSingleObject(s->systick_thread, INFINITE);
     CloseHandle(s->systick_thread);
@@ -292,13 +319,14 @@ typedef struct {
 
 struct PreSched {
     Task     tasks[PRESCHED_MAX_TASKS];
-    int      n_tasks;
+    _Atomic int      n_tasks;       /* atomic: tasks may be added at runtime */
     unsigned tick_us;
     _Atomic int      current;       /* id holding the CPU, or -1 */
     _Atomic int      running_count;
     _Atomic uint64_t ticks;
     _Atomic uint64_t switches;
     _Atomic bool     stop;
+    _Atomic bool     running;       /* true between presched_run start/end */
     timer_t  timer;
     pthread_t sched_thread;
     sem_t    done_sem;
@@ -477,14 +505,30 @@ PreSched *presched_create(unsigned tick_us) {
 }
 
 int presched_add_task_prio(PreSched *s, presched_task_fn fn, void *arg, int priority) {
-    if (!s || !fn || s->n_tasks >= PRESCHED_MAX_TASKS) return -1;
+    if (!s || !fn) return -1;
     if (priority < PRESCHED_PRIO_MIN) priority = PRESCHED_PRIO_MIN;
     if (priority > PRESCHED_PRIO_MAX) priority = PRESCHED_PRIO_MAX;
-    int id = s->n_tasks++;
+    int id = atomic_load(&s->n_tasks);   /* next free slot = new index */
+    if (id >= PRESCHED_MAX_TASKS) return -1;
     Task *t = &s->tasks[id];
     t->fn = fn; t->arg = arg; t->sched = s; t->id = id; t->priority = priority;
+    atomic_store(&t->pending_wake, 0);
+    atomic_store(&t->wake_deadline, 0);
     atomic_store(&t->state, TASK_READY);
-    if (sem_init(&t->gate, 0, 0) != 0) { s->n_tasks--; return -1; }
+    if (sem_init(&t->gate, 0, 0) != 0) return -1;
+    if (atomic_load(&s->running)) {
+        /* Runtime spawn: create the thread now (it inherits the SIGRTMIN
+         * block + SIGUSR1 handler from the spawning task thread). The
+         * scheduler grants it the CPU via its gate once it sees n_tasks. */
+        atomic_fetch_add(&s->running_count, 1);
+        if (pthread_create(&t->thread, NULL, task_trampoline, t) != 0) {
+            atomic_fetch_sub(&s->running_count, 1);
+            sem_destroy(&t->gate);
+            return -1;
+        }
+    }
+    /* Publish LAST so the slot/thread is fully set up first. */
+    atomic_store(&s->n_tasks, id + 1);
     return id;
 }
 int presched_add_task(PreSched *s, presched_task_fn fn, void *arg) {
@@ -512,8 +556,14 @@ void presched_run(PreSched *s) {
 
     /* task threads (inherit the SIGRTMIN block too — good; they must not
      * receive the tick. They DO receive directed SIGUSR1.) */
-    for (int i = 0; i < s->n_tasks; i++)
+    int n0 = atomic_load(&s->n_tasks);
+    for (int i = 0; i < n0; i++)
         pthread_create(&s->tasks[i].thread, NULL, task_trampoline, &s->tasks[i]);
+
+    /* Open the gate for runtime spawns: from here, presched_add_task
+     * creates its own thread. Safe to set now — no task body runs until
+     * its gate is posted below. */
+    atomic_store(&s->running, true);
 
     /* periodic systick -> SIGRTMIN (consumed by sched_thread's sigwait) */
     struct sigevent sev; memset(&sev, 0, sizeof sev);
@@ -543,10 +593,11 @@ void presched_run(PreSched *s) {
      * loop condition exits. */
     pthread_kill(s->sched_thread, SIGRTMIN);
     pthread_join(s->sched_thread, NULL);
-    for (int i = 0; i < s->n_tasks; i++) {
+    for (int i = 0; i < atomic_load(&s->n_tasks); i++) {
         sem_post(&s->tasks[i].gate);             /* unblock any parked */
         pthread_join(s->tasks[i].thread, NULL);
     }
+    atomic_store(&s->running, false);
     g_active = NULL;
 }
 
