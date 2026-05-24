@@ -1,0 +1,13 @@
+# Line-ending policy.
+#
+# Shell scripts run under bash (Cygwin / MSYS2 / Linux) and MUST be LF —
+# CRLF makes bash fail with "$'\r': command not found" and syntax errors
+# at `case ... in`. Pin them to LF so they stay correct even when a
+# Windows checkout has core.autocrlf=true.
+*.sh    text eol=lf
+
+# Linker scripts and the modules manifest are read by the toolchain; LF.
+*.ld    text eol=lf
+
+# PowerShell scripts are Windows-native; keep CRLF.
+*.ps1   text eol=crlf
