@@ -523,6 +523,64 @@ static void test_send_after_pop_cycles(void) {
 }
 
 /* ============================================================
+ *  Locker seam (single-threaded API behavior; the multithreaded
+ *  TSan proof lives in docs/reference/)
+ * ============================================================ */
+
+static int g_lock_calls, g_unlock_calls;
+static uintptr_t counting_lock(void *ctx)              { (void)ctx; g_lock_calls++; return 0x5A; }
+static void      counting_unlock(void *ctx, uintptr_t s){ (void)ctx; g_unlock_calls++; ASSERT_EQ_INT(0x5A, (int)s); }
+
+static void test_locker_invoked_balanced(void) {
+    VmMailbox m;
+    uint8_t storage[(16 + 2) * 4];
+    vm_mailbox_init(&m, storage, 16, 4);
+    vm_mailbox_whitelist_set(&m, 1);   /* one lock/unlock pair */
+
+    g_lock_calls = g_unlock_calls = 0;
+    VmMailboxLocker lk = { counting_lock, counting_unlock, NULL };
+    vm_mailbox_set_locker(&m, lk);
+
+    uint8_t payload[16] = {0};
+    ASSERT_EQ_INT(VM_MBOX_OK, vm_mailbox_send(&m, 1, payload, 16));   /* lock/unlock */
+    ASSERT_EQ_INT(VM_MBOX_OK, vm_mailbox_recv(&m, payload, NULL));    /* lock/unlock */
+
+    /* Every guarded mutator takes exactly one lock and one unlock. */
+    ASSERT_EQ_INT(g_lock_calls, g_unlock_calls);
+    ASSERT(g_lock_calls >= 2);   /* at least the send + recv above */
+}
+
+static void test_locker_null_fallback(void) {
+    VmMailbox m;
+    uint8_t storage[(16 + 2) * 4];
+    vm_mailbox_init(&m, storage, 16, 4);
+
+    /* A locker with NULL fn pointers must fall back to the no-op locker
+     * (not crash on the next mutator). */
+    VmMailboxLocker bad = { NULL, NULL, NULL };
+    vm_mailbox_set_locker(&m, bad);
+
+    vm_mailbox_whitelist_set(&m, 1);
+    uint8_t payload[16] = {0};
+    ASSERT_EQ_INT(VM_MBOX_OK, vm_mailbox_send(&m, 1, payload, 16));
+    ASSERT_EQ_INT(VM_MBOX_OK, vm_mailbox_recv(&m, payload, NULL));
+}
+
+static void test_locker_default_is_noop(void) {
+    /* A mailbox that never calls set_locker behaves exactly as before the
+     * seam existed: all mutators work with the implicit null locker. */
+    VmMailbox m;
+    uint8_t storage[(16 + 2) * 4];
+    vm_mailbox_init(&m, storage, 16, 4);
+    vm_mailbox_whitelist_set(&m, 2);
+    uint8_t payload[16]; memset(payload, 0xCD, sizeof payload);
+    ASSERT_EQ_INT(VM_MBOX_OK, vm_mailbox_send(&m, 2, payload, 16));
+    uint16_t snd = 0;
+    ASSERT_EQ_INT(VM_MBOX_OK, vm_mailbox_recv(&m, payload, &snd));
+    ASSERT_EQ_INT(2, snd);
+}
+
+/* ============================================================
  *  Test runner
  * ============================================================ */
 
@@ -576,6 +634,11 @@ int main(void) {
     RUN(test_small_payload_one_byte);
     RUN(test_large_payload_256_bytes);
     RUN(test_send_after_pop_cycles);
+
+    /* Locker seam (API behavior; multithreaded proof in docs/reference/) */
+    RUN(test_locker_invoked_balanced);
+    RUN(test_locker_null_fallback);
+    RUN(test_locker_default_is_noop);
 
     return TEST_SUITE_RESULT();
 }

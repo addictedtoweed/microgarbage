@@ -143,6 +143,35 @@ typedef enum {
 } VmMailboxResult;
 
 /* ============================================================
+ *  VmMailboxLocker — optional mutual exclusion for the mailbox
+ *
+ *  Mirrors SlabLocker (memory/slab_stack.h) exactly: lock() returns a
+ *  uintptr_t holding saved state (PRIMASK on Cortex-M, a mutex token on
+ *  host), unlock() restores it; ctx is passed to both.
+ *
+ *  The mailbox is single-threaded by default (no locking) — correct and
+ *  zero-cost under the cooperative scheduler, where only one handler runs
+ *  at a time. Under the PREEMPTIVE scheduler, VM tasks run concurrently
+ *  in separate threads and a sender and receiver can touch the same
+ *  mailbox at once; install a real locker via vm_mailbox_set_locker to
+ *  make send/recv/whitelist mutually exclusive. See
+ *  docs/scheduler-step5-ecall-audit.md.
+ *
+ *  vm_mailbox_init installs vm_mailbox_null_locker (no-op) by default, so
+ *  any mailbox that never calls vm_mailbox_set_locker behaves exactly as
+ *  before this seam existed.
+ * ============================================================ */
+typedef struct {
+    uintptr_t (*lock)(void *ctx);
+    void      (*unlock)(void *ctx, uintptr_t saved);
+    void      *ctx;
+} VmMailboxLocker;
+
+/* No-op locker (single-threaded / cooperative use). A value, not a
+ * pointer — assign it or pass it by value. */
+extern const VmMailboxLocker vm_mailbox_null_locker;
+
+/* ============================================================
  *  VmMailbox
  *
  *  Caller declares a VmMailbox per VM and provides the storage
@@ -171,6 +200,7 @@ typedef struct {
 
     /* === Internal — managed by the implementation === */
     FifoQueue _fifo;
+    VmMailboxLocker _locker;        /* guards mutators; null by default */
 } VmMailbox;
 
 /* ============================================================
@@ -208,6 +238,14 @@ VmMailboxResult vm_mailbox_init(VmMailbox *m,
 /* Reset to empty (drops all queued messages) without touching the
  * whitelist or storage. */
 void vm_mailbox_reset(VmMailbox *m);
+
+/* Install a locker to make the mutating operations (send, recv, peek,
+ * whitelist changes, reset) mutually exclusive. Pass
+ * vm_mailbox_null_locker (the default) for single-threaded use. Call
+ * after vm_mailbox_init, before the mailbox is shared across threads.
+ * Under the preemptive scheduler this is required for cross-VM IPC; the
+ * cooperative scheduler leaves it at the null locker. */
+void vm_mailbox_set_locker(VmMailbox *m, VmMailboxLocker locker);
 
 /* ============================================================
  *  Whitelist
