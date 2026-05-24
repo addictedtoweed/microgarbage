@@ -43,10 +43,32 @@ the integration gap the audit (`scheduler-step5-ecall-audit.md`) describes.
 All preemptive code is behind `#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE`
 (see `config.h`); the cooperative (default) build links none of it.
 
-Known caps / still deferred (per the audit): one task per VM, so at most
-`PRESCHED_MAX_TASKS` live VMs. **FS concurrency** (`SYS_OPENAT`/`READ`/`WRITE`
-against the host FS) is not yet guarded by a host-FS lock — the audit's last
-lower-priority item.
+Known caps: one task per VM, so at most `PRESCHED_MAX_TASKS` live VMs. With
+the FS work below, Step 5's preemption-safety items (mailbox, scheduler seam,
+blocking IPC, slab, spawn, FS) are all addressed.
+
+## FS concurrency under preemption (audit FS item)
+
+`vm_host_fs.c` keeps process-global state (the fd table, the mount table,
+FatFs internals), so peer VM tasks doing file syscalls concurrently would
+race. A single coarse FS mutex (gated on `GARBAGE_SCHED_MODE`; a no-op inline
+that pulls in no pthread dependency under cooperative) now serializes every FS
+entry point via thin `lk_` trampolines: the six direct handlers (`openat`,
+`close`, `lseek`, `mkdirat`, `unlinkat`, `readdir`), the three stdio fd-hooks
+(`fs_read_fd`/`fs_write_fd`/`fs_close_fd`), and the three public
+`vm_host_fs_route_*` transport entry points. The handlers themselves are
+unchanged (the trampolines keep their many early-returns and the lock scope
+obviously correct). `SYS_TTY_SET_RAW` is not wrapped (it touches no FS state),
+and `SYS_SPAWN_AND_WAIT` locks **only** its path-resolve + ELF-load — it must
+drop the lock before parking on the child, which may itself take the FS lock.
+
+**Validated:** both modes compile `-Wall -Wextra -pedantic`; the cooperative
+shell still builds; the preemptive spawn test (which loads the child ELF
+through the now-locked FS path) still runs cleanly with no deadlock. Like the
+slab locker, concurrent FS from multiple peer VM tasks is not *stress*-tested
+here (it'd want a two-VM file-I/O guest under TSan in the POSIX sandbox); the
+serialization is correct by construction (one mutex around all global FS
+state) and cooperative behavior is unchanged (no-op lock).
 
 ## Spawn-and-wait under preemption (audit spawn item)
 
