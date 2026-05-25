@@ -27,6 +27,18 @@
     don't have the RISC-V cross-compiler installed and just want to
     relink the host.
 
+.PARAMETER Release
+    Size-optimized, stripped distributable: host.exe built -Os -DNDEBUG
+    and stripped (-s; drops ~180 KB of DWARF mingw emits by default),
+    spawnable guests built -Os and stripped. This is the DEFAULT mode.
+
+.PARAMETER DebugBuild
+    Debug build: host.exe built -Og -g3 -DDEBUG with full symbols and
+    assertions on (unstripped), guest ELFs built -Og -g (unstripped).
+    (Named -DebugBuild, not -Debug, because -Debug is a reserved
+    PowerShell common parameter.) Wins if both -Release and -DebugBuild
+    are passed. The embedded shell is size-built regardless of mode.
+
 .PARAMETER Cc
     Override the host C compiler. Default: x86_64-w64-mingw32-gcc.
     Must be a mingw-w64 (native Windows) compiler for a native build.
@@ -44,6 +56,10 @@
     Relink just the native host.
 
 .EXAMPLE
+    .\build-win.ps1 -DebugBuild
+    Build a debuggable host.exe (-Og -g3, symbols + asserts).
+
+.EXAMPLE
     .\build-win.ps1 -Clean
     Remove build artifacts.
 #>
@@ -54,6 +70,7 @@ param(
     [switch]$NoGuest,
     [switch]$NoWerror,
     [switch]$Release,
+    [switch]$DebugBuild,
     [string]$Cc = "x86_64-w64-mingw32-gcc",
     [string]$GuestCc = ""
 )
@@ -153,7 +170,7 @@ $hostMain = Join-Path $ExampleDir "host.c"
 $hostExe  = Join-Path $BuildDir "host.exe"
 
 $cflags = @(
-    "-Wall", "-Wextra", "-Wpedantic", "-std=c11", "-Os",
+    "-Wall", "-Wextra", "-Wpedantic", "-std=c11",
     "-DHAVE_FATFS",
     # msvcrt's printf doesn't understand C99 %z/%ll length modifiers;
     # this makes mingw use its own C99-compliant stdio so size_t
@@ -168,15 +185,22 @@ $cflags = @(
 # Pass -NoWerror if a stricter mingw flags something unexpected.
 if (-not $NoWerror) { $cflags += "-Werror" }
 
-# -Release: size-optimized, stripped distributable. Strips host.exe
-# (-s; drops ~180 KB of DWARF mingw emits by default) and builds
-# spawnable guests for size (-Os). Embedded shell is size-built
-# regardless. Default keeps host symbols for development.
-$guestOpt = @()
-if ($Release) {
-    Write-Step "RELEASE build - stripping host.exe, -Os guests"
-    $cflags += "-s"
-    $guestOpt = @("-Os")
+# Build mode: release (default) or debug. -DebugBuild flips to debug and
+# wins over -Release if both are passed. release: -Os -DNDEBUG + strip
+# host.exe (-s drops ~180 KB of DWARF mingw emits by default) + size-built
+# stripped guests. debug: -Og -g3 -DDEBUG, symbols + asserts, guests -Og -g
+# unstripped. The embedded shell is size-built regardless (baked image).
+$mode = if ($DebugBuild) { "debug" } else { "release" }
+if ($mode -eq "debug") {
+    Write-Step "DEBUG build - host -Og -g3 (symbols + asserts), guests -Og -g"
+    $cflags += @("-Og", "-g3", "-DDEBUG")
+    $guestOpt   = @("-Og", "-g")
+    $guestStrip = @()
+} else {
+    Write-Step "RELEASE build - host -Os -DNDEBUG -s (stripped), guests -Os stripped"
+    $cflags += @("-Os", "-DNDEBUG", "-s")
+    $guestOpt   = @("-Os")
+    $guestStrip = @("-Wl,-s")
 }
 
 # Native Windows needs WinSock2 for the TCP transport, winmm for the
@@ -262,10 +286,12 @@ if ($NoGuest) {
         $guestLd  = Join-Path $RepoRoot "examples\common\guest.ld"
         $shellC   = Join-Path $ExampleDir "shell.c"
         $shellElf = Join-Path $BuildDir "shell.elf"
+        # Opt level ($guestOpt) and strip ($guestStrip) come from the build
+        # mode above: release -> -Os + -Wl,-s; debug -> -Og -g, unstripped.
         $guestCflags = @("-march=rv32imc","-mabi=ilp32",
-                         "-nostdlib","-nostartfiles","-ffreestanding","-O2")
+                         "-nostdlib","-nostartfiles","-ffreestanding")
         $gcCflags  = @("-ffunction-sections","-fdata-sections")
-        $gcLdflags = @("-Wl,--gc-sections","-Wl,-z,max-page-size=4","-Wl,-s")
+        $gcLdflags = @("-Wl,--gc-sections","-Wl,-z,max-page-size=4")
 
         # shell.elf was already built for size and embedded earlier;
         # don't rebuild it here (would overwrite the size-optimized
@@ -285,7 +311,7 @@ if ($NoGuest) {
             Write-Step "compiling host_files\$name.elf (spawnable)..."
             $gargs = $guestCflags + $guestOpt + $gcCflags +
                      @("-I$libInc","-I$guestSdk","-I$libInc2","-Wl,-T,$guestLd") +
-                     $gcLdflags + @("-o",$outElf,$_.FullName) + $libSrcs
+                     $gcLdflags + $guestStrip + @("-o",$outElf,$_.FullName) + $libSrcs
             & $GuestCc @gargs
             if ($LASTEXITCODE -ne 0) { Die "guest $name.elf compile failed" }
         }

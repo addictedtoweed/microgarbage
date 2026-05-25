@@ -16,9 +16,19 @@
 #   the target, so running this from Cygwin still yields native.
 #
 # Usage:
-#   ./build-win.sh            build native host.exe + guest ELFs
+#   ./build-win.sh            build native host.exe + guest ELFs (RELEASE)
+#   ./build-win.sh --release  size-optimized, stripped (default)
+#   ./build-win.sh --debug    -Og -g3, symbols + asserts, unstripped
 #   ./build-win.sh --no-guest host only (skip RISC-V guests)
 #   ./build-win.sh clean      remove build artifacts
+#
+# Flags combine, e.g.  ./build-win.sh --debug --no-guest
+#
+# Build modes (host.exe):
+#   release  -Os -DNDEBUG -s   smallest distributable (default)
+#   debug    -Og -g3 -DDEBUG   full symbols, assertions on, frame ptrs
+# Spawnable guest ELFs follow the mode too (release: -Os stripped;
+# debug: -Og -g, symbols kept). The embedded shell is always size-built.
 #
 # Override compilers via env:
 #   CC=x86_64-w64-mingw32-gcc        (host; must be mingw-w64)
@@ -37,20 +47,32 @@ step() { echo "build-win: $*"; }
 die()  { echo "build-win: ERROR - $*" >&2; exit 1; }
 
 NO_GUEST=0
-case "${1:-build}" in
-    clean)
-        rm -rf "$BUILD_DIR" "$HOST_FILES"
-        step "cleaned"
-        exit 0
-        ;;
-    sdk)
-        # Generate the standalone, copyable guest SDK bundle and exit.
-        step "packaging guest SDK bundle..."
-        "$REPO_ROOT/examples/common/package-guest-sdk.sh"
-        exit 0
-        ;;
-    --no-guest) NO_GUEST=1 ;;
-esac
+# Build mode: release (default) or debug. RELEASE=0 in the env flips the
+# default to debug (back-compat: RELEASE=1 / unset stays release); an
+# explicit --debug/--release flag always wins.
+BUILD_MODE="release"
+[ "${RELEASE:-1}" = "0" ] && BUILD_MODE="debug"
+for arg in "$@"; do
+    case "$arg" in
+        clean)
+            rm -rf "$BUILD_DIR" "$HOST_FILES"
+            step "cleaned"
+            exit 0
+            ;;
+        sdk)
+            # Generate the standalone, copyable guest SDK bundle and exit.
+            step "packaging guest SDK bundle..."
+            "$REPO_ROOT/examples/common/package-guest-sdk.sh"
+            exit 0
+            ;;
+        --no-guest)        NO_GUEST=1 ;;
+        --debug|-d)        BUILD_MODE="debug" ;;
+        --release|-r)      BUILD_MODE="release" ;;
+        build|"")          ;;   # no-op (default action)
+        *) die "unknown argument '$arg'
+      use: --debug | --release | --no-guest | clean | sdk" ;;
+    esac
+done
 
 # Warnings-as-errors, ON by default (enforces the zero-warning state).
 # Opt out with WERROR=0 if a stricter/newer mingw flags something we
@@ -61,17 +83,23 @@ if [ "${WERROR:-1}" != "0" ]; then
     WERROR_FLAG=(-Werror)
 fi
 
-# RELEASE=1 produces a size-optimized, stripped distributable: the
-# host.exe is stripped (-s; removes ~180 KB of DWARF that mingw emits
-# by default) and the spawnable guests are built for size (-Os). The
-# embedded shell is size-built regardless. Default keeps host symbols
-# for development.
-HOST_STRIP=()
-GUEST_OPT=()
-if [ "${RELEASE:-0}" = "1" ]; then
-    step "RELEASE build — stripping host.exe, -Os guests"
+# Mode flag sets. release: size-optimized + stripped host.exe (-s removes
+# ~180 KB of DWARF that mingw emits by default) + size-built spawnable
+# guests. debug: -Og -g3 with symbols, assertions on (no -DNDEBUG), and
+# guest ELFs left unstripped with -g. The embedded shell is size-built
+# regardless of mode (it's a baked image; size matters, debug it standalone).
+if [ "$BUILD_MODE" = "debug" ]; then
+    step "DEBUG build — host -Og -g3 (symbols + asserts), guests -Og -g"
+    HOST_OPT=(-Og -g3 -DDEBUG)
+    HOST_STRIP=()
+    GUEST_OPT=(-Og -g)
+    GUEST_STRIP=()
+else
+    step "RELEASE build — host -Os -DNDEBUG -s (stripped), guests -Os stripped"
+    HOST_OPT=(-Os -DNDEBUG)
     HOST_STRIP=(-s)
     GUEST_OPT=(-Os)
+    GUEST_STRIP=(-Wl,-s)
 fi
 
 # Host compiler: default to mingw-w64. Must target native Windows.
@@ -181,7 +209,7 @@ step "compiling native host.exe (with FatFs)..."
 # selects mingw's own C99-compliant stdio so those format specifiers
 # compile clean. (Cygwin/Linux libc handle %z natively; only the
 # native msvcrt-linked build needs this.)
-"$CC" -Wall -Wextra -Wpedantic -std=c11 -Os -DHAVE_FATFS \
+"$CC" -Wall -Wextra -Wpedantic -std=c11 "${HOST_OPT[@]}" -DHAVE_FATFS \
     -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" "${HOST_STRIP[@]}" \
     "${PREEMPT_CFLAGS[@]}" \
     -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
@@ -212,9 +240,11 @@ else
     else
         step "guest compiler: $GUEST_CC"
         GUEST_LD="$REPO_ROOT/examples/common/guest.ld"
-        GCFLAGS=(-march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -O2)
+        # Opt level (GUEST_OPT) and strip (GUEST_STRIP) come from the build
+        # mode set above: release -> -Os + -Wl,-s; debug -> -Og -g, unstripped.
+        GCFLAGS=(-march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding)
         GC=(-ffunction-sections -fdata-sections)
-        GLD=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
+        GLD=(-Wl,--gc-sections -Wl,-z,max-page-size=4)
 
         # NOTE: shell.elf was already built (for size) and embedded
         # earlier, before the host compile. We don't rebuild it here —
@@ -239,7 +269,7 @@ else
                 -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
                 -I"$(guest_path "$GUEST_SDK")" \
                 -I"$(guest_path "$GUEST_SDK/include")" \
-                -Wl,-T,"$(guest_path "$GUEST_LD")" "${GLD[@]}" \
+                -Wl,-T,"$(guest_path "$GUEST_LD")" "${GLD[@]}" "${GUEST_STRIP[@]}" \
                 -o "$(guest_path "$HOST_FILES/$name.elf")" \
                 "$(guest_path "$src")" "${LIB_SRCS[@]}"
         done
