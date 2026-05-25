@@ -47,6 +47,28 @@ typedef enum {
     PPU_SC_64x64 = 3,
 } PpuScreenSize;
 
+/* Registers an HDMA channel (or a future timer-IRQ write) can drive
+ * per scanline. More are added as color math / Mode 7 land. */
+typedef enum {
+    PPU_REG_NONE = 0,
+    PPU_REG_BG1_HOFS, PPU_REG_BG1_VOFS,
+    PPU_REG_BG2_HOFS, PPU_REG_BG2_VOFS,
+    PPU_REG_BG3_HOFS, PPU_REG_BG3_VOFS,
+    PPU_REG_BG4_HOFS, PPU_REG_BG4_VOFS,
+    PPU_REG_BRIGHTNESS,
+} PpuRegId;
+
+#define PPU_HDMA_MAX 8
+
+/* One per-scanline register-replay channel. `value` points at a
+ * host-owned array of PPU_SCREEN_H entries — the value `target` takes
+ * on each scanline. The host expands its WRAM HDMA tables into these
+ * (this is the render-from-state stand-in for the HDMA byte stream). */
+typedef struct {
+    PpuRegId        target;
+    const uint16_t *value;   /* [PPU_SCREEN_H], or NULL for an unused slot */
+} PpuHdmaChannel;
+
 /* One background layer's decoded configuration. */
 typedef struct {
     uint16_t      tilemap_word;  /* VRAM word address of the tilemap base   */
@@ -72,6 +94,10 @@ typedef struct {
     uint8_t  obj_size_sel;  /* OBSEL bits 5-7: which small/large size pair */
     uint16_t obj_char_word; /* VRAM word base of OBJ tile 0 (page 0)       */
     uint16_t obj_gap_word;  /* word offset of OBJ page 1 (tiles 256-511)   */
+
+    /* Per-scanline register replay (HDMA / future timer-IRQ writes). */
+    PpuHdmaChannel hdma[PPU_HDMA_MAX];
+    unsigned       hdma_count;
 
     /* Hardware memory, identical to the real chip.
      *   oam[0..511]   = low table: 4 bytes/sprite x 128:

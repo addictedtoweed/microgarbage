@@ -403,6 +403,44 @@ static void test_sprite_vs_bg_priority(void) {
     ASSERT_EQ_INT((long long)green, (long long)px(0, 0));
 }
 
+static void test_hdma_brightness(void) {
+    setup_mode1_bg1();
+    uint8_t pat[8][8]; fill8(pat, 5);
+    set_tile_4bpp(P.vram, 0x2000, 1, pat);
+    for (unsigned ty = 0; ty < 32; ty++)         /* red everywhere */
+        for (unsigned tx = 0; tx < 32; tx++) set_map(P.vram, 0x1000, tx, ty, 1);
+
+    static uint16_t bright[PPU_SCREEN_H];
+    for (unsigned y = 0; y < PPU_SCREEN_H; y++) bright[y] = (y < 112u) ? 15u : 7u;
+    P.hdma[0].target = PPU_REG_BRIGHTNESS;
+    P.hdma[0].value  = bright;
+    P.hdma_count = 1;
+    ppu_render(&P, FB);
+
+    ASSERT_EQ_INT((long long)PRESENT_RGBA(255, 0, 0), (long long)px(0, 0));   /* top: full */
+    ASSERT_EQ_INT((long long)PRESENT_RGBA(119, 0, 0), (long long)px(0, 150)); /* bottom: 255*7/15 */
+}
+
+static void test_hdma_scroll(void) {
+    setup_mode1_bg1();
+    uint8_t pat[8][8]; fill8(pat, 5);
+    set_tile_4bpp(P.vram, 0x2000, 1, pat);
+    for (unsigned ty = 0; ty < 32; ty++)         /* red column at tile col 0 (bg x 0..7) */
+        set_map(P.vram, 0x1000, 0, ty, 1);
+
+    static uint16_t hof[PPU_SCREEN_H];
+    for (unsigned y = 0; y < PPU_SCREEN_H; y++) hof[y] = (y < 50u) ? 0u : 8u;
+    P.hdma[0].target = PPU_REG_BG1_HOFS;
+    P.hdma[0].value  = hof;
+    P.hdma_count = 1;
+    ppu_render(&P, FB);
+
+    uint32_t red = ppu_bgr555_to_rgba(RED555);
+    uint32_t blk = ppu_bgr555_to_rgba(0);
+    ASSERT_EQ_INT((long long)red, (long long)px(0, 0));    /* hofs 0 -> red at x0 */
+    ASSERT_EQ_INT((long long)blk, (long long)px(0, 60));   /* hofs 8 -> bg x8 transparent -> backdrop */
+}
+
 int main(void) {
     TEST_SUITE("ppu");
     RUN(test_bgr555_conversion);
@@ -422,5 +460,7 @@ int main(void) {
     RUN(test_sprite_negative_x);
     RUN(test_sprite_lowest_index_wins);
     RUN(test_sprite_vs_bg_priority);
+    RUN(test_hdma_brightness);
+    RUN(test_hdma_scroll);
     return TEST_SUITE_RESULT();
 }

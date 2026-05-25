@@ -75,14 +75,14 @@ typedef struct {
 /* Sample BG layer `li` at screen pixel (sx,sy). Returns true if opaque
  * (pixel value != 0); fills *out_color (BGR555) and *out_prio. */
 static bool bg_sample(const PpuState *p, const LayerInfo *li,
-                      unsigned sx, unsigned sy,
+                      unsigned sx, unsigned sy, uint16_t hofs, uint16_t vofs,
                       uint16_t *out_color, unsigned *out_prio) {
     const PpuBg *bg = li->bg;
     unsigned mapw = (bg->size == PPU_SC_64x32 || bg->size == PPU_SC_64x64) ? 512u : 256u;
     unsigned maph = (bg->size == PPU_SC_32x64 || bg->size == PPU_SC_64x64) ? 512u : 256u;
 
-    unsigned bgx = ((unsigned)sx + bg->hofs) & (mapw - 1u);
-    unsigned bgy = ((unsigned)sy + bg->vofs) & (maph - 1u);
+    unsigned bgx = ((unsigned)sx + hofs) & (mapw - 1u);
+    unsigned bgy = ((unsigned)sy + vofs) & (maph - 1u);
     unsigned tx = bgx >> 3, ty = bgy >> 3;
     unsigned fx = bgx & 7u, fy = bgy & 7u;
 
@@ -225,6 +225,30 @@ static unsigned build_layers(const PpuState *p, LayerInfo *li) {
     return 3u;
 }
 
+/* Apply this scanline's HDMA register overrides onto the effective
+ * scroll / brightness used to render the line. */
+static void apply_hdma(const PpuState *p, unsigned y,
+                       uint16_t eff_hofs[4], uint16_t eff_vofs[4],
+                       unsigned *eff_bright) {
+    for (unsigned c = 0; c < p->hdma_count && c < PPU_HDMA_MAX; c++) {
+        const PpuHdmaChannel *ch = &p->hdma[c];
+        if (!ch->value) continue;
+        uint16_t v = ch->value[y];
+        switch (ch->target) {
+        case PPU_REG_BG1_HOFS: eff_hofs[0] = v; break;
+        case PPU_REG_BG1_VOFS: eff_vofs[0] = v; break;
+        case PPU_REG_BG2_HOFS: eff_hofs[1] = v; break;
+        case PPU_REG_BG2_VOFS: eff_vofs[1] = v; break;
+        case PPU_REG_BG3_HOFS: eff_hofs[2] = v; break;
+        case PPU_REG_BG3_VOFS: eff_vofs[2] = v; break;
+        case PPU_REG_BG4_HOFS: eff_hofs[3] = v; break;
+        case PPU_REG_BG4_VOFS: eff_vofs[3] = v; break;
+        case PPU_REG_BRIGHTNESS: *eff_bright = v & 15u; break;
+        case PPU_REG_NONE: default: break;
+        }
+    }
+}
+
 /* ---- frame ------------------------------------------------- */
 
 void ppu_render(const PpuState *p, uint32_t *fb) {
@@ -248,6 +272,15 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
     unsigned obj_prio[PPU_SCREEN_W];
 
     for (unsigned y = 0; y < PPU_SCREEN_H; y++) {
+        /* Effective per-scanline registers (base + this line's HDMA). */
+        uint16_t eff_hofs[4], eff_vofs[4];
+        unsigned eff_bright = p->brightness;
+        for (unsigned i = 0; i < 4; i++) {
+            eff_hofs[i] = p->bg[i].hofs;
+            eff_vofs[i] = p->bg[i].vofs;
+        }
+        apply_hdma(p, y, eff_hofs, eff_vofs, &eff_bright);
+
         render_obj_line(p, y, obj_op, obj_col, obj_prio);
         uint32_t *row = fb + (size_t)y * PPU_SCREEN_W;
         for (unsigned x = 0; x < PPU_SCREEN_W; x++) {
@@ -257,7 +290,8 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
             unsigned pr[4]  = { 0, 0, 0, 0 };
             for (unsigned l = 0; l < nlayers; l++) {
                 if (li[l].bg->on_main)
-                    op[l] = bg_sample(p, &li[l], x, y, &col[l], &pr[l]);
+                    op[l] = bg_sample(p, &li[l], x, y, eff_hofs[l], eff_vofs[l],
+                                      &col[l], &pr[l]);
             }
             /* Walk front-to-back; first opaque match at its priority wins.
              * layer == OBJ_LAYER consults the sprite line buffer. */
@@ -270,7 +304,7 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
                     out = col[l]; break;
                 }
             }
-            row[x] = color_to_fb(out, p->brightness);
+            row[x] = color_to_fb(out, eff_bright);
         }
     }
 }
