@@ -147,6 +147,7 @@ esac
     "$REPO_ROOT/src/audio/audio_fft.c" \
     "$REPO_ROOT/src/audio/audio_fft_kernel.c" \
     "$REPO_ROOT/src/audio/audio_wav_read.c" \
+    "$REPO_ROOT/src/audio/audio_file_stream.c" \
     "$REPO_ROOT/src/audio/audio_sink_wav.c" \
     "$REPO_ROOT/src/audio/audio_sink_waveout.c" \
     "$REPO_ROOT/src/containers/spsc_ring.c" \
@@ -254,6 +255,7 @@ case "$(uname -s 2>/dev/null)" in
             "$REPO_ROOT/src/audio/audio_fft_kernel.c" \
             "$REPO_ROOT/src/audio/audio_sink_wav.c" \
             "$REPO_ROOT/src/audio/audio_wav_read.c" \
+            "$REPO_ROOT/src/audio/audio_file_stream.c" \
             "${STRESS_EXTRA_SRCS[@]}" \
             "$REPO_ROOT/src/containers/ring_buffer.c" \
             "$REPO_ROOT/src/containers/spsc_ring.c" \
