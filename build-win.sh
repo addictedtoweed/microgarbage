@@ -98,54 +98,15 @@ esac
 
 mkdir -p "$BUILD_DIR"
 
-VM_CORE=(
-    "$REPO_ROOT/src/vm/vm_core.c"
-    "$REPO_ROOT/src/vm/vm_loader.c"
-    "$REPO_ROOT/src/vm/vm_ecall.c"
-    "$REPO_ROOT/src/vm/vm_ecall_handlers.c"
-    "$REPO_ROOT/src/vm/vm_mailbox.c"
-    "$REPO_ROOT/src/vm/vm_sched.c"
-    "$REPO_ROOT/src/vm/vm_sched_ops_coop.c"
-    "$REPO_ROOT/src/vm/vm_sched_ops_pre.c"
-    "$REPO_ROOT/src/vm/vm_system.c"
-    "$REPO_ROOT/src/vm/vm_host_stdio.c"
-    "$REPO_ROOT/src/vm/vm_host_stdio_win32.c"
-    "$REPO_ROOT/src/vm/vm_host_platform.c"
-    "$REPO_ROOT/src/vm/vm_host_tui.c"
-    "$REPO_ROOT/src/memory/bump.c"
-    "$REPO_ROOT/src/memory/slab_stack.c"
-    "$REPO_ROOT/src/containers/fifo_queue.c"
-    "$REPO_ROOT/src/containers/ring_buffer.c"
-)
-HOST_EXTRA=(
-    "$REPO_ROOT/src/host/platform_win.c"
-    "$REPO_ROOT/src/vm/vm_host_fs.c"
-    "$REPO_ROOT/src/storage/trashdrive.c"
-    "$REPO_ROOT/src/storage/trashfs.c"
-    "$REPO_ROOT/src/storage/trashdrive_fatfs.c"
-    "$REPO_ROOT/src/util/inicfg.c"
-    # Audio: native-Windows build now includes the full audio service.
-    # The channel transport is channel_win32.c (Win32 CreateThread +
-    # CONDITION_VARIABLE) — NOT channel_thread.c (pthreads). host.c uses
-    # CreateThread for the worker and opens the waveOut sink, so a
-    # standalone .exe gets live audio with no pthread/Cygwin dependency.
-    "$REPO_ROOT/src/vm/channel_win32.c"
-    "$REPO_ROOT/src/vm/service_channel.c"
-    "$REPO_ROOT/src/vm/vm_host_audio.c"
-    "$REPO_ROOT/src/containers/spsc_ring.c"
-    "$REPO_ROOT/src/audio/audio_service.c"
-    "$REPO_ROOT/src/audio/audio_arbiter.c"
-    "$REPO_ROOT/src/audio/audio_pool.c"
-    "$REPO_ROOT/src/audio/audio_pool_stream.c"
-    "$REPO_ROOT/src/audio/audio_mixer.c"
-    "$REPO_ROOT/src/audio/music_player.c"
-    "$REPO_ROOT/src/audio/audio_fft.c"
-    "$REPO_ROOT/src/audio/audio_fft_kernel.c"
-    "$REPO_ROOT/src/audio/audio_wav_read.c"
-    "$REPO_ROOT/src/audio/audio_file_stream.c"
-    "$REPO_ROOT/src/audio/audio_sink_wav.c"
-    "$REPO_ROOT/src/audio/audio_sink_waveout.c"
-)
+# Host source set — read from the shared manifest (host_sources.txt) so
+# build-win.sh and build-win.ps1 can never drift. One list, both scripts.
+HOST_SRCS=()
+while IFS= read -r _line || [ -n "$_line" ]; do
+    _line="${_line%%#*}"                                  # strip comment
+    _line="$(printf '%s' "$_line" | tr -d '[:space:]')"   # trim whitespace
+    [ -n "$_line" ] || continue
+    HOST_SRCS+=("$REPO_ROOT/$_line")
+done < "$EXAMPLE_DIR/host_sources.txt"
 FATFS_SRCS=(
     "$FATFS_DIR/ff_wrapped.c"
     "$FATFS_SRC/ffsystem.c"
@@ -228,7 +189,7 @@ step "compiling native host.exe (with FatFs)..."
     -o "$BUILD_DIR/host.exe" \
     "$EXAMPLE_DIR/host.c" \
     "$SHELL_DATA_C" \
-    "${VM_CORE[@]}" "${HOST_EXTRA[@]}" "${FATFS_SRCS[@]}" "${PREEMPT_SRCS[@]}" \
+    "${HOST_SRCS[@]}" "${FATFS_SRCS[@]}" "${PREEMPT_SRCS[@]}" \
     -static -lws2_32 -lwinmm "${PREEMPT_LIBS[@]}"
 # -static: bundle the mingw runtime so the .exe is a single self-
 #   contained file for testers (no libgcc_s/libwinpthread DLL hunt).

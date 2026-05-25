@@ -135,58 +135,14 @@ if (-not (Test-Path $fatfsFfC)) {
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 # ----------------------------------------------------------------
-# Host source set — mirrors examples/common/vm_objs.sh VM_CORE_SRCS
-# plus the shell host's extra deps (fs, trashdrive, FatFs, inicfg).
+# Host source set — read from the SHARED manifest (host_sources.txt) so
+# build-win.ps1 and build-win.sh can never drift. One list, both scripts.
 # ----------------------------------------------------------------
-$vmCore = @(
-    "src\vm\vm_core.c",
-    "src\vm\vm_loader.c",
-    "src\vm\vm_ecall.c",
-    "src\vm\vm_ecall_handlers.c",
-    "src\vm\vm_mailbox.c",
-    "src\vm\vm_sched.c",
-    "src\vm\vm_sched_ops_coop.c",
-    "src\vm\vm_sched_ops_pre.c",
-    "src\vm\vm_system.c",
-    "src\vm\vm_host_stdio.c",
-    "src\vm\vm_host_stdio_win32.c",
-    "src\vm\vm_host_platform.c",
-    "src\vm\vm_host_tui.c",
-    "src\memory\bump.c",
-    "src\memory\slab_stack.c",
-    "src\containers\fifo_queue.c",
-    "src\containers\ring_buffer.c"
-) | ForEach-Object { Join-Path $RepoRoot $_ }
-
-$hostExtra = @(
-    "src\host\platform_win.c",
-    "src\vm\vm_host_fs.c",
-    "src\storage\trashdrive.c",
-    "src\storage\trashfs.c",
-    "src\storage\trashdrive_fatfs.c",
-    "src\util\inicfg.c",
-    # Audio (native Windows): channel_win32.c is the Win32 transport
-    # (CreateThread + CONDITION_VARIABLE), NOT channel_thread.c (pthreads).
-    # Gives a standalone .exe live audio with no pthread/Cygwin dep.
-    # NOTE: this .ps1 is MIRROR-ONLY of build-win.sh and is UNVERIFIED by
-    # the author's toolchain — the .sh is the verified build path.
-    "src\vm\channel_win32.c",
-    "src\vm\service_channel.c",
-    "src\vm\vm_host_audio.c",
-    "src\containers\spsc_ring.c",
-    "src\audio\audio_service.c",
-    "src\audio\audio_arbiter.c",
-    "src\audio\audio_pool.c",
-    "src\audio\audio_pool_stream.c",
-    "src\audio\audio_mixer.c",
-    "src\audio\music_player.c",
-    "src\audio\audio_fft.c",
-    "src\audio\audio_fft_kernel.c",
-    "src\audio\audio_wav_read.c",
-    "src\audio\audio_file_stream.c",
-    "src\audio\audio_sink_wav.c",
-    "src\audio\audio_sink_waveout.c"
-) | ForEach-Object { Join-Path $RepoRoot $_ }
+$manifest = Join-Path $ExampleDir "host_sources.txt"
+$hostSrcs = Get-Content $manifest |
+    ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
+    Where-Object   { $_ -ne '' } |
+    ForEach-Object { Join-Path $RepoRoot $_ }
 
 $fatfs = @(
     (Join-Path $FatfsDir "ff_wrapped.c"),
@@ -274,7 +230,7 @@ if (-not $baked) {
 }
 
 Write-Step "compiling native host.exe (with FatFs)..."
-$allSrc = @($hostMain) + @($shellDataC) + $vmCore + $hostExtra + $fatfs
+$allSrc = @($hostMain) + @($shellDataC) + $hostSrcs + $fatfs
 $ccArgs = $cflags + @("-I$ExampleDir") + @("-o", $hostExe) + $allSrc + $libs
 & $Cc @ccArgs
 if ($LASTEXITCODE -ne 0) { Die "host compile failed (exit $LASTEXITCODE)" }

@@ -1,0 +1,59 @@
+# host_sources.txt — source manifest for the 05_shell host (host.exe).
+#
+# ONE list, read by BOTH build-win.sh and build-win.ps1, so the two can
+# never drift. (Adding a source to only one script was a real bug.)
+# Repo-relative paths, '#' line comments, blank lines ignored.
+#
+# NOT listed here (handled in the build scripts because they're special):
+#   - host.c                  the host main
+#   - build/gen/shell_elf_data.c   generated (bin2c of the embedded shell)
+#   - third_party/fatfs/*     vendored FatFs (own -I flags + presence check)
+#   - src/vm/presched.c       conditional (GARBAGE_PREEMPTIVE=1)
+
+# --- VM core ---
+src/vm/vm_core.c
+src/vm/vm_loader.c
+src/vm/vm_ecall.c
+src/vm/vm_ecall_handlers.c
+src/vm/vm_mailbox.c
+src/vm/vm_sched.c
+src/vm/vm_sched_ops_coop.c
+src/vm/vm_sched_ops_pre.c
+src/vm/vm_system.c
+src/vm/vm_host_stdio.c
+src/vm/vm_host_stdio_win32.c
+src/vm/vm_host_platform.c
+src/vm/vm_host_tui.c
+src/memory/bump.c
+src/memory/slab_stack.c
+src/containers/fifo_queue.c
+src/containers/ring_buffer.c
+
+# --- host extras: fs / storage / config ---
+src/host/platform_win.c
+src/vm/vm_host_fs.c
+src/storage/trashdrive.c
+src/storage/trashfs.c
+src/storage/trashdrive_fatfs.c
+src/util/inicfg.c
+
+# --- intercore channel + audio service (native-Windows transport) ---
+# channel_win32.c is the Win32 transport (CreateThread + CONDITION_VARIABLE),
+# NOT channel_thread.c (pthreads) — a standalone .exe gets live audio with
+# no pthread/Cygwin dependency.
+src/vm/channel_win32.c
+src/vm/service_channel.c
+src/vm/vm_host_audio.c
+src/containers/spsc_ring.c
+src/audio/audio_service.c
+src/audio/audio_arbiter.c
+src/audio/audio_pool.c
+src/audio/audio_pool_stream.c
+src/audio/audio_mixer.c
+src/audio/music_player.c
+src/audio/audio_fft.c
+src/audio/audio_fft_kernel.c
+src/audio/audio_wav_read.c
+src/audio/audio_file_stream.c
+src/audio/audio_sink_wav.c
+src/audio/audio_sink_waveout.c
