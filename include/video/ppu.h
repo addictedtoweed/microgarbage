@@ -66,7 +66,17 @@ typedef struct {
 
     PpuBg    bg[4];         /* BG1..BG4 (BG3/BG4 used by Mode 0)            */
 
-    /* Hardware memory, identical to the real chip. */
+    /* Sprites (OBJ). The host decodes OBSEL/TM/TS into these. */
+    bool     obj_on_main;   /* OBJ enabled on the main screen (TM bit 4)   */
+    bool     obj_on_sub;    /* OBJ enabled on the sub screen  (TS bit 4)   */
+    uint8_t  obj_size_sel;  /* OBSEL bits 5-7: which small/large size pair */
+    uint16_t obj_char_word; /* VRAM word base of OBJ tile 0 (page 0)       */
+    uint16_t obj_gap_word;  /* word offset of OBJ page 1 (tiles 256-511)   */
+
+    /* Hardware memory, identical to the real chip.
+     *   oam[0..511]   = low table: 4 bytes/sprite x 128:
+     *                   X(lo8), Y, tile(lo8), attr(N|ppp|oo|h|v)
+     *   oam[512..543] = high table: 2 bits/sprite (X hi bit, size bit). */
     uint16_t vram[PPU_VRAM_WORDS];
     uint16_t cgram[PPU_CGRAM_LEN];   /* BGR555: 0bbbbbgggggrrrrr            */
     uint8_t  oam[PPU_OAM_LEN];       /* (sprites: later increment)          */

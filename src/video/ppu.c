@@ -106,6 +106,77 @@ static bool bg_sample(const PpuState *p, const LayerInfo *li,
     return true;
 }
 
+/* ---- sprites (OBJ) ----------------------------------------- */
+
+#define OBJ_LAYER 4u   /* OrderEntry.layer value meaning "sprites" */
+
+/* The 8 OBJ size pairs (small / large), selected by OBSEL bits 5-7;
+ * the per-sprite size bit (OAM high table) picks small or large. */
+static const struct { uint8_t sw, sh, lw, lh; } OBJ_SIZES[8] = {
+    {  8,  8, 16, 16 }, {  8,  8, 32, 32 }, {  8,  8, 64, 64 },
+    { 16, 16, 32, 32 }, { 16, 16, 64, 64 }, { 32, 32, 64, 64 },
+    { 16, 32, 32, 64 }, { 16, 32, 32, 32 },
+};
+
+/* Build this scanline's sprite line buffers: for each x, whether a
+ * sprite pixel is present, its color (BGR555), and its 2-bit priority.
+ * Sprites draw in OAM order with the LOWEST index in front, so we walk
+ * 0..127 and keep the first opaque writer at each x. Pixel value 0 is
+ * transparent; OBJ palettes live at CGRAM 128 + pal*16. */
+static void render_obj_line(const PpuState *p, unsigned y,
+                            bool *op, uint16_t *col, unsigned *prio) {
+    for (unsigned x = 0; x < PPU_SCREEN_W; x++) { op[x] = false; col[x] = 0; prio[x] = 0; }
+    if (!p->obj_on_main) return;
+
+    const uint8_t *oam = p->oam;
+    unsigned sel = p->obj_size_sel & 7u;
+
+    for (unsigned i = 0; i < 128u; i++) {
+        const uint8_t *e = oam + i * 4u;
+        unsigned hbyte = oam[512u + (i >> 2)];
+        unsigned shift = (i & 3u) * 2u;
+        unsigned xhi = (hbyte >> shift) & 1u;
+        unsigned big = (hbyte >> (shift + 1u)) & 1u;
+
+        unsigned w = big ? OBJ_SIZES[sel].lw : OBJ_SIZES[sel].sw;
+        unsigned h = big ? OBJ_SIZES[sel].lh : OBJ_SIZES[sel].sh;
+
+        unsigned sy = e[1];
+        if (!(y >= sy && y < sy + h)) continue;       /* scanline misses sprite */
+
+        int sx = (int)((unsigned)e[0] | (xhi << 8));  /* 9-bit, signed */
+        if (sx >= 256) sx -= 512;
+
+        unsigned attr  = e[3];
+        bool     vflip = (attr >> 7) & 1u;
+        bool     hflip = (attr >> 6) & 1u;
+        unsigned sprio = (attr >> 4) & 3u;
+        unsigned pal   = (attr >> 1) & 7u;
+        unsigned tnum  = e[2] | ((attr & 1u) << 8);   /* 9-bit tile */
+        unsigned page  = (tnum >> 8) & 1u;
+        unsigned base_lo = tnum & 0xFFu;
+        uint16_t page_base = (uint16_t)(p->obj_char_word + (page ? p->obj_gap_word : 0u));
+
+        unsigned row = y - sy;
+        if (vflip) row = h - 1u - row;
+        unsigned tr = row >> 3, py = row & 7u;
+
+        for (unsigned xx = 0; xx < w; xx++) {
+            int screen_x = sx + (int)xx;
+            if (screen_x < 0 || screen_x >= (int)PPU_SCREEN_W) continue;
+            if (op[screen_x]) continue;               /* lower-index sprite wins */
+            unsigned cin = hflip ? (w - 1u - xx) : xx; /* source column (flip-aware) */
+            unsigned tc = cin >> 3, px = cin & 7u;
+            unsigned cell = (base_lo + tr * 16u + tc) & 0xFFu;  /* 16-wide OBJ grid */
+            unsigned val = tile_pixel(p->vram, page_base, cell, 4u, px, py);
+            if (val == 0u) continue;                  /* transparent */
+            op[screen_x]   = true;
+            col[screen_x]  = p->cgram[(128u + pal * 16u + val) & (PPU_CGRAM_LEN - 1u)];
+            prio[screen_x] = sprio;
+        }
+    }
+}
+
 /* ---- compositing order ------------------------------------- */
 
 typedef struct { uint8_t layer; uint8_t prio; } OrderEntry;
@@ -114,19 +185,24 @@ typedef struct { uint8_t layer; uint8_t prio; } OrderEntry;
  * fills `ord`. `ord` must hold at least 8 entries. */
 static unsigned build_order(const PpuState *p, OrderEntry *ord) {
     unsigned n = 0;
+    const uint8_t O = (uint8_t)OBJ_LAYER;
     if (p->mode == 0u) {
-        /* BG1/BG2 above BG3/BG4, priority-1 tiles above priority-0. */
+        /* Sprites interleave at 4 priority levels with BG1/BG2 over BG3/BG4. */
         static const OrderEntry m0[] = {
-            {0,1},{1,1},{0,0},{1,0},{2,1},{3,1},{2,0},{3,0},
+            {4,3},{0,1},{1,1},{4,2},{0,0},{1,0},{4,1},{2,1},{3,1},{4,0},{2,0},{3,0},
         };
         for (unsigned i = 0; i < sizeof m0 / sizeof m0[0]; i++) ord[n++] = m0[i];
     } else { /* mode 1 (BG1/BG2 4bpp, BG3 2bpp) */
         if (p->bg3_priority) ord[n++] = (OrderEntry){2, 1};
+        ord[n++] = (OrderEntry){O, 3};
         ord[n++] = (OrderEntry){0, 1};
         ord[n++] = (OrderEntry){1, 1};
+        ord[n++] = (OrderEntry){O, 2};
         ord[n++] = (OrderEntry){0, 0};
         ord[n++] = (OrderEntry){1, 0};
+        ord[n++] = (OrderEntry){O, 1};
         if (!p->bg3_priority) ord[n++] = (OrderEntry){2, 1};
+        ord[n++] = (OrderEntry){O, 0};
         ord[n++] = (OrderEntry){2, 0};
     }
     return n;
@@ -161,15 +237,21 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
     }
 
     LayerInfo li[4];
-    OrderEntry ord[8];
+    OrderEntry ord[16];
     unsigned nlayers = build_layers(p, li);
     unsigned norder  = build_order(p, ord);
     uint16_t backdrop = p->cgram[0];
 
+    /* Per-scanline sprite line buffers. */
+    bool     obj_op[PPU_SCREEN_W];
+    uint16_t obj_col[PPU_SCREEN_W];
+    unsigned obj_prio[PPU_SCREEN_W];
+
     for (unsigned y = 0; y < PPU_SCREEN_H; y++) {
+        render_obj_line(p, y, obj_op, obj_col, obj_prio);
         uint32_t *row = fb + (size_t)y * PPU_SCREEN_W;
         for (unsigned x = 0; x < PPU_SCREEN_W; x++) {
-            /* Sample each main-screen layer once. */
+            /* Sample each main-screen BG layer once. */
             bool     op[4]  = { false, false, false, false };
             uint16_t col[4] = { 0, 0, 0, 0 };
             unsigned pr[4]  = { 0, 0, 0, 0 };
@@ -177,11 +259,16 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
                 if (li[l].bg->on_main)
                     op[l] = bg_sample(p, &li[l], x, y, &col[l], &pr[l]);
             }
-            /* Walk front-to-back; first opaque match at its priority wins. */
+            /* Walk front-to-back; first opaque match at its priority wins.
+             * layer == OBJ_LAYER consults the sprite line buffer. */
             uint16_t out = backdrop;
             for (unsigned o = 0; o < norder; o++) {
                 unsigned l = ord[o].layer;
-                if (op[l] && pr[l] == ord[o].prio) { out = col[l]; break; }
+                if (l == OBJ_LAYER) {
+                    if (obj_op[x] && obj_prio[x] == ord[o].prio) { out = obj_col[x]; break; }
+                } else if (op[l] && pr[l] == ord[o].prio) {
+                    out = col[l]; break;
+                }
             }
             row[x] = color_to_fb(out, p->brightness);
         }
