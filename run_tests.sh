@@ -86,6 +86,7 @@ run trashdrive       storage  src/storage/trashdrive.c
 run trashfs          storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_p2       storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_p3       storage  src/storage/trashfs.c src/storage/trashdrive.c
+run trashfs_dirs     storage  src/storage/trashfs.c src/storage/trashdrive.c
 if [ -f "$FATFS_SRC/ff.c" ]; then
     run trashdrive_fatfs storage -DHAVE_FATFS -I"$FATFS_DIR" -I"$FATFS_SRC" \
         src/storage/trashdrive_fatfs.c src/storage/trashdrive.c \

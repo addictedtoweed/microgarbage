@@ -8,7 +8,8 @@
  *  Key parameters (LOCKED — see the spec):
  *    - 128-byte blocks, uint32 block indices.
  *    - 64-byte inodes: 8 direct + single + double + triple indirect.
- *    - 48-byte directory entries, 32-char names, flat namespace.
+ *    - 48-byte directory entries, 32-char names, hierarchical
+ *      directories (mkdir/rmdir, nested paths, "." and "..").
  *    - free-block bitmap; inode table sized as a fraction of volume.
  *    - little-endian on disk (matches RISC-V guest + host order).
  *
@@ -78,9 +79,12 @@ typedef enum {
     TRASHFS_ERR_BAD_MAGIC,      /* superblock magic mismatch         */
     TRASHFS_ERR_BAD_VERSION,    /* unsupported version               */
     TRASHFS_ERR_BAD_GEOMETRY,   /* superblock fields inconsistent    */
-    TRASHFS_ERR_NO_SPACE,       /* ENOSPC (later phases)             */
-    TRASHFS_ERR_NOT_FOUND,      /* (later phases)                    */
+    TRASHFS_ERR_NO_SPACE,       /* ENOSPC                            */
+    TRASHFS_ERR_NOT_FOUND,      /* a path component does not exist   */
     TRASHFS_ERR_IO,             /* unexpected internal failure       */
+    TRASHFS_ERR_EXISTS,         /* target name already exists        */
+    TRASHFS_ERR_NOT_EMPTY,      /* rmdir on a non-empty directory    */
+    TRASHFS_ERR_NOT_DIR,        /* path component isn't a directory  */
 } TrashfsResult;
 
 /* ---- On-disk structures ------------------------------------ *
@@ -237,12 +241,32 @@ typedef struct {
     uint32_t size;      /* file size in bytes                    */
 } TrashfsDirent_Out;
 
-/* Open a file by name (flat namespace; a leading '/' is accepted and
- * ignored). With TRASHFS_O_CREAT, a missing file is created; without
- * it, a missing file returns TRASHFS_ERR_NOT_FOUND. TRASHFS_O_TRUNC
- * frees the file's blocks and resets size to 0. Fills *f. */
+/* Open a file by path. Paths are '/'-separated; a leading '/' is
+ * optional (resolution always starts at the root), and "." / ".."
+ * components are honored ("/" or "" resolves to the root directory).
+ * Intermediate components must be existing directories
+ * (TRASHFS_ERR_NOT_FOUND / TRASHFS_ERR_NOT_DIR otherwise). With
+ * TRASHFS_O_CREAT a missing FILE is created in its parent directory
+ * (the parent must exist — open does not mkdir intermediate dirs);
+ * without it, a missing file returns TRASHFS_ERR_NOT_FOUND.
+ * TRASHFS_O_TRUNC frees the file's blocks and resets size to 0.
+ * Fills *f. */
 TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
                            uint32_t flags, TrashfsFile *f);
+
+/* Create a directory at `path`. The parent directory must already
+ * exist (no recursive mkdir -p). Returns TRASHFS_ERR_EXISTS if the
+ * name is taken, TRASHFS_ERR_NOT_FOUND/NOT_DIR if the parent path is
+ * bad, TRASHFS_ERR_NO_SPACE if out of inodes/blocks. `now` stamps the
+ * created/modified time (0 if no RTC). */
+TrashfsResult trashfs_mkdir(TrashfsVolume *vol, const char *path, uint32_t now);
+
+/* Remove an EMPTY directory at `path`. Returns TRASHFS_ERR_NOT_DIR if
+ * `path` is a file, TRASHFS_ERR_NOT_EMPTY if it still has entries,
+ * TRASHFS_ERR_NOT_FOUND if absent, TRASHFS_ERR_INVALID_ARG for the
+ * root. Frees the directory's inode + blocks and clears its entry in
+ * the parent. */
+TrashfsResult trashfs_rmdir(TrashfsVolume *vol, const char *path);
 
 /* Read up to n bytes at the current position. Returns the byte count
  * via *out_read (0 at EOF). Unallocated blocks within the file (holes)
@@ -269,14 +293,17 @@ TrashfsResult trashfs_lseek(TrashfsFile *f, int32_t off, int whence,
 /* Close a file handle. */
 TrashfsResult trashfs_close(TrashfsFile *f);
 
-/* Remove a file by name, freeing its data blocks (and indirect
- * blocks) and its inode, and clearing its directory entry. Returns
- * TRASHFS_ERR_NOT_FOUND if absent. (Phase 3.) */
+/* Remove a FILE by path, freeing its data blocks (and indirect blocks)
+ * and its inode, and clearing its directory entry. Returns
+ * TRASHFS_ERR_NOT_FOUND if absent, TRASHFS_ERR_NOT_DIR if the path
+ * resolves to a directory (use trashfs_rmdir for those). */
 TrashfsResult trashfs_unlink(TrashfsVolume *vol, const char *name);
 
-/* Open the (root) directory for iteration. Phase 2 has a flat
- * namespace, so this opens the root regardless of path. */
-TrashfsResult trashfs_opendir(TrashfsVolume *vol, TrashfsDir *d);
+/* Open the directory at `path` for iteration ("/" or "" = root).
+ * Returns TRASHFS_ERR_NOT_FOUND if absent, TRASHFS_ERR_NOT_DIR if the
+ * path is a file. */
+TrashfsResult trashfs_opendir(TrashfsVolume *vol, const char *path,
+                              TrashfsDir *d);
 
 /* Yield the next directory entry. *out_have is set to true if an
  * entry was produced, false at end-of-directory. */

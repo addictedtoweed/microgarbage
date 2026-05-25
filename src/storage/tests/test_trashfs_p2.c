@@ -289,7 +289,7 @@ static void test_lseek_negative_fails(void) {
 static void test_readdir_empty(void) {
     fresh_volume();
     TrashfsVolume vol; trashfs_mount(&vol, g_region, sizeof(g_region));
-    TrashfsDir d; ASSERT_EQ_INT(TRASHFS_OK, (int)trashfs_opendir(&vol, &d));
+    TrashfsDir d; ASSERT_EQ_INT(TRASHFS_OK, (int)trashfs_opendir(&vol, "/", &d));
     TrashfsDirent_Out ent; bool have = true;
     ASSERT_EQ_INT(TRASHFS_OK, (int)trashfs_readdir(&d, &ent, &have));
     ASSERT(!have);   /* empty directory */
@@ -302,7 +302,7 @@ static void test_readdir_lists_files(void) {
     plant_file(g_region, "two.txt",  (const uint8_t*)"22", 2);
     plant_file(g_region, "three.bin",(const uint8_t*)"333", 3);
     TrashfsVolume vol; trashfs_mount(&vol, g_region, sizeof(g_region));
-    TrashfsDir d; trashfs_opendir(&vol, &d);
+    TrashfsDir d; trashfs_opendir(&vol, "/", &d);
 
     int count = 0; bool saw_two = false; bool have = false;
     TrashfsDirent_Out ent;
@@ -328,7 +328,7 @@ static void test_readdir_32char_name(void) {
     ASSERT_EQ_INT(32, (int)strlen(n32));
     plant_file(g_region, n32, (const uint8_t*)"x", 1);
     TrashfsVolume vol; trashfs_mount(&vol, g_region, sizeof(g_region));
-    TrashfsDir d; trashfs_opendir(&vol, &d);
+    TrashfsDir d; trashfs_opendir(&vol, "/", &d);
     TrashfsDirent_Out ent; bool have = false;
     trashfs_readdir(&d, &ent, &have);
     ASSERT(have);

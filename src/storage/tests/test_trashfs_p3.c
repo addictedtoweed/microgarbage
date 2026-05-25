@@ -234,7 +234,7 @@ static void test_create_after_unlink_reuses(void) {
     trashfs_write(&f, "2", 1, NULL, 0);
     trashfs_close(&f);
     /* Only one file present. */
-    TrashfsDir d; trashfs_opendir(&vol, &d);
+    TrashfsDir d; trashfs_opendir(&vol, "/", &d);
     int count = 0; bool have = false; TrashfsDirent_Out e;
     while (trashfs_readdir(&d, &e, &have) == TRASHFS_OK && have) count++;
     trashfs_closedir(&d);

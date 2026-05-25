@@ -503,15 +503,17 @@ static uint32_t map_lbn(TrashfsVolume *vol, const uint8_t *inode, uint32_t lbn) 
 
 /* Scan the root directory for an entry named (name,len). On match,
  * returns true and fills *out_inode / *out_type. */
-static bool dir_find(TrashfsVolume *vol, const char *name, uint32_t len,
-                     uint32_t *out_inode, uint8_t *out_type) {
-    const uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
-    uint32_t dsize = rd32(root + 4u);
+/* Find an entry by name within directory inode `dir_ino`. */
+static bool dir_find_in(TrashfsVolume *vol, uint32_t dir_ino,
+                        const char *name, uint32_t len,
+                        uint32_t *out_inode, uint8_t *out_type) {
+    const uint8_t *dn = inode_ptr(vol, dir_ino);
+    uint32_t dsize = rd32(dn + 4u);
 
     for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
          off += TRASHFS_DIRENT_SIZE) {
         uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
-        uint32_t blk = map_lbn(vol, root, lbn);
+        uint32_t blk = map_lbn(vol, dn, lbn);
         if (blk == TRASHFS_BLOCK_NONE) continue;   /* hole — skip */
         const uint8_t *e = block_ptr(vol->region, blk)
                          + (off % TRASHFS_BLOCK_SIZE);
@@ -528,15 +530,159 @@ static bool dir_find(TrashfsVolume *vol, const char *name, uint32_t len,
     return false;
 }
 
-/* Strip a single leading '/', returning name + length. Flat
- * namespace: we don't parse deeper path components. */
-static const char *normalize_name(const char *name, uint32_t *out_len) {
-    if (!name) { *out_len = 0; return NULL; }
-    if (name[0] == '/') name++;
+/* True if directory inode `dir_ino` has no live entries. */
+static bool dir_is_empty(TrashfsVolume *vol, uint32_t dir_ino) {
+    const uint8_t *dn = inode_ptr(vol, dir_ino);
+    uint32_t dsize = rd32(dn + 4u);
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
+         off += TRASHFS_DIRENT_SIZE) {
+        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+        uint32_t blk = map_lbn(vol, dn, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) continue;
+        const uint8_t *e = block_ptr(vol->region, blk)
+                         + (off % TRASHFS_BLOCK_SIZE);
+        if (rd32(e + 0) != 0u) return false;       /* a live entry */
+    }
+    return true;
+}
+
+/* Find an entry by name in `dir_ino`, clear its slot, and return the
+ * inode it referenced (and its type) via out-params. Does NOT touch
+ * the referenced inode itself — the caller frees it. Returns true if
+ * an entry was found+cleared. */
+static bool dir_clear_entry_in(TrashfsVolume *vol, uint32_t dir_ino,
+                               const char *name, uint32_t len,
+                               uint32_t *out_inode, uint8_t *out_type) {
+    uint8_t *dn = inode_ptr(vol, dir_ino);
+    uint32_t dsize = rd32(dn + 4u);
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
+         off += TRASHFS_DIRENT_SIZE) {
+        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
+        uint32_t blk = map_lbn(vol, dn, lbn);
+        if (blk == TRASHFS_BLOCK_NONE) continue;
+        uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
+        uint32_t einode = rd32(e + 0);
+        if (einode == 0u) continue;
+        if (e[5] == len && memcmp(e + 6, name, len) == 0) {
+            if (out_inode) *out_inode = einode;
+            if (out_type)  *out_type  = e[4];
+            memset(e, 0, TRASHFS_DIRENT_SIZE);     /* inode=0 -> free slot */
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ---- path resolution --------------------------------------- *
+ *
+ *  Paths are '/'-separated; a leading '/' is optional. "." is skipped,
+ *  ".." ascends (clamped at root). Intermediate components must be
+ *  existing directories. */
+
+#define TRASHFS_MAX_PATH_COMPS  40u   /* tokenizer cap (deep enough)  */
+#define TRASHFS_PATH_DEPTH      40u   /* ".." ascend stack            */
+
+/* Walk the first `count` components (from the tokenized arrays) as
+ * directory steps, starting at root. If allow_last_nondir is false
+ * every step must resolve to a directory; if true the FINAL step may
+ * be a file (used to resolve a full path to its target). Returns the
+ * resulting inode + type. */
+static TrashfsResult path_step(TrashfsVolume *vol,
+                               const char *const *cs, const uint32_t *cl,
+                               uint32_t count, bool allow_last_nondir,
+                               uint32_t *out_inode, uint8_t *out_type) {
+    uint32_t stack[TRASHFS_PATH_DEPTH];
+    uint32_t sp = 0;
+    stack[0] = TRASHFS_ROOT_INODE;
+    uint32_t cur = TRASHFS_ROOT_INODE;
+    uint8_t  cur_type = TRASHFS_TYPE_DIR;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *nm = cs[i];
+        uint32_t len = cl[i];
+        bool last = (i + 1u == count);
+
+        if (len == 1u && nm[0] == '.') continue;                 /* "."  */
+        if (len == 2u && nm[0] == '.' && nm[1] == '.') {         /* ".." */
+            if (sp > 0) sp--;
+            cur = stack[sp];
+            cur_type = TRASHFS_TYPE_DIR;
+            continue;
+        }
+
+        uint32_t ino; uint8_t type;
+        if (!dir_find_in(vol, cur, nm, len, &ino, &type))
+            return TRASHFS_ERR_NOT_FOUND;
+        if (!last || !allow_last_nondir) {
+            if (type != TRASHFS_TYPE_DIR) return TRASHFS_ERR_NOT_DIR;
+            if (sp + 1u >= TRASHFS_PATH_DEPTH) return TRASHFS_ERR_INVALID_ARG;
+            stack[++sp] = ino;
+        }
+        cur = ino;
+        cur_type = type;
+    }
+
+    if (out_inode) *out_inode = cur;
+    if (out_type)  *out_type  = cur_type;
+    return TRASHFS_OK;
+}
+
+/* Tokenize `path` into component pointer/length arrays. Returns the
+ * count via *out_n, or an error (name too long / too many comps). */
+static TrashfsResult path_tokenize(const char *path,
+                                   const char **cs, uint32_t *cl,
+                                   uint32_t *out_n) {
     uint32_t n = 0;
-    while (name[n] != '\0') n++;
-    *out_len = n;
-    return name;
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        uint32_t len = (uint32_t)(p - s);
+        if (len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
+        if (n >= TRASHFS_MAX_PATH_COMPS) return TRASHFS_ERR_INVALID_ARG;
+        cs[n] = s; cl[n] = len; n++;
+    }
+    *out_n = n;
+    return TRASHFS_OK;
+}
+
+/* Resolve a full path to its target inode + type ("/" or "" = root). */
+static TrashfsResult resolve_full(TrashfsVolume *vol, const char *path,
+                                  uint32_t *out_inode, uint8_t *out_type) {
+    if (!path) return TRASHFS_ERR_INVALID_ARG;
+    const char *cs[TRASHFS_MAX_PATH_COMPS]; uint32_t cl[TRASHFS_MAX_PATH_COMPS];
+    uint32_t n = 0;
+    TrashfsResult r = path_tokenize(path, cs, cl, &n);
+    if (r != TRASHFS_OK) return r;
+    return path_step(vol, cs, cl, n, true, out_inode, out_type);
+}
+
+/* Resolve all but the final component to a parent directory inode, and
+ * return the final component as the leaf name. The leaf must be a real
+ * name (not "", "." or ".."). */
+static TrashfsResult resolve_parent(TrashfsVolume *vol, const char *path,
+                                    uint32_t *out_parent,
+                                    const char **out_leaf, uint32_t *out_leaf_len) {
+    if (!path) return TRASHFS_ERR_INVALID_ARG;
+    const char *cs[TRASHFS_MAX_PATH_COMPS]; uint32_t cl[TRASHFS_MAX_PATH_COMPS];
+    uint32_t n = 0;
+    TrashfsResult r = path_tokenize(path, cs, cl, &n);
+    if (r != TRASHFS_OK) return r;
+    if (n == 0) return TRASHFS_ERR_INVALID_ARG;          /* "/" has no leaf */
+
+    const char *leaf = cs[n - 1]; uint32_t llen = cl[n - 1];
+    if (llen == 0 ||
+        (llen == 1 && leaf[0] == '.') ||
+        (llen == 2 && leaf[0] == '.' && leaf[1] == '.'))
+        return TRASHFS_ERR_INVALID_ARG;                  /* not a nameable leaf */
+
+    uint8_t ptype;
+    r = path_step(vol, cs, cl, n - 1u, false, out_parent, &ptype);
+    if (r != TRASHFS_OK) return r;
+    *out_leaf = leaf; *out_leaf_len = llen;
+    return TRASHFS_OK;
 }
 
 TrashfsResult trashfs_read(TrashfsFile *f, void *buf, uint32_t n,
@@ -603,13 +749,20 @@ TrashfsResult trashfs_close(TrashfsFile *f) {
 
 /* ---- directory iteration ----------------------------------- */
 
-TrashfsResult trashfs_opendir(TrashfsVolume *vol, TrashfsDir *d) {
-    if (!vol || !vol->mounted || !d) return TRASHFS_ERR_INVALID_ARG;
-    const uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
+TrashfsResult trashfs_opendir(TrashfsVolume *vol, const char *path,
+                              TrashfsDir *d) {
+    if (!vol || !vol->mounted || !path || !d) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t ino = 0; uint8_t type = 0;
+    TrashfsResult r = resolve_full(vol, path, &ino, &type);
+    if (r != TRASHFS_OK) return r;
+    if (type != TRASHFS_TYPE_DIR) return TRASHFS_ERR_NOT_DIR;
+
+    const uint8_t *dn = inode_ptr(vol, ino);
     memset(d, 0, sizeof(*d));
     d->vol   = vol;
-    d->inode = TRASHFS_ROOT_INODE;
-    d->size  = rd32(root + 4u);
+    d->inode = ino;
+    d->size  = rd32(dn + 4u);
     d->pos   = 0;
     d->open  = true;
     return TRASHFS_OK;
@@ -772,28 +925,31 @@ TrashfsResult trashfs_write(TrashfsFile *f, const void *buf, uint32_t n,
 /* Find a free directory slot (inode==0) in the root, or grow the root
  * directory by one entry-slot, returning a pointer to the 48-byte
  * slot. Returns NULL on ENOSPC. *grew is set if the dir size grew. */
-static uint8_t *root_alloc_dirent(TrashfsVolume *vol, bool *grew) {
-    uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
-    uint32_t dsize = rd32(root + 4u);
+static uint8_t *dir_alloc_dirent_in(TrashfsVolume *vol, uint32_t dir_ino,
+                                    bool *grew) {
+    uint8_t *dn = inode_ptr(vol, dir_ino);
+    uint32_t dsize = rd32(dn + 4u);
     *grew = false;
 
     /* Reuse a freed slot first. */
     for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
          off += TRASHFS_DIRENT_SIZE) {
         uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
-        uint32_t blk = map_lbn(vol, root, lbn);
+        uint32_t blk = map_lbn(vol, dn, lbn);
         if (blk == TRASHFS_BLOCK_NONE) continue;
         uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
         if (rd32(e + 0) == 0u) return e;   /* free slot */
     }
 
-    /* Append a new slot at the end, allocating a block if needed. */
+    /* Append a new slot at the end, allocating a block if needed.
+     * Re-fetch the inode pointer after bmap_alloc — it doesn't move the
+     * region, but keep the read fresh for the size update below. */
     uint32_t off = dsize;
     uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
-    uint32_t blk = bmap_alloc(vol, root, lbn);
+    uint32_t blk = bmap_alloc(vol, dn, lbn);
     if (blk == TRASHFS_BLOCK_NONE) return NULL;
     uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
-    wr32(root + 4u, dsize + TRASHFS_DIRENT_SIZE);
+    wr32(dn + 4u, dsize + TRASHFS_DIRENT_SIZE);
     *grew = true;
     return e;
 }
@@ -802,22 +958,23 @@ TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
                            uint32_t flags, TrashfsFile *f) {
     if (!vol || !vol->mounted || !name || !f) return TRASHFS_ERR_INVALID_ARG;
 
-    uint32_t len = 0;
-    const char *nm = normalize_name(name, &len);
-    if (len == 0 || len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
+    /* Resolve the parent directory; the leaf is the file name. */
+    uint32_t parent = 0; const char *nm = NULL; uint32_t len = 0;
+    TrashfsResult pr = resolve_parent(vol, name, &parent, &nm, &len);
+    if (pr != TRASHFS_OK) return pr;
 
     uint32_t ino = 0; uint8_t type = 0;
-    bool found = dir_find(vol, nm, len, &ino, &type);
+    bool found = dir_find_in(vol, parent, nm, len, &ino, &type);
 
     if (!found) {
         if (!(flags & TRASHFS_O_CREAT)) return TRASHFS_ERR_NOT_FOUND;
 
-        /* Create: allocate an inode + a directory entry. */
+        /* Create: allocate an inode + a directory entry in the parent. */
         uint32_t newino = alloc_inode_v(vol);
         if (newino == 0xFFFFFFFFu) return TRASHFS_ERR_NO_SPACE;
 
         bool grew = false;
-        uint8_t *slot = root_alloc_dirent(vol, &grew);
+        uint8_t *slot = dir_alloc_dirent_in(vol, parent, &grew);
         if (!slot) {
             /* Roll back the inode reservation. */
             vol->free_inodes++;   /* alloc_inode_v decremented it */
@@ -866,33 +1023,80 @@ TrashfsResult trashfs_open(TrashfsVolume *vol, const char *name,
 TrashfsResult trashfs_unlink(TrashfsVolume *vol, const char *name) {
     if (!vol || !vol->mounted || !name) return TRASHFS_ERR_INVALID_ARG;
 
-    uint32_t len = 0;
-    const char *nm = normalize_name(name, &len);
-    if (len == 0 || len > TRASHFS_NAME_MAX) return TRASHFS_ERR_INVALID_ARG;
+    uint32_t parent = 0; const char *nm = NULL; uint32_t len = 0;
+    TrashfsResult pr = resolve_parent(vol, name, &parent, &nm, &len);
+    if (pr != TRASHFS_OK) return pr;
 
-    /* Locate the directory entry (and clear it). We scan directly so
-     * we can both find the inode and zero the slot in one pass. */
-    uint8_t *root = inode_ptr(vol, TRASHFS_ROOT_INODE);
-    uint32_t dsize = rd32(root + 4u);
+    /* Peek the entry's type first: unlink is for files only. */
+    uint32_t ino; uint8_t type;
+    if (!dir_find_in(vol, parent, nm, len, &ino, &type))
+        return TRASHFS_ERR_NOT_FOUND;
+    if (type == TRASHFS_TYPE_DIR) return TRASHFS_ERR_NOT_DIR;  /* use rmdir */
 
-    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
-         off += TRASHFS_DIRENT_SIZE) {
-        uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
-        uint32_t blk = map_lbn(vol, root, lbn);
-        if (blk == TRASHFS_BLOCK_NONE) continue;
-        uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
-        uint32_t einode = rd32(e + 0);
-        if (einode == 0u) continue;
-        uint8_t elen = e[5];
-        if (elen == len && memcmp(e + 6, nm, len) == 0) {
-            /* Free the file's blocks + inode, clear the dir slot. */
-            uint8_t *in = inode_ptr(vol, einode);
-            free_all_blocks(vol, in);
-            memset(in, 0, TRASHFS_INODE_SIZE);   /* mode=0 -> inode free */
-            vol->free_inodes++;
-            memset(e, 0, TRASHFS_DIRENT_SIZE);   /* inode=0 -> slot free */
-            return TRASHFS_OK;
-        }
-    }
-    return TRASHFS_ERR_NOT_FOUND;
+    /* Clear the entry, then free the file's blocks + inode. */
+    (void)dir_clear_entry_in(vol, parent, nm, len, NULL, NULL);
+    uint8_t *in = inode_ptr(vol, ino);
+    free_all_blocks(vol, in);
+    memset(in, 0, TRASHFS_INODE_SIZE);   /* mode=0 -> inode free */
+    vol->free_inodes++;
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_mkdir(TrashfsVolume *vol, const char *path, uint32_t now) {
+    if (!vol || !vol->mounted || !path) return TRASHFS_ERR_INVALID_ARG;
+
+    uint32_t parent = 0; const char *nm = NULL; uint32_t len = 0;
+    TrashfsResult pr = resolve_parent(vol, path, &parent, &nm, &len);
+    if (pr != TRASHFS_OK) return pr;
+
+    if (dir_find_in(vol, parent, nm, len, NULL, NULL))
+        return TRASHFS_ERR_EXISTS;
+
+    uint32_t newino = alloc_inode_v(vol);
+    if (newino == 0xFFFFFFFFu) return TRASHFS_ERR_NO_SPACE;
+
+    bool grew = false;
+    uint8_t *slot = dir_alloc_dirent_in(vol, parent, &grew);
+    if (!slot) { vol->free_inodes++; return TRASHFS_ERR_NO_SPACE; }
+
+    /* New empty directory: MODE_USED|MODE_DIR, size 0 (no data block
+     * until an entry is added — readdir of a size-0 dir yields nothing). */
+    uint8_t *in = inode_ptr(vol, newino);
+    memset(in, 0, TRASHFS_INODE_SIZE);
+    wr16(in + 0, (uint16_t)(TRASHFS_MODE_USED | TRASHFS_MODE_DIR));
+    wr16(in + 2, 1u);              /* links */
+    wr32(in + 8u, now);            /* created  */
+    wr32(in + 12u, now);           /* modified */
+
+    wr32(slot + 0, newino);
+    slot[4] = TRASHFS_TYPE_DIR;
+    slot[5] = (uint8_t)len;
+    memcpy(slot + 6, nm, len);
+    memset(slot + 6 + len, 0, TRASHFS_DIRENT_SIZE - 6u - len);
+    return TRASHFS_OK;
+}
+
+TrashfsResult trashfs_rmdir(TrashfsVolume *vol, const char *path) {
+    if (!vol || !vol->mounted || !path) return TRASHFS_ERR_INVALID_ARG;
+
+    /* Resolve the target itself — must be a directory, and not root. */
+    uint32_t ino = 0; uint8_t type = 0;
+    TrashfsResult r = resolve_full(vol, path, &ino, &type);
+    if (r != TRASHFS_OK) return r;
+    if (type != TRASHFS_TYPE_DIR) return TRASHFS_ERR_NOT_DIR;
+    if (ino == TRASHFS_ROOT_INODE) return TRASHFS_ERR_INVALID_ARG;
+    if (!dir_is_empty(vol, ino)) return TRASHFS_ERR_NOT_EMPTY;
+
+    /* Resolve the parent + leaf to clear its entry. */
+    uint32_t parent = 0; const char *nm = NULL; uint32_t len = 0;
+    r = resolve_parent(vol, path, &parent, &nm, &len);
+    if (r != TRASHFS_OK) return r;
+
+    if (!dir_clear_entry_in(vol, parent, nm, len, NULL, NULL))
+        return TRASHFS_ERR_NOT_FOUND;
+    uint8_t *in = inode_ptr(vol, ino);
+    free_all_blocks(vol, in);            /* the dir's (empty) data blocks */
+    memset(in, 0, TRASHFS_INODE_SIZE);
+    vol->free_inodes++;
+    return TRASHFS_OK;
 }

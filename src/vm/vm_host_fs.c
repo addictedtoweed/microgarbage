@@ -749,10 +749,15 @@ static void handle_openat(VmCpu *cpu, void *system) {
             int fd = alloc_fd(SLOT_TRASH_DIR);
             if (fd < 0) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE; return; }
             FdSlot *s = &g_fds[fd - FD_BASE];
-            TrashfsResult tr = trashfs_opendir(vol, &s->u.tdir);
+            /* buf is the resolved mount-relative path; trashfs_opendir is
+             * now path-aware (it used to ignore it and always open root). */
+            TrashfsResult tr = trashfs_opendir(vol, buf, &s->u.tdir);
             if (tr != TRASHFS_OK) {
                 free_slot(s);
-                cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
+                int e = (tr == TRASHFS_ERR_NOT_FOUND) ? -VM_ENOENT
+                      : (tr == TRASHFS_ERR_NOT_DIR)   ? -VM_ENOTDIR
+                      : -VM_EIO;
+                cpu->regs[VM_REG_A0] = (uint32_t)e;
                 return;
             }
             cpu->regs[VM_REG_A0] = (uint32_t)fd;
