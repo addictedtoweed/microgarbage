@@ -62,7 +62,7 @@ run fifo_queue       containers  src/containers/fifo_queue.c src/containers/ring
 run stack            containers  src/containers/stack.c
 run slist            containers  src/containers/slist.c
 run dlist            containers  src/containers/dlist.c
-run tree             containers  src/containers/tree.c
+run tree             containers  src/containers/tree.c src/containers/avl_core.c
 run spsc_ring        containers  src/containers/spsc_ring.c
 run spsc_ring_stress containers  src/containers/spsc_ring.c -lpthread
 
