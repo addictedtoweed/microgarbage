@@ -285,6 +285,63 @@ static uint16_t composite(const OrderEntry *ord, unsigned norder,
     return backdrop;
 }
 
+/* ---- Mode 7 (affine BG) ------------------------------------ */
+
+/* Renders the single affine Mode 7 background (256-color), with
+ * per-scanline matrix/scroll HDMA (the perspective effect) and sprites
+ * composited on top. Texel transform is affine-about-center:
+ *   d  = (screen + scroll) - center
+ *   tex = ((M * d) >> 8) + center      (M = [a b; c d], 8.8 fixed)
+ * Out-of-range texels wrap the 1024x1024 (128-tile) space. Sprites are
+ * drawn over the BG where opaque (sprite-vs-BG priority not modeled in
+ * Mode 7). */
+static void render_mode7(const PpuState *p, uint32_t *fb) {
+    bool     obj_op[PPU_SCREEN_W];
+    uint16_t obj_col[PPU_SCREEN_W];
+    unsigned obj_prio[PPU_SCREEN_W];
+
+    for (unsigned y = 0; y < PPU_SCREEN_H; y++) {
+        int a = p->m7a, b = p->m7b, c = p->m7c, d = p->m7d;
+        int cx = p->m7x, cy = p->m7y, hofs = p->m7hofs, vofs = p->m7vofs;
+        unsigned eff_bright = p->brightness;
+
+        for (unsigned ch = 0; ch < p->hdma_count && ch < PPU_HDMA_MAX; ch++) {
+            const PpuHdmaChannel *h = &p->hdma[ch];
+            if (!h->value) continue;
+            int v = (int16_t)h->value[y];
+            switch (h->target) {
+            case PPU_REG_M7A: a = v; break;
+            case PPU_REG_M7B: b = v; break;
+            case PPU_REG_M7C: c = v; break;
+            case PPU_REG_M7D: d = v; break;
+            case PPU_REG_M7X: cx = v; break;
+            case PPU_REG_M7Y: cy = v; break;
+            case PPU_REG_M7HOFS: hofs = v; break;
+            case PPU_REG_M7VOFS: vofs = v; break;
+            case PPU_REG_BRIGHTNESS: eff_bright = h->value[y] & 15u; break;
+            default: break;
+            }
+        }
+
+        render_obj_line(p, y, obj_op, obj_col, obj_prio);
+        uint32_t *row = fb + (size_t)y * PPU_SCREEN_W;
+        for (unsigned x = 0; x < PPU_SCREEN_W; x++) {
+            int dx = (int)x + hofs - cx;
+            int dy = (int)y + vofs - cy;
+            int tx = ((a * dx + b * dy) >> 8) + cx;
+            int ty = ((c * dx + d * dy) >> 8) + cy;
+            unsigned wx = (unsigned)tx & 1023u;   /* wrap the 1024x1024 texture */
+            unsigned wy = (unsigned)ty & 1023u;
+            unsigned tile = p->vram[((wy >> 3) * 128u + (wx >> 3)) & 0x7FFFu] & 0xFFu;
+            unsigned val  = (p->vram[(tile * 64u + (wy & 7u) * 8u + (wx & 7u)) & 0x7FFFu] >> 8) & 0xFFu;
+
+            uint16_t out = (val != 0u) ? p->cgram[val] : p->cgram[0];
+            if (p->obj_on_main && obj_op[x]) out = obj_col[x];  /* sprites over Mode 7 */
+            row[x] = color_to_fb(out, eff_bright);
+        }
+    }
+}
+
 /* ---- frame ------------------------------------------------- */
 
 void ppu_render(const PpuState *p, uint32_t *fb) {
@@ -295,6 +352,8 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
             fb[i] = PRESENT_RGBA(0, 0, 0);
         return;
     }
+
+    if (p->mode == 7u) { render_mode7(p, fb); return; }
 
     LayerInfo li[4];
     OrderEntry ord[16];

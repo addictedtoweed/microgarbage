@@ -108,6 +108,27 @@ static void setup_obj(unsigned size_sel) {
     P.cgram[128 + 6] = GREEN555;   /* OBJ pal0 index 6 */
 }
 
+/* Mode 7 VRAM is interleaved: tilemap = low byte of word (ty*128+tx),
+ * char data = high byte of word (tile*64 + py*8 + px). */
+static void m7_set_map(uint16_t *vram, unsigned tx, unsigned ty, uint8_t tile) {
+    unsigned i = (ty * 128u + tx) & 0x7FFFu;
+    vram[i] = (uint16_t)((vram[i] & 0xFF00u) | tile);
+}
+static void m7_set_tile_solid(uint16_t *vram, unsigned tile, uint8_t val) {
+    for (unsigned i = 0; i < 64u; i++) {
+        unsigned w = (tile * 64u + i) & 0x7FFFu;
+        vram[w] = (uint16_t)((vram[w] & 0x00FFu) | ((unsigned)val << 8));
+    }
+}
+static void setup_mode7(void) {
+    ppu_state_clear(&P);
+    P.mode = 7;
+    P.m7a = 256; P.m7d = 256; P.m7b = 0; P.m7c = 0;   /* identity (8.8) */
+    P.m7x = 0; P.m7y = 0; P.m7hofs = 0; P.m7vofs = 0;
+    P.cgram[0] = 0;
+    P.cgram[50] = RED555;     /* 256-color: cgram[texel] */
+}
+
 /* ---- tests ------------------------------------------------- */
 
 static void test_bgr555_conversion(void) {
@@ -479,6 +500,51 @@ static void test_colormath_layer_gated(void) {
     ASSERT_EQ_INT((long long)ppu_bgr555_to_rgba(RED555), (long long)px(0, 0)); /* plain red */
 }
 
+static void test_mode7_identity(void) {
+    setup_mode7();
+    m7_set_tile_solid(P.vram, 1, 50);    /* tile 1 = solid texel 50 (red) */
+    m7_set_map(P.vram, 0, 0, 1);         /* tilemap (0,0) -> tile 1; (1,0) stays tile 0 */
+    ppu_render(&P, FB);
+
+    uint32_t red = ppu_bgr555_to_rgba(RED555);
+    uint32_t blk = ppu_bgr555_to_rgba(0);
+    ASSERT_EQ_INT((long long)red, (long long)px(0, 0));   /* tex (0,0) -> tile1 */
+    ASSERT_EQ_INT((long long)red, (long long)px(7, 0));   /* still tile1 */
+    ASSERT_EQ_INT((long long)blk, (long long)px(8, 0));   /* tex (8,0) -> tile0 (transparent) */
+}
+
+static void test_mode7_scale2x(void) {
+    setup_mode7();
+    P.m7a = 128; P.m7d = 128;            /* 0.5 in 8.8 -> 2x magnification */
+    m7_set_tile_solid(P.vram, 1, 50);
+    m7_set_map(P.vram, 0, 0, 1);
+    ppu_render(&P, FB);
+
+    uint32_t red = ppu_bgr555_to_rgba(RED555);
+    uint32_t blk = ppu_bgr555_to_rgba(0);
+    ASSERT_EQ_INT((long long)red, (long long)px(0, 0));
+    ASSERT_EQ_INT((long long)red, (long long)px(15, 0));  /* tex x = 15/2 = 7 -> still tile1 */
+    ASSERT_EQ_INT((long long)blk, (long long)px(16, 0));  /* tex x = 8 -> tile0 */
+}
+
+static void test_mode7_hdma_matrix(void) {
+    setup_mode7();                       /* base identity (a=256) */
+    m7_set_tile_solid(P.vram, 1, 50);
+    for (unsigned ty = 0; ty < 128u; ty++)  /* red strip at tile column 0, all rows */
+        m7_set_map(P.vram, 0, ty, 1);
+    static uint16_t aval[PPU_SCREEN_H];
+    for (unsigned y = 0; y < PPU_SCREEN_H; y++) aval[y] = (y < 112u) ? 256u : 128u;
+    P.hdma[0].target = PPU_REG_M7A;
+    P.hdma[0].value  = aval;
+    P.hdma_count = 1;
+    ppu_render(&P, FB);
+
+    uint32_t red = ppu_bgr555_to_rgba(RED555);
+    uint32_t blk = ppu_bgr555_to_rgba(0);
+    ASSERT_EQ_INT((long long)blk, (long long)px(15, 0));   /* top: a=256, tex15 -> tile0 */
+    ASSERT_EQ_INT((long long)red, (long long)px(15, 150)); /* bottom: a=128, tex7 -> tile1 */
+}
+
 int main(void) {
     TEST_SUITE("ppu");
     RUN(test_bgr555_conversion);
@@ -503,5 +569,8 @@ int main(void) {
     RUN(test_colormath_add_half);
     RUN(test_colormath_fixed_subtract);
     RUN(test_colormath_layer_gated);
+    RUN(test_mode7_identity);
+    RUN(test_mode7_scale2x);
+    RUN(test_mode7_hdma_matrix);
     return TEST_SUITE_RESULT();
 }

@@ -56,6 +56,9 @@ typedef enum {
     PPU_REG_BG3_HOFS, PPU_REG_BG3_VOFS,
     PPU_REG_BG4_HOFS, PPU_REG_BG4_VOFS,
     PPU_REG_BRIGHTNESS,
+    PPU_REG_M7A, PPU_REG_M7B, PPU_REG_M7C, PPU_REG_M7D,  /* Mode 7 matrix */
+    PPU_REG_M7X, PPU_REG_M7Y,                            /* rotation center */
+    PPU_REG_M7HOFS, PPU_REG_M7VOFS,                      /* Mode 7 scroll */
 } PpuRegId;
 
 #define PPU_HDMA_MAX 8
@@ -111,6 +114,15 @@ typedef struct {
     bool     cm_half;           /* halve the result                */
     bool     cm_use_subscreen;  /* 2nd operand: subscreen vs fixed */
     uint16_t cm_fixed_color;    /* fixed-color operand (BGR555)    */
+
+    /* Mode 7 (affine BG1, 256-color). Matrix A-D is 8.8 fixed; the
+     * center (X,Y) and scroll (HOFS,VOFS) are 13-bit signed (host
+     * sign-extends into int16). VRAM is interleaved: tilemap = low
+     * bytes of words 0..0x3FFF (128x128 1-byte entries), char data =
+     * high bytes (256 tiles x 8x8 x 8bpp). Out-of-range texels wrap. */
+    int16_t  m7a, m7b, m7c, m7d;
+    int16_t  m7x, m7y;
+    int16_t  m7hofs, m7vofs;
 
     /* Hardware memory, identical to the real chip.
      *   oam[0..511]   = low table: 4 bytes/sprite x 128:
