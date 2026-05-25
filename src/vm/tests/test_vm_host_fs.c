@@ -1,33 +1,24 @@
 /* test_vm_host_fs.c — exercise the file syscall handlers
- * against a host-side FatFs volume backed by a trashdrive.
+ * against a host-side trashfs RAM-disk volume.
  *
- * Compiles in two modes:
+ * Runs real tests by:
+ *   1. Formatting + mounting a trashfs volume on the host and
+ *      registering it as a mount via vm_host_fs_mount_trashfs
+ *   2. Setting up a VmSystem with stdio + fs installed
+ *   3. Synthesizing ECALL invocations by directly calling
+ *      vm_ecall_dispatch with controlled CPU state, and
+ *      inspecting the resulting registers
  *
- *   - Without HAVE_FATFS: tiny stub that prints "SKIP" and exits.
- *     Same pattern as test_trashdrive_fatfs.c.
- *
- *   - With -DHAVE_FATFS plus -Ithird_party/fatfs/source and
- *     -Ithird_party/fatfs: runs real tests by:
- *       1. Setting up a TrashDrive + FatFs mount on the host
- *       2. Setting up a VmSystem with stdio + fs installed
- *       3. Synthesizing ECALL invocations by directly calling
- *          vm_ecall_dispatch with controlled CPU state, and
- *          inspecting the resulting registers
- *
- * Build (HAVE_FATFS mode):
- *   cc -Wall -Wextra -Wpedantic -std=c11 -O2 \
- *      -Iinclude -DHAVE_FATFS \
- *      -Ithird_party/fatfs/source -Ithird_party/fatfs \
+ * Build:
+ *   cc -Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude \
  *      -o test_vm_host_fs \
  *      src/vm/tests/test_vm_host_fs.c \
- *      src/vm/vm_host_fs.c \
- *      src/storage/trashdrive_fatfs.c src/storage/trashdrive.c \
+ *      src/vm/vm_host_fs.c src/storage/trashfs.c \
  *      src/vm/vm_host_stdio.c src/vm/vm_system.c src/vm/vm_sched.c \
  *      src/vm/vm_ecall.c src/vm/vm_ecall_handlers.c \
  *      src/vm/vm_mailbox.c src/vm/vm_loader.c src/vm/vm_core.c \
  *      src/memory/slab_stack.c src/memory/bump.c \
- *      src/containers/fifo_queue.c src/containers/ring_buffer.c \
- *      third_party/fatfs/ff_wrapped.c third_party/fatfs/source/ffsystem.c
+ *      src/containers/fifo_queue.c src/containers/ring_buffer.c
  *
  * Public domain (CC0). No warranty.
  */
@@ -52,8 +43,8 @@
 /* ============================================================
  *  Test fixture
  *
- *  Each test runs against a fresh-formatted 64 KB trashdrive
- *  volume mounted as FatFs drive 0. The VmSystem has just enough
+ *  Each test runs against a fresh-formatted trashfs volume
+ *  mounted as /td0. The VmSystem has just enough
  *  setup to exercise the syscall router; we don't actually run
  *  guest code — we drive the handlers via vm_ecall_dispatch
  *  directly.
@@ -333,7 +324,7 @@ static void test_open_fd_limit(void) {
 }
 
 /* After the M.3 refactor, the only valid absolute path shape is
- * /<name>/.... Bare paths like "/foo" and FatFs's native
+ * /<name>/.... Bare paths like "/foo" and a drive-letter
  * "0:/foo" form must be rejected. This test pins that down. */
 static void test_path_translation_rejects_bare_paths(void) {
     ASSERT(fixture_init());
@@ -344,7 +335,7 @@ static void test_path_translation_rejects_bare_paths(void) {
                                  VM_O_WRONLY | VM_O_CREAT, 0);
     ASSERT_EQ_INT(-(int)VM_ENOENT, (int)r1);
 
-    /* FatFs-native volume prefix — also rejected now */
+    /* Drive-letter volume prefix — also rejected */
     uint32_t p2 = put_string("0:/explicit", 64);
     int32_t r2 = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, p2,
                                  VM_O_WRONLY | VM_O_CREAT, 0);
@@ -415,7 +406,7 @@ static uint8_t *slurp(const char *path, size_t *out_size) {
     return buf;
 }
 
-/* SYS_SPAWN_AND_WAIT: write guest_minimal.elf into the FatFs
+/* SYS_SPAWN_AND_WAIT: write guest_minimal.elf into the trashfs
  * volume, spawn it via the syscall, verify return value is 0
  * (the minimal program is sys_exit(0)).
  *

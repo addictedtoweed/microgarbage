@@ -1,10 +1,11 @@
 # trashfs — on-disk format specification (draft)
 
 A small, purpose-built filesystem for the **internal RAM disk** (and
-FMC/PSRAM-mapped RAM disks). It is *not* a replacement for FatFs —
-FatFs stays for removable, PC-readable media (SD/USB). trashfs is for
-always-resident, never-removed storage where FAT's 512-byte sectors,
-8.3 names, and LFN code size are pure overhead.
+FMC/PSRAM-mapped RAM disks). It is deliberately *not* FAT-compatible,
+so it is not for removable, PC-readable media (SD/USB) — bring your
+own FAT driver if you need that. trashfs is for always-resident,
+never-removed storage where FAT's 512-byte sectors, 8.3 names, and
+LFN code size are pure overhead.
 
 Status: **format LOCKED, not yet implemented.** All design decisions
 are settled (see "Resolved design decisions" below). This document is
@@ -200,8 +201,8 @@ guarantees ≥16 files — the agreed balanced default.
 
 ## Operations the format must serve (the backend API)
 
-trashfs implements a function set mirroring how FatFs's `f_*` are
-called from `vm_host_fs.c`, so it slots in as a third backend:
+trashfs implements the function set `vm_host_fs.c` calls into for a
+read/write backend:
 
 ```
 trashfs_mount(vol, region, region_bytes)      validate superblock, rebuild caches

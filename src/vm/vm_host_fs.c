@@ -34,8 +34,8 @@
 /* ============================================================
  *  FS serialization (preemptive backend)
  *
- *  This module keeps process-global state: the fd table (g_fds),
- *  the mount table, and FatFs's own internals. Under the cooperative
+ *  This module keeps process-global state: the fd table (g_fds)
+ *  and the mount table. Under the cooperative
  *  scheduler one host thread touches all of it, so no locking is
  *  needed. Under the preemptive scheduler, peer VM tasks run in
  *  separate threads and can issue file syscalls concurrently — so we
@@ -798,7 +798,8 @@ static void handle_mkdirat(VmCpu *cpu, void *system) {
  *
  *   a0 = dirfd (must be VM_AT_FDCWD)
  *   a1 = path
- *   a2 = flags (0 or VM_AT_REMOVEDIR; FatFs's f_unlink handles both)
+ *   a2 = flags (0 = file via trashfs_unlink; VM_AT_REMOVEDIR = dir
+ *        via trashfs_rmdir)
  *   → a0 = 0 on success, -errno on failure
  */
 static void handle_unlinkat(VmCpu *cpu, void *system) {
@@ -1107,13 +1108,13 @@ uint32_t vm_host_fs_get_spawn_data_size(void) {
 }
 
 /* Load an entire file into a freshly-malloc'd buffer. Works for
- * both FatFs and host-filesystem paths. Returns:
+ * both trashfs and host-filesystem paths. Returns:
  *   - On success: a malloc'd buffer; *out_size set; caller frees.
  *   - On failure: NULL; out_errno set to a positive errno.
  *
  * The path string passed in is the already-resolved host-side
- * path (e.g., "0:/foo.elf" for FatFs or "C:/host_files/foo.elf"
- * for the host mount).
+ * path (a trashfs mount-relative path, or e.g.
+ * "C:/host_files/foo.elf" for the host mount).
  */
 static uint8_t *slurp_file(const char *path, PathBackend backend,
                            const Mount *mnt,

@@ -18,15 +18,13 @@
 # suites are POSIX-only (pipe/fsync, /tmp) and are SKIPPED with a
 # reason under a native-Windows toolchain, while the native build adds
 # the Windows-only shim sources (vm_host_stdio_win32.c, waveout).
-# FatFs and real-ELF suites skip themselves when prerequisites are absent.
+# Real-ELF suites skip themselves when prerequisite guest ELFs are absent.
 
 set -u
 CC="${CC:-cc}"
 CFLAGS="-Wall -Wextra -Wpedantic -std=c11 -O2 -Iinclude"
 OUT="build/tests"
 FILTER="${1:-}"
-FATFS_DIR="third_party/fatfs"
-FATFS_SRC="$FATFS_DIR/source"
 mkdir -p "$OUT"
 
 MACHINE=$($CC -dumpmachine 2>/dev/null || echo unknown)
@@ -87,13 +85,6 @@ run trashfs          storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_p2       storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_p3       storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_dirs     storage  src/storage/trashfs.c src/storage/trashdrive.c
-if [ -f "$FATFS_SRC/ff.c" ]; then
-    run trashdrive_fatfs storage -DHAVE_FATFS -I"$FATFS_DIR" -I"$FATFS_SRC" \
-        src/storage/trashdrive_fatfs.c src/storage/trashdrive.c \
-        "$FATFS_DIR/ff_wrapped.c" "$FATFS_SRC/ffsystem.c"
-else
-    skip trashdrive_fatfs "FatFs not present at $FATFS_SRC/ff.c"
-fi
 
 # ---- audio ----
 RB=src/containers/ring_buffer.c
@@ -150,14 +141,8 @@ else
     skip vm_host_stdio "needs examples/02_counter + 04_keydump guest.elf (run their build.sh)"
 fi
 
-# vm_host_fs pulls in FatFs (ff.h) + the trashfs/trashdrive backends.
-if [ -f "$FATFS_SRC/ff.c" ]; then
-    run vm_host_fs   vm  -DHAVE_FATFS -I"$FATFS_DIR" -I"$FATFS_SRC" $VM_CORE \
-        src/vm/vm_host_fs.c src/storage/trashfs.c src/storage/trashdrive.c \
-        src/storage/trashdrive_fatfs.c "$FATFS_DIR/ff_wrapped.c" "$FATFS_SRC/ffsystem.c"
-else
-    skip vm_host_fs "needs FatFs at $FATFS_SRC/ff.c"
-fi
+# vm_host_fs: trashfs RAM disk + host-passthrough backends (no FatFs).
+run vm_host_fs   vm  $VM_CORE src/vm/vm_host_fs.c src/storage/trashfs.c
 
 # vm_real_elf needs prebuilt guest ELFs from examples/01_hello/build/.
 if [ -f examples/01_hello/build/guest_minimal.elf ]; then

@@ -153,7 +153,7 @@ static inline audio_object audio_load_wav(const char *path) {
  *  it plays, so a multi-MB song works despite the ~1 MB pool. Stereo is
  *  preserved; mono is promoted to L==R (no downmix). The voice loops
  *  until stopped. `path` is a mount path: "/host/song.wav" (host files)
- *  or "/td0/song.wav" (the trashdrive FatFs volume).
+ *  or "/td0/song.wav" (the trashfs RAM volume).
  *
  *  Returns a voice handle, or AUDIO_VOICE_NONE on error (missing file,
  *  not PCM, no free music stream slot, unstreamable path).

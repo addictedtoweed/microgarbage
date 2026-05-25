@@ -1,9 +1,10 @@
 /* ============================================================
  *  trashfs.h — a small filesystem for internal RAM disks.
  *
- *  Purpose-built for always-resident RAM/PSRAM-backed storage,
- *  distinct from FatFs (which serves removable, PC-readable SD/USB
- *  media). See docs/trashfs-format.md for the full on-disk format.
+ *  Purpose-built for always-resident RAM/PSRAM-backed storage —
+ *  a native, public-domain filesystem, not a FAT-compatible one
+ *  (it is not meant for removable, PC-readable SD/USB media). See
+ *  docs/trashfs-format.md for the full on-disk format.
  *
  *  Key parameters (LOCKED — see the spec):
  *    - 128-byte blocks, uint32 block indices.

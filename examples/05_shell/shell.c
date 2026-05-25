@@ -1,18 +1,18 @@
 /* shell.c — interactive file-system shell for the VM.
  *
- * Connects to host stdin/stdout via SYS_READ/SYS_WRITE and to a
- * host-mounted FatFs volume via the file syscalls in vm_host_fs.
+ * Connects to host stdin/stdout via SYS_READ/SYS_WRITE and to the
+ * host-mounted volumes via the file syscalls in vm_host_fs.
  * Provides ls, cd, pwd, mkdir, rmdir, rm, cat, touch, write, help,
  * exit.
  *
  * Why this exists: demonstrates the file-syscall surface end to
  * end. A guest running this image can browse, create, edit, and
- * delete files in a RAM-backed FAT volume controlled by the host.
+ * delete files in a RAM-backed trashfs volume controlled by the host.
  *
  * Design choices:
  *
- * - The VM has no per-process current directory (FatFs is built
- *   with FF_FS_RPATH=0). We track CWD entirely in the guest:
+ * - The VM has no per-process current directory. We track CWD
+ *   entirely in the guest:
  *   a static string starts at "/" and gets updated by `cd`.
  *   Relative paths from the user get prefixed with cwd before
  *   we hand them to openat/mkdirat/etc.
@@ -1497,8 +1497,8 @@ static void cmd_rmdir(int argc, char **argv) {
         return;
     }
     if (reject_if_builtin("rmdir", path, BLTN_WRITE)) return;
-    /* FatFs's f_unlink handles directories (must be empty); we
-     * pass AT_REMOVEDIR for clarity though FatFs ignores it. */
+    /* AT_REMOVEDIR tells the host to remove a directory (which must
+     * be empty); the backend rejects a non-empty dir with ENOTEMPTY. */
     int r = sys_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
     if (r < 0) perror_("rmdir", r);
 }
@@ -1630,9 +1630,8 @@ static void cmd_cp(int argc, char **argv) {
  * we print a warning so the user knows to clean up.
  *
  * A future commit could add a SYS_RENAME for the same-mount
- * case (which FatFs can do via f_rename and the host fs via
- * rename(2)), but cp+unlink works as a portable fallback
- * for all our cases today. */
+ * case (trashfs and the host fs can both rename in place), but
+ * cp+unlink works as a portable fallback for all our cases today. */
 static void cmd_mv(int argc, char **argv) {
     if (argc < 3) { putln("mv: usage: mv <src> <dst>"); return; }
     char src[PATH_CAP], dst[PATH_CAP];
@@ -1677,7 +1676,7 @@ static void cmd_mv(int argc, char **argv) {
  * on the user's terminal interleaved with our own output.
  *
  * The path can be:
- *   - On the FatFs RAM volume (any path that doesn't start with /host)
+ *   - On the trashfs RAM volume (e.g., /td0/calc.elf)
  *   - On the host filesystem (under /host/, e.g., /host/calc.elf)
  *
  * Prints the child's exit code only if it's non-zero (so the

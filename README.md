@@ -7,9 +7,9 @@ The targets in mind are M0/M3/M4-class microcontrollers, but
 nothing here is architecture-specific — these will work fine on a
 hosted system too.
 
-A small amount of third-party code (FatFs, used by
-`trashdrive_fatfs`) lives under `third_party/` with its own
-license — see `third_party/README.md`.
+Every file in this repository is CC0 — there is no third-party or
+vendored code. File storage is provided by `trashfs`, the native
+public-domain RAM-disk filesystem.
 
 ## Layout
 
@@ -49,9 +49,8 @@ garbage/
 │   │   ├── audio_fft.h           ← FFT band meter (fixed-point, no libm)
 │   │   └── audio_sink.h          ← output-backend seam + WAV parse
 │   ├── storage/
-│   │   ├── trashdrive.h
-│   │   ├── trashdrive_fatfs.h    ← FatFs bridge (needs third_party/fatfs)
-│   │   └── trashfs.h             ← tiny built-in read/write filesystem
+│   │   ├── trashdrive.h          ← RAM-backed block device
+│   │   └── trashfs.h             ← native read/write RAM-disk filesystem
 │   ├── memory/
 │   │   ├── bump.h
 │   │   └── slab_stack.h
@@ -59,7 +58,7 @@ garbage/
 │       ├── vm_core.h
 │       ├── vm_ecall.h
 │       ├── vm_host_stdio.h
-│       ├── vm_host_fs.h        ← optional file syscalls (needs FatFs)
+│       ├── vm_host_fs.h        ← optional file syscalls (trashfs + host passthrough)
 │       ├── vm_host_audio.h     ← guest SYS_AUDIO_* → audio service
 │       ├── vm_loader.h
 │       ├── vm_mailbox.h
@@ -93,9 +92,8 @@ garbage/
     │   ├── audio_sink_waveout.c  ← live Win32 waveOut backend
     │   └── tests/                ← unit-test suites (test_*.c)
     ├── storage/
-    │   ├── trashdrive.c
-    │   ├── trashdrive_fatfs.c    ← FatFs diskio shim
-    │   ├── trashfs.c             ← built-in filesystem
+    │   ├── trashdrive.c          ← RAM-backed block device
+    │   ├── trashfs.c             ← native RAM-disk filesystem
     │   └── tests/                ← unit-test suites (test_*.c)
     ├── memory/
     │   ├── bump.c
@@ -110,7 +108,7 @@ garbage/
         ├── vm_sched.c            ← cooperative scheduler
         ├── vm_system.c           ← top-level composition
         ├── vm_host_stdio.c       ← optional host stdin/stdout bridge
-        ├── vm_host_fs.c          ← optional host file syscalls (FatFs)
+        ├── vm_host_fs.c          ← optional host file syscalls (trashfs + passthrough)
         ├── vm_host_audio.c       ← guest audio syscalls → service
         ├── service_channel.c     ← SPSC request/response channel
         ├── channel_thread.c      ← pthread channel transport (POSIX/Cygwin)
@@ -143,19 +141,6 @@ Design notes for the larger subsystems live under `docs/`:
 transports), `trashfs-format.md` (the built-in filesystem on-disk
 format), and `execution-model.md` (the planned cooperative/preemptive
 RTOS configuration + tiered-memory design — a spec, not yet built).
-
-A `third_party/` directory holds vendored code that uses a
-different license from the rest of the repo:
-
-```
-third_party/
-├── README.md
-└── fatfs/                        ← Elm Chan FatFs (BSD-1-clause)
-    ├── LICENSE.txt
-    ├── ffconf.h                  ← OUR tuned config
-    └── source/                   ← from elm-chan.org (NOT committed —
-                                   ←  see PLACEHOLDER.md for setup)
-```
 
 All public headers live under `include/`. The category aggregators
 sit at `include/`'s top level for one-include access; per-module
@@ -209,7 +194,6 @@ errors:
 | audio_sink    | (none — WAV dump; waveout needs -lwinmm) |
 | audio_service | audio_mixer, audio_pool, audio_arbiter, music_player, service_channel |
 | trashdrive    | (none)                               |
-| trashdrive_fatfs | trashdrive, FatFs (third_party)   |
 | trashfs       | (none)                               |
 | bump          | slab_stack (only if using slab path) |
 | slab_stack    | (none)                               |
@@ -223,7 +207,7 @@ errors:
 | vm_sched      | vm_core, vm_ecall                    |
 | vm_system     | all of the above + slab_stack        |
 | vm_host_stdio | vm_system (optional host bridge)     |
-| vm_host_fs    | vm_system, vm_host_stdio, trashdrive_fatfs |
+| vm_host_fs    | vm_system, vm_host_stdio, trashfs    |
 | vm_host_audio | vm_system, audio_service, service_channel |
 
 So for example, to use `music_player`, copy and build:
@@ -309,7 +293,7 @@ native mingw-w64 `cc`: the runner detects the toolchain and adds the
 Windows-only shim sources (`vm_host_stdio_win32.c`, the waveOut
 backend), and a small `include/test_portable.h` shim papers over the
 temp-file / `fsync` / `pipe` / `mkdir` differences for the host-shim
-suites. FatFs suites and the ELF-driven integration suites
+suites. The ELF-driven integration suites
 (`vm_real_elf`, `vm_host_stdio` — which load guest ELFs from
 `examples/*/build/`) skip themselves when their prerequisites are
 absent; build those examples first for full coverage.
@@ -628,30 +612,25 @@ API: `audio_service_create`, `audio_service_destroy`,
 
 #### trashdrive
 
-A small RAM-backed block device for mounting your own filesystem
-on top of. "BYOFS" — bring your own filesystem. Designed to pair
-with FatFs or Petit FatFs (or anything else that consumes a block
-device interface), giving you a tiny FAT volume in RAM that uses
-the same API as your SD card.
-
-Why this shape: most embedded projects already have a filesystem
-library (typically FatFs) integrated for SD card access. By
-implementing a block device rather than a filesystem, trashdrive
-plugs into that existing library — your code reads RAM-backed files
-through the same `f_open` / `f_read` / `f_write` calls as SD files,
-just with a different drive number.
+A small RAM-backed block device — a fixed-512-byte-sector
+read/write interface over a caller-provided memory region. It
+exists so you can layer a block-oriented filesystem on top of a
+RAM/PSRAM region using the same `disk_*` seam an SD card would
+present. (The in-repo `trashfs` does *not* need it — trashfs
+operates on a region directly — so trashdrive is here for when
+you bring an external block-device-consuming filesystem.)
 
 Properties:
-- Fixed 512-byte sectors (matches FatFs / Petit FatFs conventions).
+- Fixed 512-byte sectors.
 - Caller provides the memory region. Minimum 16 KB, must be a
   multiple of 512 bytes.
 - Region contents NOT touched by `trash_init` — formatting is the
-  filesystem library's job (e.g., `f_mkfs`). Use `trash_clear` if
-  you want to zero the region first.
+  filesystem's job. Use `trash_clear` if you want to zero it first.
 - No allocations: the `TrashDrive` struct is caller-declared, just
   a few pointers and counts. Init fills it in.
 
-Typical wiring with FatFs (excerpt — NOT part of this module):
+Typical wiring (excerpt — the diskio glue is NOT part of this
+module; you write it for whatever filesystem you bring):
 
 ```c
 static TrashDrive g_ram_drive;
@@ -661,97 +640,51 @@ void app_init(void) {
     trash_init(&g_ram_drive, psram_region, sizeof(psram_region));
 }
 
-// In your project's diskio.c:
-DRESULT disk_read(BYTE pdrv, BYTE *buf, LBA_t sec, UINT n) {
-    if (pdrv != DRIVE_RAM) return RES_PARERR;
-    return trash_read(&g_ram_drive, buf, sec, n) == TRASH_OK
-           ? RES_OK : RES_ERROR;
+// In your project's diskio glue:
+int disk_read(uint8_t *buf, uint32_t sec, uint32_t n) {
+    return trash_read(&g_ram_drive, buf, sec, n) == TRASH_OK ? 0 : -1;
 }
-// ... similar wrappers for disk_write, disk_ioctl, etc.
-```
-
-Then application code is normal FatFs:
-
-```c
-FATFS fs;
-f_mount(&fs, "1:", 1);
-f_mkfs("1:", NULL, NULL, 0);   // first time only
-
-FIL f;
-f_open(&f, "1:/scripts/foo.lua", FA_WRITE | FA_CREATE_ALWAYS);
-f_write(&f, code, code_len, &bw);
-f_close(&f);
+// ... similar wrappers for disk_write, etc.
 ```
 
 API: `trash_init`, `trash_clear`, `trash_read`, `trash_write`,
 `trash_sector_count`, `trash_sector_size`, `trash_total_bytes`.
 
-#### trashdrive_fatfs
+#### trashfs
 
-Bridges `trashdrive` to Elm Chan's [FatFs](http://elm-chan.org/fsw/ff/)
-library so you can mount a real FAT filesystem inside a RAM
-region. After registration you use FatFs's standard API
-(`f_open`, `f_read`, `f_write`, `f_mkdir`, `f_unlink`, etc.) —
-the diskio shim in this module routes the underlying sector
-reads and writes to the registered TrashDrive.
+The native, public-domain read/write filesystem — what the shell
+example and `vm_host_fs` use to give guests real files. It is
+distinct from a removable-media FAT volume: trashfs is purpose-built
+for a small in-RAM (or PSRAM/FMC-mapped) disk, operates **directly
+on a memory region** (no block-device layer required), and is
+case-preserving with hierarchical directories.
 
-This is a thin C file (~150 lines) that implements the five
-`disk_*` functions FatFs requires. The actual filesystem logic
-lives in FatFs proper, under `third_party/fatfs/`. **FatFs is
-NOT public domain** like the rest of this library — it's
-BSD-1-clause licensed by Elm Chan. See `third_party/README.md`
-and `third_party/fatfs/LICENSE.txt` for the details.
+Layout: 128-byte blocks, 64-byte inodes, a free-block bitmap, and
+directories stored as inode tables (with `.`/`..`). See
+`docs/trashfs-format.md` for the on-disk format.
 
 ```c
-#include "storage/trashdrive.h"
-#include "storage/trashdrive_fatfs.h"
-#include "ff.h"
+#include "storage/trashfs.h"
 
-static uint8_t  pool[64 * 1024];
-static TrashDrive drive;
-static FATFS fs;
+static uint8_t region[64 * 1024];
+static TrashfsVolume vol;
 
-/* Initialize the block device, then register it as FatFs drive 0. */
-trash_init(&drive, pool, sizeof(pool));
-trash_fatfs_register(0, &drive);
+trashfs_format(region, sizeof(region));
+trashfs_mount(&vol, region, sizeof(region));
 
-/* Format and mount. */
-BYTE work[FF_MAX_SS];
-f_mkfs("0:", NULL, work, sizeof(work));
-f_mount(&fs, "0:", 1);
+trashfs_mkdir(&vol, "/scripts");
 
-/* Use standard FatFs from here. */
-FIL f;
-f_open(&f, "0:/hello.txt", FA_WRITE | FA_CREATE_ALWAYS);
-UINT bw;
-f_write(&f, "hi", 2, &bw);
-f_close(&f);
+TrashfsFile f;
+trashfs_open(&vol, "/scripts/foo.txt", TRASHFS_O_WRONLY | TRASHFS_O_CREAT, &f);
+trashfs_write(&f, "hi", 2);
+trashfs_close(&f);
 ```
 
-API: `trash_fatfs_register`, `trash_fatfs_get`. Everything else
-is FatFs (see `third_party/fatfs/source/ff.h` for the full API
-once you've extracted FatFs).
-
-**Setting it up:**
-
-1. Run `./setup_licenses.sh` from the repo root (writes `LICENSE`
-   and creates `third_party/` scaffold). See the script's
-   comments for what it does.
-2. Download FatFs from <http://elm-chan.org/fsw/ff/> and extract
-   the source files into `third_party/fatfs/source/`. The exact
-   files needed are documented in
-   `third_party/fatfs/PLACEHOLDER.md`.
-3. Build with the extra include paths:
-   `-Ithird_party/fatfs/source -Ithird_party/fatfs -DHAVE_FATFS`
-4. Link `src/storage/trashdrive_fatfs.c`, `src/storage/trashdrive.c`,
-   `third_party/fatfs/source/ff.c`, and
-   `third_party/fatfs/source/ffsystem.c`.
-
-The tests in `src/storage/tests/test_trashdrive_fatfs.c` will compile
-without FatFs (they print "skipped" and exit cleanly) so CI
-keeps green even when FatFs isn't present. With `-DHAVE_FATFS`
-and the FatFs source in place, they run real `f_open`/`f_write`/
-`f_mkdir`/`f_unlink` operations against a 64 KB RAM volume.
+API (selected): `trashfs_format`, `trashfs_mount`, `trashfs_open`,
+`trashfs_read`, `trashfs_write`, `trashfs_lseek`, `trashfs_close`,
+`trashfs_mkdir`, `trashfs_rmdir`, `trashfs_unlink`,
+`trashfs_opendir`/`trashfs_readdir`. Errors mirror POSIX
+(`NOT_FOUND`, `EXISTS`, `NOT_DIR`, `NOT_EMPTY`, `NO_SPACE`).
 
 ### memory
 
@@ -999,8 +932,9 @@ Exposes POSIX-shaped file operations to guest VMs via ECALL:
 
 Syscall numbers match Linux's RISC-V generic ABI for compatibility
 with stock libc wrappers (picolibc, newlib). The host backs them
-with FatFs (via `trashdrive_fatfs`), giving the guest a real
-read-write filesystem inside a RAM region.
+with `trashfs` (a real read-write filesystem inside a RAM region)
+and/or a read-only passthrough to a host directory, selected per
+mount point.
 
 The fd table holds up to `VM_HOST_FS_MAX_FILES` (default 16) open
 files. fd 0/1/2 stay reserved for stdio (managed by
@@ -1008,19 +942,19 @@ files. fd 0/1/2 stay reserved for stdio (managed by
 via a small setter hook so `read`/`write`/`close` work uniformly
 across stdio and file fds.
 
-Guests can use POSIX-ish paths starting with `/` — they get
-rewritten to `0:/...` for FatFs's volume convention. Guests that
-need to access multiple volumes can use the FatFs-native form
-`<digit>:/...` directly.
+Guests use POSIX-ish absolute paths. The first path component
+selects a mount point (`/td0/...` → a trashfs volume, `/host/...`
+→ the host-directory passthrough); a mount table maps each name to
+its backend. The shell example mounts a trashfs RAM disk as `/td0`
+and the host's `host_files/` directory as a read-only `/host`.
 
 The VM has no concept of current working directory. The *at-style
 syscalls require `dirfd = AT_FDCWD (-100)` and interpret paths as
-absolute. Adding chdir/getcwd support is straightforward (flip
-`FF_FS_RPATH` to 2 in ffconf.h) but not done by default.
+absolute.
 
-Build dependency: requires FatFs (see `third_party/fatfs/`). The
-tests (`test_vm_host_fs.c`) compile in two modes — with or without
-`-DHAVE_FATFS` — for the same reason as `test_trashdrive_fatfs.c`.
+No external dependency: `vm_host_fs` links only `trashfs.c` (plus
+the host platform). The tests (`test_vm_host_fs.c`) drive the full
+syscall layer against a trashfs RAM disk.
 
 ## Roadmap
 

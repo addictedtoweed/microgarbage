@@ -40,8 +40,6 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 EXAMPLE_DIR="$REPO_ROOT/examples/05_shell"
 BUILD_DIR="$EXAMPLE_DIR/build"
 HOST_FILES="$EXAMPLE_DIR/host_files"
-FATFS_DIR="$REPO_ROOT/third_party/fatfs"
-FATFS_SRC="$FATFS_DIR/source"
 
 step() { echo "build-win: $*"; }
 die()  { echo "build-win: ERROR - $*" >&2; exit 1; }
@@ -120,10 +118,6 @@ case "$MACHINE" in
         step "         a native build wants mingw-w64; continuing anyway." ;;
 esac
 
-# FatFs presence.
-[ -f "$FATFS_SRC/ff.c" ] || die "FatFs not found at $FATFS_SRC/ff.c
-      See third_party/fatfs/PLACEHOLDER.md."
-
 mkdir -p "$BUILD_DIR"
 
 # Host source set — read from the shared manifest (host_sources.txt) so
@@ -135,10 +129,6 @@ while IFS= read -r _line || [ -n "$_line" ]; do
     [ -n "$_line" ] || continue
     HOST_SRCS+=("$REPO_ROOT/$_line")
 done < "$EXAMPLE_DIR/host_sources.txt"
-FATFS_SRCS=(
-    "$FATFS_DIR/ff_wrapped.c"
-    "$FATFS_SRC/ffsystem.c"
-)
 
 # ------------------------------------------------------------------
 # Bake the guest shell into host.exe (XIP-executed at runtime). The
@@ -203,21 +193,21 @@ if [ "${GARBAGE_PREEMPTIVE:-0}" = "1" ]; then
     PREEMPT_LIBS=(-lpthread)
 fi
 
-step "compiling native host.exe (with FatFs)..."
+step "compiling native host.exe..."
 # -D__USE_MINGW_ANSI_STDIO=1: msvcrt's printf doesn't understand C99
 # %z/%ll length modifiers, so mingw warns on every %zu (size_t). This
 # selects mingw's own C99-compliant stdio so those format specifiers
 # compile clean. (Cygwin/Linux libc handle %z natively; only the
 # native msvcrt-linked build needs this.)
-"$CC" -Wall -Wextra -Wpedantic -std=c11 "${HOST_OPT[@]}" -DHAVE_FATFS \
+"$CC" -Wall -Wextra -Wpedantic -std=c11 "${HOST_OPT[@]}" \
     -D__USE_MINGW_ANSI_STDIO=1 "${WERROR_FLAG[@]}" "${HOST_STRIP[@]}" \
     "${PREEMPT_CFLAGS[@]}" \
-    -I"$REPO_ROOT/include" -I"$FATFS_DIR" -I"$FATFS_SRC" \
+    -I"$REPO_ROOT/include" \
     -I"$EXAMPLE_DIR" \
     -o "$BUILD_DIR/host.exe" \
     "$EXAMPLE_DIR/host.c" \
     "$SHELL_DATA_C" \
-    "${HOST_SRCS[@]}" "${FATFS_SRCS[@]}" "${PREEMPT_SRCS[@]}" \
+    "${HOST_SRCS[@]}" "${PREEMPT_SRCS[@]}" \
     -static -lws2_32 -lwinmm "${PREEMPT_LIBS[@]}"
 # -static: bundle the mingw runtime so the .exe is a single self-
 #   contained file for testers (no libgcc_s/libwinpthread DLL hunt).

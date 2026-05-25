@@ -49,8 +49,8 @@ blocking IPC, slab, spawn, FS) are all addressed.
 
 ## FS concurrency under preemption (audit FS item)
 
-`vm_host_fs.c` keeps process-global state (the fd table, the mount table,
-FatFs internals), so peer VM tasks doing file syscalls concurrently would
+`vm_host_fs.c` keeps process-global state (the fd table, the mount table),
+so peer VM tasks doing file syscalls concurrently would
 race. A single coarse FS mutex (gated on `GARBAGE_SCHED_MODE`; a no-op inline
 that pulls in no pthread dependency under cooperative) now serializes every FS
 entry point via thin `lk_` trampolines: the six direct handlers (`openat`,

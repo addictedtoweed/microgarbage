@@ -1,10 +1,9 @@
 #!/bin/bash
 # 05_shell/build.sh — build the host and guest for the shell example.
 #
-# Unlike the other examples, this one needs FatFs to be extracted
-# into third_party/fatfs/source/. If FatFs is missing, the host
-# can't link (it pulls in f_open/f_read/etc.) and the script will
-# fail with a clear message.
+# The shell's filesystem is trashfs (the native, public-domain RAM
+# disk) plus a read-only host-directory passthrough — no third-party
+# filesystem library required.
 
 set -e
 
@@ -36,21 +35,6 @@ if [ "${RELEASE:-0}" = "1" ]; then
     GUEST_OPT=(-Os)
 fi
 
-# Check that FatFs is present.
-FATFS_DIR="$REPO_ROOT/third_party/fatfs"
-FATFS_SOURCE="$FATFS_DIR/source"
-FATFS_FF_C="$FATFS_SOURCE/ff.c"
-
-if [ ! -f "$FATFS_FF_C" ]; then
-    echo "05_shell: ERROR — FatFs source not found at $FATFS_FF_C"
-    echo ""
-    echo "  This example needs FatFs to be downloaded and extracted."
-    echo "  See third_party/fatfs/PLACEHOLDER.md for instructions."
-    echo ""
-    echo "  Other examples (01_hello, 02_counter, 03_mailbox,"
-    echo "  04_keydump) don't need FatFs and will build fine without it."
-    exit 1
-fi
 
 mkdir -p "$BUILD_DIR"
 
@@ -108,36 +92,30 @@ fi
 # Build the host. We need:
 #   - The VM library (VM_CORE_SRCS already includes vm_host_stdio,
 #     vm_host_fs is added below)
-#   - trashdrive.c and trashdrive_fatfs.c
-#   - FatFs's ff.c and ffsystem.c
+#   - trashfs.c (the native RAM-disk filesystem — replaces FatFs)
 #   - The generated embedded-shell array (shell_elf_data.c)
 #   - On native Windows: -lws2_32 for the TCP transport's WinSock
 #     calls. Linux/Cygwin pull BSD sockets from libc; no extra
 #     library needed.
-echo "05_shell: compiling host (with FatFs)..."
+echo "05_shell: compiling host..."
 HOST_LIBS=()
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) HOST_LIBS+=(-lws2_32) ;;
     CYGWIN*)      HOST_LIBS+=(-lpthread -lwinmm) ;;  # worker + waveOut (live audio)
     *)            HOST_LIBS+=(-lpthread) ;;          # audio worker thread
 esac
-# The host is almost all cold code (FatFs, setup, transports, the
-# shell waits on I/O), so build it for size with -Os. The one hot
-# file — vm_core.c, the interpreter loop — pins itself back to -O2
-# via a #pragma, so this doesn't slow execution. -Os comes after
-# CFLAGS so it overrides the -O2 there.
+# The host is almost all cold code (setup, transports, the shell waits
+# on I/O), so build it for size with -Os. The one hot file — vm_core.c,
+# the interpreter loop — pins itself back to -O2 via a #pragma, so this
+# doesn't slow execution. -Os comes after CFLAGS so it overrides -O2.
 "$CC" "${CFLAGS[@]}" -Os "${HOST_STRIP[@]}" \
-    -DHAVE_FATFS \
-    -I"$FATFS_DIR" -I"$FATFS_SOURCE" \
     -o "$BUILD_DIR/host" \
     "$EXAMPLE_DIR/host.c" \
     "$SHELL_DATA_C" \
     "${VM_CORE_SRCS[@]}" \
     "$HOST_PLATFORM_SRC" \
     "$REPO_ROOT/src/vm/vm_host_fs.c" \
-    "$REPO_ROOT/src/storage/trashdrive.c" \
     "$REPO_ROOT/src/storage/trashfs.c" \
-    "$REPO_ROOT/src/storage/trashdrive_fatfs.c" \
     "$REPO_ROOT/src/audio/audio_service.c" \
     "$REPO_ROOT/src/audio/audio_arbiter.c" \
     "$REPO_ROOT/src/audio/audio_pool.c" \
@@ -156,8 +134,6 @@ esac
     "$REPO_ROOT/src/vm/channel_thread.c" \
     "$REPO_ROOT/src/vm/vm_host_audio.c" \
     "$REPO_ROOT/src/util/inicfg.c" \
-    "$FATFS_DIR/ff_wrapped.c" \
-    "$FATFS_SOURCE/ffsystem.c" \
     "${HOST_LIBS[@]}"
 
 # Build the guest.

@@ -222,7 +222,7 @@ static void test_clear_zeros_region(void) {
 }
 
 /* ============================================================
- *  FatFs-style integration simulation
+ *  Filesystem-style integration simulation
  *
  *  Verify that a sequence of operations resembling what a
  *  filesystem would do (write metadata to sector 0, then write
@@ -230,7 +230,7 @@ static void test_clear_zeros_region(void) {
  *  work together as expected.
  * ============================================================ */
 
-static void test_fatfs_style_workflow(void) {
+static void test_filesystem_style_workflow(void) {
     TrashDrive td;
     trash_init(&td, g_region, sizeof(g_region));
     trash_clear(&td);
@@ -351,7 +351,7 @@ int main(void) {
     RUN(test_clear_zeros_region);
 
     /* Integration */
-    RUN(test_fatfs_style_workflow);
+    RUN(test_filesystem_style_workflow);
     RUN(test_all_sectors_distinct_patterns);
 
     return TEST_SUITE_RESULT();

@@ -80,8 +80,8 @@ enum {
      * service opens it via its AudioFileReader, builds a looping
      * file-stream music voice, and returns the voice handle. No pool
      * object is involved (the file is read incrementally, service-side).
-     * This is how arbitrarily long songs play on desktop (stdio/FatFs)
-     * and on the H745 (FatFs over SD). */
+     * This is how arbitrarily long songs play on desktop (stdio +
+     * trashfs) and, on an MCU port, off SD/flash. */
     REQ_AUDIO_STREAM_WAV   = 0x010C,
     /* Reclaim everything a dying VM owns: stop its arbiter tracks/voices,
      * free its pool objects, release its FFT hold. a0 = vm_id. Posted by

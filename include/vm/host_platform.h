@@ -27,7 +27,7 @@
  *  Only the primitives that genuinely differ across targets and
  *  that the host needs every run: time, sleep, and the stop/
  *  interrupt hook. NOT here, on purpose:
- *    - Filesystem: already abstracted (trashdrive + FatFs).
+ *    - Filesystem: already abstracted (trashfs + host passthrough).
  *    - Sockets:    contained in transport_tcp.c. MCU networking is
  *                  lwIP, a different shape; we'll design that seam
  *                  when it's real, not against desktop sockets now.

@@ -23,8 +23,8 @@ Built and tested (desktop, native-Windows + Cygwin/POSIX):
   (open/read/seek/close); `SYS_AUDIO_STREAM_WAV` builds a looping
   file-stream voice that reads incrementally, so a song far larger than
   the pool plays without loading into it. Desktop binds stdio (`/host`)
-  + FatFs (`/td0`); the H745 binds FatFs over SD — same source, only
-  the reader differs. (Source-rate≠output-rate resampling is still a
+  + trashfs (`/td0`); an MCU port binds its own SD/flash reader — same
+  source, only the reader differs. (Source-rate≠output-rate resampling is still a
   TODO — author WAVs at the output rate, 44.1 kHz.)
 - **Full-stereo mixer** — every channel is `PCM16_STEREO`. Stereo is
   preserved; mono sources are promoted to L==R (no downmix) in the SFX

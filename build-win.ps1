@@ -85,8 +85,6 @@ $RepoRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ExampleDir = Join-Path $RepoRoot "examples\05_shell"
 $BuildDir   = Join-Path $ExampleDir "build"
 $HostFiles  = Join-Path $ExampleDir "host_files"
-$FatfsDir   = Join-Path $RepoRoot "third_party\fatfs"
-$FatfsSrc   = Join-Path $FatfsDir "source"
 $IncludeDir = Join-Path $RepoRoot "include"
 
 function Write-Step($msg) { Write-Host "build-win: $msg" -ForegroundColor Cyan }
@@ -139,16 +137,6 @@ if ($machine -notmatch "mingw|w64.*windows") {
     Write-Step "host compiler: $Cc (target $machine) - native Windows OK"
 }
 
-# ----------------------------------------------------------------
-# FatFs presence check (the shell host links f_open/f_read/etc.).
-# ----------------------------------------------------------------
-$fatfsFfC = Join-Path $FatfsSrc "ff.c"
-if (-not (Test-Path $fatfsFfC)) {
-    Die ("FatFs source not found at $fatfsFfC.`n" +
-         "      This example needs FatFs downloaded and extracted.`n" +
-         "      See third_party\fatfs\PLACEHOLDER.md for instructions.")
-}
-
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 # ----------------------------------------------------------------
@@ -161,25 +149,17 @@ $hostSrcs = Get-Content $manifest |
     Where-Object   { $_ -ne '' } |
     ForEach-Object { Join-Path $RepoRoot $_ }
 
-$fatfs = @(
-    (Join-Path $FatfsDir "ff_wrapped.c"),
-    (Join-Path $FatfsSrc "ffsystem.c")
-)
-
 $hostMain = Join-Path $ExampleDir "host.c"
 $hostExe  = Join-Path $BuildDir "host.exe"
 
 $cflags = @(
     "-Wall", "-Wextra", "-Wpedantic", "-std=c11",
-    "-DHAVE_FATFS",
     # msvcrt's printf doesn't understand C99 %z/%ll length modifiers;
     # this makes mingw use its own C99-compliant stdio so size_t
     # format specifiers (%zu) compile clean. Without it, native
     # builds warn on every %zu in the host.
     "-D__USE_MINGW_ANSI_STDIO=1",
-    "-I$IncludeDir",
-    "-I$FatfsDir",
-    "-I$FatfsSrc"
+    "-I$IncludeDir"
 )
 # Warnings-as-errors, ON by default (enforces zero-warning state).
 # Pass -NoWerror if a stricter mingw flags something unexpected.
@@ -253,8 +233,8 @@ if (-not $baked) {
         Set-Content -Path $shellDataC -Encoding ASCII
 }
 
-Write-Step "compiling native host.exe (with FatFs)..."
-$allSrc = @($hostMain) + @($shellDataC) + $hostSrcs + $fatfs
+Write-Step "compiling native host.exe..."
+$allSrc = @($hostMain) + @($shellDataC) + $hostSrcs
 $ccArgs = $cflags + @("-I$ExampleDir") + @("-o", $hostExe) + $allSrc + $libs
 & $Cc @ccArgs
 if ($LASTEXITCODE -ne 0) { Die "host compile failed (exit $LASTEXITCODE)" }

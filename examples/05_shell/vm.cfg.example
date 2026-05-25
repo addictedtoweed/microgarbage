@@ -73,10 +73,10 @@
 #
 # Two backend kinds in M.3a:
 #
-#   type = td     RAM-backed FatFs volume. Persists for the lifetime
+#   type = td     RAM-backed trashfs volume. Persists for the lifetime
 #                 of the host process. Multiple td mounts aren't
-#                 supported yet (the static FatFs backing has one
-#                 volume). size_kb is parsed but ignored — the pool
+#                 supported yet (the static trashfs backing has one
+#                 volume). size_kb is parsed but ignored — the region
 #                 size is compile-time.
 #
 #   type = host   Passthrough to a host-side directory. Files in the

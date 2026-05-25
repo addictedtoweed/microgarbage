@@ -76,7 +76,7 @@
  *
  *  Stream IDs are opaque integers chosen by the application. A
  *  typical setup uses one stream_id per file, mapped by the
- *  callback to an open FILE* (or FatFs FIL, or memory pointer).
+ *  callback to an open FILE* (or a trashfs file, or memory pointer).
  *  Use MUSIC_STREAM_NONE to indicate "no intro" or "no loop"
  *  (whichever is missing). At least one must be configured.
  *

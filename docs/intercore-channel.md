@@ -107,7 +107,7 @@ Grouped by service. Each is a request; most have a matching response.
         → voice_handle | REJECTED (track limit)
   - `REQ_AUDIO_VOICE_STOP` (voice_handle)
 
-**File** (M4 transparently owns SD/FatFs):
+**File** (M4 transparently owns the SD-card filesystem):
   - `REQ_FILE_OPEN` (path_buf, flags) → fd | -errno
   - `REQ_FILE_READ` (fd, buf, n) → bytes | -errno
   - `REQ_FILE_WRITE` (fd, buf, n) → bytes | -errno
@@ -203,14 +203,15 @@ talk only to `ServiceChannel`. Same code, both platforms.
 
 ## Filesystem split (consequence for the existing fs)
 
-On the H745 the M4 owns SD/FatFs, so the M7's `vm_host_fs` FatFs
-backend becomes a **proxy** that forwards open/read/write/close as
-`REQ_FILE_*` over the channel. The **trashfs RAM disk stays M7-local**
-(it's just memory the M7 can touch directly — no benefit to crossing
-cores). So the fs seam gains a third routing case on the MCU:
+On the H745 the M4 owns the SD-card filesystem, so the M7's
+`vm_host_fs` SD backend becomes a **proxy** that forwards
+open/read/write/close as `REQ_FILE_*` over the channel. The
+**trashfs RAM disk stays M7-local** (it's just memory the M7 can
+touch directly — no benefit to crossing cores). So the fs seam gains
+a third routing case on the MCU:
   - host passthrough → desktop only
   - trashfs → M7-local (direct, as today)
-  - FatFs/SD → M4 via the channel (proxy)
+  - SD-card FS → M4 via the channel (proxy)
 On the desktop, everything stays inline (the worker thread is optional
 for SD; the channel is mainly exercised for audio). This is a future
 change to vm_host_fs, noted here so the channel protocol reserves the

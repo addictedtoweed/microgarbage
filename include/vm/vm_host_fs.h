@@ -3,9 +3,9 @@
  *
  *  Adds POSIX-shaped file operations (open, close, read, write,
  *  lseek, mkdir, unlink, readdir) to the VM's ECALL surface,
- *  backed by Elm Chan's FatFs on the host. Combined with
- *  trashdrive_fatfs this gives a guest a real read/write
- *  filesystem inside a host-managed RAM region.
+ *  backed by the native trashfs RAM disk and/or a read-only
+ *  host-directory passthrough. This gives a guest a real read/write
+ *  filesystem inside a host-managed RAM region — no external library.
  *
  *  ---------------------------------------------------------------
  *  Why bother
@@ -14,7 +14,7 @@
  *  Two reasons:
  *
  *  1. Guests can persist work between runs (within the same
- *     trashdrive instance) and structure data into files/dirs
+ *     trashfs volume instance) and structure data into files/dirs
  *     rather than ad-hoc memory layouts. A "shell" guest with
  *     ls/mkdir/cat/rm becomes possible.
  *
@@ -37,9 +37,9 @@
  *  host without warning. Strict /<name>/ paths force the
  *  call site to commit to a backend.
  *
- *  Relative paths are passed to FatFs (when the cwd is on a FatFs
- *  mount) or to the host's fopen (when it's a HOST mount). The
- *  guest controls cwd via its own logic; this module just resolves
+ *  Relative paths are resolved within the cwd's mount — a TRASHFS
+ *  mount or a HOST mount. The guest controls cwd via its own logic;
+ *  this module just resolves
  *  whatever absolute path the syscall is given. (For HOST mounts,
  *  relative cwds are not currently supported — the shell rewrites
  *  relative paths into /<name>/<rel> before passing them.)
@@ -179,10 +179,10 @@ typedef struct {
  *
  * Pre-conditions:
  *   - sys is a valid VmSystem (vm_system_init done).
- *   - FatFs has been set up: a TrashDrive (or other block device)
- *     is registered with trash_fatfs_register, and f_mount has
- *     been called on the volume the guest will access. install_fs
- *     does NOT do these for you — they're the host's responsibility.
+ *   - At least one mount has been registered (e.g. a formatted +
+ *     mounted trashfs volume via vm_host_fs_mount_trashfs, or a host
+ *     directory). install_fs does NOT do this for you — registering
+ *     mounts is the host's responsibility.
  *
  * Returns true on success, false if any handler registration
  * fails (typically because a handler is already installed for
@@ -291,9 +291,9 @@ unsigned vm_host_fs_mount_count(void);
  *  fresh RAM from the host's bump arena. This means:
  *
  *    - The ELF file's storage doesn't need to be contiguous or
- *      stable. FatFs-on-trashdrive (scattered sectors) and host-
- *      filesystem-on-disk (entirely outside our address space)
- *      both work fine — the bytes are copied as they're read.
+ *      stable. A trashfs volume (scattered blocks) and a host-
+ *      filesystem file (entirely outside our address space) both
+ *      work fine — the bytes are copied as they're read.
  *
  *    - Each spawn consumes RAM from the bump arena. Plan for
  *      ~20-30 KB per spawned VM (code + rodata + data region).
@@ -341,7 +341,7 @@ unsigned vm_host_fs_max_files(void);
  *
  *  Hosts that install their own SYS_READ/SYS_WRITE/SYS_CLOSE
  *  handlers (instead of using vm_host_stdio's) should call these
- *  for fds >= 3. They route to FatFs or to the host-passthrough
+ *  for fds >= 3. They route to the trashfs or host-passthrough
  *  mount as appropriate.
  *
  *  Returns:

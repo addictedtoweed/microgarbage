@@ -76,8 +76,8 @@ static uint32_t put16(uint8_t *p, uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>
  *  End-to-end through the service: a mock AudioFileReader serves a
  *  synthetic STEREO wav from memory, the service opens it on STREAM_WAV
  *  and renders non-silent stereo output (L != R proves stereo is
- *  preserved, not downmixed). The desktop stdio/FatFs readers feed this
- *  exact path — only the reader differs.
+ *  preserved, not downmixed). The desktop stdio/trashfs readers feed
+ *  this exact path — only the reader differs.
  * ============================================================ */
 static void test_stream_wav(void) {
     static uint8_t wav[64 * 1024];

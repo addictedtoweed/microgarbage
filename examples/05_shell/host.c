@@ -16,11 +16,8 @@
  *   --pty          POSIX pseudoterminal (Linux/Cygwin); attach with
  *                  screen/minicom. POSIX-only.
  *
- * Build dependencies (beyond the standard -Iinclude):
- *   -Ithird_party/fatfs/source -Ithird_party/fatfs -DHAVE_FATFS
- *
- * Without those flags this example will fail to build because
- * FatFs symbols (f_mount, f_mkfs, etc.) won't resolve. See the
+ * No external dependencies beyond the standard -Iinclude: the
+ * filesystem is the native trashfs (src/storage/trashfs.c). See the
  * build.sh in this directory for the full link line.
  */
 
@@ -75,7 +72,6 @@ typedef SOCKET tcp_sock_t;
 #  include <stdatomic.h>
 #endif
 #include "util/inicfg.h"
-#include "ff.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -472,11 +468,11 @@ static void host_audio_stop(void) {
 
 /* Mount entry parsed from [mount.<name>] sections.
  *
- * `tmpfs` and `sd` are separate config type names that both map
- * to FatFs internally on the dev host today. They diverge when
- * the platform moves to hardware:
- *   tmpfs → FatFs over a RAM-backed block device (volatile)
- *   sd    → FatFs over an SD card driver (persistent)
+ * `tmpfs` and `sd` are separate config type names that both map to a
+ * trashfs volume on the dev host today. They diverge when the
+ * platform moves to hardware:
+ *   tmpfs → trashfs over volatile RAM
+ *   sd    → a persistent volume on an SD card driver
  * On the dev host both look the same; the distinction is intent. */
 typedef enum {
     HOST_MOUNT_TMPFS = 0,

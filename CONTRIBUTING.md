@@ -32,9 +32,9 @@ When a warning appears, handle it in this order of preference:
    ```
 
 3. **Suppress per file** only if line-level won't work — e.g.
-   third-party/vendor code we don't own (FatFs is the likely case).
-   Prefer a targeted `-Wno-...` on just that translation unit in the
-   build script over editing vendor source. Document why.
+   generated code you can't annotate at the source (bin2c output is
+   the likely case). Prefer a targeted `-Wno-...` on just that
+   translation unit in the build script. Document why.
 
 4. **Never** add a blanket project-wide `-Wno-...`. That hides real
    bugs everywhere to silence one. If you're reaching for this, stop
@@ -69,7 +69,6 @@ the source.
   per platform, selected by the build. Porting to a new target
   (e.g. STM32) starts from `platform_stub.c`.
 - `examples/` — runnable hosts; `05_shell` is the main one.
-- `third_party/fatfs/` — vendored FatFs (don't edit; wrap instead).
 
 ## Testing
 

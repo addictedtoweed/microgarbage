@@ -1,14 +1,15 @@
 # Example 05: Shell
 
 An interactive file-system shell running as a VM guest, with
-file operations backed by a FatFs volume on a trashdrive.
+file operations backed by a trashfs RAM disk (`/td0`) and a
+read-only host-directory passthrough (`/host`).
 
 ## What this demonstrates
 
 - **The full file-syscall ABI** (`openat`, `read`, `write`,
   `close`, `lseek`, `mkdirat`, `unlinkat`, `readdir`) — every
   call the guest makes routes through `vm_host_fs.c` into
-  FatFs into trashdrive.
+  trashfs (or the host-directory passthrough).
 - **Guest-side path resolution**: the shell tracks its own
   current working directory (since the VM has no native CWD
   concept) and prefixes relative paths before calling into the
@@ -28,14 +29,9 @@ file operations backed by a FatFs volume on a trashdrive.
 
 ## Prerequisites
 
-This example needs **FatFs** to be extracted under
-`third_party/fatfs/source/`. See `third_party/fatfs/PLACEHOLDER.md`
-for download instructions. Without FatFs, the host won't link
-(it needs `f_open`, `f_read`, etc. from FatFs) and `build.sh`
-will fail with a clear message.
-
-The other examples (01–04) don't need FatFs and will continue
-to build without it.
+None beyond the standard toolchain. The filesystem is the native,
+public-domain `trashfs` (`src/storage/trashfs.c`), built straight
+from this repo — there is no external library to download.
 
 ## Build and run
 
@@ -46,7 +42,7 @@ to build without it.
 You'll see something like:
 
 ```
-05_shell: compiling host (with FatFs)...
+05_shell: compiling host...
 05_shell: compiling guest (RV32IMC)...
 05_shell: built. To run:
     .../examples/05_shell/build/host
@@ -131,7 +127,7 @@ $
 ELFs always load with `VM_BACKING_COPY_RAM` — code and rodata
 are copied into fresh RAM from the bump arena, not run XIP from
 the source file. This is required because the source storage
-(FatFs sectors, or host-fs bytes outside our address space) is
+(trashfs blocks, or host-fs bytes outside our address space) is
 not necessarily contiguous in memory. Plan for roughly 20–30 KB
 of RAM per spawned VM (code + rodata + 16 KB data region).
 
@@ -168,9 +164,9 @@ Try: ls, cd /home, mkdir foo, touch bar.txt, cat readme.txt
 /$ cd home
 /home$ mkdir docs
 /home$ touch docs/note.txt
-/home$ write docs/note.txt Hello FatFs from a VM
+/home$ write docs/note.txt Hello trashfs from a VM
 /home$ cat docs/note.txt
-Hello FatFs from a VM
+Hello trashfs from a VM
 /home$ ls docs
   note.txt        22
 
@@ -192,10 +188,10 @@ bye
   hypothetical `run &` would need scheduler changes so the
   parent VM keeps running while the child does too.
 - **No completion / globbing**: no `*` expansion.
-- **Volume persistence**: the trashdrive lives in host RAM; each
-  run starts with a freshly-formatted volume. To persist across
-  runs you'd skip `f_mkfs` and let FatFs auto-detect the
-  existing layout — and use file-backed storage instead of RAM.
+- **Volume persistence**: the trashfs volume lives in host RAM;
+  each run starts with a freshly-formatted volume. To persist
+  across runs you'd skip the `trashfs_format` call and mount a
+  pre-formatted region backed by a file instead of RAM.
 
 ## Routing stdio over TCP (and pty)
 
@@ -244,7 +240,7 @@ mutually exclusive; multiple `--tcp` ports are fine.
 
 ## Files
 
-- `host.c` — sets up trashdrive + FatFs + VmSystem + stdio/fs
+- `host.c` — sets up the trashfs volume + VmSystem + stdio/fs
   bridges, loads `shell.elf`, runs scheduler. Parses CLI args
   including `--host-fs=`, `--tcp=`, and `--pty`.
 - `shell.c` — the guest shell with a raw-mode line editor
@@ -255,4 +251,4 @@ mutually exclusive; multiple `--tcp` ports are fine.
 - `host_files/` — auto-populated by `build.sh` with the sample
   ELFs. This directory is what the shell sees as `/host`.
 - `build.sh` — builds the host, the shell guest, and each
-  spawnable. Checks for FatFs presence first.
+  spawnable.

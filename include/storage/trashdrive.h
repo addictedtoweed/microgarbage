@@ -3,42 +3,31 @@
  *
  *  A "trash drive" is a chunk of RAM that pretends to be a disk:
  *  fixed-size sectors, read and write by sector index. You bring
- *  your own filesystem — FatFs, Petit FatFs, or any block-device
- *  consumer — and mount it on top.
+ *  your own block-oriented filesystem and mount it on top via that
+ *  filesystem's disk-IO callbacks.
  *
- *  Sector size is fixed at TRASH_SECTOR_SIZE (512 bytes) to match
- *  what FatFs / Petit FatFs expect.
+ *  Sector size is fixed at TRASH_SECTOR_SIZE (512 bytes), the
+ *  conventional disk sector size that block filesystems expect.
  *
  *  This module doesn't depend on any filesystem library. It just
  *  provides read_sectors / write_sectors / query primitives. The
  *  caller wires those into whatever filesystem's disk callbacks.
  *
  *  ---------------------------------------------------------------
- *  Typical wiring with FatFs (excerpt from your project's
- *  diskio.c — NOT part of this module):
+ *  Typical wiring (excerpt from your project's disk-IO glue —
+ *  NOT part of this module):
  *
  *      static TrashDrive g_ram_drive;
  *
- *      DSTATUS disk_initialize(BYTE pdrv) {
- *          if (pdrv == DRIVE_RAM) return 0;   // already up
- *          return STA_NOINIT;
- *      }
- *
- *      DRESULT disk_read(BYTE pdrv, BYTE *buf, LBA_t sec, UINT n) {
- *          if (pdrv != DRIVE_RAM) return RES_PARERR;
+ *      int disk_read(uint8_t *buf, uint32_t sec, uint32_t n) {
  *          return trash_read(&g_ram_drive, buf, sec, n) == TRASH_OK
- *                 ? RES_OK : RES_ERROR;
+ *                 ? 0 : -1;
  *      }
- *      // ... and similar for disk_write, disk_ioctl
+ *      // ... and similar for disk_write
  *
- *  Your application code then uses FatFs normally:
- *
- *      FATFS fs;
- *      f_mount(&fs, "1:", 1);
- *      FIL f;
- *      f_open(&f, "1:/scripts/foo.lua", FA_WRITE | FA_CREATE_ALWAYS);
- *      f_write(&f, code, code_len, &bw);
- *      f_close(&f);
+ *  NOTE: the in-repo trashfs filesystem does NOT use this — it
+ *  operates on a memory region directly. trashdrive is here for
+ *  when you bring an external block-device-consuming filesystem.
  *
  *  ---------------------------------------------------------------
  *  Public domain (CC0). No warranty.
@@ -50,15 +39,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* All trash drives use this sector size. Matches the FatFs /
- * Petit FatFs convention; changing it would break compatibility. */
+/* All trash drives use this sector size — the conventional disk
+ * sector size; changing it would break compatibility with block
+ * filesystems that assume 512. */
 #define TRASH_SECTOR_SIZE 512
 
-/* Minimum region size for a usable drive. Below this, FatFs can't
- * format a filesystem. The actual practical minimum depends on the
- * filesystem (FAT12 needs more headroom than Petit FatFs which can
- * work with very small volumes). 16 KB is generous enough for any
- * of them. */
+/* Minimum region size for a usable drive. Below this, most block
+ * filesystems can't format a volume. The actual practical minimum
+ * depends on the filesystem; 16 KB is generous enough for typical
+ * small FAT-family volumes. */
 #define TRASH_MIN_BYTES (16 * 1024)
 
 /* ============================================================
@@ -98,8 +87,7 @@ typedef struct {
  *
  * The region's contents are NOT touched by init — neither cleared
  * nor formatted. The first time you mount a filesystem on the
- * drive, the filesystem library should be told to format it
- * (e.g., FatFs's f_mkfs).
+ * drive, the filesystem should be told to format it.
  *
  * Returns TRASH_OK on success, TRASH_ERR_INVALID_ARG if the region
  * is null, too small, or not sector-aligned.
@@ -117,7 +105,7 @@ void trash_clear(TrashDrive *td);
 /* ============================================================
  *  Block I/O
  *
- *  These mirror the contract of FatFs's disk_read / disk_write:
+ *  These mirror the conventional disk_read / disk_write contract:
  *  read or write `count` consecutive sectors starting at `sector`.
  *
  *  Returns TRASH_OK on success, TRASH_ERR_OUT_OF_RANGE if the
@@ -138,8 +126,8 @@ TrashResult trash_write(TrashDrive *td,
  *  Introspection
  * ============================================================ */
 
-/* Return sector count and sector size — useful for filling out
- * FatFs's disk_ioctl GET_SECTOR_COUNT and GET_SECTOR_SIZE. */
+/* Return sector count and sector size — useful for filling out a
+ * filesystem's disk_ioctl GET_SECTOR_COUNT / GET_SECTOR_SIZE. */
 size_t trash_sector_count(const TrashDrive *td);
 size_t trash_sector_size(const TrashDrive *td);
 size_t trash_total_bytes(const TrashDrive *td);

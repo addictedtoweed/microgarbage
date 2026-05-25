@@ -9,8 +9,8 @@ fixed_point	math	-	Q-format fixed-point arithmetic (Q15, Q31, Q16.16, Q32.32, Q4
 fast_div	math	-	Fast integer division by a runtime-known divisor (u32/s32/u64/s64)
 audio_mixer	audio	ring_buffer,fixed_point	Multi-channel audio mixer with resampling, pan, looping, sync (v2)
 music_player	audio	audio_mixer	Intro-and-loop music playback with stream callback and pinned heads
-trashdrive	storage	-	RAM-backed block device for mounting BYO filesystems (FatFs, Petit FatFs)
-trashdrive_fatfs	storage	trashdrive,third_party/fatfs	Bridges trashdrive to Elm Chan FatFs; provides disk_* functions for f_open/f_read/etc. FatFs is BSD-1-clause (not public domain)
+trashdrive	storage	-	RAM-backed block device for mounting a block-oriented filesystem
+trashfs	storage	-	Native public-domain RAM-disk filesystem (hierarchical dirs); operates directly on a memory region
 bump	memory	(slab_stack optional)	Bump allocator; can stand alone or draw memory from slab_stack
 slab_stack	memory	-	Two-layer slab allocator: 16 power-of-2 bins, bitmap + per-bin stacks
 vm_core	vm	-	RV32IMC dispatcher: portable switch-on-opcode interpreter for the I+M+C subset
@@ -20,4 +20,4 @@ vm_mailbox	vm	fifo_queue,ring_buffer	Per-VM bounded mailbox with sender whitelis
 vm_sched	vm	vm_core,vm_ecall	Cooperative round-robin scheduler with adaptive quantum and critical-section debt
 vm_system	vm	vm_core,vm_loader,vm_ecall,vm_mailbox,vm_sched,slab_stack,bump	Top-level composition of the VM library; one-call setup of a complete system
 vm_host_stdio	vm	vm_system	Optional host stdio bridge: SYS_READ and SYS_WRITE forwarded to host stdin/stdout, raw-mode tty support
-vm_host_fs	vm	vm_system,vm_host_stdio,trashdrive_fatfs	Optional host file syscalls: openat, read, write, close, lseek, mkdirat, unlinkat, readdir against a host-mounted FatFs volume
+vm_host_fs	vm	vm_system,vm_host_stdio,trashfs	Optional host file syscalls: openat, read, write, close, lseek, mkdirat, unlinkat, readdir against a trashfs RAM disk and/or a read-only host-directory passthrough

@@ -9,8 +9,8 @@
  *
  *  Platform seam: all file I/O goes through an AudioFileReader vtable.
  *  The desktop supplies a stdio reader (the /host directory) and a
- *  FatFs reader (the /td0 volume); the STM32 supplies a FatFs reader
- *  over the SD card. The same streaming source code runs on both —
+ *  trashfs reader (the /td0 volume); an MCU port supplies its own
+ *  SD/flash reader. The same streaming source code runs on both —
  *  only the reader differs.
  *
  *  Output is INTERLEAVED STEREO PCM16 (the mixer's music format):
@@ -33,7 +33,7 @@
 /* Platform file-reader seam. Offsets and counts are BYTES. open()
  * returns an opaque handle (NULL on failure); the other ops take it
  * back. The service stays filesystem-agnostic — the platform binds
- * stdio / FatFs / SD here. */
+ * stdio / trashfs / SD here. */
 typedef struct {
     void    *(*open)(void *ctx, const char *path);
     uint32_t (*read)(void *ctx, void *fh, void *dst, uint32_t bytes);

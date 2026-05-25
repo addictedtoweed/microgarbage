@@ -78,11 +78,12 @@ typedef struct {
     void           *staging_buffer;
     size_t          staging_capacity;
     /* File-reader seam for streaming long WAVs (REQ_AUDIO_STREAM_WAV).
-     * The platform supplies it: desktop binds stdio (/host) + FatFs
-     * (/td0); the H745 binds FatFs over SD. A single reader whose
-     * open() dispatches on the resolved native path is expected (e.g.
-     * "0:/x" -> FatFs, otherwise stdio). If reader.open is NULL,
-     * stream requests are rejected. The service stays FS-agnostic. */
+     * The platform supplies it: the desktop binds stdio (/host) +
+     * trashfs (/td0); an MCU port binds its own SD/flash reader. A
+     * single reader whose open() dispatches on the resolved native
+     * path is expected (e.g. "td0:/x" -> trashfs, otherwise stdio).
+     * If reader.open is NULL, stream requests are rejected. The
+     * service stays FS-agnostic. */
     AudioFileReader file_reader;
 } AudioServiceConfig;
 
