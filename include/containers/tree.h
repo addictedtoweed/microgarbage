@@ -56,6 +56,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "containers/containers_config.h"  /* GARBAGE_TREE_DEFAULT_NODES */
+
 #define TREE_NIL  0xFFFFFFFFu
 
 /* Per-node overhead: left + right + parent indices, plus an int8
@@ -66,6 +68,11 @@
 /* Bytes of node pool for `cap` nodes of `elem` bytes (compile-time). */
 #define TREE_POOL_BYTES(cap, elem) \
     ((size_t)(cap) * (TREE_NODE_OVERHEAD + (size_t)(elem)))
+
+/* Bytes for a pool of the configured default node count (override via
+ * GARBAGE_TREE_DEFAULT_NODES; see containers_config.h). */
+#define TREE_DEFAULT_POOL_BYTES(elem) \
+    TREE_POOL_BYTES(GARBAGE_TREE_DEFAULT_NODES, (elem))
 
 /* Insertion / balancing discipline, chosen at init. */
 typedef enum {

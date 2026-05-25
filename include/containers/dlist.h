@@ -38,6 +38,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "containers/containers_config.h"  /* GARBAGE_DLIST_DEFAULT_NODES */
+
 /* A node is two link indices + the inline payload. We use 32-bit
  * indices (not pointers) into the pool so the structure is the same
  * size on 32- and 64-bit hosts — which keeps DLIST_POOL_BYTES() a
@@ -53,6 +55,11 @@
  * Compile-time constant form (for static arrays and _Static_assert). */
 #define DLIST_POOL_BYTES(cap, elem) \
     ((size_t)(cap) * (DLIST_NODE_OVERHEAD + (size_t)(elem)))
+
+/* Bytes for a pool of the configured default node count (override via
+ * GARBAGE_DLIST_DEFAULT_NODES; see containers_config.h). */
+#define DLIST_DEFAULT_POOL_BYTES(elem) \
+    DLIST_POOL_BYTES(GARBAGE_DLIST_DEFAULT_NODES, (elem))
 
 typedef struct {
     uint8_t *pool;          /* caller-owned node buffer            */

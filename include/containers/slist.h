@@ -42,6 +42,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "containers/containers_config.h"  /* GARBAGE_SLIST_DEFAULT_NODES */
+
 #define SLIST_NIL  0xFFFFFFFFu
 
 /* Per-node overhead: a single next index. */
@@ -51,6 +53,11 @@
  * constant form). */
 #define SLIST_POOL_BYTES(cap, elem) \
     ((size_t)(cap) * (SLIST_NODE_OVERHEAD + (size_t)(elem)))
+
+/* Bytes for a pool of the configured default node count (override via
+ * GARBAGE_SLIST_DEFAULT_NODES; see containers_config.h). */
+#define SLIST_DEFAULT_POOL_BYTES(elem) \
+    SLIST_POOL_BYTES(GARBAGE_SLIST_DEFAULT_NODES, (elem))
 
 typedef struct {
     uint8_t *pool;          /* caller-owned node buffer            */

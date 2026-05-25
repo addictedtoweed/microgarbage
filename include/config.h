@@ -36,4 +36,15 @@
 #define GARBAGE_SCHED_MODE  GARBAGE_SCHED_COOPERATIVE
 #endif
 
+/* ------------------------------------------------------------
+ *  Container default pool sizes
+ *
+ *  Aggregated here so one umbrella config carries the build-wide
+ *  knobs, but the per-type node-count defaults live in their own
+ *  file. Same override rule: define a knob before this header is
+ *  reached (build -D or host pre-include) and its #ifndef leaves
+ *  your value untouched.
+ * ------------------------------------------------------------ */
+#include "containers/containers_config.h"
+
 #endif /* GARBAGE_CONFIG_H */
