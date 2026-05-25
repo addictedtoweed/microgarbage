@@ -35,9 +35,13 @@ SRCS=("$HERE/main.c" "$HERE/src/vm_runtime.c" "$HERE/src/tui.c")
 for m in "${MODULES[@]}"; do SRCS+=("$HERE/src/$m.c"); done
 PSRCS=(); for s in "${SRCS[@]}"; do PSRCS+=("$(p "$s")"); done
 
+# Size flags: -Os + function/data sections + --gc-sections drop unused
+# SDK code per build; max-page-size=4 removes LOAD-segment alignment
+# padding (no MMU); -Wl,-s strips symbols. Drop -Wl,-s if you want symbols
+# for debugging (costs ~0.5 KB).
 "$CC" -march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding -Os \
     -ffunction-sections -fdata-sections \
     -I"$(p "$HERE/include")" \
-    -Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-T,"$(p "$HERE/guest.ld")" \
+    -Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s -Wl,-T,"$(p "$HERE/guest.ld")" \
     -o "$(p "$OUT")" "${PSRCS[@]}"
 echo "build.sh: built $OUT  (cross: $CC)"

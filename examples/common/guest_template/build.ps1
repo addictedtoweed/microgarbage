@@ -30,7 +30,8 @@ foreach ($m in $Modules) { $srcs += "$Here\src\$($m -replace '/','\').c" }
 $cargs = @("-march=rv32imc","-mabi=ilp32","-nostdlib","-nostartfiles",
            "-ffreestanding","-Os","-ffunction-sections","-fdata-sections",
            "-I$Here\include",
-           "-Wl,--gc-sections","-Wl,-z,max-page-size=4","-Wl,-T,$Here\guest.ld",
+           # -Wl,-s strips symbols (~0.5 KB smaller); drop it for debug symbols.
+           "-Wl,--gc-sections","-Wl,-z,max-page-size=4","-Wl,-s","-Wl,-T,$Here\guest.ld",
            "-o",$Out) + $srcs
 & $cc @cargs
 if ($LASTEXITCODE -ne 0) { Write-Error "guest compile failed" }
