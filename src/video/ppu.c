@@ -46,9 +46,12 @@ static uint16_t color_math(uint16_t a, uint16_t b, bool sub, bool half) {
     int rg = sub ? ag - bg : ag + bg;
     int rb = sub ? ab - bb : ab + bb;
     if (half) { rr /= 2; rg /= 2; rb /= 2; }
-    if (rr < 0) rr = 0; if (rr > 31) rr = 31;
-    if (rg < 0) rg = 0; if (rg > 31) rg = 31;
-    if (rb < 0) rb = 0; if (rb > 31) rb = 31;
+    if (rr < 0) rr = 0;
+    if (rr > 31) rr = 31;
+    if (rg < 0) rg = 0;
+    if (rg > 31) rg = 31;
+    if (rb < 0) rb = 0;
+    if (rb > 31) rb = 31;
     return (uint16_t)(rr | (rg << 5) | (rb << 10));
 }
 
