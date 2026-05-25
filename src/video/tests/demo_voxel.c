@@ -114,10 +114,10 @@ static void gen_terrain(uint32_t seed) {
             if (h < 0) h = 0;
             if (h > 255) h = 255;
             uint8_t mat = MAT_ROCK;
-            if (h > 185) mat = MAT_SNOW;                       /* snow caps */
+            if (h > 160) mat = MAT_SNOW;                       /* snow caps */
             float lava = fbm((float)x / 90.0f + 17.0f,
                              (float)y / 90.0f + 41.0f, seed ^ 0x5A5Au);
-            if (h < 105 && lava > 0.62f) mat = MAT_LAVA;        /* lava in low channels */
+            if (h < 100 && lava > 0.55f) mat = MAT_LAVA;        /* lava in low channels */
             Hmap[y * MAPSZ + x] = (uint8_t)h;
             Mmap[y * MAPSZ + x] = mat;
         }
@@ -179,8 +179,8 @@ static void build_vocab_and_palettes(void) {
     for (int m = 0; m < 3; m++) {
         P.cgram[(m) * 16 + 1] = mat[m].base;            /* near palette */
         P.cgram[(m) * 16 + 2] = mat[m].hi;
-        P.cgram[(m + 3) * 16 + 1] = fade(mat[m].base, sky, 0.55f);  /* far (hazed) */
-        P.cgram[(m + 3) * 16 + 2] = fade(mat[m].hi,   sky, 0.55f);
+        P.cgram[(m + 3) * 16 + 1] = fade(mat[m].base, sky, 0.62f);  /* far (hazed) */
+        P.cgram[(m + 3) * 16 + 2] = fade(mat[m].hi,   sky, 0.62f);
     }
 }
 
@@ -192,37 +192,44 @@ static void render_terrain(float cx, float cz, float cy, float yaw) {
     const float FOV     = 1.15f;
     const float HORIZON = 96.0f;              /* horizon screen row (pitch) */
     const float HSCALE  = 150.0f;
+    const float ZNEAR   = 4.0f, ZFAR = 200.0f, FARZ = 80.0f;
 
     for (int tc = 0; tc < TCOLS; tc++) {
         float scx = (float)(tc * 8 + 4);
         float ang = yaw + (scx - 128.0f) / 128.0f * (FOV * 0.5f);
         float dx = fsin(ang), dz = fcos(ang);
 
-        float top_y = (float)PPU_SCREEN_H;    /* "all sky" until terrain rises above it */
-        int   mat = MAT_ROCK;
-        float topdist = 1e9f;
-        for (float z = 4.0f; z < 200.0f; z += 1.0f) {
+        /* Comanche span fill: march near->far, painting each newly-visible
+         * band (terrain that rises above what nearer terrain already drew)
+         * with ITS material + depth. Gives the receding, shaded slope. */
+        int8_t  rmat[PPU_SCREEN_H];      /* material per screen row, -1 = sky */
+        uint8_t rfar[PPU_SCREEN_H];      /* depth band (0 near, 1 far)        */
+        for (int y = 0; y < PPU_SCREEN_H; y++) { rmat[y] = -1; rfar[y] = 0; }
+
+        int ybuf = PPU_SCREEN_H;         /* lowest row not yet painted */
+        for (float z = ZNEAR; z < ZFAR; z += 1.0f) {
             float wx = cx + dx * z, wz = cz + dz * z;
-            float h  = height_at(wx, wz);
-            float sy = HORIZON - (h - cy) * HSCALE / z;
-            if (sy < top_y) {
-                top_y = sy;
-                int hx = (int)ffloor(wx) & MAPMASK, hy = (int)ffloor(wz) & MAPMASK;
-                mat = Mmap[hy * MAPSZ + hx];
-                topdist = z;
+            int hx = (int)ffloor(wx) & MAPMASK, hy = (int)ffloor(wz) & MAPMASK;
+            float h = (float)Hmap[hy * MAPSZ + hx];
+            int sy = (int)(HORIZON - (h - cy) * HSCALE / z);
+            if (sy < 0) sy = 0;
+            if (sy < ybuf) {             /* this terrain rises above the slope so far */
+                int mat = Mmap[hy * MAPSZ + hx];
+                uint8_t isfar = (z > FARZ) ? 1u : 0u;   /* 'far' is a windows.h macro */
+                for (int y = sy; y < ybuf; y++) { rmat[y] = (int8_t)mat; rfar[y] = isfar; }
+                ybuf = sy;
             }
         }
 
-        int topi = (int)ffloor(top_y);
-        if (topi < 0) topi = 0;
-        int pal = mat + (topdist > 110.0f ? 3 : 0);
-
+        /* Collapse screen rows to tile cells. Terrain is contiguous from the
+         * bottom up to the silhouette, so a cell's terrain is its bottom
+         * `fill` rows; material/depth come from the nearest (lowest) row. */
         for (int tr = 0; tr < TROWS; tr++) {
-            int celltop = tr * 8, cellbot = tr * 8 + 8;
-            uint16_t tile;
-            if (topi >= cellbot)        tile = 0;                       /* sky */
-            else if (topi <= celltop)   tile = 8;                       /* solid ground */
-            else                        tile = (uint16_t)(cellbot - topi); /* edge */
+            int top = tr * 8, bot = tr * 8 + 8, fill = 0, mat = MAT_ROCK, isfar = 0;
+            for (int y = top; y < bot; y++)
+                if (rmat[y] >= 0) { fill++; mat = rmat[y]; isfar = rfar[y]; }
+            uint16_t tile = (fill == 0) ? 0u : (fill >= 8) ? 8u : (uint16_t)fill;
+            int pal = mat + (isfar ? 3 : 0);
             P.vram[(TILEMAP_W + (unsigned)tr * 32u + (unsigned)tc) & 0x7FFFu] =
                 (uint16_t)(tile | ((unsigned)pal << 10));
         }
