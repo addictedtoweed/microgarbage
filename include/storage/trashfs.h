@@ -6,12 +6,16 @@
  *  (it is not meant for removable, PC-readable SD/USB media). See
  *  docs/trashfs-format.md for the full on-disk format.
  *
- *  Key parameters (LOCKED — see the spec):
- *    - 128-byte blocks, uint32 block indices.
- *    - 64-byte inodes: 8 direct + single + double + triple indirect.
- *    - 48-byte directory entries, 32-char names, hierarchical
+ *  Key parameters:
+ *    - Block size is a build-time knob (TRASHFS_BLOCK_SIZE, default
+ *      128 B; e.g. 512 B for volumes holding larger objects like guest
+ *      ELFs). uint32 block indices.
+ *    - 64-byte inodes (LOCKED): 8 direct + single + double + triple
+ *      indirect. Packed BLOCK_SIZE/64 per block (2 @128, 8 @512).
+ *    - 48-byte directory entries (LOCKED), 32-char names, hierarchical
  *      directories (mkdir/rmdir, nested paths, "." and "..").
- *    - free-block bitmap; inode table sized as a fraction of volume.
+ *    - free-block bitmap; inode table sized by bytes-of-volume, so the
+ *      file budget stays constant across block sizes.
  *    - little-endian on disk (matches RISC-V guest + host order).
  *
  *  This header covers Phase 1: format (mkfs) + mount + introspection.
@@ -37,13 +41,23 @@ extern "C" {
 #define TRASHFS_VERSION_MAJOR  1
 #define TRASHFS_VERSION_MINOR  0
 
+/* Block size — the one build-time geometry knob. Default 128 B suits
+ * tiny RAM disks with many small files; 512 B cuts indirection and
+ * per-file metadata for volumes holding larger objects (e.g. guest
+ * ELFs). Must be a power of two and a multiple of the 64-byte inode
+ * size (the static_asserts in trashfs.c enforce this). A volume
+ * records its block size in the superblock and mount rejects a
+ * mismatch, so a region formatted at one size won't mis-mount. */
+#ifndef TRASHFS_BLOCK_SIZE
 #define TRASHFS_BLOCK_SIZE     128u
+#endif
+
 #define TRASHFS_INODE_SIZE     64u
 #define TRASHFS_DIRENT_SIZE    48u
 
-#define TRASHFS_INODES_PER_BLOCK  (TRASHFS_BLOCK_SIZE / TRASHFS_INODE_SIZE)   /* 2 */
-#define TRASHFS_DIRENTS_PER_BLOCK (TRASHFS_BLOCK_SIZE / TRASHFS_DIRENT_SIZE)  /* 2 */
-#define TRASHFS_PTRS_PER_BLOCK    (TRASHFS_BLOCK_SIZE / 4u)                   /* 32 */
+#define TRASHFS_INODES_PER_BLOCK  (TRASHFS_BLOCK_SIZE / TRASHFS_INODE_SIZE)   /* 2 @128, 8 @512 */
+#define TRASHFS_DIRENTS_PER_BLOCK (TRASHFS_BLOCK_SIZE / TRASHFS_DIRENT_SIZE)  /* 2 @128, 10 @512 */
+#define TRASHFS_PTRS_PER_BLOCK    (TRASHFS_BLOCK_SIZE / 4u)                   /* 32 @128, 128 @512 */
 
 #define TRASHFS_DIRECT_PTRS    8u
 #define TRASHFS_NAME_MAX       32u
@@ -52,10 +66,18 @@ extern "C" {
  * Below this the metadata floor leaves too little for data. */
 #define TRASHFS_MIN_BYTES      (16u * 1024u)
 
-/* Inode-table sizing default: ~1 inode per 16 blocks, floored at 16.
- * (mkfs can override via an explicit hint.) */
+/* Inode-table sizing default: one inode per TRASHFS_BYTES_PER_INODE of
+ * volume, floored at TRASHFS_INODES_FLOOR. Sizing by BYTES (not blocks)
+ * keeps the file budget constant across block sizes — a larger block
+ * does NOT reduce how many files fit. 2048 reproduces the historical
+ * "1 inode per 16 blocks" budget at the 128-byte default. (mkfs can
+ * override the count via an explicit hint.) */
 #define TRASHFS_INODES_FLOOR   16u
-#define TRASHFS_BLOCKS_PER_INODE 16u
+#ifndef TRASHFS_BYTES_PER_INODE
+#define TRASHFS_BYTES_PER_INODE 2048u
+#endif
+/* Derived: blocks consumed per inode-budget unit (16 @128, 4 @512). */
+#define TRASHFS_BLOCKS_PER_INODE (TRASHFS_BYTES_PER_INODE / TRASHFS_BLOCK_SIZE)
 
 /* Block pointer 0 means "none" (block 0 is always the superblock). */
 #define TRASHFS_BLOCK_NONE     0u

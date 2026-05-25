@@ -16,13 +16,25 @@
 #include <string.h>
 
 /* ---- compile-time format checks ---------------------------- */
-/* These guard the LOCKED format constants. C11 _Static_assert. */
-_Static_assert(TRASHFS_BLOCK_SIZE == 128, "block size locked at 128");
+/* The inode and dirent sizes are LOCKED format constants (64-byte
+ * inodes, 48-byte dirents holding a 32-char name). The block size is a
+ * build-time knob (TRASHFS_BLOCK_SIZE); the rest of the geometry
+ * derives from it, so instead of pinning exact values we assert the
+ * invariants that derivation depends on. C11 _Static_assert. */
 _Static_assert(TRASHFS_INODE_SIZE == 64, "inode size locked at 64");
 _Static_assert(TRASHFS_DIRENT_SIZE == 48, "dirent size locked at 48");
-_Static_assert(TRASHFS_INODES_PER_BLOCK == 2, "2 inodes per block");
-_Static_assert(TRASHFS_DIRENTS_PER_BLOCK == 2, "2 dirents per block");
-_Static_assert(TRASHFS_PTRS_PER_BLOCK == 32, "32 pointers per block");
+_Static_assert((TRASHFS_BLOCK_SIZE & (TRASHFS_BLOCK_SIZE - 1u)) == 0u,
+               "block size must be a power of two");
+_Static_assert(TRASHFS_BLOCK_SIZE % TRASHFS_INODE_SIZE == 0u,
+               "inodes must pack evenly into a block");
+_Static_assert(TRASHFS_BLOCK_SIZE % 4u == 0u,
+               "block must hold a whole number of 4-byte block pointers");
+_Static_assert(TRASHFS_BLOCK_SIZE >= TRASHFS_DIRENT_SIZE,
+               "block must hold at least one directory entry");
+_Static_assert(TRASHFS_BYTES_PER_INODE % TRASHFS_BLOCK_SIZE == 0u,
+               "bytes-per-inode must be a multiple of the block size");
+_Static_assert(TRASHFS_BLOCKS_PER_INODE >= 1u,
+               "bytes-per-inode must be >= the block size");
 
 /* ---- little-endian byte accessors -------------------------- */
 

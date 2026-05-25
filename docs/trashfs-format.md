@@ -13,8 +13,13 @@ the authoritative on-disk layout reference; implementation follows it.
 
 ## Goals and decisions (locked)
 
-- **128-byte blocks** — 4× finer than FAT's 512, so small files and
-  log records waste little; half the bookkeeping of a 64-byte block.
+- **Block size is a build-time knob (`TRASHFS_BLOCK_SIZE`, default
+  128 B)** — 128 is 4× finer than FAT's 512, so small files and log
+  records waste little; 512 cuts indirection and per-file metadata for
+  volumes holding larger objects (e.g. guest ELFs). Must be a power of
+  two and a multiple of the 64-byte inode size. The block size is
+  recorded in the superblock and mount rejects a mismatch. (Inode and
+  dirent sizes stay locked at 64 and 48 bytes.)
 - **uint32 block indices** — 4 GB addressable (2^32 × ... no: 2^32
   blocks would be huge; the practical ceiling is volume size). Chosen
   over uint16 because real FMC SDRAM parts (e.g. 256 Mbit = 32 MB)
