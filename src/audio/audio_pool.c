@@ -43,36 +43,24 @@ static AudioObject *resolve(const AudioPool *p, AudioObjHandle h) {
     return (AudioObject *)o;
 }
 
-/* ---- free bitmap helpers (1 = free) ---- */
+/* ---- block free map (bitset; set bit = allocated) ---- */
 
-static bool blk_is_free(const AudioPool *p, uint32_t b) {
-    return (p->free_bitmap[b >> 3] >> (b & 7)) & 1u;
-}
-static void blk_set_free(AudioPool *p, uint32_t b, bool free_) {
-    uint8_t mask = (uint8_t)(1u << (b & 7));
-    if (free_) p->free_bitmap[b >> 3] |= mask;
-    else       p->free_bitmap[b >> 3] &= (uint8_t)~mask;
-}
-
-/* Allocate one free block, or NO_BLOCK. Updates bitmap + free count.
- * Linear scan from a rotating hint for spread; simple and fine at
- * 1024 blocks. */
+/* Allocate one free block, or NO_BLOCK. Updates the map + free count.
+ * The bitset scans words with ctz from a rolling hint — O(1) amortized
+ * even at thousands of blocks (the old code was a from-0 linear scan). */
 static uint32_t alloc_one_block(AudioPool *p) {
     if (p->free_blocks == 0) return AUDIO_POOL_NO_BLOCK;
-    for (uint32_t b = 0; b < p->block_count; b++) {
-        if (blk_is_free(p, b)) {
-            blk_set_free(p, b, false);
-            p->free_blocks--;
-            return b;
-        }
-    }
-    return AUDIO_POOL_NO_BLOCK;   /* free_blocks said otherwise — shouldn't happen */
+    size_t b = bitset_find_first_clear(&p->used_map);
+    if (b == BITSET_NPOS) return AUDIO_POOL_NO_BLOCK;   /* shouldn't happen */
+    bitset_set(&p->used_map, b);
+    p->free_blocks--;
+    return (uint32_t)b;
 }
 
 static void free_one_block(AudioPool *p, uint32_t b) {
     if (b >= p->block_count) return;
-    if (!blk_is_free(p, b)) {
-        blk_set_free(p, b, true);
+    if (bitset_test(&p->used_map, b)) {
+        bitset_clear(&p->used_map, b);
         p->free_blocks++;
     }
     p->owner[b] = AUDIO_POOL_NO_BLOCK;
@@ -101,13 +89,13 @@ AudioPoolResult audio_pool_init(AudioPool *p, void *region, size_t region_size) 
     p->block_count = (uint32_t)(region_size / AUDIO_POOL_BLOCK_SIZE);
     if (p->block_count == 0) return AUDIO_POOL_ERR_INVALID_ARG;
 
-    size_t bitmap_bytes = (p->block_count + 7u) / 8u;
-    p->owner       = malloc(p->block_count * sizeof(uint32_t));
-    p->next        = malloc(p->block_count * sizeof(uint32_t));
-    p->free_bitmap = malloc(bitmap_bytes);
-    if (!p->owner || !p->next || !p->free_bitmap) {
-        free(p->owner); free(p->next); free(p->free_bitmap);
-        p->owner = p->next = NULL; p->free_bitmap = NULL;
+    size_t map_words = bitset_words(p->block_count);
+    p->owner      = malloc(p->block_count * sizeof(uint32_t));
+    p->next       = malloc(p->block_count * sizeof(uint32_t));
+    p->used_words = malloc(map_words * sizeof(uint32_t));
+    if (!p->owner || !p->next || !p->used_words) {
+        free(p->owner); free(p->next); free(p->used_words);
+        p->owner = p->next = NULL; p->used_words = NULL;
         return AUDIO_POOL_ERR_NO_SPACE;
     }
 
@@ -115,11 +103,10 @@ AudioPoolResult audio_pool_init(AudioPool *p, void *region, size_t region_size) 
         p->owner[b] = AUDIO_POOL_NO_BLOCK;
         p->next[b]  = AUDIO_POOL_NO_BLOCK;
     }
-    memset(p->free_bitmap, 0xFF, bitmap_bytes);   /* all free */
-    /* clear any padding bits beyond block_count in the last byte */
-    for (uint32_t b = p->block_count; b < bitmap_bytes * 8u; b++) {
-        blk_set_free(p, b, false);
-    }
+    /* set bit = allocated; start all clear (every block free). The
+     * bitset masks tail bits beyond block_count, so no padding fixup. */
+    bitset_init(&p->used_map, p->used_words, p->block_count);
+    bitset_clear_all(&p->used_map);
     p->free_blocks = p->block_count;
 
     /* generations start at 1 so a fresh slot never matches a 0 gen
@@ -133,8 +120,8 @@ AudioPoolResult audio_pool_init(AudioPool *p, void *region, size_t region_size) 
 
 void audio_pool_destroy(AudioPool *p) {
     if (!p) return;
-    free(p->owner); free(p->next); free(p->free_bitmap);
-    p->owner = p->next = NULL; p->free_bitmap = NULL;
+    free(p->owner); free(p->next); free(p->used_words);
+    p->owner = p->next = NULL; p->used_words = NULL;
 }
 
 /* ---- object allocation ---- */

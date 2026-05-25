@@ -45,6 +45,7 @@ src/vm/channel_win32.c
 src/vm/service_channel.c
 src/vm/vm_host_audio.c
 src/containers/spsc_ring.c
+src/containers/bitset.c
 src/audio/audio_service.c
 src/audio/audio_arbiter.c
 src/audio/audio_pool.c

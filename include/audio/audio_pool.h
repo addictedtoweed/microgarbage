@@ -64,6 +64,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "containers/bitset.h"   /* block free-map */
+
 /* ---- tunables ---- */
 
 #ifndef AUDIO_POOL_BLOCK_SIZE
@@ -116,7 +118,8 @@ typedef struct {
     /* out-of-band metadata (caller-or-internally provided) */
     uint32_t *owner;         /* [block_count] object slot, or NO_BLOCK */
     uint32_t *next;          /* [block_count] next in chain, or NO_BLK */
-    uint8_t  *free_bitmap;   /* [(block_count+7)/8] 1=free             */
+    Bitset    used_map;      /* set bit = block allocated (see bitset.h)*/
+    uint32_t *used_words;    /* backing store for used_map (malloc'd)   */
 
     AudioObject objects[AUDIO_POOL_MAX_OBJECTS];
     uint16_t    generations[AUDIO_POOL_MAX_OBJECTS]; /* live gen per slot */
@@ -127,7 +130,7 @@ typedef struct {
 /* Initialize a pool over a caller-provided audio-memory region. The
  * region is carved into block_size blocks (the tail remainder, if
  * any, is unused). The out-of-band metadata arrays (owner, next,
- * free_bitmap) are allocated with malloc here and freed by
+ * used_map words) are allocated with malloc here and freed by
  * audio_pool_destroy — on the MCU these would instead be placed in a
  * fixed reserved region, but the logic is identical. Returns OK or
  * an error. */

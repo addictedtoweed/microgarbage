@@ -151,6 +151,7 @@ esac
     "$REPO_ROOT/src/audio/audio_sink_wav.c" \
     "$REPO_ROOT/src/audio/audio_sink_waveout.c" \
     "$REPO_ROOT/src/containers/spsc_ring.c" \
+    "$REPO_ROOT/src/containers/bitset.c" \
     "$REPO_ROOT/src/vm/service_channel.c" \
     "$REPO_ROOT/src/vm/channel_thread.c" \
     "$REPO_ROOT/src/vm/vm_host_audio.c" \
@@ -259,6 +260,7 @@ case "$(uname -s 2>/dev/null)" in
             "${STRESS_EXTRA_SRCS[@]}" \
             "$REPO_ROOT/src/containers/ring_buffer.c" \
             "$REPO_ROOT/src/containers/spsc_ring.c" \
+            "$REPO_ROOT/src/containers/bitset.c" \
             "$REPO_ROOT/src/vm/service_channel.c" \
             "$REPO_ROOT/src/vm/channel_thread.c" \
             -lpthread "${STRESS_EXTRA_LIBS[@]}" \

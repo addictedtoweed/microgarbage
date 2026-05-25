@@ -96,12 +96,13 @@ fi
 
 # ---- audio ----
 RB=src/containers/ring_buffer.c
+BITSET=src/containers/bitset.c          # audio_pool's block free-map
 run audio_mixer      audio  src/audio/audio_mixer.c $RB
 run music_player     audio  src/audio/music_player.c src/audio/audio_mixer.c $RB
-run audio_pool       audio  -DAUDIO_POOL_BLOCK_SIZE=64 src/audio/audio_pool.c
-run audio_arbiter    audio  -DAUDIO_POOL_BLOCK_SIZE=64 -DAUDIO_ARBITER_MAX_TRACKS=4 src/audio/audio_arbiter.c src/audio/audio_pool.c
-run audio_pool_stream audio -DAUDIO_POOL_BLOCK_SIZE=64 src/audio/audio_pool_stream.c src/audio/audio_pool.c
-run audio_pool_stream_integration audio src/audio/audio_pool_stream.c src/audio/audio_pool.c src/audio/music_player.c src/audio/audio_mixer.c $RB
+run audio_pool       audio  -DAUDIO_POOL_BLOCK_SIZE=64 src/audio/audio_pool.c $BITSET
+run audio_arbiter    audio  -DAUDIO_POOL_BLOCK_SIZE=64 -DAUDIO_ARBITER_MAX_TRACKS=4 src/audio/audio_arbiter.c src/audio/audio_pool.c $BITSET
+run audio_pool_stream audio -DAUDIO_POOL_BLOCK_SIZE=64 src/audio/audio_pool_stream.c src/audio/audio_pool.c $BITSET
+run audio_pool_stream_integration audio src/audio/audio_pool_stream.c src/audio/audio_pool.c src/audio/music_player.c src/audio/audio_mixer.c $RB $BITSET
 run audio_fft        audio  src/audio/audio_fft.c src/audio/audio_fft_kernel.c
 run audio_wav_read   audio  src/audio/audio_wav_read.c
 run audio_file_stream audio src/audio/audio_file_stream.c src/audio/audio_wav_read.c
@@ -115,7 +116,7 @@ esac
 run audio_service    audio  src/audio/audio_service.c src/audio/audio_arbiter.c src/audio/audio_pool.c \
     src/audio/audio_pool_stream.c src/audio/audio_mixer.c src/audio/music_player.c src/audio/audio_fft.c \
     src/audio/audio_fft_kernel.c src/audio/audio_wav_read.c src/audio/audio_file_stream.c \
-    src/vm/service_channel.c src/vm/channel_thread.c $RB src/containers/spsc_ring.c -lpthread
+    src/vm/service_channel.c src/vm/channel_thread.c $RB $BITSET src/containers/spsc_ring.c -lpthread
 
 # ---- vm ----
 # Base sources most VM suites link against (cooperative build). The
