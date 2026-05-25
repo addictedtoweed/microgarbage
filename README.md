@@ -691,7 +691,7 @@ once you've extracted FatFs).
    `third_party/fatfs/source/ff.c`, and
    `third_party/fatfs/source/ffsystem.c`.
 
-The tests in `src/storage/test_trashdrive_fatfs.c` will compile
+The tests in `src/storage/tests/test_trashdrive_fatfs.c` will compile
 without FatFs (they print "skipped" and exit cleanly) so CI
 keeps green even when FatFs isn't present. With `-DHAVE_FATFS`
 and the FatFs source in place, they run real `f_open`/`f_write`/

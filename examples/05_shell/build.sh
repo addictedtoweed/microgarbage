@@ -166,24 +166,18 @@ if have_guest_cc; then
     # ./host_files/ as /host by default, auto-creating the
     # directory if it doesn't exist.
     #
-    # Each top-level .c in host_files_src/ becomes one guest ELF.
-    # Sources under host_files_src/lib/ are library code linked
-    # into every guest (small enough that we don't bother building
-    # static-archive form). Guests that don't actually call any
-    # library symbols just leave the dead code in place — the
-    # linker doesn't strip it but the cost is negligible (a few
-    # KB per ELF).
+    # Each top-level .c in host_files_src/ becomes one guest ELF,
+    # linked against the shared guest SDK (examples/common/guest/).
+    # Unused SDK code is stripped per ELF via gc-sections (below).
     HOST_FILES_DIR="$EXAMPLE_DIR/host_files"
     mkdir -p "$HOST_FILES_DIR"
 
-    # Gather library sources (host_files_src/lib/*.c).
+    # Gather the guest SDK sources (examples/common/guest/*.c).
     #
-    # Each guest .c links against all library .c files. Most of
-    # the library is small functions and the linker strips unused
-    # ones because we add -ffunction-sections / -fdata-sections /
-    # -Wl,--gc-sections below — so a guest that never calls
-    # tui_init pays only a few bytes overhead instead of the full
-    # library's ~6 KB.
+    # Each guest .c links against all SDK .c files; the linker strips
+    # the unused ones because we add -ffunction-sections /
+    # -fdata-sections / -Wl,--gc-sections below — so a guest that never
+    # calls tui_init pays only a few bytes instead of the full ~6 KB.
     GUEST_LIB_SRCS=()
     GUEST_GC_CFLAGS=(-ffunction-sections -fdata-sections)
     # -z max-page-size=4 collapses LOAD segment alignment from
