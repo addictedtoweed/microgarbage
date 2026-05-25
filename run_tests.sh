@@ -86,6 +86,11 @@ run trashfs_p2       storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_p3       storage  src/storage/trashfs.c src/storage/trashdrive.c
 run trashfs_dirs     storage  src/storage/trashfs.c src/storage/trashdrive.c
 
+# ---- video ----
+# ppu is headless (renders to a memory framebuffer); the present shim
+# (present_gl_win32.c) is a GUI layer with no unit test — visual only.
+run ppu              video  src/video/ppu.c
+
 # ---- audio ----
 RB=src/containers/ring_buffer.c
 BITSET=src/containers/bitset.c          # audio_pool's block free-map
