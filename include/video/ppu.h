@@ -99,6 +99,19 @@ typedef struct {
     PpuHdmaChannel hdma[PPU_HDMA_MAX];
     unsigned       hdma_count;
 
+    /* Color math (subscreen add/subtract) — the translucency path.
+     * The main-screen pixel is combined with a second operand: the
+     * sub-screen pixel (layers flagged on_sub) when cm_use_subscreen,
+     * else the fixed color. Math applies only where the winning main
+     * layer's cm-enable bit is set. (CGADSUB / CGWSEL / COLDATA.) */
+    bool     cm_bg[4];          /* per-BG color-math enable        */
+    bool     cm_obj;            /* OBJ color-math enable           */
+    bool     cm_backdrop;       /* backdrop color-math enable      */
+    bool     cm_subtract;       /* subtract instead of add         */
+    bool     cm_half;           /* halve the result                */
+    bool     cm_use_subscreen;  /* 2nd operand: subscreen vs fixed */
+    uint16_t cm_fixed_color;    /* fixed-color operand (BGR555)    */
+
     /* Hardware memory, identical to the real chip.
      *   oam[0..511]   = low table: 4 bytes/sprite x 128:
      *                   X(lo8), Y, tile(lo8), attr(N|ppp|oo|h|v)

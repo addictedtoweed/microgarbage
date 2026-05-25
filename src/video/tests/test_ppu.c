@@ -441,6 +441,44 @@ static void test_hdma_scroll(void) {
     ASSERT_EQ_INT((long long)blk, (long long)px(0, 60));   /* hofs 8 -> bg x8 transparent -> backdrop */
 }
 
+static void test_colormath_add_half(void) {
+    /* Water-style: BG1 (main) red + BG2 (sub) green, add + half -> blend. */
+    ppu_state_clear(&P); P.mode = 1;
+    P.bg[0].on_main = true; P.bg[0].tilemap_word = 0x1000; P.bg[0].char_word = 0x2000;
+    P.bg[1].on_sub  = true; P.bg[1].tilemap_word = 0x1100; P.bg[1].char_word = 0x3000;
+    P.cgram[0] = 0; P.cgram[5] = RED555; P.cgram[6] = GREEN555;
+    uint8_t r[8][8]; fill8(r, 5); set_tile_4bpp(P.vram, 0x2000, 1, r); set_map(P.vram, 0x1000, 0, 0, 1);
+    uint8_t g[8][8]; fill8(g, 6); set_tile_4bpp(P.vram, 0x3000, 1, g); set_map(P.vram, 0x1100, 0, 0, 1);
+    P.cm_bg[0] = true; P.cm_use_subscreen = true; P.cm_half = true;
+    ppu_render(&P, FB);
+    /* (red + green)/2 = (r15,g15) -> (123,123,0) */
+    ASSERT_EQ_INT((long long)PRESENT_RGBA(123, 123, 0), (long long)px(0, 0));
+}
+
+static void test_colormath_fixed_subtract(void) {
+    /* main white minus fixed red = cyan. */
+    ppu_state_clear(&P); P.mode = 1;
+    P.bg[0].on_main = true; P.bg[0].tilemap_word = 0x1000; P.bg[0].char_word = 0x2000;
+    P.cgram[0] = 0; P.cgram[5] = WHITE555;
+    uint8_t w[8][8]; fill8(w, 5); set_tile_4bpp(P.vram, 0x2000, 1, w); set_map(P.vram, 0x1000, 0, 0, 1);
+    P.cm_bg[0] = true; P.cm_use_subscreen = false; P.cm_fixed_color = RED555; P.cm_subtract = true;
+    ppu_render(&P, FB);
+    ASSERT_EQ_INT((long long)PRESENT_RGBA(0, 255, 255), (long long)px(0, 0));
+}
+
+static void test_colormath_layer_gated(void) {
+    /* Color math configured, but NOT for the winning main layer (BG1) -> no blend. */
+    ppu_state_clear(&P); P.mode = 1;
+    P.bg[0].on_main = true; P.bg[0].tilemap_word = 0x1000; P.bg[0].char_word = 0x2000;
+    P.bg[1].on_sub  = true; P.bg[1].tilemap_word = 0x1100; P.bg[1].char_word = 0x3000;
+    P.cgram[0] = 0; P.cgram[5] = RED555; P.cgram[6] = GREEN555;
+    uint8_t r[8][8]; fill8(r, 5); set_tile_4bpp(P.vram, 0x2000, 1, r); set_map(P.vram, 0x1000, 0, 0, 1);
+    uint8_t g[8][8]; fill8(g, 6); set_tile_4bpp(P.vram, 0x3000, 1, g); set_map(P.vram, 0x1100, 0, 0, 1);
+    P.cm_bg[0] = false; P.cm_bg[1] = true; P.cm_use_subscreen = true; P.cm_half = true;
+    ppu_render(&P, FB);
+    ASSERT_EQ_INT((long long)ppu_bgr555_to_rgba(RED555), (long long)px(0, 0)); /* plain red */
+}
+
 int main(void) {
     TEST_SUITE("ppu");
     RUN(test_bgr555_conversion);
@@ -462,5 +500,8 @@ int main(void) {
     RUN(test_sprite_vs_bg_priority);
     RUN(test_hdma_brightness);
     RUN(test_hdma_scroll);
+    RUN(test_colormath_add_half);
+    RUN(test_colormath_fixed_subtract);
+    RUN(test_colormath_layer_gated);
     return TEST_SUITE_RESULT();
 }

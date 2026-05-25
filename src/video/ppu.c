@@ -37,6 +37,21 @@ uint32_t ppu_bgr555_to_rgba(uint16_t bgr555) {
     return color_to_fb(bgr555, 15u);
 }
 
+/* Color math: combine two BGR555 colors per channel (add or subtract,
+ * optionally halved), clamped to 0..31. */
+static uint16_t color_math(uint16_t a, uint16_t b, bool sub, bool half) {
+    int ar = a & 31, ag = (a >> 5) & 31, ab = (a >> 10) & 31;
+    int br = b & 31, bg = (b >> 5) & 31, bb = (b >> 10) & 31;
+    int rr = sub ? ar - br : ar + br;
+    int rg = sub ? ag - bg : ag + bg;
+    int rb = sub ? ab - bb : ab + bb;
+    if (half) { rr /= 2; rg /= 2; rb /= 2; }
+    if (rr < 0) rr = 0; if (rr > 31) rr = 31;
+    if (rg < 0) rg = 0; if (rg > 31) rg = 31;
+    if (rb < 0) rb = 0; if (rb > 31) rb = 31;
+    return (uint16_t)(rr | (rg << 5) | (rb << 10));
+}
+
 /* ---- tile fetch -------------------------------------------- */
 
 /* Pixel value (0..2^bpp-1) of tile `tile` at intra-tile (px,py), from
@@ -249,6 +264,27 @@ static void apply_hdma(const PpuState *p, unsigned y,
     }
 }
 
+/* Resolve one screen (main or sub) at a pixel: walk front-to-back and
+ * return the first opaque, enabled layer at its priority, else backdrop.
+ * en[] is per-layer enable (0-3 BG, 4 OBJ). Writes the winning layer id
+ * (0-3 BG, 4 OBJ, 5 backdrop) to *out_layer. */
+static uint16_t composite(const OrderEntry *ord, unsigned norder,
+                          const bool op[4], const uint16_t col[4], const unsigned pr[4],
+                          bool obj_op, uint16_t obj_col, unsigned obj_prio,
+                          const bool en[5], uint16_t backdrop, int *out_layer) {
+    for (unsigned o = 0; o < norder; o++) {
+        unsigned l = ord[o].layer;
+        if (l == OBJ_LAYER) {
+            if (en[4] && obj_op && obj_prio == ord[o].prio) { *out_layer = 4; return obj_col; }
+        } else if (en[l] && op[l] && pr[l] == ord[o].prio) {
+            *out_layer = (int)l;
+            return col[l];
+        }
+    }
+    *out_layer = 5;
+    return backdrop;
+}
+
 /* ---- frame ------------------------------------------------- */
 
 void ppu_render(const PpuState *p, uint32_t *fb) {
@@ -264,7 +300,15 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
     OrderEntry ord[16];
     unsigned nlayers = build_layers(p, li);
     unsigned norder  = build_order(p, ord);
-    uint16_t backdrop = p->cgram[0];
+
+    /* Per-screen layer enables (BG0-3, OBJ) and whether any color math
+     * is configured at all (skip the second composite if not). */
+    const bool main_en[5] = { p->bg[0].on_main, p->bg[1].on_main,
+                              p->bg[2].on_main, p->bg[3].on_main, p->obj_on_main };
+    const bool sub_en[5]  = { p->bg[0].on_sub,  p->bg[1].on_sub,
+                              p->bg[2].on_sub,  p->bg[3].on_sub,  p->obj_on_sub };
+    bool cm_any = p->cm_bg[0] || p->cm_bg[1] || p->cm_bg[2] || p->cm_bg[3]
+                || p->cm_obj  || p->cm_backdrop;
 
     /* Per-scanline sprite line buffers. */
     bool     obj_op[PPU_SCREEN_W];
@@ -284,26 +328,41 @@ void ppu_render(const PpuState *p, uint32_t *fb) {
         render_obj_line(p, y, obj_op, obj_col, obj_prio);
         uint32_t *row = fb + (size_t)y * PPU_SCREEN_W;
         for (unsigned x = 0; x < PPU_SCREEN_W; x++) {
-            /* Sample each main-screen BG layer once. */
+            /* Sample each layer used by either screen once. */
             bool     op[4]  = { false, false, false, false };
             uint16_t col[4] = { 0, 0, 0, 0 };
             unsigned pr[4]  = { 0, 0, 0, 0 };
             for (unsigned l = 0; l < nlayers; l++) {
-                if (li[l].bg->on_main)
+                if (li[l].bg->on_main || li[l].bg->on_sub)
                     op[l] = bg_sample(p, &li[l], x, y, eff_hofs[l], eff_vofs[l],
                                       &col[l], &pr[l]);
             }
-            /* Walk front-to-back; first opaque match at its priority wins.
-             * layer == OBJ_LAYER consults the sprite line buffer. */
-            uint16_t out = backdrop;
-            for (unsigned o = 0; o < norder; o++) {
-                unsigned l = ord[o].layer;
-                if (l == OBJ_LAYER) {
-                    if (obj_op[x] && obj_prio[x] == ord[o].prio) { out = obj_col[x]; break; }
-                } else if (op[l] && pr[l] == ord[o].prio) {
-                    out = col[l]; break;
+
+            int ml;
+            uint16_t out = composite(ord, norder, op, col, pr,
+                                     obj_op[x], obj_col[x], obj_prio[x],
+                                     main_en, p->cgram[0], &ml);
+
+            /* Color math: blend the main pixel with the subscreen (or a
+             * fixed color) where the winning main layer enables it. */
+            if (cm_any) {
+                bool cmf = (ml == 4) ? p->cm_obj
+                         : (ml == 5) ? p->cm_backdrop
+                                     : p->cm_bg[ml];
+                if (cmf) {
+                    uint16_t operand;
+                    if (p->cm_use_subscreen) {
+                        int sl;
+                        operand = composite(ord, norder, op, col, pr,
+                                            obj_op[x], obj_col[x], obj_prio[x],
+                                            sub_en, p->cm_fixed_color, &sl);
+                    } else {
+                        operand = p->cm_fixed_color;
+                    }
+                    out = color_math(out, operand, p->cm_subtract, p->cm_half);
                 }
             }
+
             row[x] = color_to_fb(out, eff_bright);
         }
     }
