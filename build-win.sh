@@ -256,20 +256,22 @@ else
         # embedded image. The spawnable demos below still build here.
 
         mkdir -p "$HOST_FILES"
+        # Guest SDK (shared runtime + host hooks + mini-libc) lives at
+        # examples/common/guest/; link its .c and add its include dirs.
+        GUEST_SDK="$REPO_ROOT/examples/common/guest"
         LIB_SRCS=()
-        if [ -d "$EXAMPLE_DIR/host_files_src/lib" ]; then
-            for libsrc in "$EXAMPLE_DIR"/host_files_src/lib/*.c; do
-                [ -f "$libsrc" ] || continue
-                LIB_SRCS+=("$(guest_path "$libsrc")")
-            done
-        fi
+        for libsrc in "$GUEST_SDK"/*.c; do
+            [ -f "$libsrc" ] || continue
+            LIB_SRCS+=("$(guest_path "$libsrc")")
+        done
         for src in "$EXAMPLE_DIR"/host_files_src/*.c; do
             [ -f "$src" ] || continue
             name=$(basename "$src" .c)
             step "compiling host_files/$name.elf (spawnable)..."
             "$GUEST_CC" "${GCFLAGS[@]}" "${GUEST_OPT[@]}" "${GC[@]}" \
                 -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
-                -I"$(guest_path "$EXAMPLE_DIR/host_files_src/lib/include")" \
+                -I"$(guest_path "$GUEST_SDK")" \
+                -I"$(guest_path "$GUEST_SDK/include")" \
                 -Wl,-T,"$(guest_path "$GUEST_LD")" "${GLD[@]}" \
                 -o "$(guest_path "$HOST_FILES/$name.elf")" \
                 "$(guest_path "$src")" "${LIB_SRCS[@]}"

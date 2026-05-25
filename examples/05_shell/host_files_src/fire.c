@@ -21,7 +21,7 @@
  * ============================================================ */
 
 #include <stdint.h>
-#include "lib/tui.h"
+#include "tui.h"
 
 #define SYS_EXIT          93
 #define SYS_TICKS_NOW   1043

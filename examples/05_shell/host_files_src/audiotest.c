@@ -13,8 +13,8 @@
  *  separate. This confirms the control path is wired correctly.
  * ============================================================ */
 
-#include "lib/vm_runtime.h"
-#include "lib/audio.h"
+#include "vm_runtime.h"
+#include "audio.h"
 #include <stdint.h>
 
 /* tiny printf via the host format syscall */

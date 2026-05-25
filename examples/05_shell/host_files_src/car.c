@@ -20,7 +20,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "lib/tui.h"
+#include "tui.h"
 
 /* Syscall numbers for things tui.h doesn't expose. */
 #define SYS_EXIT             93

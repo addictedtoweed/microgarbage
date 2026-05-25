@@ -315,23 +315,20 @@ if ($NoGuest) {
         # don't rebuild it here (would overwrite the size-optimized
         # on-disk copy with the plain one). Spawnable demos below only.
 
-        # Spawnable guests under host_files_src/*.c, linked against
-        # everything in host_files_src/lib/*.c. Output to host_files/.
+        # Spawnable guests under host_files_src/*.c, linked against the
+        # shared guest SDK (examples\common\guest). Output to host_files/.
         New-Item -ItemType Directory -Force -Path $HostFiles | Out-Null
-        $libInc  = Join-Path $ExampleDir "host_files_src"
-        $libInc2 = Join-Path $ExampleDir "host_files_src\lib\include"
-        $libSrcs = @()
-        $libDir  = Join-Path $ExampleDir "host_files_src\lib"
-        if (Test-Path $libDir) {
-            $libSrcs = Get-ChildItem -Path $libDir -Filter *.c | ForEach-Object { $_.FullName }
-        }
+        $guestSdk = Join-Path $RepoRoot "examples\common\guest"
+        $libInc   = Join-Path $ExampleDir "host_files_src"
+        $libInc2  = Join-Path $guestSdk "include"
+        $libSrcs  = Get-ChildItem -Path $guestSdk -Filter *.c | ForEach-Object { $_.FullName }
         Get-ChildItem -Path (Join-Path $ExampleDir "host_files_src") -Filter *.c |
         ForEach-Object {
             $name = $_.BaseName
             $outElf = Join-Path $HostFiles "$name.elf"
             Write-Step "compiling host_files\$name.elf (spawnable)..."
             $gargs = $guestCflags + $guestOpt + $gcCflags +
-                     @("-I$libInc","-I$libInc2","-Wl,-T,$guestLd") +
+                     @("-I$libInc","-I$guestSdk","-I$libInc2","-Wl,-T,$guestLd") +
                      $gcLdflags + @("-o",$outElf,$_.FullName) + $libSrcs
             & $GuestCc @gargs
             if ($LASTEXITCODE -ne 0) { Die "guest $name.elf compile failed" }

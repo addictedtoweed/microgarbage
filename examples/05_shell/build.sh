@@ -193,12 +193,11 @@ if have_guest_cc; then
     # -s strips the symbol table, which on snake.elf is another
     # ~1.2 KB of debug names we don't need at runtime.
     GUEST_GC_LDFLAGS=(-Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-s)
-    if [ -d "$EXAMPLE_DIR/host_files_src/lib" ]; then
-        for libsrc in "$EXAMPLE_DIR"/host_files_src/lib/*.c; do
-            [ -f "$libsrc" ] || continue
-            GUEST_LIB_SRCS+=("$(guest_path "$libsrc")")
-        done
-    fi
+    GUEST_SDK="$(dirname "$GUEST_LD")/guest"   # examples/common/guest
+    for libsrc in "$GUEST_SDK"/*.c; do
+        [ -f "$libsrc" ] || continue
+        GUEST_LIB_SRCS+=("$(guest_path "$libsrc")")
+    done
 
     for src in "$EXAMPLE_DIR"/host_files_src/*.c; do
         [ -f "$src" ] || continue
@@ -206,7 +205,8 @@ if have_guest_cc; then
         echo "05_shell: compiling host_files/$name.elf (spawnable)..."
         "$GUEST_CC" "${GUEST_CFLAGS[@]}" "${GUEST_OPT[@]}" "${GUEST_GC_CFLAGS[@]}" \
             -I"$(guest_path "$EXAMPLE_DIR/host_files_src")" \
-            -I"$(guest_path "$EXAMPLE_DIR/host_files_src/lib/include")" \
+            -I"$(guest_path "$GUEST_SDK")" \
+            -I"$(guest_path "$GUEST_SDK/include")" \
             -Wl,-T,"$(guest_path "$GUEST_LD")" \
             "${GUEST_GC_LDFLAGS[@]}" \
             -o "$(guest_path "$HOST_FILES_DIR/$name.elf")" \

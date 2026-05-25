@@ -23,9 +23,9 @@
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 
-#include "lib/tui.h"
-#include "lib/audio.h"
-#include "lib/vm_runtime.h"
+#include "tui.h"
+#include "audio.h"
+#include "vm_runtime.h"
 #include <stdint.h>
 
 #define NB           16      /* FFT bands the meter shows */

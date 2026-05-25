@@ -14,7 +14,7 @@
  * Public domain (CC0).
  */
 
-#include "lib/tui.h"
+#include "tui.h"
 
 /* ============================================================
  *  Syscall stubs (not in tui — these are timing / control)
