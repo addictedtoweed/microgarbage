@@ -180,7 +180,7 @@ static void render_fb(float cx, float cz, float cy, float yaw) {
 
 /* ---- load framebuffer into Mode 7 VRAM + set the scale ----- */
 
-static void load_mode7(void) {
+static void load_mode7(float roll) {
     const int TW = FBW / 8;                            /* tiles across */
     for (int ty = 0; ty < FBH / 8; ty++)
         for (int tx = 0; tx < TW; tx++) {
@@ -194,10 +194,22 @@ static void load_mode7(void) {
             unsigned mw = ((unsigned)ty * 128u + (unsigned)tx) & 0x7FFFu;
             P.vram[mw] = (uint16_t)((P.vram[mw] & 0xFF00u) | (tile & 0xFFu));             /* tilemap = low byte */
         }
-    /* Matrix maps screen -> framebuffer: tex_x = FBW/256 * x, etc. */
-    P.m7a = (int16_t)FBW;
-    P.m7d = (int16_t)(256 * FBH / PPU_SCREEN_H);
-    P.m7b = 0; P.m7c = 0; P.m7x = 0; P.m7y = 0; P.m7hofs = 0; P.m7vofs = 0;
+    /* Matrix: scale framebuffer->screen, with a `roll` rotation about the
+     * screen/framebuffer centre (camera banking). At roll=0 this is a pure
+     * scale (a=FBW, d=256*FBH/H). The pivot is centred via m7x/m7y +
+     * hofs/vofs so the world tilts around screen centre. (Anisotropic scale
+     * shears a little at large roll; fine for bank angles.) */
+    float sx = (float)FBW;
+    float sy = (float)(256 * FBH / PPU_SCREEN_H);
+    float cs = fcos(roll), sn = fsin(roll);
+    P.m7a = (int16_t)(sx * cs);
+    P.m7b = (int16_t)(-sx * sn);
+    P.m7c = (int16_t)(sy * sn);
+    P.m7d = (int16_t)(sy * cs);
+    P.m7x = (int16_t)(FBW / 2);
+    P.m7y = (int16_t)(FBH / 2);
+    P.m7hofs = (int16_t)(FBW / 2 - PPU_SCREEN_W / 2);
+    P.m7vofs = (int16_t)(FBH / 2 - PPU_SCREEN_H / 2);
 }
 
 int main(void) {
@@ -216,7 +228,7 @@ int main(void) {
 
     float tx = 128.0f, tz = 0.0f, ty = 0.0f, tyaw = 0.0f;
     float ax = 128.0f, az = 0.0f, ay = 200.0f, ayaw = 0.0f;
-    const float SPEED = 1.30f, LAG = 0.06f;   /* fast soar to read velocity */
+    const float SPEED = 5.0f, LAG = 0.06f;   /* fast soar to read velocity */
 
     const double target_dt = 1.0 / SNES_NTSC_HZ;
     double last = now_sec(), acc = 0.0;
@@ -237,7 +249,8 @@ int main(void) {
         }
         if (stepped) {
             render_fb(ax, az, ay, ayaw);
-            load_mode7();
+            float bank = 0.9f * ayaw;   /* bank into the turn (flip sign if reversed) */
+            load_mode7(bank);
             ppu_render(&P, FB);
         }
         present_frame(FB);
