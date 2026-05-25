@@ -982,9 +982,34 @@ static void handle_mkdirat(VmCpu *cpu, void *system) {
     }
 
     char buf[VM_HOST_FS_MAX_PATH];
-    int p = copy_path(cpu, path, buf, sizeof(buf));
+    PathBackend backend;
+    bool writable;
+    const Mount *mnt = NULL;
+    int p = resolve_guest_path(cpu, path, buf, sizeof(buf),
+                               &backend, &writable, &mnt);
     if (p < 0) {
         cpu->regs[VM_REG_A0] = (uint32_t)p;
+        return;
+    }
+
+    if (backend == PATH_BACKEND_HOST) {
+        /* The /host passthrough is a read-only view. */
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EROFS;
+        return;
+    }
+
+    if (backend == PATH_BACKEND_TRASHFS) {
+        TrashfsVolume *vol = mnt ? mnt->trashfs_vol : NULL;
+        if (!vol) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO; return; }
+        TrashfsResult r = trashfs_mkdir(vol, buf, 0);
+        int e = (r == TRASHFS_OK)             ? 0
+              : (r == TRASHFS_ERR_EXISTS)     ? -VM_EEXIST
+              : (r == TRASHFS_ERR_NOT_FOUND)  ? -VM_ENOENT
+              : (r == TRASHFS_ERR_NOT_DIR)    ? -VM_ENOTDIR
+              : (r == TRASHFS_ERR_NO_SPACE)   ? -VM_ENOSPC
+              : (r == TRASHFS_ERR_INVALID_ARG)? -VM_EINVAL
+              : -VM_EIO;
+        cpu->regs[VM_REG_A0] = (uint32_t)e;
         return;
     }
 
@@ -1001,8 +1026,9 @@ static void handle_mkdirat(VmCpu *cpu, void *system) {
  */
 static void handle_unlinkat(VmCpu *cpu, void *system) {
     (void)system;
-    int32_t dirfd = (int32_t)cpu->regs[VM_REG_A0];
-    uint32_t path = cpu->regs[VM_REG_A1];
+    int32_t  dirfd = (int32_t)cpu->regs[VM_REG_A0];
+    uint32_t path  = cpu->regs[VM_REG_A1];
+    uint32_t flags = cpu->regs[VM_REG_A2];
 
     if (dirfd != VM_AT_FDCWD) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
@@ -1029,9 +1055,16 @@ static void handle_unlinkat(VmCpu *cpu, void *system) {
     if (backend == PATH_BACKEND_TRASHFS) {
         TrashfsVolume *vol = mnt ? mnt->trashfs_vol : NULL;
         if (!vol) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO; return; }
-        TrashfsResult r = trashfs_unlink(vol, buf);
-        int e = (r == TRASHFS_OK)            ? 0
-              : (r == TRASHFS_ERR_NOT_FOUND) ? -VM_ENOENT
+        /* AT_REMOVEDIR -> rmdir (dirs only); otherwise unlink (files
+         * only — trashfs_unlink refuses a directory). */
+        TrashfsResult r = (flags & VM_AT_REMOVEDIR)
+                        ? trashfs_rmdir(vol, buf)
+                        : trashfs_unlink(vol, buf);
+        int e = (r == TRASHFS_OK)             ? 0
+              : (r == TRASHFS_ERR_NOT_FOUND)  ? -VM_ENOENT
+              : (r == TRASHFS_ERR_NOT_DIR)    ? -VM_ENOTDIR
+              : (r == TRASHFS_ERR_NOT_EMPTY)  ? -VM_ENOTEMPTY
+              : (r == TRASHFS_ERR_INVALID_ARG)? -VM_EINVAL
               : -VM_EIO;
         cpu->regs[VM_REG_A0] = (uint32_t)e;
         return;

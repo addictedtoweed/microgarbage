@@ -803,6 +803,7 @@
 #define VM_EROFS          30   /* read-only filesystem              */
 #define VM_ENOSYS         38   /* function not implemented          */
 #define VM_ENAMETOOLONG   36   /* path component too long           */
+#define VM_ENOTEMPTY      39   /* directory not empty (rmdir)       */
 #define VM_ETIMEDOUT     110   /* operation timed out               */
 
 /* ============================================================
