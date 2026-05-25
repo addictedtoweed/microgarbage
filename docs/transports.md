@@ -1,7 +1,7 @@
 # Transports
 
-> Status: Round U complete. Pluggable transports (stdio, pipe, pty,
-> TCP) with per-VM routing and multi-session orchestration. One host
+> Status: Round U complete. Pluggable transports (stdio, pty, TCP)
+> with per-VM routing and multi-session orchestration. One host
 > process can run N independent shell sessions, each on its own
 > transport with its own canvas and input.
 
@@ -79,7 +79,7 @@ needing the caller to know which kind of byte it's writing.
 The stateful tracking is per-transport-instance via a `prev_was_cr`
 flag. For multi-instance TCP it lives in the per-connection `ctx`
 (so two sessions don't share LF→CRLF state); for the single-instance
-pipe/pty transports it's a static.
+pty transport it's a static.
 
 ## Available transports
 
@@ -91,17 +91,6 @@ This is the fallback when no transport is installed — `handle_read`,
 
 Limitations: no transport-level raw mode; relies on tcgetattr/tcsetattr
 inside `vm_host_stdio.c`.
-
-### `--pipe=<name>` — Windows/Cygwin named pipe
-
-Bidirectional `\\.\pipe\<name>` byte stream. PuTTY connects as
-**Serial** (Connection type), pipe path in the Serial line field,
-any speed.
-
-- Available: Windows/Cygwin builds
-- `is_terminal`: true
-- `set_raw`: no-op (pipes have no line discipline)
-- `flush`: no-op (kernel buffer is unbuffered at app layer)
 
 ### `--pty` — POSIX pseudoterminal
 
@@ -198,9 +187,8 @@ interactive client.
 | Transport | Platforms       | Network? | TTY semantics | Multi? | Use case                        |
 |-----------|-----------------|----------|---------------|--------|---------------------------------|
 | stdio     | all             | no       | inherited     | no     | default; running from a shell   |
-| pipe      | Windows/Cygwin  | local    | none          | no     | PuTTY/serial-like UX on Windows |
 | pty       | POSIX           | no       | real          | no     | screen/minicom on Linux         |
-| tcp       | all             | yes      | none          | yes    | remote shells, N-session demo   |
+| tcp       | all             | yes      | none          | yes    | PuTTY/nc; remote + N-session    |
 
 ## Adding a new transport
 
@@ -303,9 +291,9 @@ Each session is fully independent — separate cwd, history, and TUI
 surface. A TUI program launched in one session (snake, car) renders
 only to that session's client.
 
-Up to `MAX_TCP_PORTS` (16) `--tcp=` ports are accepted. `--pipe` and
-`--pty` remain single-instance and can't be combined with `--tcp` or
-each other (multi-instancing them is a future refinement; TCP is the
+Up to `MAX_TCP_PORTS` (16) `--tcp=` ports are accepted. `--pty`
+remains single-instance and can't be combined with `--tcp`
+(multi-instancing it is a future refinement; TCP is the
 demo-relevant multi case).
 
 ### Lifecycle
@@ -333,7 +321,7 @@ the last one. Reconnect-after-exit is a future refinement.
 
 - **Multi-instance TCP** (U.7b): each TCP transport's per-connection
   state (sockets, LF→CRLF tracking) lives behind the vtable's `ctx`
-  pointer, so N transports coexist. pipe/pty stay single-instance.
+  pointer, so N transports coexist. pty stays single-instance.
 
 - **Spawn inheritance** (U.7b): when a shell spawns a child VM (e.g.
   running `snake.elf`), the child inherits the parent's transport

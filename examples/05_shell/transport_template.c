@@ -13,7 +13,8 @@
  *       The read/write contracts are the only thing to get right —
  *       see the comments on each.
  *    4. Call my_transport_setup() from host.c after stdio is
- *       installed, the same way setup_pipe_transport() is called.
+ *       installed, the same way setup_pty_transport() / the TCP
+ *       transport setup is wired in.
  *    5. Add the file to the build (build.sh / build-win.*).
  *
  *  This template is a working LOOPBACK: whatever the guest writes,

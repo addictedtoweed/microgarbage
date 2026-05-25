@@ -11,11 +11,11 @@
  *
  * Stdio routing:
  *   default        process stdin/stdout/stderr (current behavior)
- *   --pipe=<name>  bidirectional Windows named pipe; PuTTY (or
- *                  another client) connects to it as a "serial"
- *                  line. Decouples VM execution from the local
- *                  terminal's scheduling/rendering and is also a
- *                  realistic stand-in for a UART on real hardware.
+ *   --tcp=<port>   listen on a TCP port; PuTTY (Raw/Telnet) or nc
+ *                  connects to localhost:<port>. Repeatable for
+ *                  multiple concurrent sessions. Cross-platform.
+ *   --pty          POSIX pseudoterminal (Linux/Cygwin); attach with
+ *                  screen/minicom. POSIX-only.
  *
  * Build dependencies (beyond the standard -Iinclude):
  *   -Ithird_party/fatfs/source -Ithird_party/fatfs -DHAVE_FATFS
@@ -92,11 +92,6 @@ typedef SOCKET tcp_sock_t;
 #include <unistd.h>
 
 #include "vm/host_compat.h"
-
-#if defined(__CYGWIN__) || defined(_WIN32)
-#  define PIPE_MODE_SUPPORTED 1
-#  include <windows.h>
-#endif
 
 /* PTY transport requires posix_openpt + grantpt + unlockpt + ptsname.
  * Available on Linux, BSD, macOS, and Cygwin (POSIX-compliant). Not
@@ -808,219 +803,6 @@ static int load_file(const char *path, uint8_t **out_buf, size_t *out_size) {
     return 0;
 }
 
-#ifdef PIPE_MODE_SUPPORTED
-/* ---------------------------------------------------------------
- *  Named-pipe transport (Windows-only)
- *
- *  Creates a bidirectional Windows named pipe and waits for a
- *  single client to connect. The pipe is byte-oriented, in
- *  blocking mode (PIPE_WAIT — the default). PuTTY (or any other
- *  named-pipe-capable serial client) connects to the pipe and
- *  sees a normal blocking byte stream.
- *
- *  Approach: register our own SYS_READ and SYS_WRITE ECALL
- *  handlers (replacing the bridge's default ones) that talk
- *  directly to the HANDLE via Win32 APIs. This avoids two
- *  Cygwin-specific problems:
- *
- *    1. Attaching a HANDLE to a Cygwin fd via
- *       cygwin_attach_handle_to_fd works, but read() on that
- *       fd can block even after fcntl(O_NONBLOCK), because the
- *       Cygwin POSIX layer may not fully honor non-blocking
- *       semantics for every kind of attached HANDLE.
- *    2. fopencookie FILE*s have no backing fd (fileno returns
- *       -1), which the bridge doesn't tolerate.
- *
- *  By using PeekNamedPipe before each ReadFile, we get
- *  guaranteed-non-blocking reads on a pipe that remains in
- *  blocking mode for PuTTY's side (PIPE_NOWAIT would cause
- *  PuTTY to see EOF immediately and disconnect).
- *
- *  We also translate '\n' to '\r\n' on writes — there's no
- *  terminal driver in the path (OPOST/ONLCR don't apply to
- *  raw pipes), so the guest's '\n' output would otherwise
- *  appear in PuTTY as "down one line, same column" instead
- *  of "down one line, column 1." The translation produces
- *  cooked-terminal-style line endings.
- *
- *  Why this lives in host.c instead of vm_host_stdio.c:
- *    - Host-application policy (which transport) vs VM-bridge
- *      functionality (how the guest sees stdio)
- *    - Windows-specific; the bridge is portable
- *    - Future hosts (TCP socket, etc.) plug in here using the
- *      same custom-handler pattern
- * --------------------------------------------------------------- */
-
-static HANDLE g_pipe_handle = INVALID_HANDLE_VALUE;
-/* ============================================================
- *  Pipe transport (round U.2)
- *
- *  Implements the VmHostTransport vtable. Shares the named-pipe
- *  HANDLE with the legacy pipe_sys_* ecall handlers (which are
- *  no longer registered when the transport is active — see
- *  setup_pipe_transport).
- *
- *  The write function performs LF→CRLF translation, but ONLY
- *  for lone '\n' bytes (those not preceded by '\r'). This means:
- *
- *    - Shell cooked output (lone '\n' as line terminator) gets
- *      the '\r' inserted, so PuTTY shows it correctly.
- *    - TUI canvas escapes that emit '\r\n' deliberately pass
- *      through unchanged. Adding a second '\r' would corrupt
- *      cursor positioning.
- *
- *  The translation is single-pass and stateful across the call
- *  via the `prev_was_cr` static — that's correct because the
- *  transport instance is process-global today and we want
- *  cross-call coherence. When U.4/U.5 make this per-session,
- *  the state moves into transport ctx. */
-
-static int pipe_t_read(VmHostTransport *t, void *buf, unsigned cap) {
-    (void)t;
-    if (g_pipe_handle == INVALID_HANDLE_VALUE) return -5;  /* -EIO */
-    if (cap == 0) return 0;
-    DWORD avail = 0;
-    if (!PeekNamedPipe(g_pipe_handle, NULL, 0, NULL, &avail, NULL)) {
-        return -5;
-    }
-    if (avail == 0) return 0;
-    DWORD want = (DWORD)cap;
-    if (want > avail) want = avail;
-    DWORD got = 0;
-    if (!ReadFile(g_pipe_handle, buf, want, &got, NULL)) return -5;
-    return (int)got;
-}
-
-static int pipe_t_write(VmHostTransport *t, const void *buf, unsigned n) {
-    (void)t;
-    if (g_pipe_handle == INVALID_HANDLE_VALUE) return -5;
-    static int prev_was_cr = 0;
-    const char *p = (const char *)buf;
-    DWORD total_in = 0;
-    /* Scan through the buffer, batching runs that don't need
-     * translation. When we hit a lone '\n', emit "\r\n" instead. */
-    size_t run_start = 0;
-    for (size_t i = 0; i < n; i++) {
-        char c = p[i];
-        if (c == '\n' && !prev_was_cr) {
-            if (i > run_start) {
-                DWORD wr = 0;
-                if (!WriteFile(g_pipe_handle, p + run_start,
-                               (DWORD)(i - run_start), &wr, NULL)) return -5;
-            }
-            DWORD wr = 0;
-            if (!WriteFile(g_pipe_handle, "\r\n", 2, &wr, NULL)) return -5;
-            total_in += 1;          /* one source byte consumed */
-            run_start = i + 1;
-            prev_was_cr = 0;
-            continue;
-        }
-        prev_was_cr = (c == '\r');
-    }
-    if (run_start < n) {
-        DWORD wr = 0;
-        if (!WriteFile(g_pipe_handle, p + run_start,
-                       (DWORD)(n - run_start), &wr, NULL)) return -5;
-        total_in += (DWORD)(n - run_start);
-    }
-    return (int)total_in;
-}
-
-static int pipe_t_flush(VmHostTransport *t) {
-    (void)t;
-    /* WriteFile on a Windows named pipe is unbuffered at the
-     * application layer — bytes go straight to the kernel pipe
-     * object. Nothing for the transport to flush. */
-    return 0;
-}
-
-static int pipe_t_set_raw(VmHostTransport *t, bool enable) {
-    (void)t; (void)enable;
-    /* Pipes don't have a line discipline; raw mode is implicit
-     * (no terminal driver intervenes between us and PuTTY).
-     * Always report success. */
-    return 0;
-}
-
-static VmHostTransport g_pipe_transport = {
-    .read_nonblock = pipe_t_read,
-    .write         = pipe_t_write,
-    .flush         = pipe_t_flush,
-    .set_raw       = pipe_t_set_raw,
-    .close         = NULL,
-    .is_terminal   = true,
-    .ctx           = NULL,
-};
-
-/* Create the named pipe, wait for the client to connect, and
- * register our SYS_READ/SYS_WRITE/SYS_FFLUSH handlers on the
- * given VmSystem.
- *
- * Returns true on success. On failure, prints a diagnostic and
- * returns false; the caller should exit. */
-static bool setup_pipe_transport(VmSystem *sys, const char *name) {
-    (void)sys;   /* stdio install moved to main() in U.7b */
-    /* Pipe naming: callers can pass either a fully-qualified
-     * "\\\\.\\pipe\\foo" or a short "foo". Translate short forms
-     * to the full prefix to make the CLI friendlier. */
-    char full[256];
-    if (strncmp(name, "\\\\.\\pipe\\", 9) == 0) {
-        snprintf(full, sizeof(full), "%s", name);
-    } else {
-        snprintf(full, sizeof(full), "\\\\.\\pipe\\%s", name);
-    }
-
-    /* PIPE_ACCESS_DUPLEX     — bidirectional
-     * PIPE_TYPE_BYTE         — stream-oriented, not message-oriented
-     * PIPE_WAIT              — default blocking semantics; PuTTY
-     *                          and other normal clients expect this
-     * 1 instance, 4 KB buffers, default timeout. */
-    g_pipe_handle = CreateNamedPipeA(
-        full,
-        PIPE_ACCESS_DUPLEX,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1,                     /* max instances */
-        4096, 4096,            /* out, in buffer sizes */
-        0,                     /* default timeout */
-        NULL);                 /* default security */
-    if (g_pipe_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "host: CreateNamedPipe('%s') failed (error %lu)\n",
-                full, (unsigned long)GetLastError());
-        return false;
-    }
-
-    fprintf(stderr, "host: waiting for client on %s ...\n", full);
-    fprintf(stderr, "host: in PuTTY: Session type=Serial, "
-                    "Serial line=%s, Speed=any\n", full);
-    fflush(stderr);
-
-    /* Blocks until a client connects. ERROR_PIPE_CONNECTED means
-     * the client connected between CreateNamedPipe and here,
-     * which is fine. */
-    if (!ConnectNamedPipe(g_pipe_handle, NULL)) {
-        DWORD err = GetLastError();
-        if (err != ERROR_PIPE_CONNECTED) {
-            fprintf(stderr, "host: ConnectNamedPipe failed (error %lu)\n",
-                    (unsigned long)err);
-            CloseHandle(g_pipe_handle);
-            g_pipe_handle = INVALID_HANDLE_VALUE;
-            return false;
-        }
-    }
-    fprintf(stderr, "host: client connected.\n");
-    fflush(stderr);
-
-    /* Round U.2/U.7b: stdio handlers are installed by main() before
-     * this is called. We only point the process-default transport
-     * at our pipe vtable. The stdio handlers consult the transport
-     * for every byte — shell prompt, guest puts/printf, AND TUI
-     * canvas escapes all divert to the pipe. */
-    vm_host_set_transport(&g_pipe_transport);
-
-    return true;
-}
-#endif  /* PIPE_MODE_SUPPORTED */
-
 #ifdef PTY_MODE_SUPPORTED
 /* ============================================================
  *  PTY transport (round U.3)
@@ -1043,8 +825,8 @@ static bool setup_pipe_transport(VmSystem *sys, const char *name) {
  *  too because the active transport routes every byte through
  *  the master fd.
  *
- *  Compared to the pipe transport:
- *    - Cross-platform: works on Linux, BSD, macOS, and Cygwin.
+ *  Notes:
+ *    - POSIX-only: works on Linux, BSD, macOS, and Cygwin.
  *      Does NOT work on native Windows (no posix_openpt).
  *    - Has a real line discipline. set_raw() actually does
  *      something — it flips the slave's termios into cbreak.
@@ -1083,7 +865,7 @@ static int pty_t_read(VmHostTransport *t, void *buf, unsigned cap) {
 static int pty_t_write(VmHostTransport *t, const void *buf, unsigned n) {
     (void)t;
     if (g_pty_master_fd < 0) return -5;
-    /* Same LF→CRLF policy as the pipe transport. */
+    /* Same LF→CRLF policy as the TCP transport. */
     static int prev_was_cr = 0;
     const char *p = (const char *)buf;
     unsigned total_in = 0;
@@ -1242,7 +1024,7 @@ static bool setup_pty_transport(VmSystem *sys) {
  *    - Future Ethernet on STM32: same transport, just compiled
  *      against lwIP's BSD-sockets layer instead of libc's.
  *
- *  Compared to pipe / pty:
+ *  Compared to pty / default stdio:
  *    - Network-addressable (not just same-machine).
  *    - No TTY semantics: the client provides its own line
  *      discipline. set_raw is a no-op.
@@ -1575,11 +1357,11 @@ int main(int argc, char **argv) {
      *   --host-fs-rw        Make the /host mount writable. Default
      *                       is read-only for safety.
      *   --no-host-fs        Disable the /host mount entirely.
-     *   --pipe=<name>       (Windows/Cygwin) Route stdio through a
-     *                       named pipe; PuTTY connects to it as a
-     *                       Serial session. Name can be a bare
-     *                       identifier ('microgarbage') or a full
-     *                       \\.\\pipe\\<name> path.
+     *   --tcp=<port>        Listen on a TCP port; PuTTY (Raw/Telnet)
+     *                       or nc connects to localhost:<port>.
+     *                       Repeatable for multiple sessions.
+     *   --pty               Route stdio through a POSIX pty
+     *                       (Linux/Cygwin); attach with screen.
      *
      * Layering: built-in defaults < config file < CLI.
      *
@@ -1590,7 +1372,6 @@ int main(int argc, char **argv) {
     bool host_fs_root_explicit = false;        /* set by CLI/config? */
     bool host_fs_writable    = false;
     bool host_fs_disabled    = false;
-    const char *pipe_name    = NULL;
     bool        want_pty     = false;
     /* U.7b: collect up to MAX_TCP_PORTS --tcp= ports for multi-session. */
 #define MAX_TCP_PORTS 16
@@ -1641,8 +1422,6 @@ int main(int argc, char **argv) {
             host_fs_writable = true;
         } else if (strcmp(argv[i], "--no-host-fs") == 0) {
             host_fs_disabled = true;
-        } else if (strncmp(argv[i], "--pipe=", 7) == 0) {
-            pipe_name = argv[i] + 7;
         } else if (strcmp(argv[i], "--pty") == 0) {
             want_pty = true;
         } else if (strncmp(argv[i], "--tcp=", 6) == 0) {
@@ -1669,7 +1448,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  --host-fs=<path>    mount path as /host (default: ./host_files)\n");
             fprintf(stderr, "  --host-fs-rw        allow writes to /host (default: read-only)\n");
             fprintf(stderr, "  --no-host-fs        disable /host mount\n");
-            fprintf(stderr, "  --pipe=<name>       route stdio through a named pipe (Windows)\n");
             fprintf(stderr, "  --pty               route stdio through a POSIX pty (Linux/Cygwin)\n");
             fprintf(stderr, "  --tcp=<port>        listen on TCP port; first client gets the shell\n");
             return 1;
@@ -1743,13 +1521,6 @@ int main(int argc, char **argv) {
     }
     if (cli_raw_mode != -1) hc.raw_mode = (cli_raw_mode != 0);
 
-#ifndef PIPE_MODE_SUPPORTED
-    if (pipe_name) {
-        fprintf(stderr, "host: --pipe is Windows-only "
-                        "(this build targets a non-Windows platform).\n");
-        return 1;
-    }
-#endif
 #ifndef PTY_MODE_SUPPORTED
     if (want_pty) {
         fprintf(stderr, "host: --pty is not supported on this platform "
@@ -1757,28 +1528,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
-    if (pipe_name && want_pty) {
-        fprintf(stderr, "host: --pipe and --pty are mutually exclusive\n");
+    /* --pty is a single-instance transport; TCP can be multi-instance
+     * (multiple --tcp= ports = multiple sessions). Mixing them isn't
+     * supported — pick either --pty OR one-or-more --tcp ports. */
+    if (want_pty && n_tcp_ports > 0) {
+        fprintf(stderr, "host: --tcp can't be combined with --pty (for now)\n");
         return 1;
-    }
-    {
-        /* pipe and pty are single-instance transports; TCP can be
-         * multi-instance (multiple --tcp= ports = multiple sessions).
-         * But mixing single-instance transports with each other or
-         * with TCP isn't supported in this round — keep it to either
-         * one pipe/pty, OR one-or-more TCP ports. */
-        int single_chosen = 0;
-        if (pipe_name) single_chosen++;
-        if (want_pty)  single_chosen++;
-        if (single_chosen > 1) {
-            fprintf(stderr, "host: only one of --pipe / --pty at a time\n");
-            return 1;
-        }
-        if (single_chosen > 0 && n_tcp_ports > 0) {
-            fprintf(stderr, "host: --tcp can't be combined with "
-                            "--pipe / --pty (for now)\n");
-            return 1;
-        }
     }
 
     /* Install the platform's stop/interrupt handler(s): SIGINT on
@@ -1919,13 +1674,13 @@ int main(int argc, char **argv) {
     }
 
     /* Stdio handlers are always installed: they consult the
-     * per-VM transport table (U.6) for every byte. For single-
-     * instance transports (pipe/pty) we also set a process-default
+     * per-VM transport table (U.6) for every byte. For the single-
+     * instance --pty transport we also set a process-default
      * transport. For multi-instance TCP, we bind per-VM after each
      * connection is accepted and a shell is spawned. */
     {
         VmHostStdioConfig sio = {0};
-        sio.raw_mode = (pipe_name || want_pty || n_tcp_ports > 0)
+        sio.raw_mode = (want_pty || n_tcp_ports > 0)
                            ? false : hc.raw_mode;
         if (!vm_host_install_stdio_ex(&sys, &sio)) {
             fprintf(stderr, "host: vm_host_install_stdio failed\n");
@@ -1933,15 +1688,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (pipe_name) {
-#ifdef PIPE_MODE_SUPPORTED
-        if (!setup_pipe_transport(&sys, pipe_name)) {
-            return 1;
-        }
-#else
-        return 1;   /* unreachable — checked above */
-#endif
-    } else if (want_pty) {
+    if (want_pty) {
 #ifdef PTY_MODE_SUPPORTED
         if (!setup_pty_transport(&sys)) {
             return 1;
@@ -2167,7 +1914,7 @@ int main(int argc, char **argv) {
      *       runs until all spawned shells have exited AND no
      *       listeners remain that could still produce a client.
      *
-     *   (b) Single session: pipe / pty / default stdio. Load one
+     *   (b) Single session: pty / default stdio. Load one
      *       shell, run until it exits. (The transport was already
      *       set as the process default above.)
      * ============================================================ */
@@ -2326,7 +2073,7 @@ int main(int argc, char **argv) {
     }
 #endif  /* TCP_MODE_SUPPORTED */
 
-    /* ----- Single-session path (pipe / pty / default stdio) ----- */
+    /* ----- Single-session path (pty / default stdio) ----- */
 
     /* 7. Load the shell. */
     VmLoadVmResult lr = vm_system_load_vm(&sys, elf, elf_size, 16 * 1024,

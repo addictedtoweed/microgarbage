@@ -19,11 +19,12 @@ file operations backed by a FatFs volume on a trashdrive.
   line), Ctrl-C (cancel line), and Ctrl-D (exit).
 - **A real "application" running as a guest** — not a demo
   loop. Most of the code is shell logic, not VM glue.
-- **Optional named-pipe stdio routing** — `--pipe=<name>` on
-  Windows hosts (Cygwin or MSYS2) opens a Win32 named pipe
-  that PuTTY can attach to as a Serial session. Useful on
-  Windows where the local terminal's scheduling can affect
-  VM pacing.
+- **Optional TCP / pty stdio routing** — `--tcp=<port>` listens
+  on a localhost port that PuTTY (Raw/Telnet) or `nc` connects
+  to; it's repeatable for multiple concurrent sessions, each
+  with its own shell VM. `--pty` does the same over a POSIX
+  pseudoterminal (Linux/Cygwin). Both decouple VM pacing from
+  the launching terminal's scheduling.
 
 ## Prerequisites
 
@@ -196,60 +197,56 @@ bye
   runs you'd skip `f_mkfs` and let FatFs auto-detect the
   existing layout — and use file-backed storage instead of RAM.
 
-## Routing stdio through a named pipe (Windows / Cygwin)
+## Routing stdio over TCP (and pty)
 
 By default the host binds to the launching terminal (mintty,
-Windows Terminal, the inherited stdin/stdout). On Windows that
-couples the VM's pacing to the local terminal's scheduling
-quantum, which can stutter under load — and it doesn't reflect
-the eventual deployment story (talking to a real STM32 over
-a UART, which never shares a process with a GUI terminal).
+Windows Terminal, the inherited stdin/stdout). That couples the
+VM's pacing to the local terminal's scheduling quantum, which can
+stutter under load.
 
-The `--pipe=<name>` flag opens a Windows named pipe and routes
-all VM stdio (stdin, stdout, stderr) through it. PuTTY connects
-to the pipe as a "Serial" session, and the two processes are
-scheduled independently. Pacing improves; the experience is
-much closer to a real serial console.
+The `--tcp=<port>` flag instead listens on a TCP port and routes
+all VM stdio (stdin, stdout, stderr) through the connection.
+PuTTY (or `nc`) connects to `localhost:<port>` and the two
+processes are scheduled independently. The flag is repeatable —
+each port is its own listener, and each accepted connection gets
+its own shell VM, so several clients can run concurrently against
+the one host process (audio, the filesystem, etc. are shared).
 
 To use it:
 
 ```
-# In a Cygwin shell:
-$ ./build/host --pipe=microgarbage
-host: waiting for client on \\.\pipe\microgarbage ...
-host: in PuTTY: Session type=Serial, Serial line=\\.\pipe\microgarbage, Speed=any
+$ ./build/host.exe --tcp=5000
+host: listening on TCP port 5000 (connect: nc localhost 5000)
+# ...and for two concurrent sessions:
+$ ./build/host.exe --tcp=5000 --tcp=5001
 ```
 
 In PuTTY:
 
 1. Open PuTTY.
-2. Connection type: **Serial**
-3. Serial line: `\\.\pipe\microgarbage`  (or whatever name you passed)
-4. Speed: any number (ignored for pipes — pipes have no baud rate)
-5. Click **Open**.
+2. Connection type: **Raw** (or **Telnet**).
+3. Host Name: `localhost`, Port: `5000` (or whichever you passed).
+4. Click **Open**.
 
-The host prints "client connected" and the shell banner appears
-in the PuTTY window. From there it works exactly like running
-the host directly — `ls`, `cd`, `run /host/snake.elf`, etc.
-Close PuTTY (or hit Ctrl-C in the launching mintty) to end the
-session.
+Or from a shell: `nc localhost 5000`.
 
-Notes:
+The shell banner appears in the client window; from there it works
+exactly like running the host directly — `ls`, `cd`,
+`run /host/snake.elf`, etc. Closing the client ends that session;
+the host keeps running as long as a listener could still produce a
+client. Lone `\n` output is translated to `\r\n` (Telnet clients
+expect CRLF; raw `nc` doesn't care).
 
-- One PuTTY at a time. The pipe has a single instance; a second
-  client gets "pipe busy."
-- If you see double-echo when you type, go to PuTTY's
-  Terminal → Local echo → "Force off."
-- The pipe is created when the host starts and destroyed when
-  it exits — no leftover state on the system.
-- The same approach works with other named-pipe-capable clients
-  (Tera Term, RealTerm). PuTTY's just the most commonly used.
+On POSIX hosts (Linux/Cygwin), `--pty` is the local-IPC equivalent:
+it allocates a pseudoterminal and prints the slave path to attach a
+terminal emulator (`screen /dev/pts/N`). `--pty` and `--tcp` are
+mutually exclusive; multiple `--tcp` ports are fine.
 
 ## Files
 
 - `host.c` — sets up trashdrive + FatFs + VmSystem + stdio/fs
   bridges, loads `shell.elf`, runs scheduler. Parses CLI args
-  including `--host-fs=` and `--pipe=`.
+  including `--host-fs=`, `--tcp=`, and `--pty`.
 - `shell.c` — the guest shell with a raw-mode line editor
   including up/down history recall, Ctrl-L, Ctrl-U, etc.
 - `host_files_src/` — sources for the sample spawnable guests

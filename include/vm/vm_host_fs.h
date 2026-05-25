@@ -380,10 +380,9 @@ unsigned vm_host_fs_max_files(void);
  *  File-fd routing for alternate transports
  *
  *  Hosts that install their own SYS_READ/SYS_WRITE/SYS_CLOSE
- *  handlers (instead of using vm_host_stdio's) — for example
- *  the named-pipe transport in the 05_shell example on
- *  Cygwin — should call these for fds >= 3. They route to
- *  FatFs or to the host-passthrough mount as appropriate.
+ *  handlers (instead of using vm_host_stdio's) should call these
+ *  for fds >= 3. They route to FatFs or to the host-passthrough
+ *  mount as appropriate.
  *
  *  Returns:
  *    > 0   bytes transferred (read/write only)

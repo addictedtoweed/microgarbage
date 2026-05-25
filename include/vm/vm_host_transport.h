@@ -15,19 +15,16 @@
  *    TUI input parser   → transport->read_nonblock
  *    set raw mode       → transport->set_raw
  *
- *  Today (round U.2) there is one active transport for the whole
- *  host process. Future rounds will introduce per-session
- *  transports so that, e.g., a host accepting both a named-pipe
- *  client and a TCP client can run two independent shells —
- *  each with its own screen, raw-mode state, and input parser.
+ *  Transports are per-session: a host accepting multiple TCP
+ *  clients runs an independent shell per connection — each with
+ *  its own screen, raw-mode state, and input parser.
  *
- *  Built-in transports:
+ *  Built-in transports (05_shell host.c provides):
  *    - stdio (default, file-descriptors 0/1/2)
- *    - named pipe (Windows/Cygwin; host.c provides)
+ *    - TCP socket (all platforms; repeatable, multi-session)
+ *    - POSIX pty (Linux/Cygwin)
  *
  *  Future transports:
- *    - TCP socket
- *    - Cygwin pty
  *    - STM32 UART (when hardware bring-up begins)
  *    - lwIP TCP socket on STM32 with 10M Ethernet
  *

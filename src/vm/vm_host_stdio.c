@@ -688,8 +688,8 @@ static void handle_read(VmCpu *cpu, void *system) {
          * disable_raw_mode). Use it to disambiguate.
          *
          * Additional case: when stdin is a non-tty fd we've put
-         * into non-blocking mode (e.g., a named pipe in a host
-         * that uses --pipe), read() returning 0 USUALLY means
+         * into non-blocking mode (e.g., a socket in a host that
+         * uses --tcp), read() returning 0 USUALLY means
          * EOF — but for some attachment types it can mean "no
          * data" instead. We can't easily distinguish without
          * more context, so when the override path is in use we
