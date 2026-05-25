@@ -124,7 +124,7 @@ static uint16_t lerp555(uint16_t a, uint16_t b, float t) {
     return BGR555(ar + (int)((br - ar) * t), ag + (int)((bg - ag) * t), ab + (int)((bb - ab) * t));
 }
 static void build_palette(void) {
-    const uint16_t sky = BGR555(17, 6, 26);          /* violet Aardvark */
+    const uint16_t sky = BGR555(29, 23, 31);         /* bright daytime lavender (violet, not blue) */
     P.cgram[0] = sky;                                 /* index 0 = sky/backdrop */
     /* nr/fr (not near/far — those are windows.h macros): near + far color. */
     struct { uint16_t nr, fr; } m[3] = {

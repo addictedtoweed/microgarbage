@@ -144,7 +144,7 @@ static uint16_t lerp555(uint16_t a, uint16_t b, float t) {
     return BGR555(ar + (int)((br - ar) * t), ag + (int)((bg - ag) * t), ab + (int)((bb - ab) * t));
 }
 static void build_palette(void) {
-    const uint16_t sky = BGR555(17, 6, 26);
+    const uint16_t sky = BGR555(29, 23, 31);   /* bright daytime lavender (violet, not blue) */
     P.cgram[0] = sky;
     struct { uint16_t nr, fr; } m[3] = {
         { BGR555(22, 20, 17), lerp555(BGR555(6, 5, 6),    sky, 0.5f) },
