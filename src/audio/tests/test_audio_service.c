@@ -136,6 +136,24 @@ static void test_stream_wav(void) {
     CHECK(nz > 0, "streamed wav reached the output (non-silent)");
     CHECK(lr_diff > 0, "stereo preserved through the stream (L != R)");
 
+    /* Mute regression: SET_GAIN on a streaming voice must be accepted
+     * and actually silence the output. A streaming voice has no pool
+     * object, so the old object-existence gate rejected it (BAD_VOICE)
+     * and the [M]ute key in musicplayer no-op'd. */
+    ChannelMsg gr, gain = req(REQ_AUDIO_SET_GAIN, v, /*gain q15*/0, 0, 0);
+    gain.seq = service_channel_next_seq(&ch2);
+    channel_request_post(&ch2, &gain); audio_service_process(svc, 8);
+    channel_response_poll(&ch2, &gr);
+    CHECK(gr.a3 == AUDIO_ARB_OK, "SET_GAIN accepted on a streaming voice");
+    memset(out, 0, sizeof out);
+    for (int k = 0; k < 3; k++) {
+        audio_service_process(svc, 1);
+        audio_service_render(svc, out, 256);
+    }
+    int nz_muted = 0;
+    for (int i = 0; i < 256 * 2; i++) if (out[i]) nz_muted++;
+    CHECK(nz_muted == 0, "gain=0 silences the streaming voice (mute works)");
+
     ChannelMsg st, stop = req(REQ_AUDIO_STOP_MUSIC, v, 0, 0, 0);
     stop.seq = service_channel_next_seq(&ch2);
     channel_request_post(&ch2, &stop); audio_service_process(svc, 8);

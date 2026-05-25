@@ -627,9 +627,12 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
     }
     case REQ_AUDIO_SET_GAIN: {
         /* a0 = voice handle, a1 = gain q15. Map voice -> track, set
-         * the mixer channel volume. */
-        AudioObjHandle dummy = audio_arbiter_voice_object(&svc->arbiter, m->a0);
-        if (dummy == AUDIO_POOL_HANDLE_NONE) {
+         * the mixer channel volume. Gate on the voice being a live
+         * track, NOT on it having a pool object: streaming-WAV voices
+         * (audio_arbiter_play_external) have object == NONE, so the old
+         * object check rejected them and mute/gain silently no-op'd on
+         * the music stream. */
+        if (!audio_arbiter_voice_valid(&svc->arbiter, m->a0)) {
             respond(svc, m, (uint32_t)AUDIO_ARB_BAD_VOICE, 0);
             break;
         }
