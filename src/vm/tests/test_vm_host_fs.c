@@ -35,32 +35,12 @@
 #include "test_runner.h"
 #include "test_portable.h"
 
-#ifndef HAVE_FATFS
-
-#include <stdio.h>
-int main(void) {
-    (void)tr_passed_;
-    (void)tr_failed_;
-    (void)tr_current_failed_;
-    (void)tr_suite_name_;
-    (void)tr_current_test_name_;
-    TEST_SUITE("vm_host_fs");
-    printf("  SKIP  FatFs not built in (compile with -DHAVE_FATFS and "
-           "-Ithird_party/fatfs/source -Ithird_party/fatfs)\n");
-    printf("0 passed, 0 failed (skipped)\n");
-    return 0;
-}
-
-#else  /* HAVE_FATFS */
-
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_fs.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
-#include "storage/trashdrive.h"
-#include "storage/trashdrive_fatfs.h"
-#include "ff.h"
+#include "storage/trashfs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,43 +63,29 @@ int main(void) {
 /* Sized for max_vms=2 spawn_data_kb=16 in fixture_init below
  * (vm_system_local_required reports ~211 KB; we round to 256). */
 #define LOCAL_BYTES  (256 * 1024)
-/* 128 KB — needs to be at least ~96 KB for FatFs R0.16 f_mkfs (see
- * test_trashdrive_fatfs.c for the same rationale). */
+/* trashfs RAM-disk region for the /td0 mount these tests exercise. */
 #define POOL_BYTES   (128 * 1024)
 #define DATA_BYTES   (4 * 1024)   /* fake guest "memory" for path strings etc. */
 
 static uint8_t g_shared[SHARED_BYTES];
 static uint8_t g_local[LOCAL_BYTES];
-static uint8_t g_pool[POOL_BYTES];
+static uint8_t g_trashfs_region[POOL_BYTES];
 static uint8_t g_data[DATA_BYTES];   /* fake guest data region */
 
 static VmSystem g_sys;
-static TrashDrive g_drive;
-static FATFS g_fs;
+static TrashfsVolume g_trashfs_vol;
 static VmCpu g_cpu;        /* fake "guest" CPU used to invoke syscalls */
 
-/* Set up the full stack: trashdrive + FatFs mount + VmSystem +
- * fs syscalls registered. Returns true on success. */
+/* Set up the full stack: trashfs RAM disk + VmSystem + fs syscalls
+ * registered. Returns true on success. */
 static bool fixture_init(void) {
-    /* 1. Wipe the trashdrive backing and any prior FatFs state. */
-    memset(g_pool, 0, sizeof(g_pool));
-    f_mount(NULL, "0:", 0);                  /* unmount any prior */
-    for (uint8_t i = 0; i < TRASH_FATFS_MAX_VOLUMES; i++) {
-        trash_fatfs_register(i, NULL);
-    }
     vm_host_fs_reset();                       /* close any leaked fds */
 
-    /* 2. Block device. */
-    if (trash_init(&g_drive, g_pool, sizeof(g_pool)) != TRASH_OK) return false;
-    if (!trash_fatfs_register(0, &g_drive)) return false;
-
-    /* 3. FatFs format and mount. */
-    BYTE work[FF_MAX_SS];
-    MKFS_PARM opt = {0};
-    opt.fmt = FM_FAT;
-    opt.n_fat = 1;
-    if (f_mkfs("0:", &opt, work, sizeof(work)) != FR_OK) return false;
-    if (f_mount(&g_fs, "0:", 1) != FR_OK) return false;
+    /* 1-3. Fresh trashfs volume, mounted below as /td0. */
+    if (trashfs_format(g_trashfs_region, sizeof(g_trashfs_region), 0, 0)
+            != TRASHFS_OK) return false;
+    if (trashfs_mount(&g_trashfs_vol, g_trashfs_region,
+                      sizeof(g_trashfs_region)) != TRASHFS_OK) return false;
 
     /* 4. VmSystem. */
     VmSystemConfig cfg = {
@@ -136,8 +102,8 @@ static bool fixture_init(void) {
     if (!vm_host_install_stdio(&g_sys)) return false;
     if (!vm_host_install_fs(&g_sys)) return false;
 
-    /* Register the freshly-mounted FatFs as /td0. */
-    if (!vm_host_fs_mount_fatfs("td0", 0, &g_fs)) return false;
+    /* Register the freshly-mounted trashfs volume as /td0. */
+    if (!vm_host_fs_mount_trashfs("td0", &g_trashfs_vol)) return false;
 
     /* 5. Fake VmCpu with one writable data region so handlers
      * can translate guest pointers. We put it at region 2 (DATA),
@@ -153,8 +119,6 @@ static bool fixture_init(void) {
 
 static void fixture_teardown(void) {
     vm_host_fs_reset();
-    f_mount(NULL, "0:", 0);
-    trash_fatfs_register(0, NULL);
     vm_system_destroy(&g_sys);
 }
 
@@ -247,7 +211,7 @@ static void test_mkdirat_and_readdir(void) {
     ASSERT_EQ_INT(0, invoke_syscall(SYS_MKDIRAT, VM_AT_FDCWD, p1, 0, 0));
     ASSERT_EQ_INT(0, invoke_syscall(SYS_MKDIRAT, VM_AT_FDCWD, p2, 0, 0));
 
-    /* Open root of the FatFs mount for readdir. */
+    /* Open root of the trashfs mount for readdir. */
     uint32_t root = put_string("/td0", 128);
     int32_t dfd = invoke_syscall(SYS_OPENAT, VM_AT_FDCWD, root,
                                   VM_O_RDONLY | VM_O_DIRECTORY, 0);
@@ -261,8 +225,9 @@ static void test_mkdirat_and_readdir(void) {
         if (r == 1) break;                /* end of directory */
         ASSERT_EQ_INT(0, r);
         VmDirent *de = (VmDirent *)(g_data + 256);
-        if (strcmp(de->name, "D1") == 0) { saw_d1 = 1; ASSERT_EQ_INT((int)VM_DT_DIR, (int)de->type); }
-        if (strcmp(de->name, "D2") == 0) { saw_d2 = 1; ASSERT_EQ_INT((int)VM_DT_DIR, (int)de->type); }
+        /* trashfs preserves case (FatFs short names were uppercased). */
+        if (strcmp(de->name, "d1") == 0) { saw_d1 = 1; ASSERT_EQ_INT((int)VM_DT_DIR, (int)de->type); }
+        if (strcmp(de->name, "d2") == 0) { saw_d2 = 1; ASSERT_EQ_INT((int)VM_DT_DIR, (int)de->type); }
     }
     ASSERT(saw_d1);
     ASSERT(saw_d2);
@@ -490,13 +455,21 @@ static void test_spawn_and_wait_minimal_elf(void) {
     ASSERT(vm_sched_register_at(g_sys.sched, &g_cpu, 0) == 0);
     g_sys.vms[0] = &g_cpu;
 
-    /* Write the ELF into the FatFs volume at /spawn.elf. */
-    FIL ff;
-    ASSERT(f_open(&ff, "0:/spawn.elf", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK);
-    UINT bw;
-    ASSERT(f_write(&ff, elf, (UINT)elf_size, &bw) == FR_OK);
-    ASSERT(bw == elf_size);
-    ASSERT(f_close(&ff) == FR_OK);
+    /* Write the ELF into the trashfs volume at /spawn.elf (looping on
+     * short writes, since trashfs_write may return a partial count). */
+    TrashfsFile tf;
+    ASSERT(trashfs_open(&g_trashfs_vol, "/spawn.elf",
+                        TRASHFS_O_CREAT | TRASHFS_O_TRUNC, &tf) == TRASHFS_OK);
+    uint32_t done = 0;
+    while (done < (uint32_t)elf_size) {
+        uint32_t w = 0;
+        ASSERT(trashfs_write(&tf, elf + done, (uint32_t)elf_size - done,
+                             &w, 0) == TRASHFS_OK);
+        ASSERT(w > 0);
+        done += w;
+    }
+    ASSERT(done == (uint32_t)elf_size);
+    trashfs_close(&tf);
     free(elf);
 
     /* Spawn it. The async handler loads the child, parks g_cpu
@@ -723,17 +696,17 @@ static void test_mount_invalid_names(void) {
     ASSERT(fixture_init());
 
     /* Empty, too long, and bad characters all rejected. */
-    ASSERT(!vm_host_fs_mount_fatfs("",                     1, &g_fs));
-    ASSERT(!vm_host_fs_mount_fatfs("toolongnameisawful_x", 1, &g_fs));
-    ASSERT(!vm_host_fs_mount_fatfs("bad/slash",            1, &g_fs));
-    ASSERT(!vm_host_fs_mount_fatfs("bad.dot",              1, &g_fs));
-    ASSERT(!vm_host_fs_mount_fatfs("bad space",            1, &g_fs));
+    ASSERT(!vm_host_fs_mount_trashfs("",                     &g_trashfs_vol));
+    ASSERT(!vm_host_fs_mount_trashfs("toolongnameisawful_x", &g_trashfs_vol));
+    ASSERT(!vm_host_fs_mount_trashfs("bad/slash",            &g_trashfs_vol));
+    ASSERT(!vm_host_fs_mount_trashfs("bad.dot",              &g_trashfs_vol));
+    ASSERT(!vm_host_fs_mount_trashfs("bad space",            &g_trashfs_vol));
     /* Good ones. */
-    ASSERT(vm_host_fs_mount_fatfs("a",        1, &g_fs));
-    ASSERT(vm_host_fs_mount_fatfs("td-1",     2, &g_fs));
-    ASSERT(vm_host_fs_mount_fatfs("UPPER_OK", 3, &g_fs));
+    ASSERT(vm_host_fs_mount_trashfs("a",        &g_trashfs_vol));
+    ASSERT(vm_host_fs_mount_trashfs("td-1",     &g_trashfs_vol));
+    ASSERT(vm_host_fs_mount_trashfs("UPPER_OK", &g_trashfs_vol));
     /* Duplicate name rejected. */
-    ASSERT(!vm_host_fs_mount_fatfs("a", 4, &g_fs));
+    ASSERT(!vm_host_fs_mount_trashfs("a", &g_trashfs_vol));
 
     fixture_teardown();
 }
@@ -744,10 +717,10 @@ static void test_mount_count_and_unmount(void) {
     /* fixture_init already added one (td0). */
     ASSERT_EQ_INT(1, (int)vm_host_fs_mount_count());
 
-    ASSERT(vm_host_fs_mount_fatfs("td1", 1, &g_fs));
+    ASSERT(vm_host_fs_mount_trashfs("td1", &g_trashfs_vol));
     ASSERT_EQ_INT(2, (int)vm_host_fs_mount_count());
 
-    ASSERT(vm_host_fs_mount_fatfs("td2", 2, &g_fs));
+    ASSERT(vm_host_fs_mount_trashfs("td2", &g_trashfs_vol));
     ASSERT_EQ_INT(3, (int)vm_host_fs_mount_count());
 
     /* Unmount the middle one. The count drops; td0 and td2 still
@@ -781,5 +754,3 @@ int main(void) {
     RUN(test_mount_count_and_unmount);
     return TEST_SUITE_RESULT();
 }
-
-#endif /* HAVE_FATFS */
