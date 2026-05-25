@@ -390,9 +390,12 @@ static void test_single_threaded(void) {
         ChannelMsg g2; ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), g2);
         CHECK(g2.a4 == 16, "one consumer leaves -> meter stays on for the other");
 
-        /* app 2 dies without disabling (disconnect). Sweep releases its
-         * hold so the meter doesn't leak on forever. */
-        audio_service_sweep_vm(svc, 2);
+        /* app 2 dies without disabling (disconnect). The host's VM-teardown
+         * hook posts REQ_AUDIO_SWEEP_VM, which releases its hold so the
+         * meter doesn't leak on forever. Drive it through the channel (not
+         * the direct call) to cover the dispatch the unload hook uses. */
+        ChannelMsg sw; ROUNDTRIP(req(REQ_AUDIO_SWEEP_VM, /*vm*/2, 0, 0, 0), sw);
+        CHECK(sw.a3 == (uint32_t)AUDIO_ARB_OK, "sweep request acked");
         ChannelMsg g3; ROUNDTRIP(req(REQ_AUDIO_GET_LEVELS, 0, 0, 0, 0), g3);
         CHECK(g3.a4 == 0, "last consumer swept -> meter off (no leak)");
         #undef PUMP

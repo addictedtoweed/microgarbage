@@ -693,6 +693,14 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         respond(svc, m, (uint32_t)r, 0);
         break;
     }
+    case REQ_AUDIO_SWEEP_VM: {
+        /* a0 = vm_id of a dying guest. Reclaim its tracks, pool objects,
+         * and FFT hold. We're on the worker thread here, so this is
+         * naturally serialized against the mixer pump. */
+        audio_service_sweep_vm(svc, (uint16_t)m->a0);
+        respond(svc, m, (uint32_t)AUDIO_ARB_OK, 0);
+        break;
+    }
     default:
         respond(svc, m, (uint32_t)AUDIO_ARB_INVALID_ARG, 0);
         break;

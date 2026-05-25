@@ -51,4 +51,12 @@ typedef struct {
  * false on bad args or if any registration fails (rolls back). */
 bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg);
 
+/* Reclaim everything a dying VM owns on the audio service: its arbiter
+ * tracks/voices, its pool objects, and its FFT hold. Post this from the
+ * host's VM-teardown path when a guest exits or crashes, BEFORE its id
+ * can be reused — otherwise audio resources (and the FFT refcount) leak.
+ * Safe no-op if audio was never installed. The sweep runs on the service
+ * worker thread, so it's serialized against the mixer pump. */
+void vm_host_audio_sweep_vm(uint16_t vm_id);
+
 #endif /* VM_HOST_AUDIO_H */

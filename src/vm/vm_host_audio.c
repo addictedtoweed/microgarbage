@@ -11,6 +11,7 @@
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
 #include "vm/channel_msg.h"
+#include "config.h"             /* GARBAGE_SCHED_MODE */
 #include "audio/audio_sink.h"   /* WAV parser (wav_parse/wav_to_mono_pcm16) */
 
 #include <stdio.h>
@@ -24,12 +25,32 @@ static size_t          g_staging_cap;
 static uint32_t        g_timeout_ms;
 static const char     *g_host_fs_root;
 
+/* Serialize the VM->service round-trip. The audio channel is lock-free
+ * SPSC (exactly one producer + one consumer); under preemption each VM
+ * runs in its OWN thread, so two audio-using VMs would otherwise be
+ * multiple producers on the request ring / consumers on the response
+ * ring AND race on the shared staging buffer. Hold this across the whole
+ * post+wait — and, for staged loads, across the staging write too — so
+ * each exchange is atomic per VM. Cooperative builds step VMs serially
+ * on one thread, so this compiles to nothing. (Mirrors fs_lock in
+ * vm_host_fs.c.) */
+#if GARBAGE_SCHED_MODE == GARBAGE_SCHED_PREEMPTIVE
+#include <pthread.h>
+static pthread_mutex_t g_audio_mtx = PTHREAD_MUTEX_INITIALIZER;
+static inline void audio_lock(void)   { pthread_mutex_lock(&g_audio_mtx); }
+static inline void audio_unlock(void) { pthread_mutex_unlock(&g_audio_mtx); }
+#else
+static inline void audio_lock(void)   { }
+static inline void audio_unlock(void) { }
+#endif
+
 /* Post a request and wait for its response; returns the response's
- * status (a3) and handle (a4) via out params. Returns false on
- * channel failure / timeout. */
-static bool audio_call(uint16_t type, uint32_t a0, uint32_t a1,
-                       uint32_t a2, uint32_t a3,
-                       uint32_t *out_status, uint32_t *out_handle) {
+ * status (a3) and handle (a4) via out params. Returns false on channel
+ * failure / timeout. The _locked form assumes the audio lock is already
+ * held (used when the caller also wrote the staging buffer under it). */
+static bool audio_call_locked(uint16_t type, uint32_t a0, uint32_t a1,
+                              uint32_t a2, uint32_t a3,
+                              uint32_t *out_status, uint32_t *out_handle) {
     ChannelMsg m;
     memset(&m, 0, sizeof(m));
     m.type = type;
@@ -39,6 +60,15 @@ static bool audio_call(uint16_t type, uint32_t a0, uint32_t a1,
     if (out_status) *out_status = m.a3;
     if (out_handle) *out_handle = m.a4;
     return true;
+}
+
+static bool audio_call(uint16_t type, uint32_t a0, uint32_t a1,
+                       uint32_t a2, uint32_t a3,
+                       uint32_t *out_status, uint32_t *out_handle) {
+    audio_lock();
+    bool r = audio_call_locked(type, a0, a1, a2, a3, out_status, out_handle);
+    audio_unlock();
+    return r;
 }
 
 /* ---- SYS_AUDIO_LOAD_SAMPLE (buf, size) -> object handle or 0 ---- */
@@ -53,14 +83,16 @@ static void handle_load_sample(VmCpu *cpu, void *system) {
     const void *src = vm_translate_read(cpu, guest_buf, size);
     if (!src) { cpu->regs[VM_REG_A0] = 0; return; }
 
-    /* Stage the PCM, then ask the service to copy staging->pool. */
+    /* Stage the PCM, then ask the service to copy staging->pool. Hold the
+     * audio lock across the staging write + round-trip so a concurrent VM
+     * can't clobber the shared staging buffer mid-flight. */
+    audio_lock();
     memcpy(g_staging, src, size);
     uint32_t status = 0, handle = 0;
-    if (!audio_call(REQ_AUDIO_LOAD_STAGED, size, cpu->vm_id, 0, 0,
-                    &status, &handle)) {
-        cpu->regs[VM_REG_A0] = 0; return;
-    }
-    cpu->regs[VM_REG_A0] = (status == 0) ? handle : 0;
+    bool ok = audio_call_locked(REQ_AUDIO_LOAD_STAGED, size, cpu->vm_id, 0, 0,
+                                &status, &handle);
+    audio_unlock();
+    cpu->regs[VM_REG_A0] = (ok && status == 0) ? handle : 0;
 }
 
 /* ---- SYS_AUDIO_FREE (object) -> 0 ---- */
@@ -149,9 +181,10 @@ static void handle_get_levels(VmCpu *cpu, void *system) {
     ChannelMsg m;
     memset(&m, 0, sizeof(m));
     m.type = REQ_AUDIO_GET_LEVELS;
-    if (!channel_request_call(g_channel, &m, g_timeout_ms, NULL, NULL)) {
-        cpu->regs[VM_REG_A0] = 0; return;
-    }
+    audio_lock();
+    bool ok = channel_request_call(g_channel, &m, g_timeout_ms, NULL, NULL);
+    audio_unlock();
+    if (!ok) { cpu->regs[VM_REG_A0] = 0; return; }
     uint32_t got = m.a4;
     if (got > want) got = want;
     if (got == 0) { cpu->regs[VM_REG_A0] = 0; return; }
@@ -213,16 +246,18 @@ static void handle_load_wav(VmCpu *cpu, void *system) {
     WavInfo info;
     if (wav_parse(filebuf, rd, &info) != WAV_OK) { free(filebuf); return; }
 
-    /* downmix straight into the staging buffer (mono int16) */
+    /* Downmix straight into the staging buffer (mono int16), under the
+     * audio lock so a concurrent VM can't clobber it before the load. */
     uint32_t max_frames = (uint32_t)(g_staging_cap / sizeof(int16_t));
+    audio_lock();
     uint32_t frames = wav_to_mono_pcm16(&info, (int16_t *)g_staging, max_frames);
     free(filebuf);
-    if (frames == 0) return;
-
+    if (frames == 0) { audio_unlock(); return; }
     uint32_t status = 0, handle = 0;
-    if (!audio_call(REQ_AUDIO_LOAD_STAGED, frames * sizeof(int16_t),
-                    cpu->vm_id, 0, 0, &status, &handle)) return;
-    cpu->regs[VM_REG_A0] = (status == 0) ? handle : 0;
+    bool ok = audio_call_locked(REQ_AUDIO_LOAD_STAGED, frames * sizeof(int16_t),
+                                cpu->vm_id, 0, 0, &status, &handle);
+    audio_unlock();
+    cpu->regs[VM_REG_A0] = (ok && status == 0) ? handle : 0;
 }
 /* ---- SYS_AUDIO_STREAM_WAV (path) -> voice handle or 0 ----
  * Unlike LOAD_WAV (which decodes the whole file into the pool), this
@@ -253,12 +288,13 @@ static void handle_stream_wav(VmCpu *cpu, void *system) {
 
     size_t plen = strlen(native) + 1;             /* include the NUL */
     if (plen > g_staging_cap) return;
+    audio_lock();
     memcpy(g_staging, native, plen);
-
     uint32_t status = 0, voice = 0;
-    if (!audio_call(REQ_AUDIO_STREAM_WAV, (uint32_t)plen, cpu->vm_id, 0, 0,
-                    &status, &voice)) return;
-    cpu->regs[VM_REG_A0] = (status == 0) ? voice : 0;
+    bool ok = audio_call_locked(REQ_AUDIO_STREAM_WAV, (uint32_t)plen,
+                                cpu->vm_id, 0, 0, &status, &voice);
+    audio_unlock();
+    cpu->regs[VM_REG_A0] = (ok && status == 0) ? voice : 0;
 }
 
 static void handle_fft_enable(VmCpu *cpu, void *system) {
@@ -269,6 +305,21 @@ static void handle_fft_enable(VmCpu *cpu, void *system) {
      * and release this VM's hold on sweep. */
     audio_call(REQ_AUDIO_FFT_ENABLE, en ? 1u : 0u, cpu->vm_id, 0, 0, &status, &h);
     cpu->regs[VM_REG_A0] = 0;
+}
+
+/* ---- teardown reclaim ---- */
+void vm_host_audio_sweep_vm(uint16_t vm_id) {
+    if (!g_channel) return;   /* audio never installed */
+    uint32_t status = 0, h = 0;
+    audio_call(REQ_AUDIO_SWEEP_VM, vm_id, 0, 0, 0, &status, &h);
+}
+
+/* Adapter so the sweep can ride vm_system's unload-hook seam (called
+ * before the VM's CPU/regions are freed). Idempotent + safe even if the
+ * VM never touched audio (the service ignores an unknown vm_id). */
+static void audio_unload_hook(uint16_t vm_id, void *userdata) {
+    (void)userdata;
+    vm_host_audio_sweep_vm(vm_id);
 }
 
 /* ---- installation ---- */
@@ -303,6 +354,12 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
                            handle_load_wav)) goto f9;
     if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_STREAM_WAV,
                            handle_stream_wav)) goto f10;
+
+    /* Reclaim a guest's audio resources (+ its FFT hold) when it exits
+     * or crashes, before its vm_id can be reused. Best-effort: a full
+     * hook table just means no auto-sweep (resources reclaim when the
+     * service is torn down). */
+    vm_system_register_unload_hook(sys, audio_unload_hook, NULL);
     return true;
 
 f10: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_LOAD_WAV);

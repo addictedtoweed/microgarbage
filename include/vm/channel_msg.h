@@ -83,6 +83,13 @@ enum {
      * This is how arbitrarily long songs play on desktop (stdio/FatFs)
      * and on the H745 (FatFs over SD). */
     REQ_AUDIO_STREAM_WAV   = 0x010C,
+    /* Reclaim everything a dying VM owns: stop its arbiter tracks/voices,
+     * free its pool objects, release its FFT hold. a0 = vm_id. Posted by
+     * the host VM-teardown hook so a crashed/exited guest can't leak audio
+     * resources or strand its FFT refcount. Runs on the worker thread, so
+     * it's serialized against the mixer pump (no locking the pool/arbiter
+     * out from under the audio callback). */
+    REQ_AUDIO_SWEEP_VM     = 0x010D,
 
     /* file (0x02xx) — reserved for the M4-owns-SD proxy */
     REQ_FILE_OPEN   = 0x0200,
