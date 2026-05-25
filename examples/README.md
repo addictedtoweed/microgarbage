@@ -76,6 +76,9 @@ Or clean:
 | `03_mailbox`| Two guests talking via SYS_SEND/SYS_RECV. The "VM OS" pattern. |
 | `04_keydump`| Raw-mode terminal input via SYS_READ. Foundation for TUI work. |
 | `05_shell`  | Interactive file-system shell. Demonstrates the file ECALL group (openat/read/write/close/lseek/mkdirat/unlinkat/readdir) against a FatFs volume mounted on a trashdrive. **Requires FatFs** (see `third_party/fatfs/PLACEHOLDER.md`). |
+| `06_scheduler`| The **preemptive** scheduler over native tasks (no guest): round-robin and strict-priority time-slicing. |
+| `07_vm_task`| One real RV32 guest running *as* a preemptive task, time-sliced against a native task — the VM and scheduler meet. |
+| `08_rtos_demo`| **Several** guest VMs running concurrently as preemptive tasks; the systick interleaves their output. Built on the shared guest SDK. |
 
 ## Shared bits
 
