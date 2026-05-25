@@ -1,8 +1,7 @@
 /* 05_shell/host.c — run the file-system shell guest.
  *
  * Sets up the full stack:
- *   - 64 KB trashdrive (RAM block device)
- *   - FatFs filesystem mounted at "0:/" (format-on-start)
+ *   - trashfs RAM disk, mounted as /td0 (format-on-start)
  *   - VmSystem with stdio bridge and file syscalls installed
  *   - shell.elf loaded as the sole VM
  *
@@ -62,8 +61,6 @@ typedef SOCKET tcp_sock_t;
 #include "vm/vm_host_tui.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
-#include "storage/trashdrive.h"
-#include "storage/trashdrive_fatfs.h"
 #include "storage/trashfs.h"
 #include "audio/audio_service.h"
 #include "audio/audio_sink.h"
@@ -136,17 +133,9 @@ static int host_mkdir(const char *path, int mode) {
 #endif
 
 /* ---------------------------------------------------------------
- * Backing storage
- *
- * The trashdrive pool needs to be large enough for FatFs R0.16 to
- * lay out a valid FAT volume. Empirically the minimum on R0.16
- * with our config (FM_FAT, n_fat=1) is around 96 KB; below that
- * f_mkfs returns FR_MKFS_ABORTED. We use 128 KB to leave headroom
- * for files plus FatFs's own bookkeeping.
- *
- * If you change this, keep it a multiple of TRASH_SECTOR_SIZE (512).
+ * Backing storage. (The /td0 filesystem region is TRASHFS_REGION_BYTES,
+ * defined with g_trashfs_region below.)
  * --------------------------------------------------------------- */
-#define POOL_BYTES   (128 * 1024)
 #define SHARED_BYTES (64 * 1024)
 /* LOCAL_BYTES is the local-slab region. The slab carves it into
  * fixed-size bins; each per-VM allocation rounds up to the next
@@ -164,17 +153,12 @@ static int host_mkdir(const char *path, int mode) {
  * We round to 1.5 MB to leave a margin. */
 #define LOCAL_BYTES  (1536 * 1024)
 
-static uint8_t g_pool[POOL_BYTES];
 static uint8_t g_shared[SHARED_BYTES];
 static uint8_t g_local[LOCAL_BYTES];
 
-static TrashDrive g_drive;
-static FATFS g_fs;
-
-/* trashfs RAM disk (mounted as /trash0). A dedicated region the
- * filesystem owns directly — no block-device layer, unlike the FatFs
- * tmpfs. 128 KB is plenty to demonstrate the integration; on a real
- * target this is sized to the available internal RAM / PSRAM. */
+/* trashfs RAM disk — the default writable volume, mounted as /td0. The
+ * filesystem owns this region directly (no block-device layer). 128 KB
+ * here; on a real target, size to available internal RAM / PSRAM. */
 #define TRASHFS_REGION_BYTES (128 * 1024)
 static uint8_t g_trashfs_region[TRASHFS_REGION_BYTES];
 static TrashfsVolume g_trashfs_vol;
@@ -344,16 +328,19 @@ static bool host_exe_dir(char *out, size_t out_sz) {
 
 /* ---- streaming WAV file reader (the service's AudioFileReader) ----
  * One composite reader bound into the service: a native path of the
- * form "0:/x" goes to FatFs (the trashdrive volume here; the SD card on
- * the H745 — the SAME f_open/f_read/f_lseek calls), anything else goes
- * to stdio (a /host file). The audio service stays filesystem-agnostic;
- * it just calls open/read/seek/close. Reads happen on the audio worker
- * thread (the M4 in the deployment), which is why the file I/O lives
- * here and not on the VM side. */
+ * form "td0:/x" goes to the trashfs RAM disk (the SD card on the H745,
+ * via the same incremental open/read/seek), anything else goes to stdio
+ * (a /host file). The audio service stays filesystem-agnostic; it just
+ * calls open/read/seek/close. Reads happen on the audio worker thread
+ * (the M4 in the deployment), which is why the file I/O lives here and
+ * not on the VM side. NOTE: trashfs_read is read-only w.r.t. the
+ * volume's metadata, but it shares g_trashfs_vol with the VM thread;
+ * don't rewrite /td0 while a /td0 WAV is streaming (a narrow edge case
+ * — long music streams from /host, not the small RAM disk). */
 typedef struct {
-    bool  is_fat;
-    FILE *fp;        /* stdio backing (is_fat == false) */
-    FIL   fil;       /* FatFs backing (is_fat == true)  */
+    bool         is_trash;
+    FILE        *fp;       /* stdio backing (is_trash == false)  */
+    TrashfsFile  tf;       /* trashfs backing (is_trash == true) */
 } StreamFile;
 
 static void *afr_open(void *ctx, const char *path) {
@@ -361,9 +348,11 @@ static void *afr_open(void *ctx, const char *path) {
     if (!path) return NULL;
     StreamFile *sf = calloc(1, sizeof *sf);
     if (!sf) return NULL;
-    if (strncmp(path, "0:/", 3) == 0) {
-        sf->is_fat = true;
-        if (f_open(&sf->fil, path, FA_READ) != FR_OK) { free(sf); return NULL; }
+    if (strncmp(path, "td0:/", 5) == 0) {
+        sf->is_trash = true;
+        /* "td0:/x" -> trashfs path "/x" (skip the "td0:" prefix). */
+        if (trashfs_open(&g_trashfs_vol, path + 4, TRASHFS_O_RDONLY, &sf->tf)
+                != TRASHFS_OK) { free(sf); return NULL; }
     } else {
         sf->fp = fopen(path, "rb");
         if (!sf->fp) { free(sf); return NULL; }
@@ -374,10 +363,10 @@ static uint32_t afr_read(void *ctx, void *fh, void *dst, uint32_t bytes) {
     (void)ctx;
     StreamFile *sf = (StreamFile *)fh;
     if (!sf) return 0;
-    if (sf->is_fat) {
-        UINT br = 0;
-        if (f_read(&sf->fil, dst, bytes, &br) != FR_OK) return 0;
-        return (uint32_t)br;
+    if (sf->is_trash) {
+        uint32_t got = 0;
+        if (trashfs_read(&sf->tf, dst, bytes, &got) != TRASHFS_OK) return 0;
+        return got;
     }
     return (uint32_t)fread(dst, 1, bytes, sf->fp);
 }
@@ -385,14 +374,18 @@ static bool afr_seek(void *ctx, void *fh, uint32_t off) {
     (void)ctx;
     StreamFile *sf = (StreamFile *)fh;
     if (!sf) return false;
-    if (sf->is_fat) return f_lseek(&sf->fil, (FSIZE_t)off) == FR_OK;
+    if (sf->is_trash) {
+        uint32_t newpos = 0;
+        return trashfs_lseek(&sf->tf, (int32_t)off, TRASHFS_SEEK_SET,
+                             &newpos) == TRASHFS_OK;
+    }
     return fseek(sf->fp, (long)off, SEEK_SET) == 0;
 }
 static void afr_close(void *ctx, void *fh) {
     (void)ctx;
     StreamFile *sf = (StreamFile *)fh;
     if (!sf) return;
-    if (sf->is_fat) f_close(&sf->fil);
+    if (sf->is_trash) trashfs_close(&sf->tf);
     else if (sf->fp) fclose(sf->fp);
     free(sf);
 }
@@ -1545,45 +1538,11 @@ int main(int argc, char **argv) {
      * real console, where Ctrl-C can't be delivered. No-op elsewhere. */
     warn_if_no_real_console();
 
-    /* 1. Initialize the block device. */
-    if (trash_init(&g_drive, g_pool, sizeof(g_pool)) != TRASH_OK) {
-        fprintf(stderr, "host: trash_init failed\n");
-        return 1;
-    }
-
-    /* 2. Register with FatFs as drive 0. */
-    if (!trash_fatfs_register(0, &g_drive)) {
-        fprintf(stderr, "host: trash_fatfs_register failed\n");
-        return 1;
-    }
-
-    /* 3. Format the volume (always — trashdrive is RAM so we
-     * start fresh each run). For persistence between runs you'd
-     * skip f_mkfs and just f_mount; FatFs auto-detects a
-     * pre-formatted volume. */
-    BYTE work[FF_MAX_SS];
-    MKFS_PARM opt = {0};
-    opt.fmt = FM_FAT;
-    opt.n_fat = 1;
-    FRESULT fr = f_mkfs("0:", &opt, work, sizeof(work));
-    if (fr != FR_OK) {
-        fprintf(stderr, "host: f_mkfs failed: %d\n", fr);
-        return 1;
-    }
-
-    /* 4. Mount the volume. */
-    fr = f_mount(&g_fs, "0:", 1);
-    if (fr != FR_OK) {
-        fprintf(stderr, "host: f_mount failed: %d\n", fr);
-        return 1;
-    }
-
-    /* 4b. Format + mount the trashfs RAM disk (mounted as /trash0
-     * below). Like the FatFs tmpfs, it's RAM-backed, so we format
-     * fresh each run. trashfs replaces FatFs in the RAM-disk role on
-     * targets that don't need PC-readable removable media; here it
-     * runs alongside td0 to exercise the integration. now=0: RTC not
-     * yet wired, so timestamps are 0 (see docs/trashfs-format.md). */
+    /* 1. Format + mount the trashfs RAM disk — the default writable
+     * volume, mounted as /td0 below. RAM-backed, so we format fresh
+     * each run (for persistence you'd skip the format and just mount a
+     * pre-formatted region). now=0: RTC not yet wired, so timestamps
+     * are 0 (see docs/trashfs-format.md). */
     if (trashfs_format(g_trashfs_region, TRASHFS_REGION_BYTES, 0, 0)
             != TRASHFS_OK) {
         fprintf(stderr, "host: trashfs_format failed\n");
@@ -1595,27 +1554,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Pre-create a few items in the volume so `ls` has something
-     * to show on first launch. Pure convenience — remove if you
-     * want a truly empty start. */
-    f_mkdir("0:/home");
-    f_mkdir("0:/tmp");
+    /* Pre-create a few items so `ls` has something to show on first
+     * launch. Pure convenience — remove for a truly empty start. */
+    trashfs_mkdir(&g_trashfs_vol, "/home", 0);
+    trashfs_mkdir(&g_trashfs_vol, "/tmp", 0);
     {
-        FIL f;
-        UINT bw;
-        if (f_open(&f, "0:/readme.txt", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
+        TrashfsFile f;
+        if (trashfs_open(&g_trashfs_vol, "/readme.txt",
+                         TRASHFS_O_CREAT | TRASHFS_O_TRUNC, &f) == TRASHFS_OK) {
             const char *msg =
                 "Welcome to the VM shell.\n"
                 "Try: ls, cd home, mkdir foo, touch bar.txt, cat readme.txt\n"
                 "\n"
                 "Filesystem layout:\n"
-                "  /td0/    this RAM-backed FatFs volume (default cwd)\n"
+                "  /td0/    the RAM-backed trashfs volume (default cwd)\n"
                 "  /host/   host directory passthrough (read-only)\n"
                 "\n"
                 "Absolute paths must start with /<name>/. Relative\n"
                 "paths are resolved against the current directory.\n";
-            f_write(&f, msg, (UINT)strlen(msg), &bw);
-            f_close(&f);
+            uint32_t off = 0, len = (uint32_t)strlen(msg), w;
+            while (off < len &&
+                   trashfs_write(&f, msg + off, len - off, &w, 0) == TRASHFS_OK
+                   && w > 0) {
+                off += w;
+            }
+            trashfs_close(&f);
         }
     }
 
@@ -1792,7 +1755,7 @@ int main(int argc, char **argv) {
      *
      * If vm.cfg's [mount.<name>] sections were used, hc.mount_count
      * is non-zero and those become the mounts. Otherwise we set up
-     * the built-in defaults: /td0 (the RAM-backed FatFs)
+     * the built-in defaults: /td0 (the RAM-backed trashfs volume)
      * and /host (a passthrough to host_fs_root, unless
      * --no-host-fs was passed).
      *
@@ -1800,21 +1763,16 @@ int main(int argc, char **argv) {
      * doesn't include a td0, the shell's first `pwd` will show a
      * non-resolvable cwd — but that's the user's choice.
      *
-     * Multiple TD mounts aren't supported in M.3a: there's only one
-     * static FatFs volume backing. A configured td<N> reuses it,
-     * but the size_kb override is ignored (the backing pool size
-     * is compile-time). M.3b adds image-file backends and proper
-     * per-mount backing pools. */
+     * Multiple writable volumes aren't supported yet: there's one
+     * static trashfs region backing. A configured td<N> reuses it,
+     * and the size_kb override is ignored (the region size is
+     * compile-time). Per-mount backing regions are a later step. */
 
     if (hc.mount_count == 0) {
-        /* No mount section in vm.cfg — use built-in defaults. */
-        if (!vm_host_fs_mount_fatfs("td0", 0, &g_fs)) {
-            fprintf(stderr, "host: vm_host_fs_mount_fatfs('td0') failed\n");
-            return 1;
-        }
-
-        if (!vm_host_fs_mount_trashfs("trash0", &g_trashfs_vol)) {
-            fprintf(stderr, "host: vm_host_fs_mount_trashfs('trash0') failed\n");
+        /* No mount section in vm.cfg — use built-in defaults: the
+         * trashfs RAM disk as /td0 (default cwd) + /host passthrough. */
+        if (!vm_host_fs_mount_trashfs("td0", &g_trashfs_vol)) {
+            fprintf(stderr, "host: vm_host_fs_mount_trashfs('td0') failed\n");
             return 1;
         }
 
@@ -1846,33 +1804,32 @@ int main(int argc, char **argv) {
         }
     } else {
         /* Config-driven mount setup. */
-        bool any_fatfs_mounted = false;
+        bool any_td_mounted = false;
         for (unsigned i = 0; i < hc.mount_count; i++) {
             const HostMount *m = &hc.mounts[i];
             if (m->kind == HOST_MOUNT_TMPFS || m->kind == HOST_MOUNT_SD) {
-                /* tmpfs and sd both map to FatFs over the single
-                 * host-side trashdrive pool today. On hardware
-                 * they'll diverge (tmpfs stays in RAM; sd uses
-                 * the SD card driver). For now: just enforce one
-                 * FatFs mount until we add multi-volume support. */
-                if (any_fatfs_mounted) {
-                    fprintf(stderr, "host: vm.cfg: multiple FatFs mounts "
-                            "(tmpfs/sd) not supported in M.3a (ignoring "
+                /* tmpfs and sd both map to the single trashfs RAM disk
+                 * today. On hardware they'll diverge (tmpfs stays in
+                 * RAM; sd uses the SD card driver). For now: enforce
+                 * one writable volume until multi-volume support. */
+                if (any_td_mounted) {
+                    fprintf(stderr, "host: vm.cfg: multiple writable mounts "
+                            "(tmpfs/sd) not supported yet (ignoring "
                             "mount.%s)\n", m->name);
                     continue;
                 }
-                if (!vm_host_fs_mount_fatfs(m->name, 0, &g_fs)) {
-                    fprintf(stderr, "host: vm_host_fs_mount_fatfs('%s') "
+                if (!vm_host_fs_mount_trashfs(m->name, &g_trashfs_vol)) {
+                    fprintf(stderr, "host: vm_host_fs_mount_trashfs('%s') "
                             "failed\n", m->name);
                     return 1;
                 }
                 const char *kind_str =
                     (m->kind == HOST_MOUNT_TMPFS) ? "tmpfs" : "sd";
-                fprintf(stderr, "host: /%s mounted (%s via FatFs, %u KB pool"
+                fprintf(stderr, "host: /%s mounted (%s via trashfs, %u KB"
                         "%s)\n", m->name, kind_str,
-                        (unsigned)(POOL_BYTES / 1024),
+                        (unsigned)(TRASHFS_REGION_BYTES / 1024),
                         m->size_kb ? "; size_kb override ignored" : "");
-                any_fatfs_mounted = true;
+                any_td_mounted = true;
             } else {
                 /* HOST. Path is required. */
                 if (m->path[0] == '\0') {
@@ -2067,7 +2024,6 @@ int main(int argc, char **argv) {
         host_audio_stop();
 #endif
         vm_system_destroy(&sys);
-        f_mount(NULL, "0:", 0);
         free(elf_owned);   /* NULL for the embedded/XIP image — safe */
         return 0;
     }
@@ -2110,7 +2066,6 @@ int main(int argc, char **argv) {
     host_audio_stop();
 #endif
     vm_system_destroy(&sys);
-    f_mount(NULL, "0:", 0);
     free(elf_owned);   /* NULL for the embedded/XIP image — safe */
     return 0;
 }

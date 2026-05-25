@@ -265,8 +265,8 @@ static void handle_load_wav(VmCpu *cpu, void *system) {
  * mount path to a native path the service's file_reader understands,
  * stages that path string, and posts REQ_AUDIO_STREAM_WAV. The service
  * opens + reads the file incrementally (on the desktop worker, or the
- * H745 M4 off SD). "/host/x" -> "<root>/x" (stdio); "/td0/x" -> "0:/x"
- * (FatFs). */
+ * H745 M4 off SD). "/host/x" -> "<root>/x" (stdio); "/td0/x" ->
+ * "td0:/x" (the trashfs RAM disk). */
 static void handle_stream_wav(VmCpu *cpu, void *system) {
     (void)system;
     uint32_t path_addr = cpu->regs[VM_REG_A0];   /* read BEFORE clearing */
@@ -281,7 +281,7 @@ static void handle_stream_wav(VmCpu *cpu, void *system) {
         if (!g_host_fs_root) return;
         snprintf(native, sizeof(native), "%s/%s", g_host_fs_root, gpath + 6);
     } else if (strncmp(gpath, "/td0/", 5) == 0) {
-        snprintf(native, sizeof(native), "0:/%s", gpath + 5);  /* FatFs vol 0 */
+        snprintf(native, sizeof(native), "td0:/%s", gpath + 5); /* trashfs */
     } else {
         return;   /* only /host and /td0 are streamable */
     }

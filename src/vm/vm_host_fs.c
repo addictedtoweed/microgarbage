@@ -390,22 +390,6 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
     return 0;
 }
 
-/* Copy a guest path for handlers that only support FatFs paths
- * (mkdir, unlink, readdir). Returns the length on success, or
- * -errno. */
-static int copy_path(VmCpu *cpu, uint32_t guest_addr,
-                     char *out, size_t cap) {
-    PathBackend backend;
-    bool writable;
-    int r = resolve_guest_path(cpu, guest_addr, out, cap, &backend, &writable, NULL);
-    if (r < 0) return r;
-    if (backend == PATH_BACKEND_HOST) {
-        /* Caller doesn't support host paths. Tell them no. */
-        return -VM_EROFS;
-    }
-    return (int)strlen(out);
-}
-
 /* ============================================================
  *  FRESULT → errno mapping
  * ============================================================ */
