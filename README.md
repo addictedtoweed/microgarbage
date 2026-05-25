@@ -25,7 +25,10 @@ garbage/
 │   ├── storage.h               ← aggregator (pulls in all storage)
 │   ├── memory.h                ← aggregator (pulls in all memory)
 │   ├── containers/
-│   │   ├── hashtable.h
+│   │   ├── containers_config.h ← default node-pool sizes (overridable)
+│   │   ├── hashtable.h         ← string-keyed, malloc, chained
+│   │   ├── avlhash.h           ← generic, node-pool, AVL buckets
+│   │   ├── avl_core.h          ← shared AVL/BST-over-pool engine (internal)
 │   │   ├── ring_buffer.h
 │   │   ├── fifo_queue.h
 │   │   ├── stack.h
@@ -186,12 +189,13 @@ errors:
 | Module        | Depends on (compile-time)            |
 |---------------|--------------------------------------|
 | hashtable     | (none)                               |
+| avlhash       | avl_core                             |
 | ring_buffer   | (none)                               |
 | fifo_queue    | ring_buffer                          |
 | stack         | (none)                               |
 | slist         | (none)                               |
 | dlist         | (none)                               |
-| tree          | (none)                               |
+| tree          | avl_core                             |
 | fixed_point   | (none)                               |
 | fast_div      | (none)                               |
 | audio_mixer   | ring_buffer, fixed_point             |
@@ -332,6 +336,29 @@ FNV-1a hash, configurable initial capacity, resizes at 0.75 load.
 API: `ht_create`, `ht_create_with_allocator`, `ht_destroy`,
 `ht_put`, `ht_get`, `ht_remove`, `ht_size`, `ht_iter`.
 
+#### avlhash
+
+A **second** hashing mechanism for the no-malloc, fixed-budget case.
+Where `hashtable` is string-keyed, malloc-backed, and chains collisions,
+`avlhash` is **generic** (any fixed-size payload + a caller `hash_fn` and
+`cmp_fn`), **caller-provides-the-pool**, and resolves collisions with
+**AVL trees** instead of chains — so a hot or adversarial bucket
+degrades to O(log n), never O(n). On a fast MCU the log-n insert/traverse
+is well within budget.
+
+All buckets draw entry nodes from **one combined node pool** + free list
+(via the shared `avl_core` engine, which also backs `tree`'s AVL path —
+no duplicated balancing code). You size the pool once for the *total*
+live entries across the whole table, independent of bucket count
+(`AVLHASH_POOL_BYTES` macro + `avlhash_pool_bytes()`). Bucket count is
+fixed at init (the no-malloc tradeoff — pick it for spread; a collision
+costs a tree level, not a probe storm). Set semantics; `avlhash_foreach`
+visits bucket-by-bucket, in-order within each bucket.
+
+API: `avlhash_init`, `avlhash_clear`, `avlhash_insert`, `avlhash_find`,
+`avlhash_contains`, `avlhash_remove`, `avlhash_count/empty/full`,
+`avlhash_foreach`.
+
 #### ring_buffer
 
 Fixed-capacity circular buffer. Caller-provided storage. Memcpy
@@ -369,6 +396,13 @@ identical on 32- and 64-bit hosts. Both ship a compile-time size macro
 (`SLIST_POOL_BYTES` / `DLIST_POOL_BYTES`, for static arrays and
 `_Static_assert`) and a matching runtime function (`slist_pool_bytes` /
 `dlist_pool_bytes`, for bump arenas) — they agree.
+
+Node overheads stay **lean and per-type** (not unified): `slist` 4 B,
+`dlist` 8 B, `tree`/`avlhash` 16 B. For one-place sizing,
+`containers_config.h` defines overridable `GARBAGE_*_DEFAULT_NODES`
+knobs (same `#ifndef`/`-D` idiom as `config.h`), and each container adds
+a `*_DEFAULT_POOL_BYTES(elem)` macro on top of its explicit
+`*_POOL_BYTES(cap, elem)`.
 
 `slist` is the **lean** one: a single link per node (4 bytes + payload),
 forward-only iteration, O(1) push/pop at the front and O(1) push at the
