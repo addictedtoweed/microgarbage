@@ -62,6 +62,16 @@ static void set_tile_4bpp(uint16_t *vram, unsigned cw, unsigned tile,
     }
 }
 
+/* Place sprite 0 (16x16, tile 1, OBJ pal 0, priority 2 = above the BG). */
+static void place_sprite0(int x, int y) {
+    P.oam[0] = (uint8_t)((unsigned)x & 0xFFu);
+    P.oam[1] = (uint8_t)y;
+    P.oam[2] = 1;                                  /* tile 1 */
+    P.oam[3] = (uint8_t)(2u << 4);                 /* pal 0, prio 2, no flip */
+    unsigned xhi = ((unsigned)x >> 8) & 1u;
+    P.oam[512] = (uint8_t)((P.oam[512] & ~3u) | (xhi | (1u << 1))); /* X hi + big */
+}
+
 static void build_scene(void) {
     ppu_state_clear(&P);
     P.mode = 1;
@@ -95,6 +105,21 @@ static void build_scene(void) {
             P.vram[(0x1000 + ty * 32u + tx) & 0x7FFFu] = tile;  /* pal 0, prio 0 */
         }
     }
+
+    /* A 16x16 solid-yellow sprite (OBJ) that bounces over the BG, so the
+     * sprite path + sprite-over-BG priority are visible too. */
+    P.obj_on_main   = true;
+    P.obj_size_sel  = 0;             /* size pair 0: small 8x8 / large 16x16 */
+    P.obj_char_word = 0x4000;
+    P.obj_gap_word  = 0;
+    P.cgram[128 + 1] = 0x03FFu;      /* OBJ pal0 index 1 = yellow (r+g) */
+    uint8_t sp[8][8];
+    for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) sp[r][c] = 1;
+    set_tile_4bpp(P.vram, 0x4000, 1, sp);   /* 16x16 = tiles 1,2,17,18 */
+    set_tile_4bpp(P.vram, 0x4000, 2, sp);
+    set_tile_4bpp(P.vram, 0x4000, 17, sp);
+    set_tile_4bpp(P.vram, 0x4000, 18, sp);
+    place_sprite0(20, 20);
 }
 
 int main(void) {
@@ -120,6 +145,7 @@ int main(void) {
     const double target_dt = 1.0 / SNES_NTSC_HZ;
     double last = now_sec(), report_t0 = last, acc = 0.0;
     unsigned emu = 0, presents = 0, emu_window = 0;
+    int sx = 20, sy = 20, vx = 2, vy = 1;        /* bouncing sprite */
 
     ppu_render(&P, FB);                          /* first frame before the loop */
 
@@ -138,6 +164,12 @@ int main(void) {
         if (stepped) {                           /* re-render only on a new frame */
             P.bg[0].hofs = (uint16_t)(emu / 2u); /* diagonal scroll */
             P.bg[0].vofs = (uint16_t)(emu / 3u);
+            sx += vx; sy += vy;                  /* bounce the sprite */
+            if (sx < 0) { sx = 0; vx = -vx; }
+            if (sx > PPU_SCREEN_W - 16) { sx = PPU_SCREEN_W - 16; vx = -vx; }
+            if (sy < 0) { sy = 0; vy = -vy; }
+            if (sy > PPU_SCREEN_H - 16) { sy = PPU_SCREEN_H - 16; vy = -vy; }
+            place_sprite0(sx, sy);
             ppu_render(&P, FB);
         }
         present_frame(FB);                       /* vsync-throttled */
