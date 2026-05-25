@@ -48,19 +48,15 @@
  *  Backends
  *  ---------------------------------------------------------------
  *
- *  Two backend kinds are implemented in M.3a:
+ *  Two backend kinds are implemented:
  *
- *  HOST   — passthrough to a real directory on the host machine.
- *           Read-only by default; writability is a per-mount flag.
- *           ".." escapes are rejected.
+ *  HOST    — passthrough to a real directory on the host machine.
+ *            Read-only by default; writability is a per-mount flag.
+ *            ".." escapes are rejected.
  *
- *  FATFS  — backed by FatFs, typically over a trashdrive RAM
- *           volume. The mount table stores the FatFs volume number
- *           (0..FF_VOLUMES-1) and a pointer to a host-owned FATFS
- *           struct that the caller has already mounted.
- *
- *  Future rounds add IMG (file-backed FatFs) without touching the
- *  /<name>/ namespace.
+ *  TRASHFS — backed by a mounted trashfs volume (the native RAM
+ *            disk). The mount table stores a pointer to a host-owned
+ *            TrashfsVolume the caller has already formatted+mounted.
  *
  *  ---------------------------------------------------------------
  *  Installation
@@ -71,11 +67,14 @@
  *      vm_host_install_stdio(&sys);     // for fds 0,1,2
  *      vm_host_install_fs(&sys);        // for fds 3+
  *
- *      // Set up at least one mount before guests run.
- *      // Example: a RAM-backed FatFs as /td0 and a
- *      // read-only host-directory passthrough at /host:
- *      vm_host_fs_mount_fatfs("td0", 0, &g_fatfs0);
- *      vm_host_fs_mount_host ("host", "./host_files", false);
+ *      // Set up at least one mount before guests run. Example: a
+ *      // trashfs RAM disk as /td0 and a read-only host passthrough:
+ *      static uint8_t       g_region[128 * 1024];
+ *      static TrashfsVolume g_vol;
+ *      trashfs_format(g_region, sizeof g_region, 0, 0);
+ *      trashfs_mount(&g_vol, g_region, sizeof g_region);
+ *      vm_host_fs_mount_trashfs("td0", &g_vol);
+ *      vm_host_fs_mount_host   ("host", "./host_files", false);
  *
  *      vm_system_load_vm(...);
  *      vm_system_run(...);
@@ -83,26 +82,6 @@
  *  The order matters: install_fs registers a delegate that
  *  install_stdio's read/write/close handlers use to route fds
  *  >= 3. Mounts can be added before or after install_fs.
- *
- *  ---------------------------------------------------------------
- *  FatFs setup is still the host's job
- *  ---------------------------------------------------------------
- *
- *  vm_host_install_fs() does NOT touch FatFs. The host runs the
- *  usual init/format/mount sequence and then registers the
- *  resulting FATFS struct as a mount:
- *
- *      static TrashDrive g_drive;
- *      static uint8_t    g_pool[128 * 1024];
- *      static FATFS      g_fs;
- *
- *      trash_init(&g_drive, g_pool, sizeof(g_pool));
- *      trash_fatfs_register(0, &g_drive);
- *      BYTE work[FF_MAX_SS];
- *      f_mkfs("0:", NULL, work, sizeof(work));
- *      f_mount(&g_fs, "0:", 1);
- *      vm_host_install_fs(&sys);
- *      vm_host_fs_mount_fatfs("td0", 0, &g_fs);  // now guests can use files
  *
  *  ---------------------------------------------------------------
  *  Syscall numbers
@@ -240,24 +219,22 @@ bool vm_host_install_fs_atexit(VmSystem *sys);
  *  table; the rest of the path is the location within the
  *  mount's backend. Two backend kinds are supported:
  *
- *    HOST  — passes through to a real directory on the host's
- *            OS filesystem. ".." escapes are rejected. Read-only
- *            by default; pass writable=true to allow creates.
+ *    HOST    — passes through to a real directory on the host's
+ *              OS filesystem. ".." escapes are rejected. Read-only
+ *              by default; pass writable=true to allow creates.
  *
- *    FATFS — backed by FatFs over a volume (typically a
- *            trashdrive RAM region). The mount stores the FatFs
- *            volume number; the caller has already mounted the
- *            FATFS struct via f_mount.
+ *    TRASHFS — backed by a mounted trashfs volume (the native RAM
+ *              disk). The mount stores a pointer to the host-owned
+ *              TrashfsVolume the caller has already mounted.
  *
  *  Names must match [A-Za-z0-9_-]{1,15} and be unique across
  *  the table. There's no enforced order; mounts are looked up
  *  by name. The table size cap is VM_HOST_FS_MAX_MOUNTS.
  *
- *  All mount_* and unmount_* calls are idempotent in the sense
- *  that they don't touch FatFs internals or open files. Closing
- *  open fds on unmount is the caller's responsibility — the
- *  cleanest sequence is unload_all_vms() -> unmount_all() ->
- *  f_mount(NULL, "0:", 0).
+ *  mount_* / unmount_* calls don't touch the underlying backend or
+ *  open files. Closing open fds on unmount is the caller's
+ *  responsibility — the cleanest sequence is unload_all_vms() ->
+ *  unmount_all().
  * ============================================================ */
 
 #ifndef VM_HOST_FS_MAX_MOUNTS
@@ -280,23 +257,6 @@ bool vm_host_fs_mount_host(const char *name,
                            const char *root,
                            bool writable);
 
-/* Register a FatFs-backed mount.
- *
- *   name         Mount point.
- *   pdrv         FatFs physical drive number (0..FF_VOLUMES-1).
- *                The caller has already done trash_fatfs_register
- *                + f_mkfs + f_mount for this drive.
- *   fatfs        Pointer to the host-owned FATFS struct (passed
- *                as void* to avoid pulling ff.h into this
- *                header). Stored as-is; lifetime must outlive
- *                this mount.
- *
- * Returns true on success; false on invalid name, full table,
- * or duplicate name. */
-bool vm_host_fs_mount_fatfs(const char *name,
-                            uint8_t pdrv,
-                            void *fatfs);
-
 /* Mount a trashfs volume under <name>. The 'vol' argument is a
  * pointer to a mounted TrashfsVolume (passed as void* to avoid
  * pulling storage/trashfs.h into this header). Stored as-is; the
@@ -310,11 +270,11 @@ bool vm_host_fs_mount_trashfs(const char *name, void *vol);
 
 /* Remove a mount by name. Returns true if the mount existed and
  * was removed; false if no such mount. Doesn't touch the
- * underlying backend (FatFs is left mounted; host directory is
- * left alone). */
+ * underlying backend (the trashfs volume stays mounted; the host
+ * directory is left alone). */
 bool vm_host_fs_unmount(const char *name);
 
-/* Tear down all mounts. Doesn't touch FatFs internals. */
+/* Tear down all mounts. Doesn't touch the underlying backends. */
 void vm_host_fs_unmount_all(void);
 
 /* Query the number of currently-registered mounts. */

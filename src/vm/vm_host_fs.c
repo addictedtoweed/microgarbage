@@ -1,10 +1,10 @@
 /* ============================================================
- *  vm_host_fs.c — implementation of file syscalls on top of FatFs
+ *  vm_host_fs.c — file syscalls over the trashfs RAM disk and a
+ *  read-only host-directory passthrough. (FatFs was removed; trashfs
+ *  is the native, public-domain filesystem now.)
  *
- *  Build dependencies:
- *    -Iinclude                          for our public headers
- *    -Ithird_party/fatfs/source         for ff.h
- *    -Ithird_party/fatfs                for ffconf.h
+ *  Build dependencies: -Iinclude for our public headers. No external
+ *  filesystem library.
  *
  *  Public domain (CC0). No warranty.
  * ============================================================ */
@@ -19,17 +19,9 @@
 #include "vm/vm_system.h"
 #include "vm/host_compat.h"
 
-/* FatFs and POSIX <dirent.h> both define a type named DIR. We
- * include dirent.h here for host-mount directory listing; remap
- * FatFs's name to FFDIR via a tiny preprocessor dance so both
- * coexist. The remap only affects this translation unit. */
-#define DIR FFDIR
-#include "ff.h"
-#undef DIR
-
 #include "storage/trashfs.h"
 
-#include <dirent.h>
+#include <dirent.h>   /* POSIX DIR for host-mount directory listing */
 
 #include <stdlib.h>
 #include <string.h>
@@ -70,9 +62,9 @@ static inline void fs_unlock(void) { }
  *  Slots 0,1,2 are reserved for stdin/stdout/stderr (managed by
  *  vm_host_stdio.c). Our slots run from 3 to 3+MAX_FILES-1.
  *
- *  Each slot can be either a regular file (FIL) or an open
- *  directory (DIR). FatFs's FIL and DIR are different types so
- *  we tag each slot with a `kind` and union the storage.
+ *  Each slot is a file or a directory on one of the backends
+ *  (trashfs RAM disk, or a host-passthrough mount); we tag each
+ *  slot with a `kind` and union the per-backend storage.
  * ============================================================ */
 
 #define FD_BASE    3
@@ -85,8 +77,6 @@ static inline void fs_unlock(void) { }
 
 typedef enum {
     SLOT_FREE = 0,
-    SLOT_FILE,        /* FatFs file (u.file) */
-    SLOT_DIR,         /* FatFs directory (u.dir) */
     SLOT_HOST_FILE,   /* Host-filesystem file (u.host) */
     SLOT_ROOT,        /* Synthetic root listing — yields mount names */
     SLOT_HOST_DIR,    /* Host-filesystem directory (u.host_dir) */
@@ -96,10 +86,8 @@ typedef enum {
 
 typedef struct {
     SlotKind kind;
-    bool     writable;    /* HOST/FATFS: was the mount writable at open? */
+    bool     writable;    /* HOST: was the mount writable at open? */
     union {
-        FIL    file;
-        FFDIR  dir;
         FILE  *host;       /* stdio FILE* for SLOT_HOST_FILE */
         struct {
             unsigned cursor;   /* index into the mount table */
@@ -158,16 +146,15 @@ static void free_slot(FdSlot *s) {
  *  entry per registered mount.
  *
  *  Mount kinds:
- *    HOST  — passthrough to a directory on the host's OS fs.
- *            Composes the resolved host path by appending the
- *            <...> portion to the mount's host_root. ".." escapes
- *            are rejected.
- *    FATFS — passes the resolved path to FatFs in volume-prefixed
- *            form ("N:/foo/bar"). The mount stores the FatFs
- *            volume number. Today's `tmpfs` and `sd` config types
- *            both map to FATFS internally; they differ in intent
- *            (volatile RAM vs. persistent block device on
- *            hardware), not in implementation on the dev host.
+ *    HOST    — passthrough to a directory on the host's OS fs.
+ *              Composes the resolved host path by appending the
+ *              <...> portion to the mount's host_root. ".." escapes
+ *              are rejected.
+ *    TRASHFS — passes the resolved mount-relative path to a mounted
+ *              trashfs volume (the RAM disk). Today's `tmpfs` and
+ *              `sd` config types both map to TRASHFS; they differ in
+ *              intent (volatile RAM vs. persistent block device on
+ *              hardware), not in implementation on the dev host.
  * ============================================================ */
 
 /* Mount table. M.3a supports up to VM_HOST_FS_MAX_MOUNTS entries
@@ -176,7 +163,6 @@ static void free_slot(FdSlot *s) {
 typedef enum {
     MOUNT_KIND_FREE   = 0,    /* slot is empty (memset state) */
     MOUNT_KIND_HOST   = 1,
-    MOUNT_KIND_FATFS  = 2,
     MOUNT_KIND_TRASHFS= 3,
 } MountKind;
 
@@ -191,10 +177,6 @@ typedef struct {
     size_t   host_root_len;
     bool     writable;        /* only meaningful for HOST */
 
-    /* FATFS fields */
-    uint8_t  fatfs_volume;    /* FatFs pdrv number */
-    FATFS   *fatfs_struct;    /* host-owned, may be NULL */
-
     /* TRASHFS fields */
     TrashfsVolume *trashfs_vol; /* host-owned mounted volume */
 } Mount;
@@ -204,7 +186,6 @@ static unsigned g_mount_count = 0;
 
 /* Which backend a path was routed to. */
 typedef enum {
-    PATH_BACKEND_FATFS = 0,
     PATH_BACKEND_HOST  = 1,
     PATH_BACKEND_TRASHFS = 2,
 } PathBackend;
@@ -285,7 +266,7 @@ static bool is_root_path(const char *path) {
  *   out, cap          buffer for the translated path
  *
  * Outputs (on success):
- *   *out_backend      PATH_BACKEND_HOST or PATH_BACKEND_FATFS
+ *   *out_backend      PATH_BACKEND_HOST or PATH_BACKEND_TRASHFS
  *   *out_writable     true if the mount allows writes
  *
  * Returns 0 on success, or -errno on failure:
@@ -355,106 +336,19 @@ static int resolve_guest_path(VmCpu *cpu, uint32_t guest_addr,
         return 0;
     }
 
-    if (m->kind == MOUNT_KIND_TRASHFS) {
-        /* Flat namespace: the "path" is just the filename within the
-         * mount (rel without its leading slash). The volume is
-         * reached via *out_mount. Reject any subdirectory component
-         * for now (no subdirs yet). */
-        const char *fname = rel;
-        if (*fname == '/') fname++;
-        /* No nested paths in the flat namespace. */
-        if (strchr(fname, '/') != NULL) return -VM_ENOENT;
-        size_t fl = strlen(fname);
-        if (fl + 1 > cap) return -VM_ENAMETOOLONG;
-        memcpy(out, fname, fl + 1);   /* may be "" for the mount root */
+    /* TRASHFS: pass the full mount-relative path (with its leading
+     * '/'), which trashfs resolves through nested dirs + "."/"..".
+     * The volume is reached via *out_mount. */
+    {
+        size_t rel_len = strlen(rel);
+        if (rel_len + 1 > cap) return -VM_ENAMETOOLONG;
+        memcpy(out, rel, rel_len + 1);   /* "/" for the mount root */
 
         *out_backend  = PATH_BACKEND_TRASHFS;
         *out_writable = true;
         if (out_mount) *out_mount = m;
         return 0;
     }
-
-    /* FATFS: emit "<volume>:<rel>". The volume number is one
-     * digit (FF_VOLUMES <= 10 in our build). */
-    size_t rel_len = strlen(rel);
-    /* '<digit>' + ':' + rel + null = 2 + rel_len + 1 */
-    if (rel_len + 3 > cap) return -VM_ENAMETOOLONG;
-    out[0] = (char)('0' + m->fatfs_volume);
-    out[1] = ':';
-    memcpy(out + 2, rel, rel_len + 1);     /* includes null */
-
-    *out_backend  = PATH_BACKEND_FATFS;
-    *out_writable = true;     /* FatFs writability is per-mount-or-not;
-                                 * for now all FatFs mounts are r/w. */
-    if (out_mount) *out_mount = m;
-    return 0;
-}
-
-/* ============================================================
- *  FRESULT → errno mapping
- * ============================================================ */
-
-static int32_t fres_to_errno(FRESULT r) {
-    switch (r) {
-        case FR_OK:                  return 0;
-        case FR_DISK_ERR:            return -VM_EIO;
-        case FR_INT_ERR:             return -VM_EIO;
-        case FR_NOT_READY:           return -VM_EIO;
-        case FR_NO_FILE:             return -VM_ENOENT;
-        case FR_NO_PATH:             return -VM_ENOENT;
-        case FR_INVALID_NAME:        return -VM_ENAMETOOLONG;
-        /* FatFs returns FR_INVALID_NAME both for syntactically bad
-         * names and (more often, with LFN off) for names that don't
-         * fit the 8.3 limit. EINVAL would be more accurate for the
-         * former but ENAMETOOLONG is more useful for the latter,
-         * which is what users actually hit. */
-        case FR_DENIED:              return -VM_EPERM;
-        case FR_EXIST:               return -VM_EEXIST;
-        case FR_INVALID_OBJECT:      return -VM_EBADF;
-        case FR_WRITE_PROTECTED:     return -VM_EROFS;
-        case FR_INVALID_DRIVE:       return -VM_ENOENT;
-        case FR_NOT_ENABLED:         return -VM_EIO;
-        case FR_NO_FILESYSTEM:       return -VM_ENOENT;
-        case FR_MKFS_ABORTED:        return -VM_EIO;
-        case FR_TIMEOUT:             return -VM_ETIMEDOUT;
-        case FR_LOCKED:              return -VM_EBUSY;
-        case FR_NOT_ENOUGH_CORE:     return -VM_ENOMEM;
-        case FR_TOO_MANY_OPEN_FILES: return -VM_EMFILE;
-        case FR_INVALID_PARAMETER:   return -VM_EINVAL;
-        default:                     return -VM_EIO;
-    }
-}
-
-/* ============================================================
- *  Open-flag translation
- *
- *  Map our (Linux-compat) VM_O_* flags onto FatFs's FA_* mode
- *  bits. Reject combinations that don't make sense (e.g.,
- *  O_TRUNC without write access).
- * ============================================================ */
-
-static int translate_open_flags(uint32_t flags, BYTE *out_mode) {
-    BYTE mode = 0;
-    uint32_t access = flags & VM_O_ACCMODE;
-
-    if (access == VM_O_RDONLY)      mode |= FA_READ;
-    else if (access == VM_O_WRONLY) mode |= FA_WRITE;
-    else if (access == VM_O_RDWR)   mode |= FA_READ | FA_WRITE;
-    else return -VM_EINVAL;
-
-    if (flags & VM_O_CREAT) {
-        if (flags & VM_O_EXCL)      mode |= FA_CREATE_NEW;
-        else if (flags & VM_O_TRUNC) mode |= FA_CREATE_ALWAYS;
-        else                         mode |= FA_OPEN_ALWAYS;
-    } else {
-        if (flags & VM_O_TRUNC)     return -VM_EINVAL;
-        mode |= FA_OPEN_EXISTING;
-    }
-
-    /* APPEND we handle after-the-fact (f_lseek to end after open). */
-
-    *out_mode = mode;
-    return 0;
 }
 
 /* ============================================================
@@ -465,8 +359,8 @@ static int translate_open_flags(uint32_t flags, BYTE *out_mode) {
  *  installed). They handle ONLY file fds (>= 3) — stdio fds are
  *  not our problem.
  *
- *  Dispatch is by slot kind: SLOT_FILE goes through FatFs's
- *  f_read/f_write/f_close, SLOT_HOST_FILE through native stdio's
+ *  Dispatch is by slot kind: SLOT_TRASH_FILE goes through the
+ *  trashfs RAM disk, SLOT_HOST_FILE through native stdio's
  *  fread/fwrite/fclose.
  * ============================================================ */
 
@@ -480,12 +374,6 @@ static int32_t fs_read_fd(int fd, void *buf, uint32_t n) {
     if (fd >= FD_LIMIT) return -VM_EBADF;
     FdSlot *s = &g_fds[fd - FD_BASE];
 
-    if (s->kind == SLOT_FILE) {
-        UINT br = 0;
-        FRESULT r = f_read(&s->u.file, buf, n, &br);
-        if (r != FR_OK) return fres_to_errno(r);
-        return (int32_t)br;
-    }
     if (s->kind == SLOT_HOST_FILE) {
         size_t br = fread(buf, 1, n, s->u.host);
         if (br < n && ferror(s->u.host)) return -VM_EIO;
@@ -505,12 +393,6 @@ static int32_t fs_write_fd(int fd, const void *buf, uint32_t n) {
     if (fd >= FD_LIMIT) return -VM_EBADF;
     FdSlot *s = &g_fds[fd - FD_BASE];
 
-    if (s->kind == SLOT_FILE) {
-        UINT bw = 0;
-        FRESULT r = f_write(&s->u.file, buf, n, &bw);
-        if (r != FR_OK) return fres_to_errno(r);
-        return (int32_t)bw;
-    }
     if (s->kind == SLOT_HOST_FILE) {
         if (!s->writable) return -VM_EROFS;
         size_t bw = fwrite(buf, 1, n, s->u.host);
@@ -535,13 +417,7 @@ static int32_t fs_close_fd(int fd) {
     if (s->kind == SLOT_FREE) return -VM_EBADF;
 
     int32_t result = 0;
-    if (s->kind == SLOT_FILE) {
-        FRESULT r = f_close(&s->u.file);
-        if (r != FR_OK) result = fres_to_errno(r);
-    } else if (s->kind == SLOT_DIR) {
-        FRESULT r = f_closedir(&s->u.dir);
-        if (r != FR_OK) result = fres_to_errno(r);
-    } else if (s->kind == SLOT_HOST_FILE) {
+    if (s->kind == SLOT_HOST_FILE) {
         if (fclose(s->u.host) != 0) result = -VM_EIO;
     } else if (s->kind == SLOT_HOST_DIR) {
         if (closedir(s->u.host_dir.dir) != 0) result = -VM_EIO;
@@ -771,65 +647,8 @@ static void handle_openat(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* ---- FatFs path ---- */
-
-    if (flags & VM_O_DIRECTORY) {
-        /* Open directory for readdir. Flags other than O_DIRECTORY
-         * + O_RDONLY are rejected — you can't write to a dir. */
-        if ((flags & VM_O_ACCMODE) != VM_O_RDONLY) {
-            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EISDIR;
-            return;
-        }
-        int fd = alloc_fd(SLOT_DIR);
-        if (fd < 0) {
-            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE;
-            return;
-        }
-        FdSlot *s = &g_fds[fd - FD_BASE];
-        FRESULT r = f_opendir(&s->u.dir, buf);
-        if (r != FR_OK) {
-            free_slot(s);
-            cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(r);
-            return;
-        }
-        cpu->regs[VM_REG_A0] = (uint32_t)fd;
-        return;
-    }
-
-    /* Regular file open. */
-    BYTE mode = 0;
-    int rc = translate_open_flags(flags, &mode);
-    if (rc < 0) {
-        cpu->regs[VM_REG_A0] = (uint32_t)rc;
-        return;
-    }
-
-    int fd = alloc_fd(SLOT_FILE);
-    if (fd < 0) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EMFILE;
-        return;
-    }
-    FdSlot *s = &g_fds[fd - FD_BASE];
-    FRESULT r = f_open(&s->u.file, buf, mode);
-    if (r != FR_OK) {
-        free_slot(s);
-        cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(r);
-        return;
-    }
-
-    /* If O_APPEND was requested, seek to end. */
-    if (flags & VM_O_APPEND) {
-        FSIZE_t end = f_size(&s->u.file);
-        FRESULT sr = f_lseek(&s->u.file, end);
-        if (sr != FR_OK) {
-            f_close(&s->u.file);
-            free_slot(s);
-            cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(sr);
-            return;
-        }
-    }
-
-    cpu->regs[VM_REG_A0] = (uint32_t)fd;
+    /* Only HOST and TRASHFS backends exist; both returned above. */
+    cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
 }
 
 /* SYS_CLOSE
@@ -917,35 +736,9 @@ static void handle_lseek(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* FatFs fd path. */
-    if (s->kind != SLOT_FILE) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
-        return;
-    }
-
-    FSIZE_t base;
-    switch (whence) {
-        case VM_SEEK_SET: base = 0; break;
-        case VM_SEEK_CUR: base = f_tell(&s->u.file); break;
-        case VM_SEEK_END: base = f_size(&s->u.file); break;
-        default:
-            cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
-            return;
-    }
-
-    /* Resulting position must be non-negative. */
-    if (off < 0 && (FSIZE_t)(-off) > base) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
-        return;
-    }
-    FSIZE_t new_pos = base + (FSIZE_t)off;
-
-    FRESULT r = f_lseek(&s->u.file, new_pos);
-    if (r != FR_OK) {
-        cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(r);
-        return;
-    }
-    cpu->regs[VM_REG_A0] = (uint32_t)new_pos;
+    /* Only trashfs files support lseek; anything else (host file/dir,
+     * trashfs dir) is not seekable here. */
+    cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
 }
 
 /* SYS_MKDIRAT
@@ -997,8 +790,8 @@ static void handle_mkdirat(VmCpu *cpu, void *system) {
         return;
     }
 
-    FRESULT r = f_mkdir(buf);
-    cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(r);
+    /* Only HOST and TRASHFS backends exist; both returned above. */
+    cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
 }
 
 /* SYS_UNLINKAT
@@ -1054,10 +847,8 @@ static void handle_unlinkat(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* FatFs's f_unlink works for both files and empty directories;
-     * the AT_REMOVEDIR flag distinction doesn't apply. */
-    FRESULT r = f_unlink(buf);
-    cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(r);
+    /* Only HOST and TRASHFS backends exist; both returned above. */
+    cpu->regs[VM_REG_A0] = (uint32_t)-VM_EIO;
 }
 
 /* SYS_READDIR
@@ -1194,40 +985,8 @@ static void handle_readdir(VmCpu *cpu, void *system) {
         return;
     }
 
-    if (s->kind != SLOT_DIR) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
-        return;
-    }
-
-    FILINFO fi;
-    FRESULT r = f_readdir(&s->u.dir, &fi);
-    if (r != FR_OK) {
-        cpu->regs[VM_REG_A0] = (uint32_t)fres_to_errno(r);
-        return;
-    }
-
-    /* End-of-directory: FatFs signals this by returning an entry
-     * whose name starts with '\0'. */
-    if (fi.fname[0] == '\0') {
-        cpu->regs[VM_REG_A0] = 1;
-        return;
-    }
-
-    /* Fill in the VmDirent. fi.fname is at most 12 bytes with
-     * LFN off; copy with bound. */
-    memset(out, 0, sizeof(VmDirent));
-    if (fi.fattrib & AM_DIR) {
-        out->type = VM_DT_DIR;
-        out->size = 0;
-    } else {
-        out->type = VM_DT_REG;
-        out->size = (uint32_t)fi.fsize;
-    }
-    size_t name_max = sizeof(out->name) - 1;
-    strncpy(out->name, fi.fname, name_max);
-    out->name[name_max] = '\0';
-
-    cpu->regs[VM_REG_A0] = 0;
+    /* Not a directory fd (SLOT_ROOT/HOST_DIR/TRASH_DIR handled above). */
+    cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF;
 }
 
 /* ============================================================
@@ -1281,28 +1040,6 @@ bool vm_host_fs_mount_host(const char *name, const char *root,
     return true;
 }
 
-bool vm_host_fs_mount_fatfs(const char *name, uint8_t pdrv,
-                            void *fatfs) {
-    if (!valid_mount_name(name)) return false;
-    if (find_mount(name)) return false;
-    /* FF_VOLUMES upper bound — we can't easily import that here
-     * without dragging ffconf into the header. Trust the caller
-     * for now; FatFs will refuse pdrv values out of range when
-     * we hand it the volume-prefixed path. */
-    if (pdrv > 9) return false;             /* keeps the prefix one digit */
-
-    Mount *m = find_free_mount_slot();
-    if (!m) return false;
-
-    memset(m, 0, sizeof(*m));
-    m->kind = MOUNT_KIND_FATFS;
-    memcpy(m->name, name, strlen(name) + 1);
-    m->fatfs_volume = pdrv;
-    m->fatfs_struct = (FATFS *)fatfs;
-    m->writable     = true;     /* FatFs mounts are always r/w for now */
-    g_mount_count++;
-    return true;
-}
 
 bool vm_host_fs_mount_trashfs(const char *name, void *vol) {
     if (!valid_mount_name(name)) return false;
@@ -1413,20 +1150,10 @@ static uint8_t *slurp_file(const char *path, PathBackend backend,
         if (tr != TRASHFS_OK || got != sz) { free(buf); *out_err = VM_EIO; return NULL; }
         *out_size = sz;
         return buf;
-    } else {
-        FIL f;
-        FRESULT r = f_open(&f, path, FA_READ);
-        if (r != FR_OK) { *out_err = -fres_to_errno(r); return NULL; }
-        FSIZE_t sz = f_size(&f);
-        uint8_t *buf = malloc((size_t)sz);
-        if (!buf) { f_close(&f); *out_err = VM_ENOMEM; return NULL; }
-        UINT br;
-        r = f_read(&f, buf, (UINT)sz, &br);
-        f_close(&f);
-        if (r != FR_OK || br != sz) { free(buf); *out_err = VM_EIO; return NULL; }
-        *out_size = (size_t)sz;
-        return buf;
     }
+    /* Only HOST and TRASHFS backends exist. */
+    *out_err = VM_EIO;
+    return NULL;
 }
 
 /* SYS_SPAWN_AND_WAIT
@@ -1668,10 +1395,10 @@ extern void vm_host_stdio_set_fs_hooks(vm_host_fs_read_hook_t,
 
 static void vm_host_fs_close_all(void) {
     for (unsigned i = 0; i < VM_HOST_FS_MAX_FILES; i++) {
-        if (g_fds[i].kind == SLOT_FILE) f_close(&g_fds[i].u.file);
-        else if (g_fds[i].kind == SLOT_DIR) f_closedir(&g_fds[i].u.dir);
-        else if (g_fds[i].kind == SLOT_HOST_FILE && g_fds[i].u.host)
+        if (g_fds[i].kind == SLOT_HOST_FILE && g_fds[i].u.host)
             fclose(g_fds[i].u.host);
+        else if (g_fds[i].kind == SLOT_HOST_DIR && g_fds[i].u.host_dir.dir)
+            closedir(g_fds[i].u.host_dir.dir);
         g_fds[i].kind = SLOT_FREE;
     }
 }
