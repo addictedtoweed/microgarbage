@@ -32,7 +32,7 @@ static void fill8(uint8_t p[8][8], uint8_t v) {
 }
 
 static void set_tile_4bpp(uint16_t *vram, unsigned cw, unsigned tile,
-                          const uint8_t p[8][8]) {
+                          uint8_t p[8][8]) {
     unsigned base = (cw + tile * 16u) & 0x7FFFu;
     for (unsigned r = 0; r < 8; r++) {
         unsigned p0 = 0, p1 = 0, p2 = 0, p3 = 0;
@@ -47,7 +47,7 @@ static void set_tile_4bpp(uint16_t *vram, unsigned cw, unsigned tile,
 }
 
 static void set_tile_2bpp(uint16_t *vram, unsigned cw, unsigned tile,
-                          const uint8_t p[8][8]) {
+                          uint8_t p[8][8]) {
     unsigned base = (cw + tile * 8u) & 0x7FFFu;
     for (unsigned r = 0; r < 8; r++) {
         unsigned p0 = 0, p1 = 0;
