@@ -240,17 +240,37 @@ a Cygwin prompt. Two equivalent entry points produce the same
 
 ```powershell
 # From PowerShell (or cmd):
-.\build-win.ps1                 # native host.exe + guest ELFs
+.\build-win.ps1                 # native host.exe + guest ELFs (release)
+.\build-win.ps1 -DebugBuild     # debuggable host (-Og -g3, symbols)
 .\build-win.ps1 -NoGuest        # host only
 .\build-win.ps1 -Clean
 ```
 
 ```sh
 # From a Cygwin or MSYS2 shell:
-./build-win.sh                  # native host.exe + guest ELFs
+./build-win.sh                  # native host.exe + guest ELFs (release)
+./build-win.sh --debug          # debuggable host (-Og -g3, symbols)
 ./build-win.sh --no-guest       # host only
 ./build-win.sh clean
 ```
+
+### Build modes
+
+Both scripts build a **release** host by default and accept an explicit
+mode flag (`--release`/`--debug` for bash; `-Release`/`-DebugBuild` for
+PowerShell — named `-DebugBuild` because `-Debug` is a reserved
+PowerShell common parameter). Flags combine, e.g. `./build-win.sh
+--debug --no-guest`.
+
+| Mode | Host flags | `host.exe` |
+| --- | --- | --- |
+| **release** *(default)* | `-Os -DNDEBUG -s` (stripped) | ~170 KB — the shippable distributable |
+| **debug** | `-Og -g3 -DDEBUG` (unstripped, asserts on) | ~12 MB — full DWARF for gdb |
+
+The spawnable guest ELFs follow the mode too (release: `-Os`, stripped;
+debug: `-Og -g`, unstripped). The shell baked into `host.exe` is always
+size-built. `RELEASE=0` in the bash environment flips the default to
+debug for back-compat; an explicit flag always wins.
 
 Both default to `x86_64-w64-mingw32-gcc` and link `-lws2_32`.
 Override the compilers with `-Cc`/`-GuestCc` (PowerShell) or
