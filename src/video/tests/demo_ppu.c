@@ -42,6 +42,8 @@ static double now_sec(void) {
 #define RED555    0x001Fu
 #define NAVY555   0x2108u   /* dark backdrop */
 
+#define SNES_NTSC_HZ 60.0988   /* SNES NTSC frame rate (PAL would be ~50.007) */
+
 static PpuState  P;
 static uint32_t  FB[PPU_SCREEN_W * PPU_SCREEN_H];
 
@@ -108,24 +110,45 @@ int main(void) {
     printf("vsync       : %s\n",
            present_vsync_requested() ? "enabled (WGL_EXT_swap_control)"
                                      : "NOT enabled");
-    printf("watching frame rate (vsync on => ~refresh rate, steady)...\n");
+    printf("pacing emulated frames at %.4f Hz; presenting vsync'd...\n", SNES_NTSC_HZ);
     fflush(stdout);
 
-    unsigned frame = 0, mark = 0;
-    double   t0 = now_sec();
-    while (!present_should_close()) {
-        P.bg[0].hofs = (uint16_t)(frame / 2u);   /* diagonal scroll */
-        P.bg[0].vofs = (uint16_t)(frame / 3u);
-        ppu_render(&P, FB);
-        present_frame(FB);
-        frame++;
+    /* Fixed-timestep loop: advance the emulated frame at the SNES rate
+     * on a wall clock, present every vsync (re-showing the latest frame
+     * when no new emulated frame is due). The game runs at true SNES
+     * speed independent of the monitor's refresh. */
+    const double target_dt = 1.0 / SNES_NTSC_HZ;
+    double last = now_sec(), report_t0 = last, acc = 0.0;
+    unsigned emu = 0, presents = 0, emu_window = 0;
 
-        if (frame - mark >= 120u) {              /* report every ~120 frames */
-            double t = now_sec(), dt = t - t0;
-            if (dt > 0.0)
-                printf("  %.1f fps  (%.2f ms/frame)\n", 120.0 / dt, dt * 1000.0 / 120.0);
+    ppu_render(&P, FB);                          /* first frame before the loop */
+
+    while (!present_should_close()) {
+        double t = now_sec();
+        acc += t - last;
+        last = t;
+        if (acc > 0.25) acc = 0.25;              /* clamp catch-up after a hitch */
+
+        bool stepped = false;
+        while (acc >= target_dt) {               /* advance emulated frame(s) due */
+            emu++; emu_window++;
+            acc -= target_dt;
+            stepped = true;
+        }
+        if (stepped) {                           /* re-render only on a new frame */
+            P.bg[0].hofs = (uint16_t)(emu / 2u); /* diagonal scroll */
+            P.bg[0].vofs = (uint16_t)(emu / 3u);
+            ppu_render(&P, FB);
+        }
+        present_frame(FB);                       /* vsync-throttled */
+        presents++;
+
+        double dt = t - report_t0;
+        if (dt >= 1.0) {                         /* once per second */
+            printf("  present %.1f fps  |  emulated %.2f fps  (target %.4f)\n",
+                   presents / dt, emu_window / dt, SNES_NTSC_HZ);
             fflush(stdout);
-            t0 = t; mark = frame;
+            report_t0 = t; presents = 0; emu_window = 0;
         }
     }
 
