@@ -73,6 +73,16 @@ void present_set_fullscreen(bool on);
 void present_set_aspect(PresentAspect aspect);
 void present_set_filter(PresentFilter filter);
 
+/* Diagnostics (valid after present_init).
+ *  present_vsync_requested(): true if vsync was successfully enabled via
+ *    WGL_EXT_swap_control. False means the swap interval couldn't be set
+ *    (driver/extension missing) — the loop may then run unthrottled.
+ *  present_gl_renderer(): the GL_RENDERER string. Your GPU name means
+ *    hardware acceleration; "GDI Generic" means you're on Microsoft's
+ *    software GL (no acceleration, no vsync) — a red flag. */
+bool        present_vsync_requested(void);
+const char *present_gl_renderer(void);
+
 void present_shutdown(void);
 
 #ifdef __cplusplus

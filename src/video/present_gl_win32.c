@@ -52,6 +52,8 @@ static struct {
     HDC             hdc;
     HGLRC           hglrc;
     GLuint          tex;
+    bool            vsync;          /* swap interval successfully set?       */
+    char            renderer[128];  /* GL_RENDERER string (HW vs software GL) */
     LONG_PTR        saved_style;    /* windowed style, for fullscreen toggle */
     WINDOWPLACEMENT saved_place;
 } g;
@@ -145,7 +147,15 @@ bool present_init(int fb_w, int fb_h, const char *title) {
         PFN_wglSwapIntervalEXT swap_interval;
         PROC raw = wglGetProcAddress("wglSwapIntervalEXT");
         memcpy(&swap_interval, &raw, sizeof swap_interval);
-        if (swap_interval) swap_interval(1);
+        g.vsync = (swap_interval != NULL) && (swap_interval(1) != FALSE);
+    }
+
+    /* Capture the renderer string (HW GPU vs "GDI Generic" software GL). */
+    {
+        const GLubyte *rs = glGetString(GL_RENDERER);
+        const char *s = rs ? (const char *)rs : "(unknown)";
+        strncpy(g.renderer, s, sizeof g.renderer - 1u);
+        g.renderer[sizeof g.renderer - 1u] = '\0';
     }
 
     glGenTextures(1, &g.tex);
@@ -226,6 +236,14 @@ bool present_should_close(void) {
     return g.inited ? g.should_close : true;
 }
 
+bool present_vsync_requested(void) {
+    return g.inited ? g.vsync : false;
+}
+
+const char *present_gl_renderer(void) {
+    return g.inited ? g.renderer : "";
+}
+
 void present_set_fullscreen(bool on) {
     if (!g.inited || on == g.fullscreen) return;
     if (on) {
@@ -287,6 +305,8 @@ bool present_init(int fb_w, int fb_h, const char *title) {
 }
 void present_frame(const uint32_t *framebuffer) { (void)framebuffer; }
 bool present_should_close(void) { return true; }
+bool present_vsync_requested(void) { return false; }
+const char *present_gl_renderer(void) { return ""; }
 void present_set_fullscreen(bool on) { (void)on; }
 void present_set_aspect(PresentAspect aspect) { (void)aspect; }
 void present_set_filter(PresentFilter filter) { (void)filter; }

@@ -26,6 +26,16 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
+#include <windows.h>   /* QueryPerformanceCounter (Windows-only harness) */
+
+/* High-resolution wall-clock seconds for the frame-rate probe. */
+static double now_sec(void) {
+    LARGE_INTEGER freq, ctr;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&ctr);
+    return (double)ctr.QuadPart / (double)freq.QuadPart;
+}
 
 #define BLUE555   0x7C00u
 #define GREEN555  0x03E0u
@@ -91,13 +101,32 @@ int main(void) {
     }
     build_scene();
 
-    unsigned frame = 0;
+    /* vsync diagnostics: the renderer string proves HW vs software GL,
+     * and the printed fps should pin near your monitor refresh (e.g.
+     * ~60) if vsync is on, or run into the hundreds/thousands if not. */
+    printf("GL renderer : %s\n", present_gl_renderer());
+    printf("vsync       : %s\n",
+           present_vsync_requested() ? "enabled (WGL_EXT_swap_control)"
+                                     : "NOT enabled");
+    printf("watching frame rate (vsync on => ~refresh rate, steady)...\n");
+    fflush(stdout);
+
+    unsigned frame = 0, mark = 0;
+    double   t0 = now_sec();
     while (!present_should_close()) {
         P.bg[0].hofs = (uint16_t)(frame / 2u);   /* diagonal scroll */
         P.bg[0].vofs = (uint16_t)(frame / 3u);
         ppu_render(&P, FB);
         present_frame(FB);
         frame++;
+
+        if (frame - mark >= 120u) {              /* report every ~120 frames */
+            double t = now_sec(), dt = t - t0;
+            if (dt > 0.0)
+                printf("  %.1f fps  (%.2f ms/frame)\n", 120.0 / dt, dt * 1000.0 / 120.0);
+            fflush(stdout);
+            t0 = t; mark = frame;
+        }
     }
 
     present_shutdown();
