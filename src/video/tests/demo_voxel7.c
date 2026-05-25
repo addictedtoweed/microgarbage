@@ -150,7 +150,9 @@ static uint8_t shade_index(int mat, float bright) {
 /* ---- software render into the 8bpp framebuffer ------------- */
 
 static void render_fb(float cx, float cz, float cy, float yaw) {
-    const float FOV = 1.15f, HORIZON = (float)FBH * 0.42f, HSCALE = (float)FBH * 0.62f;
+    /* HORIZON higher on screen => more ground visible below (looking down
+     * from the high soar). */
+    const float FOV = 1.15f, HORIZON = (float)FBH * 0.55f, HSCALE = (float)FBH * 0.62f;
     const float ZNEAR = 4.0f, ZFAR = 200.0f;
 
     for (int col = 0; col < FBW; col++) {
@@ -214,7 +216,7 @@ int main(void) {
 
     float tx = 128.0f, tz = 0.0f, ty = 0.0f, tyaw = 0.0f;
     float ax = 128.0f, az = 0.0f, ay = 200.0f, ayaw = 0.0f;
-    const float SPEED = 0.45f, LAG = 0.06f;
+    const float SPEED = 1.30f, LAG = 0.06f;   /* fast soar to read velocity */
 
     const double target_dt = 1.0 / SNES_NTSC_HZ;
     double last = now_sec(), acc = 0.0;
@@ -226,9 +228,9 @@ int main(void) {
         if (acc > 0.25) acc = 0.25;
         bool stepped = false;
         while (acc >= target_dt) {
-            tyaw = 0.6f * fsin((float)f * 0.012f);
+            tyaw = 0.3f * fsin((float)f * 0.012f);     /* gentler turns at speed */
             tx += fsin(tyaw) * SPEED; tz += fcos(tyaw) * SPEED;
-            ty  = (float)Hmap[((int)ffloor(tz) & MAPMASK) * MAPSZ + ((int)ffloor(tx) & MAPMASK)] + 55.0f;
+            ty  = 205.0f;                              /* steady high altitude (above the peaks) */
             ax += (tx - ax) * LAG; az += (tz - az) * LAG;
             ay += (ty - ay) * LAG; ayaw += (tyaw - ayaw) * LAG;
             acc -= target_dt; stepped = true; f++;
