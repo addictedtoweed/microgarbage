@@ -64,6 +64,7 @@ run slist            containers  src/containers/slist.c
 run dlist            containers  src/containers/dlist.c
 run tree             containers  src/containers/tree.c src/containers/avl_core.c
 run avlhash          containers  src/containers/avlhash.c src/containers/avl_core.c
+run bitset           containers  src/containers/bitset.c
 run spsc_ring        containers  src/containers/spsc_ring.c
 run spsc_ring_stress containers  src/containers/spsc_ring.c -lpthread
 
