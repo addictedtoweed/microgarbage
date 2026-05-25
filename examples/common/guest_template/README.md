@@ -24,6 +24,7 @@ microgarbage shell's `/host` directory) and `run app.elf`.
   - `vm_runtime.h` — core syscalls (`SYS_*`), `spawn`, time, rand, exit
   - `audio.h` — mixer / SFX / streaming music / FFT meter
   - `tui.h` — extended-char TUI + PuTTY mouse
+  - `fs.h` — files + directories (open/read/write/lseek, readdir, mkdir, remove)
   - `<stdio.h> <stdlib.h> <string.h> <time.h>` — routed to the host
   - `containers/`, `math/` — optional data structures + fixed-point
 - `src/` — the runtime linked into every build (`vm_runtime.c`, `tui.c`)

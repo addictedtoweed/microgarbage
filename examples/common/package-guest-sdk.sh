@@ -28,7 +28,7 @@ chmod +x "$OUT/build.sh"
 cp "$REPO_ROOT/examples/common/guest.ld" "$OUT/guest.ld"
 
 # SDK: host-hook headers + mini-libc headers + runtime sources.
-cp "$SDK/vm_runtime.h" "$SDK/audio.h" "$SDK/tui.h" "$OUT/include/"
+cp "$SDK/vm_runtime.h" "$SDK/audio.h" "$SDK/tui.h" "$SDK/fs.h" "$OUT/include/"
 cp "$SDK"/include/*.h "$OUT/include/"
 cp "$SDK/vm_runtime.c" "$SDK/tui.c" "$OUT/src/"
 

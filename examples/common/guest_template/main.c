@@ -16,6 +16,7 @@
 /* Other host hooks available (uncomment + see build.sh MODULES for tools):
  *   #include "tui.h"                       extended-char TUI + PuTTY mouse
  *   #include "audio.h"                      mixer / SFX / music / FFT meter
+ *   #include "fs.h"                          files + directories (open/read/readdir/mkdir)
  *   #include "containers/ring_buffer.h"     fixed-capacity ring (caller storage)
  *   #include "math/fixed_point.h"           q15/q31 fixed-point helpers
  */
