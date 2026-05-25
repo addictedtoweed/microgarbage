@@ -43,6 +43,12 @@ case "${1:-build}" in
         step "cleaned"
         exit 0
         ;;
+    sdk)
+        # Generate the standalone, copyable guest SDK bundle and exit.
+        step "packaging guest SDK bundle..."
+        "$REPO_ROOT/examples/common/package-guest-sdk.sh"
+        exit 0
+        ;;
     --no-guest) NO_GUEST=1 ;;
 esac
 
