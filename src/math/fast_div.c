@@ -94,30 +94,18 @@
  * ============================================================ */
 
 #include "math/fast_div.h"
+#include "math/bits.h"
 
 /* ============================================================
  *  Bit utilities — count leading zeros, high-half multiply
  * ============================================================ */
 
-/* Count leading zeros, 32-bit. Portable fallback; a real
- * implementation would use __builtin_clz or CLZ intrinsic.
- * Used only in prepare, so speed doesn't matter much. */
-static uint8_t clz_u32(uint32_t x) {
-    if (x == 0) return 32;
-    uint8_t n = 0;
-    if ((x & 0xFFFF0000u) == 0) { n += 16; x <<= 16; }
-    if ((x & 0xFF000000u) == 0) { n += 8;  x <<= 8;  }
-    if ((x & 0xF0000000u) == 0) { n += 4;  x <<= 4;  }
-    if ((x & 0xC0000000u) == 0) { n += 2;  x <<= 2;  }
-    if ((x & 0x80000000u) == 0) { n += 1; }
-    return n;
-}
-
-static uint8_t clz_u64(uint64_t x) {
-    if (x == 0) return 64;
-    if ((x >> 32) == 0) return 32 + clz_u32((uint32_t)x);
-    return clz_u32((uint32_t)(x >> 32));
-}
+/* Count leading zeros now live in math/bits.h (CLZ instruction on the
+ * MCU, software fallback elsewhere; clz(0) defined as the full width,
+ * which prepare relies on for d == 1). Thin aliases keep the call sites
+ * below unchanged. Used only in prepare, so speed doesn't matter. */
+static inline uint8_t clz_u32(uint32_t x) { return bits_clz32(x); }
+static inline uint8_t clz_u64(uint64_t x) { return bits_clz64(x); }
 
 /* High 32 bits of the 64-bit product a*b. */
 static uint32_t mulhi_u32(uint32_t a, uint32_t b) {

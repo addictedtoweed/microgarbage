@@ -37,7 +37,8 @@ garbage/
 │   │   └── tree.h              ← ordered tree, BST/AVL (node pool)
 │   ├── math/
 │   │   ├── fixed_point.h
-│   │   └── fast_div.h
+│   │   ├── fast_div.h
+│   │   └── bits.h              ← clz/ctz/popcount (HW insn or fallback)
 │   ├── audio/
 │   │   ├── audio_mixer.h
 │   │   ├── music_player.h
@@ -197,7 +198,8 @@ errors:
 | dlist         | (none)                               |
 | tree          | avl_core                             |
 | fixed_point   | (none)                               |
-| fast_div      | (none)                               |
+| fast_div      | bits                                 |
+| bits          | (none, header-only)                  |
 | audio_mixer   | ring_buffer, fixed_point             |
 | music_player  | audio_mixer (and its deps)           |
 | audio_pool    | (none)                               |

@@ -68,6 +68,7 @@ run spsc_ring        containers  src/containers/spsc_ring.c
 run spsc_ring_stress containers  src/containers/spsc_ring.c -lpthread
 
 # ---- math ----
+run bits             math
 run fixed_point      math  src/math/fixed_point.c
 run fast_div         math  src/math/fast_div.c
 
