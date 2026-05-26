@@ -68,10 +68,12 @@ void present_frame(const uint32_t *framebuffer);
 /* True once the user asked to close (window X or Esc). */
 bool present_should_close(void);
 
-/* Runtime toggles. Also bound to keys: F11 fullscreen, A aspect, F filter. */
+/* Runtime toggles. Also bound to keys: F11 fullscreen, A aspect, F filter,
+ * V vsync. */
 void present_set_fullscreen(bool on);
 void present_set_aspect(PresentAspect aspect);
 void present_set_filter(PresentFilter filter);
+void present_set_vsync(bool on);    /* enable/disable swap-interval vsync at runtime */
 
 /* Diagnostics (valid after present_init).
  *  present_vsync_requested(): true if vsync was successfully enabled via

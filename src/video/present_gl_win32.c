@@ -52,7 +52,8 @@ static struct {
     HDC             hdc;
     HGLRC           hglrc;
     GLuint          tex;
-    bool            vsync;          /* swap interval successfully set?       */
+    bool            vsync;          /* swap interval currently on?           */
+    PFN_wglSwapIntervalEXT swap_interval;  /* loaded fn ptr, or NULL         */
     char            renderer[128];  /* GL_RENDERER string (HW vs software GL) */
     LONG_PTR        saved_style;    /* windowed style, for fullscreen toggle */
     WINDOWPLACEMENT saved_place;
@@ -85,6 +86,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                      ? PRESENT_ASPECT_SQUARE : PRESENT_ASPECT_4_3); break;
         case 'F': present_set_filter(g.filter == PRESENT_FILTER_NEAREST
                                      ? PRESENT_FILTER_LINEAR : PRESENT_FILTER_NEAREST); break;
+        case 'V': present_set_vsync(!g.vsync); break;
         default: break;
         }
         return 0;
@@ -144,10 +146,9 @@ bool present_init(int fb_w, int fb_h, const char *title) {
     /* vsync if the driver exposes it (load the fn ptr; memcpy avoids a
      * function-pointer cast warning under -Werror). */
     {
-        PFN_wglSwapIntervalEXT swap_interval;
         PROC raw = wglGetProcAddress("wglSwapIntervalEXT");
-        memcpy(&swap_interval, &raw, sizeof swap_interval);
-        g.vsync = (swap_interval != NULL) && (swap_interval(1) != FALSE);
+        memcpy(&g.swap_interval, &raw, sizeof g.swap_interval);
+        g.vsync = (g.swap_interval != NULL) && (g.swap_interval(1) != FALSE);
     }
 
     /* Capture the renderer string (HW GPU vs "GDI Generic" software GL). */
@@ -278,6 +279,11 @@ void present_set_aspect(PresentAspect aspect) {
     if (g.inited) g.aspect = aspect;
 }
 
+void present_set_vsync(bool on) {
+    if (!g.inited || !g.swap_interval) return;
+    if (g.swap_interval(on ? 1 : 0) != FALSE) g.vsync = on;  /* reflect the new state */
+}
+
 void present_set_filter(PresentFilter filter) {
     if (!g.inited) return;
     g.filter = filter;
@@ -310,6 +316,7 @@ const char *present_gl_renderer(void) { return ""; }
 void present_set_fullscreen(bool on) { (void)on; }
 void present_set_aspect(PresentAspect aspect) { (void)aspect; }
 void present_set_filter(PresentFilter filter) { (void)filter; }
+void present_set_vsync(bool on) { (void)on; }
 void present_shutdown(void) { }
 
 #endif
