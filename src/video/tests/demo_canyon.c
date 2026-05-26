@@ -265,7 +265,7 @@ int main(void) {
     double t0 = now_sec(), report = t0, prev = t0;
     unsigned frames = 0;
     double fps = 0.0;
-    float cam_x = 0.0f, speed = 76.0f, dy = 0.0f, dz = 0.0f;
+    float cam_x = 0.0f, speed = 120.0f, dy = 0.0f, dz = 0.0f;   /* faster baseline */
     while (!present_should_close()) {
         double now = now_sec();
         float dt = (float)(now - prev); prev = now;
@@ -278,9 +278,9 @@ int main(void) {
         if (GetAsyncKeyState(VK_LEFT)  & 0x8000) dz -= mv;
         if (dy >  18.0f) dy =  18.0f; else if (dy <  -6.0f) dy =  -6.0f;
         if (dz >  18.0f) dz =  18.0f; else if (dz < -18.0f) dz = -18.0f;
-        if (GetAsyncKeyState('A') & 0x8000) speed += 120.0f * dt;   /* faster */
-        if (GetAsyncKeyState('Z') & 0x8000) speed -= 120.0f * dt;   /* slower */
-        if (speed < 8.0f) speed = 8.0f; else if (speed > 220.0f) speed = 220.0f;
+        if (GetAsyncKeyState('A') & 0x8000) speed += 250.0f * dt;   /* faster (hold to ramp up) */
+        if (GetAsyncKeyState('Z') & 0x8000) speed -= 250.0f * dt;   /* slower */
+        if (speed < 8.0f) speed = 8.0f; else if (speed > 900.0f) speed = 900.0f;   /* wingsuit ceiling */
         cam_x += speed * dt;
 
         set_camera(dy, dz);
