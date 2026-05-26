@@ -201,7 +201,7 @@ static long render_fb(V3 cam, V3 fwd, V3 right, V3 up, float fov) {
                 unsigned cell = ((unsigned)((int)ffloor(wz) & MAPMASK)) * MAPSZ
                               +  (unsigned)((int)ffloor(wx) & MAPMASK);
                 float fl = (float)Fmap[cell], cl = (float)Cmap[cell];
-                int hit_mat = -1;
+                int hit_mat = -1, is_floor = 0;
                 if (wy <= fl) {                      /* hit floor: refine */
                     float lo = prev, hi = t;
                     for (int it = 0; it < 3; it++) {
@@ -212,15 +212,35 @@ static long render_fb(V3 cam, V3 fwd, V3 right, V3 up, float fov) {
                     }
                     t = hi; cell = ((unsigned)((int)ffloor(cam.z + d.z * t) & MAPMASK)) * MAPSZ
                                  +  (unsigned)((int)ffloor(cam.x + d.x * t) & MAPMASK);
-                    hit_mat = Mmap[cell];
+                    hit_mat = Mmap[cell]; is_floor = 1;
                 } else if (cl < 254.0f && wy >= cl) { /* hit ceiling (tunnels) */
                     hit_mat = MAT_ROCK;
                 } else if (d.y >= 0.0f && wy > 255.0f) {
                     break;                            /* escaped upward -> sky */
                 }
                 if (hit_mat >= 0) {
-                    float bright = 1.0f - t / MAXT;
-                    if (bright < 0.0f) bright = 0.0f;
+                    float fog = 1.0f - t / 130.0f;             /* canyon-scale depth */
+                    if (fog < 0.20f) fog = 0.20f;
+                    if (fog > 1.0f)  fog = 1.0f;
+                    float bright;
+                    if (hit_mat == MAT_LAVA) {
+                        bright = 0.80f + 0.20f * fog;          /* emissive: lava glows */
+                    } else if (is_floor) {
+                        /* directional light off the heightfield gradient, so the
+                         * two canyon walls read as lit vs shadowed (3D form). */
+                        int xi = (int)ffloor(cam.x + d.x * t) & MAPMASK;
+                        int zi = (int)ffloor(cam.z + d.z * t) & MAPMASK;
+                        float hL = (float)Fmap[(unsigned)zi * MAPSZ + (unsigned)((xi - 1) & MAPMASK)];
+                        float hR = (float)Fmap[(unsigned)zi * MAPSZ + (unsigned)((xi + 1) & MAPMASK)];
+                        float hB = (float)Fmap[(unsigned)((zi - 1) & MAPMASK) * MAPSZ + (unsigned)xi];
+                        float hF = (float)Fmap[(unsigned)((zi + 1) & MAPMASK) * MAPSZ + (unsigned)xi];
+                        V3 nrm = vnorm(v3(hL - hR, 3.0f, hB - hF));
+                        float lam = nrm.x * 0.53f + nrm.y * 0.74f + nrm.z * 0.42f;  /* L from upper-side */
+                        if (lam < 0.0f) lam = 0.0f;
+                        bright = (0.28f + 0.72f * lam) * fog;
+                    } else {
+                        bright = 0.16f + 0.34f * fog;          /* tunnel ceiling: dim overhead */
+                    }
                     out = shade_index(hit_mat, bright);
                     break;
                 }
