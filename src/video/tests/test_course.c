@@ -44,10 +44,10 @@ static void test_bake_carves_channel(void) {
     CourseDef c;
     memset(&c, 0, sizeof c);
     c.count = 2; c.loop = false;
-    /* a straight channel along z at x=60: floor y=40, width 12, walls 130,
-     * open ceiling, lava river half-width 4. */
-    c.node[0] = mk(60, 60, 40, 12, 130, 0, 4);
-    c.node[1] = mk(60, 120, 40, 12, 130, 0, 4);
+    /* a straight channel along z at x=60: floor y=40, width 12, walls 40
+     * (edge stays under the rim), open ceiling, lava river half-width 4. */
+    c.node[0] = mk(60, 60, 40, 12, 40, 0, 4);
+    c.node[1] = mk(60, 120, 40, 12, 40, 0, 4);
     course_bake(&c, Floor, Ceil, Mat, SZ);
 
     /* path centre: carved to the floor height, lava, open sky */
@@ -55,8 +55,8 @@ static void test_bake_carves_channel(void) {
     ASSERT_EQ_INT(COURSE_MAT_LAVA, (int)Mat[cell(60, 90)]);
     ASSERT_EQ_INT((int)COURSE_OPEN_CEIL, (int)Ceil[cell(60, 90)]);
 
-    /* corridor edge: floor risen toward the wall, rock (not lava) */
-    ASSERT(Floor[cell(70, 90)] > 100);
+    /* corridor edge: floor risen toward the wall (under the rim), rock */
+    ASSERT(Floor[cell(70, 90)] > 50);
     ASSERT_EQ_INT(COURSE_MAT_ROCK, (int)Mat[cell(70, 90)]);
 
     /* far outside the path: solid rock wall, untouched */
@@ -125,12 +125,12 @@ static void test_generate(void) {
         ASSERT((int)a.node[i].z == (int)a2.node[i].z);
     }
 
-    /* in-bounds and descending high -> low */
+    /* in-bounds, floor in a level band (rim is fixed; descent is a TODO) */
     for (int i = 0; i < a.count; i++) {
         ASSERT(a.node[i].x >= 29.0f && a.node[i].x <= 227.0f);
         ASSERT(a.node[i].z >= 29.0f && a.node[i].z <= 227.0f);
+        ASSERT(a.node[i].y >= 30.0f && a.node[i].y <= 50.0f);
     }
-    ASSERT(a.node[0].y > a.node[a.count-1].y);
 
     /* longer duration -> longer course */
     ASSERT(a.count > b.count);
@@ -140,6 +140,39 @@ static void test_generate(void) {
     course_bake(&a, Floor, Ceil, Mat, SZ);
 }
 
+/* Long generator: x strictly increasing (the streaming axis), z meanders
+ * within the map, floor stays level. */
+static void test_generate_long(void) {
+    CourseDef c;
+    course_generate_long(99u, 1500.0f, 256.0f, &c);
+    ASSERT(c.count >= 4 && !c.loop);
+    for (int i = 1; i < c.count; i++)
+        ASSERT(c.node[i].x > c.node[i-1].x);          /* monotonic x */
+    for (int i = 0; i < c.count; i++) {
+        ASSERT(c.node[i].z >= 40.0f && c.node[i].z <= 216.0f);
+        ASSERT(c.node[i].y >= 30.0f && c.node[i].y <= 50.0f);
+    }
+}
+
+/* Strip bake only touches its x-columns: inside the strip the channel is
+ * carved + the rest is rim; outside the strip the map is left untouched. */
+static void test_bake_strip(void) {
+    CourseDef c;
+    memset(&c, 0, sizeof c);
+    c.count = 6; c.loop = false;
+    for (int i = 0; i < 6; i++)                        /* straight path along x at z=128 */
+        c.node[i] = mk((float)(i * 40), 128, 40, 20, 20, 0, 5);
+
+    memset(Floor, 0, sizeof Floor);                   /* sentinel: untouched stays 0 */
+    memset(Ceil, 0, sizeof Ceil);
+    memset(Mat, 0, sizeof Mat);
+    course_bake_strip(&c, Floor, Ceil, Mat, SZ, 60, 140);
+
+    ASSERT(Floor[cell(100, 128)] < (int)COURSE_WALL_H);          /* on-path, in strip: carved */
+    ASSERT_EQ_INT((int)COURSE_WALL_H, (int)Floor[cell(100, 10)]); /* off-path, in strip: rim */
+    ASSERT_EQ_INT(0, (int)Floor[cell(20, 128)]);                 /* outside strip: untouched */
+}
+
 int main(void) {
     TEST_SUITE("course");
     RUN(test_sample_passes_through_nodes);
@@ -147,5 +180,7 @@ int main(void) {
     RUN(test_bake_tunnel_and_open);
     RUN(test_arclen_maps_distance);
     RUN(test_generate);
+    RUN(test_generate_long);
+    RUN(test_bake_strip);
     return TEST_SUITE_RESULT();
 }

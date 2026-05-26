@@ -35,7 +35,7 @@ extern "C" {
 #define COURSE_MAT_LAVA   2
 
 /* Map defaults: solid rock outside the channel; "open" ceiling = sky. */
-#define COURSE_WALL_H     210u
+#define COURSE_WALL_H     70u    /* rim height: terrain outside the channel (sky above) */
 #define COURSE_OPEN_CEIL  255u   /* a ceiling value >= 254 means "open" */
 
 typedef struct {
@@ -87,6 +87,21 @@ float course_param_at_distance(const CourseArc *a, float dist);  /* distance -> 
  * (Long courses that exceed the map are the streaming case — TODO.) */
 void course_generate(uint32_t seed, float duration_sec, float velocity,
                      float mapsz, CourseDef *out);
+
+/* ---- streaming a long course through a fixed map window ---- */
+
+/* Generate a LONG ribbon course: x increases monotonically (the flight
+ * axis, far longer than the map), z meanders gently within the map, floor
+ * ~level. Meant to be streamed via course_bake_strip as the camera flies. */
+void course_generate_long(uint32_t seed, float length_x, float mapsz, CourseDef *out);
+
+/* Bake only the world-x columns [x_lo, x_hi) into the maps, TOROIDAL in x
+ * (cell_x = x & (mapsz-1)). Clears those columns to rim first, then stamps
+ * the corridor for spline samples crossing the strip. Bake the strip just
+ * AHEAD of the camera each step to scroll a long course through the map
+ * window (keep the lead < mapsz so the visible region is never clobbered). */
+void course_bake_strip(const CourseDef *c, uint8_t *floor, uint8_t *ceiling,
+                       uint8_t *material, int mapsz, int x_lo, int x_hi);
 
 #ifdef __cplusplus
 }

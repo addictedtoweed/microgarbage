@@ -15,10 +15,12 @@
 
 loop 0
 
-node   40   28   96   18   120    0     6
-node   72   58   84   22    95    0     8     # widens out
-node  104   92   70   16   140   42     5     # tight + a tunnel (ceil 42)
-node  132  124   58   26    55    0     0     # opens to sky, no lava
-node  166  152   46   20   130    0     6     # back into canyon
-node  198  186   32   14   150   34     4     # tight tunnel
-node  224  220   22   24    80    0     2     # final straight, widening
+# floors stay ~level vs the rim (height 70) so the camera, which flies
+# just above the rim, keeps the violet sky in view; walls rise to ~rim.
+node   40   40   42   34    28    0     7
+node   78   60   38   34    26    0     8     # widens out
+node  116   96   44   30    30    0     5
+node  150  120   40   38    22    0     0     # opens out, no lava
+node  184  150   42   32    28    0     6     # back into canyon
+node  214  186   40   34    30    0     7
+node  236  220   38   36    24    0     6     # final straight

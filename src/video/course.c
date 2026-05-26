@@ -196,24 +196,24 @@ void course_generate(uint32_t seed, float duration_sec, float velocity,
     float heading = 1.30f;                     /* radians, angled into the map */
 
     for (int i = 0; i < count; i++) {
-        float frac = (count > 1) ? (float)i / (float)(count - 1) : 0.0f;
-
         rng = rng*1664525u + 1013904223u; float r1 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
         rng = rng*1664525u + 1013904223u; float r2 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
         rng = rng*1664525u + 1013904223u; float r3 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
-        int open   = (r1 < 0.22f);             /* open sky, no lava */
-        int tunnel = (r1 > 0.82f);             /* low ceiling */
+        int open = (r1 < 0.25f);               /* open stretch, no lava */
 
+        /* Floor stays ~level vs the rim so the camera (just above the rim)
+         * keeps the sky in view through bends. A true descent needs the
+         * rim to descend with the floor — a baker enhancement (TODO). */
         out->node[i].x     = x;
         out->node[i].z     = z;
-        out->node[i].y     = 158.0f - 120.0f * frac;            /* descend high -> low */
-        out->node[i].width = 15.0f + r2 * 11.0f;                /* corridor 15..26 */
-        out->node[i].wall  = open ? (40.0f + r3 * 22.0f) : (108.0f + r3 * 48.0f);
-        out->node[i].ceil  = tunnel ? (26.0f + r3 * 16.0f) : 0.0f;
-        out->node[i].lava  = open ? 0.0f : (3.0f + r2 * 5.0f);
+        out->node[i].y     = 38.0f + r2 * 8.0f;                 /* ~level vs the rim */
+        out->node[i].width = 30.0f + r3 * 12.0f;                /* corridor 30..42 */
+        out->node[i].wall  = open ? (18.0f + r3 * 8.0f) : (24.0f + r3 * 8.0f);  /* edge ~ rim 70 */
+        out->node[i].ceil  = 0.0f;                              /* open (tunnels: TODO) */
+        out->node[i].lava  = open ? 0.0f : (4.0f + r2 * 5.0f);
 
         rng = rng*1664525u + 1013904223u;
-        float turn = ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 0.85f;
+        float turn = ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 0.50f;
         heading += turn;
         x += fcos_(heading) * spacing;
         z += fsin_(heading) * spacing;
@@ -221,5 +221,96 @@ void course_generate(uint32_t seed, float duration_sec, float velocity,
         if (x > hi) { x = hi; heading = COURSE_PI - heading; }
         if (z < lo) { z = lo; heading = -heading; }
         if (z > hi) { z = hi; heading = -heading; }
+    }
+}
+
+/* ---- streaming: long ribbon + strip bake ------------------- */
+
+void course_generate_long(uint32_t seed, float length_x, float mapsz, CourseDef *out) {
+    const float spacing = 24.0f;
+    int count = (int)(length_x / spacing) + 2;
+    if (count < 4) count = 4;
+    if (count > COURSE_MAX_NODES) count = COURSE_MAX_NODES;
+    out->count = count;
+    out->loop  = false;
+
+    uint32_t rng = seed ? seed : 0x9E3779B9u;
+    float zlo = 48.0f, zhi = mapsz - 48.0f;
+    float z = mapsz * 0.5f, zvel = 0.0f;
+
+    for (int i = 0; i < count; i++) {
+        rng = rng*1664525u + 1013904223u; float r1 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
+        rng = rng*1664525u + 1013904223u; float r2 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
+        rng = rng*1664525u + 1013904223u; float r3 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
+        int open = (r1 < 0.25f);
+
+        out->node[i].x     = 24.0f + spacing * (float)i;       /* monotonic flight axis */
+        out->node[i].z     = z;
+        out->node[i].y     = 38.0f + r2 * 8.0f;                /* ~level vs the rim */
+        out->node[i].width = 30.0f + r3 * 12.0f;
+        out->node[i].wall  = open ? (18.0f + r3 * 8.0f) : (24.0f + r3 * 8.0f);
+        out->node[i].ceil  = 0.0f;
+        out->node[i].lava  = open ? 0.0f : (4.0f + r2 * 5.0f);
+
+        rng = rng*1664525u + 1013904223u;
+        zvel += ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 7.0f;   /* gentle steer */
+        if (zvel >  9.0f) zvel =  9.0f;
+        if (zvel < -9.0f) zvel = -9.0f;
+        z += zvel;
+        if (z < zlo) { z = zlo; zvel = -zvel; }
+        if (z > zhi) { z = zhi; zvel = -zvel; }
+    }
+}
+
+void course_bake_strip(const CourseDef *c, uint8_t *floor, uint8_t *ceiling,
+                       uint8_t *material, int mapsz, int x_lo, int x_hi) {
+    unsigned mask = (unsigned)(mapsz - 1);
+
+    /* clear the strip's columns (toroidal in x) to rim / open / rock */
+    for (int xc = x_lo; xc < x_hi; xc++) {
+        unsigned xm = (unsigned)xc & mask;
+        for (int z = 0; z < mapsz; z++) {
+            unsigned idx = (unsigned)z * (unsigned)mapsz + xm;
+            floor[idx]    = (uint8_t)COURSE_WALL_H;
+            ceiling[idx]  = (uint8_t)COURSE_OPEN_CEIL;
+            material[idx] = COURSE_MAT_ROCK;
+        }
+    }
+    if (!c || c->count <= 0) return;
+
+    float len = course_length(c);
+    int nsamp = c->count * 64;                 /* fine enough the corridor never gaps */
+    const float WMAX = 52.0f;                  /* widest corridor reach (sample gate) */
+    for (int k = 0; k <= nsamp; k++) {
+        float s = (nsamp > 0) ? len * (float)k / (float)nsamp : 0.0f;
+        CourseNode nd;
+        course_sample(c, s, &nd);
+        if (nd.x < (float)x_lo - WMAX || nd.x > (float)x_hi + WMAX) continue;  /* not in strip */
+
+        int rad = (int)nd.width;
+        if (rad < 1) rad = 1;
+        float w2 = nd.width * nd.width;
+        float lava2 = nd.lava * nd.lava;
+        int cx0 = (int)nd.x, cz0 = (int)nd.z;
+        for (int dz = -rad; dz <= rad; dz++) {
+            for (int dx = -rad; dx <= rad; dx++) {
+                float d2 = (float)(dx * dx + dz * dz);
+                if (d2 > w2) continue;
+                unsigned cell = (((unsigned)(cz0 + dz) & mask) * (unsigned)mapsz)
+                              +  ((unsigned)(cx0 + dx) & mask);
+                float u2 = (w2 > 0.0f) ? d2 / w2 : 0.0f;
+                uint8_t fl = clamp_u8(nd.y + u2 * nd.wall);
+                if (fl < floor[cell]) {
+                    floor[cell] = fl;
+                    material[cell] = (nd.lava > 0.0f && d2 < lava2) ? COURSE_MAT_LAVA
+                                   : (fl > 170)                     ? COURSE_MAT_SNOW
+                                   :                                  COURSE_MAT_ROCK;
+                }
+                if (nd.ceil > 0.0f) {
+                    uint8_t cl = clamp_u8(nd.y + nd.ceil);
+                    if (cl < ceiling[cell]) ceiling[cell] = cl;
+                }
+            }
+        }
     }
 }

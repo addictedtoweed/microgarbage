@@ -29,6 +29,7 @@
 #include "video/ppu.h"
 #include "video/present.h"
 #include "video/course.h"
+#include "video/hfcast.h"
 
 #include <windows.h>
 #include <stdint.h>
@@ -105,20 +106,23 @@ static V3 vnorm(V3 a) { float inv = 1.0f / fsqrt(a.x * a.x + a.y * a.y + a.z * a
 static CourseDef g_course;
 static CourseArc g_arc;        /* distance<->param table, built once at load */
 
-/* Built-in fallback: a closed canyon loop (canyon / open / tunnel mix). */
+/* Built-in fallback: a gentle, near-level lava-canyon descent. The floor
+ * stays roughly level relative to the rim (COURSE_WALL_H) so the camera —
+ * which flies just above the rim — keeps the violet sky in view even
+ * through the bends. (A truly DESCENDING canyon needs the rim to descend
+ * with the floor: a baker enhancement, TODO.) */
 static void build_default_course(CourseDef *c) {
-    c->loop = true;
-    c->count = 8;
-    for (int i = 0; i < 8; i++) {
-        float a = (float)i / 8.0f * 6.28318531f;
-        int open = (i == 0 || i == 4), tunnel = (i == 2 || i == 6);
-        c->node[i].x = 128.0f + 80.0f * fcos(a);
-        c->node[i].z = 128.0f + 80.0f * fsin(a);
-        c->node[i].y = 45.0f + 18.0f * fsin(2.0f * a);
-        c->node[i].width = 20.0f;
-        c->node[i].wall  = open ? 50.0f : 130.0f;
-        c->node[i].ceil  = tunnel ? 30.0f : 0.0f;
-        c->node[i].lava  = open ? 0.0f : 5.0f;
+    c->loop = false;
+    c->count = 7;
+    for (int i = 0; i < 7; i++) {
+        float f = (float)i / 6.0f;
+        c->node[i].x = 36.0f + 184.0f * f;
+        c->node[i].z = 128.0f + 26.0f * fsin(f * 3.0f);   /* gentle bends */
+        c->node[i].y = 40.0f + 6.0f * fsin(f * 5.0f);     /* ~level vs the rim */
+        c->node[i].width = 34.0f;
+        c->node[i].wall  = 28.0f;                          /* edge ~68 ~ rim 70 */
+        c->node[i].ceil  = 0.0f;                            /* open (no tunnel for now) */
+        c->node[i].lava  = 7.0f;
     }
 }
 
@@ -157,101 +161,50 @@ static uint16_t lerp555(uint16_t a, uint16_t b, float t) {
 static void build_palette(void) {
     const uint16_t sky = BGR555(29, 23, 31);        /* bright daytime lavender */
     P.cgram[0] = sky;
-    struct { uint16_t nr, fr; } m[3] = {
-        { BGR555(20, 18, 16), lerp555(BGR555(7, 6, 7),    sky, 0.5f) },  /* rock */
-        { BGR555(31, 31, 31), lerp555(BGR555(15, 18, 24), sky, 0.5f) },  /* snow */
-        { BGR555(31, 26, 6),  lerp555(BGR555(20, 4, 2),   sky, 0.3f) },  /* lava */
+    /* Each ramp spans dark (shadow / far) -> lit (front-lit / near) with
+     * REAL contrast, so the directional light + fog are actually visible
+     * (the old ramp's endpoints were nearly identical -> everything flat).
+     * Shadows tinted toward the violet sky rather than pure black. */
+    struct { uint16_t lit, dark; } m[3] = {
+        { BGR555(26, 23, 19), BGR555(4, 3, 8)   },   /* rock: warm lit -> dark violet shadow */
+        { BGR555(31, 31, 31), BGR555(10, 12, 19) },  /* snow: white    -> cool blue shadow   */
+        { BGR555(31, 29, 9),  BGR555(14, 2, 1)   },  /* lava: hot       -> dark ember         */
     };
     int base[3] = { ROCK_BASE, SNOW_BASE, LAVA_BASE };
     for (int mat = 0; mat < 3; mat++)
         for (int s = 0; s < RAMP; s++) {
             float t = (float)s / (float)(RAMP - 1);
-            P.cgram[base[mat] + s] = lerp555(m[mat].fr, m[mat].nr, t);
+            P.cgram[base[mat] + s] = lerp555(m[mat].dark, m[mat].lit, t);  /* s=0 dark .. s=max lit */
         }
 }
-static uint8_t shade_index(int mat, float bright) {
-    int base = (mat == MAT_SNOW) ? SNOW_BASE : (mat == MAT_LAVA) ? LAVA_BASE : ROCK_BASE;
-    int s = (int)(bright * (float)(RAMP - 1) + 0.5f);
-    if (s < 0) s = 0;
-    if (s > RAMP - 1) s = RAMP - 1;
-    return (uint8_t)(base + s);
-}
-
-/* ---- raycaster over floor + ceiling ------------------------ */
+/* ---- raycaster: the portable fixed-point hfcast module does the
+ * marching; render_fb just adapts the float prototype camera to Q16.16
+ * and hands off the scene + camera. ---- */
 
 static long render_fb(V3 cam, V3 fwd, V3 right, V3 up, float fov) {
-    const float MAXT = 220.0f, DTNEAR = 1.0f, DTK = 0.02f;
-    const int   MAXSTEPS = 256;
-    float halfh = fsin(fov * 0.5f) / fcos(fov * 0.5f);
+    float halfh = fsin(fov * 0.5f) / fcos(fov * 0.5f);          /* tan(fov/2) */
     float halfw = halfh * ((float)PPU_SCREEN_W / (float)PPU_SCREEN_H);
-    long steps = 0;
 
-    for (int py = 0; py < FBH; py++) {
-        float ny = (1.0f - ((float)py + 0.5f) / (float)FBH * 2.0f) * halfh;
-        for (int px = 0; px < FBW; px++) {
-            float nx = (((float)px + 0.5f) / (float)FBW * 2.0f - 1.0f) * halfw;
-            V3 d = vadd(fwd, vadd(vmul(right, nx), vmul(up, ny)));
-            d = vnorm(d);
+    HfScene sc;
+    sc.floor = Fmap; sc.ceiling = Cmap; sc.material = Mmap; sc.mapsz = MAPSZ;
+    sc.light = vec3_q16_normalize(vec3_q16_make(q16_from_float(0.53f),
+                                                q16_from_float(0.74f),
+                                                q16_from_float(0.42f)));
+    sc.fog_range = q16_from_int(130);
+    sc.rock_base = ROCK_BASE; sc.snow_base = SNOW_BASE; sc.lava_base = LAVA_BASE;
+    sc.ramp = RAMP;
+    sc.rock_mat = MAT_ROCK; sc.snow_mat = MAT_SNOW; sc.lava_mat = MAT_LAVA;
+    sc.sky_h = q16_from_int(90);     /* terrain tops out ~80; above it (going up) is sky */
 
-            uint8_t out = 0;                         /* sky */
-            float t = 1.0f, prev = 1.0f;
-            for (int s = 0; s < MAXSTEPS; s++) {
-                steps++;
-                float wx = cam.x + d.x * t, wy = cam.y + d.y * t, wz = cam.z + d.z * t;
-                unsigned cell = ((unsigned)((int)ffloor(wz) & MAPMASK)) * MAPSZ
-                              +  (unsigned)((int)ffloor(wx) & MAPMASK);
-                float fl = (float)Fmap[cell], cl = (float)Cmap[cell];
-                int hit_mat = -1, is_floor = 0;
-                if (wy <= fl) {                      /* hit floor: refine */
-                    float lo = prev, hi = t;
-                    for (int it = 0; it < 3; it++) {
-                        float mid = (lo + hi) * 0.5f;
-                        unsigned mc = ((unsigned)((int)ffloor(cam.z + d.z * mid) & MAPMASK)) * MAPSZ
-                                    +  (unsigned)((int)ffloor(cam.x + d.x * mid) & MAPMASK);
-                        if (cam.y + d.y * mid <= (float)Fmap[mc]) hi = mid; else lo = mid;
-                    }
-                    t = hi; cell = ((unsigned)((int)ffloor(cam.z + d.z * t) & MAPMASK)) * MAPSZ
-                                 +  (unsigned)((int)ffloor(cam.x + d.x * t) & MAPMASK);
-                    hit_mat = Mmap[cell]; is_floor = 1;
-                } else if (cl < 254.0f && wy >= cl) { /* hit ceiling (tunnels) */
-                    hit_mat = MAT_ROCK;
-                } else if (d.y >= 0.0f && wy > 255.0f) {
-                    break;                            /* escaped upward -> sky */
-                }
-                if (hit_mat >= 0) {
-                    float fog = 1.0f - t / 130.0f;             /* canyon-scale depth */
-                    if (fog < 0.20f) fog = 0.20f;
-                    if (fog > 1.0f)  fog = 1.0f;
-                    float bright;
-                    if (hit_mat == MAT_LAVA) {
-                        bright = 0.80f + 0.20f * fog;          /* emissive: lava glows */
-                    } else if (is_floor) {
-                        /* directional light off the heightfield gradient, so the
-                         * two canyon walls read as lit vs shadowed (3D form). */
-                        int xi = (int)ffloor(cam.x + d.x * t) & MAPMASK;
-                        int zi = (int)ffloor(cam.z + d.z * t) & MAPMASK;
-                        float hL = (float)Fmap[(unsigned)zi * MAPSZ + (unsigned)((xi - 1) & MAPMASK)];
-                        float hR = (float)Fmap[(unsigned)zi * MAPSZ + (unsigned)((xi + 1) & MAPMASK)];
-                        float hB = (float)Fmap[(unsigned)((zi - 1) & MAPMASK) * MAPSZ + (unsigned)xi];
-                        float hF = (float)Fmap[(unsigned)((zi + 1) & MAPMASK) * MAPSZ + (unsigned)xi];
-                        V3 nrm = vnorm(v3(hL - hR, 3.0f, hB - hF));
-                        float lam = nrm.x * 0.53f + nrm.y * 0.74f + nrm.z * 0.42f;  /* L from upper-side */
-                        if (lam < 0.0f) lam = 0.0f;
-                        bright = (0.28f + 0.72f * lam) * fog;
-                    } else {
-                        bright = 0.16f + 0.34f * fog;          /* tunnel ceiling: dim overhead */
-                    }
-                    out = shade_index(hit_mat, bright);
-                    break;
-                }
-                prev = t;
-                t += DTNEAR + t * DTK;
-                if (t > MAXT) break;
-            }
-            fbuf[py * FBW + px] = out;
-        }
-    }
-    return steps;
+    HfCamera hc;
+    hc.pos   = vec3_q16_make(q16_from_float(cam.x),   q16_from_float(cam.y),   q16_from_float(cam.z));
+    hc.right = vec3_q16_make(q16_from_float(right.x), q16_from_float(right.y), q16_from_float(right.z));
+    hc.up    = vec3_q16_make(q16_from_float(up.x),    q16_from_float(up.y),    q16_from_float(up.z));
+    hc.fwd   = vec3_q16_make(q16_from_float(fwd.x),   q16_from_float(fwd.y),   q16_from_float(fwd.z));
+    hc.halfw = q16_from_float(halfw);
+    hc.halfh = q16_from_float(halfh);
+
+    return hfcast_render(&sc, &hc, fbuf, FBW, FBH);
 }
 
 /* ---- load framebuffer into Mode 7 (scale-only) ------------- */
@@ -301,10 +254,20 @@ int main(int argc, char **argv) {
     P.mode = 7;
     build_palette();
 
-    const float SONG_SEC = 12.0f;   /* one lap of the course = this many seconds */
-    const float GEN_VEL  = 34.0f;   /* tuned cruise velocity for generated courses */
+    float SONG_SEC = 12.0f;          /* one lap = this many seconds (streaming overrides) */
+    const float GEN_VEL  = 34.0f;    /* tuned cruise velocity for generated courses */
+    bool  streaming = false;
+    float baked_to  = 0.0f;
+    const float STREAM_LEAD = 200.0f; /* bake this far ahead of the camera (must be < MAPSZ) */
 
-    if (argc > 1 && strncmp(argv[1], "gen", 3) == 0) {
+    if (argc > 1 && strncmp(argv[1], "stream", 6) == 0) {
+        uint32_t seed = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
+        course_generate_long(seed, GEN_VEL * 60.0f, (float)MAPSZ, &g_course);
+        streaming = true;
+        SONG_SEC = 60.0f;            /* ~1 minute run, one pass before it wraps */
+        printf("course: streamed long ribbon seed=%u, %d nodes (~60s, sliding window)\n",
+               seed, g_course.count);
+    } else if (argc > 1 && strncmp(argv[1], "gen", 3) == 0) {
         uint32_t seed = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
         course_generate(seed, SONG_SEC, GEN_VEL, (float)MAPSZ, &g_course);
         printf("course: generated seed=%u, %d nodes (~%.0fs @ vel %.0f)\n",
@@ -313,19 +276,25 @@ int main(int argc, char **argv) {
         printf("course: %s (%d nodes, %s)\n", argv[1], g_course.count, g_course.loop ? "loop" : "linear");
     } else {
         build_default_course(&g_course);
-        printf("course: built-in canyon loop (arg: a .course file, or 'gen [seed]')\n");
+        printf("course: built-in canyon (arg: a .course file, 'gen [seed]', or 'stream [seed]')\n");
     }
-    course_bake(&g_course, Fmap, Cmap, Mmap, MAPSZ);
+
     course_build_arc(&g_course, &g_arc);
+    if (streaming) {
+        baked_to = ride_d(0.0f).x + STREAM_LEAD;   /* prime the window at the start */
+        course_bake_strip(&g_course, Fmap, Cmap, Mmap, MAPSZ, 0, (int)baked_to);
+    } else {
+        course_bake(&g_course, Fmap, Cmap, Mmap, MAPSZ);
+    }
     float total = g_arc.total;
-    printf("course length: %.0f units; %dx%d raycast -> Mode 7 stretch; clock-locked %.0fs lap.\n",
+    printf("course length: %.0f units; %dx%d raycast -> Mode 7 stretch; %.0fs run.\n",
            total, FBW, FBH, SONG_SEC);
     fflush(stdout);
 
     float dist = 0.0f;                                /* Kestrel's distance along the path */
     V3    cam = ride_d(0.0f); cam.y += 10.0f;
     float roll = 0.0f;
-    const float LAG = 0.08f;
+    const float LAG = 0.11f;        /* track tight enough not to cut into walls */
 
     /* Song-locked baseline + leashed player offset (the rubber-band).
      * The clock here is a stand-in (emulated-frame time); on the cart it
@@ -347,6 +316,7 @@ int main(int argc, char **argv) {
         acc += tnow - last; last = tnow;
         if (acc > 0.25) acc = 0.25;
         bool stepped = false;
+        bool wrapped = false;        /* the run looped back to the start this frame */
         while (acc >= target_dt) {
             f++;
             float song_t = (float)f / (float)SNES_NTSC_HZ;       /* stand-in clock (s) */
@@ -371,6 +341,7 @@ int main(int argc, char **argv) {
                     printf("  course end #%d at %.2fs (clock-locked every %.1fs)\n",
                            lap, song_t, SONG_SEC);
                     fflush(stdout);
+                    wrapped = true;
                 }
                 last_lap = lap;
             }
@@ -388,17 +359,35 @@ int main(int argc, char **argv) {
             /* chase target trails Kestrel; farther back when surging */
             float back = 3.0f + vfeel * 0.045f;
             V3 ctar = ride_d(dist - back);
-            ctar.y += 9.0f;
-            cam = vadd(cam, vmul(vsub(ctar, cam), LAG));     /* damped follow */
+            ctar.y += 18.0f;                                 /* ~floor+34: just above the rim */
 
-            /* one-ray collision clamp: stay off floor/ceiling at the camera cell */
+            if (streaming) {                                 /* scroll the map window */
+                if (wrapped) baked_to = 0.0f;                /* re-establish at the start */
+                if (ctar.x + STREAM_LEAD > baked_to) {
+                    course_bake_strip(&g_course, Fmap, Cmap, Mmap, MAPSZ,
+                                      (int)baked_to, (int)(ctar.x + STREAM_LEAD));
+                    baked_to = ctar.x + STREAM_LEAD;
+                }
+            }
+
+            /* HUG the path centre laterally (so the camera can never drift
+             * into a wall) and only smooth the HEIGHT. */
+            cam.x = ctar.x;
+            cam.z = ctar.z;
+            cam.y += (ctar.y - cam.y) * LAG;
+            if (wrapped) { cam.y = ctar.y; roll = 0.0f; }    /* snap across the wrap seam */
+
+            /* clamp off the floor/lava and below any tunnel ceiling at the
+             * camera cell (which is on the centre path now). */
             unsigned cc = ((unsigned)((int)ffloor(cam.z) & MAPMASK)) * MAPSZ
                         +  (unsigned)((int)ffloor(cam.x) & MAPMASK);
-            if (cam.y < (float)Fmap[cc] + 6.0f) cam.y = (float)Fmap[cc] + 6.0f;
-            if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - 4.0f) cam.y = (float)Cmap[cc] - 4.0f;
+            if (cam.y < (float)Fmap[cc] + 14.0f) cam.y = (float)Fmap[cc] + 14.0f;
+            if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - 8.0f) cam.y = (float)Cmap[cc] - 8.0f;
 
-            /* look ahead along the path; bank into the curve */
-            V3 look = ride_d(dist + 8.0f);
+            /* look well AHEAD and gently down INTO the canyon, so the violet
+             * sky fills the top and the lava channel recedes below. */
+            V3 look = ride_d(dist + 26.0f);
+            look.y += 6.0f;                                  /* ~floor+22 ahead vs cam ~floor+34 */
             V3 fwd = vnorm(vsub(look, cam));
             V3 right0 = vnorm(vcross(fwd, v3(0.0f, 1.0f, 0.0f)));
             V3 up0 = vcross(right0, fwd);
