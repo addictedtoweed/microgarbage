@@ -206,14 +206,14 @@ void course_generate(uint32_t seed, float duration_sec, float velocity,
          * rim to descend with the floor — a baker enhancement (TODO). */
         out->node[i].x     = x;
         out->node[i].z     = z;
-        out->node[i].y     = 38.0f + r2 * 8.0f;                 /* ~level vs the rim */
+        out->node[i].y     = 40.0f + r2 * 3.0f;                 /* ~level vs the rim */
         out->node[i].width = 30.0f + r3 * 12.0f;                /* corridor 30..42 */
         out->node[i].wall  = open ? (18.0f + r3 * 8.0f) : (24.0f + r3 * 8.0f);  /* edge ~ rim 70 */
         out->node[i].ceil  = 0.0f;                              /* open (tunnels: TODO) */
         out->node[i].lava  = open ? 0.0f : (4.0f + r2 * 5.0f);
 
         rng = rng*1664525u + 1013904223u;
-        float turn = ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 0.50f;
+        float turn = ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 0.38f;
         heading += turn;
         x += fcos_(heading) * spacing;
         z += fsin_(heading) * spacing;
@@ -246,19 +246,20 @@ void course_generate_long(uint32_t seed, float length_x, float mapsz, CourseDef 
 
         out->node[i].x     = 24.0f + spacing * (float)i;       /* monotonic flight axis */
         out->node[i].z     = z;
-        out->node[i].y     = 38.0f + r2 * 8.0f;                /* ~level vs the rim */
+        out->node[i].y     = 40.0f + r2 * 3.0f;                /* ~level vs the rim */
         out->node[i].width = 30.0f + r3 * 12.0f;
         out->node[i].wall  = open ? (18.0f + r3 * 8.0f) : (24.0f + r3 * 8.0f);
         out->node[i].ceil  = 0.0f;
         out->node[i].lava  = open ? 0.0f : (4.0f + r2 * 5.0f);
 
         rng = rng*1664525u + 1013904223u;
-        zvel += ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 7.0f;   /* gentle steer */
-        if (zvel >  9.0f) zvel =  9.0f;
-        if (zvel < -9.0f) zvel = -9.0f;
+        zvel += ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 2.0f;   /* faint random steer */
+        zvel += (mapsz * 0.5f - z) * 0.05f;            /* firm pull to centre: nearly straight */
+        if (zvel >  6.0f) zvel =  6.0f;
+        if (zvel < -6.0f) zvel = -6.0f;
         z += zvel;
-        if (z < zlo) { z = zlo; zvel = -zvel; }
-        if (z > zhi) { z = zhi; zvel = -zvel; }
+        if (z < zlo) z = zlo;                          /* clamp position only — NO velocity */
+        if (z > zhi) z = zhi;                          /* flip, so the path never kinks      */
     }
 }
 
