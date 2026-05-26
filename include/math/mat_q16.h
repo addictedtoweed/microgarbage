@@ -4,10 +4,12 @@
  *    mat2_q16    2x2            sprite/Mode-7 rotate+scale
  *    affine2_q16 2x2 + offset   Mode 7 transform (matrix + center)
  *    mat3_q16    3x3            camera basis / 3D rotation
+ *    affine3_q16 3x3 + offset   model->world / world->view transform
  *
- *  Deliberately NO 4x4 homogeneous stack: a raycaster marches rays
- *  from a basis, it doesn't push vertex lists through a projection,
- *  so a GL-style 4x4 would be unused machinery.
+ *  Still NO 4x4 homogeneous stack: affine3 (the top 3x4 of a 4x4)
+ *  carries rotation+translation, and perspective is an explicit
+ *  divide-by-z at projection — so the 4x4's bottom row (which only
+ *  exists to produce w) would be unused machinery.
  *
  *  Header-only, static inline. Rotation constructors call into
  *  trig_q16 (CORDIC), so TUs that use them link src/math/trig_q16.c.
@@ -109,6 +111,56 @@ static inline mat3_q16 mat3_q16_from_basis_cols(vec3_q16 right, vec3_q16 up, vec
         right.z, up.z, fwd.z
     } };
     return r;
+}
+/* Axis rotations (right-handed), row-major. */
+static inline mat3_q16 mat3_q16_rotation_x(q16_16_t radians) {
+    q16_16_t s, c; q16_sincos(radians, &s, &c);
+    mat3_q16 r = { { Q16_ONE,0,0,  0,c,-s,  0,s,c } }; return r;
+}
+static inline mat3_q16 mat3_q16_rotation_y(q16_16_t radians) {
+    q16_16_t s, c; q16_sincos(radians, &s, &c);
+    mat3_q16 r = { { c,0,s,  0,Q16_ONE,0,  -s,0,c } }; return r;
+}
+static inline mat3_q16 mat3_q16_rotation_z(q16_16_t radians) {
+    q16_16_t s, c; q16_sincos(radians, &s, &c);
+    mat3_q16 r = { { c,-s,0,  s,c,0,  0,0,Q16_ONE } }; return r;
+}
+
+/* ---- 3D affine : 3x3 matrix + translation -------------------
+ * p' = m*p + t. The top 3x4 of a 4x4 homogeneous transform; model->world
+ * and world->view are both affine3. Compose them, apply per vertex, then
+ * project (divide by z). */
+typedef struct { mat3_q16 m; vec3_q16 t; } affine3_q16;
+
+static inline affine3_q16 affine3_q16_identity(void) {
+    affine3_q16 a = { mat3_q16_identity(), { 0, 0, 0 } }; return a;
+}
+static inline vec3_q16 affine3_q16_apply(affine3_q16 a, vec3_q16 v) {
+    return vec3_q16_add(mat3_q16_mul_vec3(a.m, v), a.t);
+}
+/* Compose: (A o B)(v) = A(B(v)) — e.g. modelview = compose(view, model). */
+static inline affine3_q16 affine3_q16_compose(affine3_q16 A, affine3_q16 B) {
+    affine3_q16 r;
+    r.m = mat3_q16_mul(A.m, B.m);
+    r.t = vec3_q16_add(mat3_q16_mul_vec3(A.m, B.t), A.t);
+    return r;
+}
+static inline affine3_q16 affine3_q16_from_translation(vec3_q16 t) {
+    affine3_q16 a = { mat3_q16_identity(), t }; return a;
+}
+static inline affine3_q16 affine3_q16_from_rotation(mat3_q16 m) {
+    affine3_q16 a = { m, { 0, 0, 0 } }; return a;
+}
+/* World->view for a camera at `eye` with orthonormal basis (right,up,fwd):
+ * v_view = Bᵀ(v_world - eye); the rows of m are the basis vectors. */
+static inline affine3_q16 affine3_q16_view(vec3_q16 eye, vec3_q16 right,
+                                           vec3_q16 up, vec3_q16 fwd) {
+    mat3_q16 bt = { { right.x, right.y, right.z,
+                      up.x,    up.y,    up.z,
+                      fwd.x,   fwd.y,   fwd.z } };
+    vec3_q16 me = mat3_q16_mul_vec3(bt, eye);
+    affine3_q16 a = { bt, { -me.x, -me.y, -me.z } };
+    return a;
 }
 
 #ifdef __cplusplus
