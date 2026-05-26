@@ -20,14 +20,15 @@
  *
  * Build + run on Windows:
  *   cc -Wall -Wextra -Wpedantic -std=c11 -Iinclude -o build/demo_fly3d \
- *      src/video/ppu.c src/video/present_gl_win32.c \
+ *      src/video/ppu.c src/video/present_gl_win32.c src/video/course.c \
  *      src/video/tests/demo_fly3d.c -lopengl32 -lgdi32 -luser32
- *   ./build/demo_fly3d
+ *   ./build/demo_fly3d [course.txt]   (no arg = built-in canyon loop)
  *
  * Public domain (CC0). No warranty.
  */
 #include "video/ppu.h"
 #include "video/present.h"
+#include "video/course.h"
 
 #include <windows.h>
 #include <stdint.h>
@@ -97,47 +98,51 @@ static V3 vnorm(V3 a) { float inv = 1.0f / fsqrt(a.x * a.x + a.y * a.y + a.z * a
 /* ---- the course: a closed path carved into floor/ceiling --- */
 
 /* Centerline of the racing channel (closed loop in the 256x256 torus). */
-static V3 path_pt(float th) {
-    float x = 128.0f + 72.0f * fcos(th) + 16.0f * fcos(3.0f * th);
-    float z = 128.0f + 72.0f * fsin(th) + 20.0f * fsin(2.0f * th);
-    float y = 70.0f + 28.0f * fsin(2.0f * th);     /* dynamic channel height */
-    return v3(x, y, z);
+/* The active course: loaded from a .course file, else a built-in loop.
+ * The maps are baked from it by course_bake() (the same baker the cart
+ * uses at level-load). */
+static CourseDef g_course;
+
+/* Built-in fallback: a closed canyon loop (canyon / open / tunnel mix). */
+static void build_default_course(CourseDef *c) {
+    c->loop = true;
+    c->count = 8;
+    for (int i = 0; i < 8; i++) {
+        float a = (float)i / 8.0f * 6.28318531f;
+        int open = (i == 0 || i == 4), tunnel = (i == 2 || i == 6);
+        c->node[i].x = 128.0f + 80.0f * fcos(a);
+        c->node[i].z = 128.0f + 80.0f * fsin(a);
+        c->node[i].y = 45.0f + 18.0f * fsin(2.0f * a);
+        c->node[i].width = 20.0f;
+        c->node[i].wall  = open ? 50.0f : 130.0f;
+        c->node[i].ceil  = tunnel ? 30.0f : 0.0f;
+        c->node[i].lava  = open ? 0.0f : 5.0f;
+    }
 }
 
-static void gen_course(void) {
-    for (int i = 0; i < MAPSZ * MAPSZ; i++) { Fmap[i] = WALL_H; Cmap[i] = OPEN_CEIL; Mmap[i] = MAT_ROCK; }
-
-    const float CORR = 20.0f;                       /* channel half-width (wider canyon) */
-    for (float th = 0.0f; th < 6.28318531f; th += 0.004f) {
-        float seg = th / 6.28318531f * 8.0f;        /* 8 stretches around the loop */
-        int   s = (int)seg & 7;
-        int tunnel = (s == 2 || s == 6);            /* a couple of tunnels */
-        int open   = (s == 0 || s == 4);            /* a couple of open-air stretches */
-        float wallrise = open ? 45.0f : 135.0f;     /* open = low walls; canyon = tall */
-
-        V3 p = path_pt(th);
-        int cx0 = (int)p.x, cz0 = (int)p.z, rad = (int)CORR;
-        for (int dz = -rad; dz <= rad; dz++)
-            for (int dx = -rad; dx <= rad; dx++) {
-                float d = fsqrt((float)(dx * dx + dz * dz));
-                if (d > CORR) continue;
-                int cx = (cx0 + dx) & MAPMASK, cz = (cz0 + dz) & MAPMASK;
-                unsigned cell = (unsigned)cz * MAPSZ + (unsigned)cx;
-                float u = d / CORR;
-                int fl = (int)(p.y - 24.0f + u * u * wallrise);   /* bottom rises to walls */
-                if (fl < 0) fl = 0;
-                if (fl < Fmap[cell]) {                            /* carve the channel */
-                    Fmap[cell] = (uint8_t)fl;
-                    Mmap[cell] = (d < 5.0f && !open) ? MAT_LAVA    /* narrow lava river (not whole floor) */
-                               : (fl > 170)          ? MAT_SNOW    /* snow on high wall tops */
-                               :                       MAT_ROCK;   /* rock floor either side of the river */
-                }
-                if (tunnel) {
-                    int cl = (int)(p.y + 30.0f);
-                    if (cl < Cmap[cell]) Cmap[cell] = (uint8_t)cl;
-                }
-            }
+/* Parse a .course text file: "node x z y width wall ceil lava" lines,
+ * an optional "loop 1"; '#' comments and blank lines ignored. */
+static bool load_course(const char *path, CourseDef *c) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return false;
+    c->count = 0; c->loop = false;
+    char line[256];
+    while (fgets(line, sizeof line, fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
+        if (strncmp(p, "loop", 4) == 0) {
+            int v = 0; (void)sscanf(p + 4, "%d", &v); c->loop = (v != 0); continue;
+        }
+        if (strncmp(p, "node", 4) == 0 && c->count < COURSE_MAX_NODES) {
+            CourseNode n;
+            if (sscanf(p + 4, "%f %f %f %f %f %f %f",
+                       &n.x, &n.z, &n.y, &n.width, &n.wall, &n.ceil, &n.lava) == 7)
+                c->node[c->count++] = n;
+        }
     }
+    fclose(fp);
+    return c->count >= 2;
 }
 
 /* ---- palette: depth-shaded material ramps ------------------ */
@@ -248,20 +253,31 @@ static void load_mode7(void) {
     P.m7b = 0; P.m7c = 0; P.m7x = 0; P.m7y = 0; P.m7hofs = 0; P.m7vofs = 0;
 }
 
-/* Channel fly-height at a path point (above the lava floor). */
-static V3 ride(float th) { V3 p = path_pt(th); p.y = p.y - 24.0f + 16.0f; return p; }
+/* Channel fly-height: a bit above the course floor at param s. */
+static V3 ride(float s) {
+    CourseNode n;
+    course_sample(&g_course, s, &n);
+    return v3(n.x, n.y + 16.0f, n.z);
+}
 
-int main(void) {
-    if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - lava canyon")) return 1;
+int main(int argc, char **argv) {
+    if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - course flythrough")) return 1;
     printf("GL renderer : %s\n", present_gl_renderer());
-    printf("lava-canyon course, %dx%d raycast -> Mode 7 stretch; chase cam w/ speed-distance + banking.\n",
-           FBW, FBH);
-    fflush(stdout);
 
     ppu_state_clear(&P);
     P.mode = 7;
     build_palette();
-    gen_course();
+
+    if (argc > 1 && load_course(argv[1], &g_course))
+        printf("course: %s (%d nodes, %s)\n", argv[1], g_course.count, g_course.loop ? "loop" : "linear");
+    else {
+        build_default_course(&g_course);
+        printf("course: built-in canyon loop (pass a .course file as arg 1 to load one)\n");
+    }
+    course_bake(&g_course, Fmap, Cmap, Mmap, MAPSZ);
+    float len = course_length(&g_course);
+    printf("%dx%d raycast -> Mode 7 stretch; chase cam, speed-distance + banking.\n", FBW, FBH);
+    fflush(stdout);
 
     float kth = 0.0f;                                 /* Kestrel's path param */
     V3    cam = ride(0.0f); cam.y += 10.0f;
@@ -283,6 +299,7 @@ int main(void) {
             /* speed varies: accelerate/brake along the run */
             speed = 0.020f + 0.012f * fsin((float)f * 0.012f);
             kth += speed;
+            if (kth >= len) kth -= len;              /* loop the preview */
             acc -= target_dt; stepped = true; f++;
         }
         if (stepped) {

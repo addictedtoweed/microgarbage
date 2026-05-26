@@ -90,6 +90,7 @@ run trashfs_dirs     storage  src/storage/trashfs.c src/storage/trashdrive.c
 # ppu is headless (renders to a memory framebuffer); the present shim
 # (present_gl_win32.c) is a GUI layer with no unit test — visual only.
 run ppu              video  src/video/ppu.c
+run course           video  src/video/course.c
 
 # ---- audio ----
 RB=src/containers/ring_buffer.c
