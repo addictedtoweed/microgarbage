@@ -6,8 +6,8 @@
 #include "video/hfcast.h"
 #include "math/mat_q16.h"
 
-/* march tuning (Q16.16), matching the float prototype */
-#define HF_MAXT     q16_from_int(160)
+/* march tuning (Q16.16), matching the float prototype. Draw distance
+ * (the hard march cap) is per-scene now: HfScene.max_t. */
 #define HF_DTNEAR   q16_from_double(1.5)
 #define HF_DTK      q16_from_double(0.045)
 #define HF_MAXSTEPS 256
@@ -126,7 +126,7 @@ long hfcast_render(const HfScene *s, const HfCamera *c,
 
                 prev = t;
                 t += HF_DTNEAR + q16_mul(t, HF_DTK);
-                if (t > HF_MAXT) break;
+                if (t > s->max_t) break;
             }
             fb[py * fbw + px] = out;
         }

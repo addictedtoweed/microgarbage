@@ -27,6 +27,7 @@ static HfScene make_scene(void) {
                                                q16_from_double(0.74),
                                                q16_from_double(0.42)));
     s.fog_range = q16_from_int(130);
+    s.max_t = q16_from_int(160);
     s.rock_base = ROCK_BASE; s.snow_base = SNOW_BASE; s.lava_base = LAVA_BASE;
     s.ramp = RAMP;
     s.rock_mat = 0; s.snow_mat = 1; s.lava_mat = 2;

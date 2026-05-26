@@ -7,6 +7,7 @@
  * ============================================================ */
 
 #include "video/course.h"
+#include "video/canyon_tune.h"   /* streamed-canyon shape tunables */
 
 /* ---- libm-free float helpers (this module avoids <math.h>) ---- */
 #define COURSE_PI 3.14159265358979f
@@ -330,8 +331,12 @@ static void stamp_corridor(uint8_t *floor, uint8_t *ceiling, uint8_t *material,
             if (d2 > w2) continue;
             unsigned cell = (((unsigned)(cz0 + dz) & mask) * (unsigned)mapsz)
                           +  ((unsigned)(cx0 + dx) & mask);
-            float u2 = (w2 > 0.0f) ? d2 / w2 : 0.0f;
-            uint8_t fl = clamp_u8(nd->y + u2 * nd->wall);
+            /* flat floor across the inner channel, then a steep wall up to
+             * the plateau (= nd->y + nd->wall) — flat-bottomed canyon. */
+            float u2 = (w2 > 0.0f) ? d2 / w2 : 0.0f;           /* (d/width)^2, 0..1 */
+            float t  = (u2 <= CANYON_FLAT2) ? 0.0f
+                     : (u2 - CANYON_FLAT2) / (1.0f - CANYON_FLAT2);
+            uint8_t fl = clamp_u8(nd->y + t * nd->wall);
             if (fl < floor[cell]) {
                 floor[cell] = fl;
                 material[cell] = (nd->lava > 0.0f && d2 < lava2) ? COURSE_MAT_LAVA
@@ -353,26 +358,29 @@ void course_eval_long(uint32_t seed, float x, CourseNode *out) {
     float p3 = (float)((seed >> 16) & 0xFF) * 0.0246f;
 
     out->x     = x;
-    out->z     = 128.0f;                                   /* dead straight — a half-pipe to fly down */
-    out->y     = 72.0f  + 12.0f * fsin_(x * 0.0016f + p3); /* gentle roll (big swings creep the horizon) */
-    out->width = 64.0f  + 6.0f * fsin_(x * 0.013f + p1);   /* WIDE half-pipe (58..70 half-width) */
-    out->wall  = 54.0f  + 4.0f * fsin_(x * 0.021f + p2);   /* TALL walls curving up to the rim */
+    out->z     = CANYON_Z_CENTER;                          /* dead straight — a canyon to fly down */
+    out->y     = CANYON_FLOOR_Y + CANYON_ROLL_AMP   * fsin_(x * CANYON_ROLL_FREQ  + p3);
+    out->width = CANYON_WIDTH   + CANYON_WIDTH_AMP  * fsin_(x * CANYON_WIDTH_FREQ + p1);
+    out->wall  = CANYON_WALL    + CANYON_WALL_AMP1  * fsin_(x * CANYON_WALL_FREQ1 + p2)  /* TALL walls; */
+                                + CANYON_WALL_AMP2  * fsin_(x * CANYON_WALL_FREQ2 + p1); /* two-scale variety */
     out->ceil  = 0.0f;                                     /* open (tunnels: TODO) */
-    float gate = fsin_(x * 0.006f + p3);                   /* slow open/lava alternation */
-    out->lava  = (gate > 0.25f) ? (5.0f + 3.0f * fsin_(x * 0.05f)) : 0.0f;
+    float gate = fsin_(x * CANYON_GATE_FREQ + p3);         /* slow open/lava alternation */
+    out->lava  = (gate > CANYON_LAVA_GATE)
+               ? (CANYON_LAVA + CANYON_LAVA_AMP * fsin_(x * CANYON_LAVA_FREQ)) : 0.0f;
 }
 
 void course_bake_strip_proc(uint32_t seed, uint8_t *floor, uint8_t *ceiling,
                             uint8_t *material, int mapsz, int x_lo, int x_hi) {
     unsigned mask = (unsigned)(mapsz - 1);
 
-    const float RIM = 52.0f;                               /* canyon depth: rim above the floor (tall half-pipe) */
-    for (int xc = x_lo; xc < x_hi; xc++) {                 /* clear columns to a rim that TRACKS
-                                                            * the floor, so it descends with it */
+    for (int xc = x_lo; xc < x_hi; xc++) {                 /* clear columns to the plateau the canyon
+                                                            * walls rise to (= floor + wall height),
+                                                            * so it tracks the floor and the walls meet
+                                                            * it cleanly; wall height varies along x */
         unsigned xm = (unsigned)xc & mask;
         CourseNode r;
         course_eval_long(seed, (float)xc, &r);
-        uint8_t rim = clamp_u8(r.y + RIM);
+        uint8_t rim = clamp_u8(r.y + r.wall);
         for (int z = 0; z < mapsz; z++) {
             unsigned idx = (unsigned)z * (unsigned)mapsz + xm;
             floor[idx]    = rim;

@@ -30,6 +30,7 @@
 #include "video/present.h"
 #include "video/course.h"
 #include "video/hfcast.h"
+#include "video/canyon_tune.h"
 
 #include <windows.h>
 #include <stdint.h>
@@ -38,12 +39,12 @@
 #include <stdio.h>
 /* no <math.h> (resolves to the repo math aggregator under -Iinclude) */
 
-#define MAPSZ         256
+#define MAPSZ         CANYON_MAPSZ   /* toroidal terrain ring; bounds max draw distance */
 #define MAPMASK       (MAPSZ - 1)
 #define SNES_NTSC_HZ  60.0988
 
-#define FBW  64        /* lower res than the open-world demo: enclosed */
-#define FBH  56        /* course needs fewer pixels, leaves M7 headroom */
+#define FBW  CANYON_FB_W   /* lower res than the open-world demo: enclosed */
+#define FBH  CANYON_FB_H   /* course needs fewer pixels, leaves M7 headroom */
 
 #define RAMP 20
 #define ROCK_BASE 1
@@ -189,14 +190,15 @@ static long render_fb(V3 cam, V3 fwd, V3 right, V3 up, float fov) {
 
     HfScene sc;
     sc.floor = Fmap; sc.ceiling = Cmap; sc.material = Mmap; sc.mapsz = MAPSZ;
-    sc.light = vec3_q16_normalize(vec3_q16_make(q16_from_float(0.53f),
-                                                q16_from_float(0.74f),
-                                                q16_from_float(0.42f)));
-    sc.fog_range = q16_from_int(130);
+    sc.light = vec3_q16_normalize(vec3_q16_make(q16_from_float(CANYON_LIGHT_X),
+                                                q16_from_float(CANYON_LIGHT_Y),
+                                                q16_from_float(CANYON_LIGHT_Z)));
+    sc.fog_range = q16_from_int(CANYON_FOG_RANGE);
+    sc.max_t     = q16_from_int(CANYON_MAX_T);
     sc.rock_base = ROCK_BASE; sc.snow_base = SNOW_BASE; sc.lava_base = LAVA_BASE;
     sc.ramp = RAMP;
     sc.rock_mat = MAT_ROCK; sc.snow_mat = MAT_SNOW; sc.lava_mat = MAT_LAVA;
-    sc.sky_h = q16_from_int(90);     /* terrain tops out ~80; above it (going up) is sky */
+    sc.sky_h = q16_from_int(CANYON_SKY_H);
 
     /* The map is toroidal (period MAPSZ). The camera's world-x grows without
      * bound on an endless run; wrap it (and z) into [0,MAPSZ) BEFORE the Q16.16
@@ -277,11 +279,11 @@ int main(int argc, char **argv) {
     P.mode = 7;
     build_palette();
 
-    float SONG_SEC = 2.5f;           /* one lap = this many seconds (streaming overrides) */
-    const float GEN_VEL  = 34.0f;    /* tuned cruise velocity for generated courses */
+    float SONG_SEC = CANYON_SONG_SEC; /* one lap = this many seconds (streaming overrides) */
+    const float GEN_VEL  = CANYON_GEN_VEL;
     bool  streaming = false;
     float baked_to  = 0.0f;
-    const float STREAM_LEAD = 200.0f; /* bake this far ahead of the camera (must be < MAPSZ) */
+    const float STREAM_LEAD = CANYON_STREAM_LEAD; /* bake this far ahead (must be < MAPSZ) */
 
     if (argc > 1 && strncmp(argv[1], "stream", 6) == 0) {
         g_seed   = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
@@ -316,9 +318,10 @@ int main(int argc, char **argv) {
 
     V3    cam = path_point(0.0f); cam.y += 10.0f;
     float roll = 0.0f;
-    const float LAG    = 0.12f;     /* altitude follow — tight (floor is slow, so no bounce) */
-    const float POS_K  = 0.04f;     /* heavy lateral smoothing: a near-straight rail */
-    const float AIM_K  = 0.06f;     /* gimbal smoothing of the look direction */
+    const float RIDE_H = CANYON_RIDE_H;  /* camera clearance above the channel floor */
+    const float LAG    = CANYON_ALT_LAG; /* altitude follow rate */
+    const float POS_K  = CANYON_POS_K;   /* lateral smoothing: a near-straight rail */
+    const float AIM_K  = CANYON_AIM_K;   /* gimbal smoothing of the look direction */
     V3    camfwd = vnorm(vsub(path_point(26.0f), path_point(0.0f)));  /* smoothed aim vector */
 
     /* Song-locked baseline + a GENTLE leash offset (the rubber-band). The
@@ -327,9 +330,9 @@ int main(int argc, char **argv) {
      * sample position. The offset is a small simulated lead/lag; real
      * brake/accelerate input replaces it, clamped to a leash so it can
      * never drift the timeline. */
-    const float OFF_AMP = 0.0f;     /* simulated lead/lag off => dead-steady forward (drone) */
-    const float OFF_W   = 0.5f;     /* lead/lag rate (rad/s)          */
-    const float STREAM_SPEED = 380.0f;   /* units/sec for the endless run (fast) */
+    const float OFF_AMP = CANYON_OFF_AMP;     /* simulated lead/lag (0 => dead-steady drone) */
+    const float OFF_W   = CANYON_OFF_W;       /* lead/lag rate (rad/s) */
+    const float STREAM_SPEED = CANYON_STREAM_SPEED;   /* units/sec for the endless run */
     const float cruise  = g_stream ? STREAM_SPEED
                                    : (total > 0.0f ? total / SONG_SEC : 0.0f);  /* units/sec */
 
@@ -369,7 +372,7 @@ int main(int argc, char **argv) {
         if (vfeel < 0.0f) vfeel = 0.0f;
 
         V3 kpos = path_point(dist);
-        float back = 3.0f + vfeel * 0.045f;
+        float back = CANYON_BACK_BASE + vfeel * CANYON_BACK_K;
         V3 ctar = path_point(dist - back);                   /* trailing centre (lateral target) */
 
         if (streaming) {                                     /* scroll the map window forward */
@@ -385,7 +388,8 @@ int main(int argc, char **argv) {
          * FOLLOWS the floor's slow descent/climb (heavily smoothed, so the slow
          * elevation comes through but fast bumps don't bounce). Flies above the
          * rim, so the lateral slack can't clip walls. */
-        float alt_target = ctar.y + 8.0f;   /* low in the half-pipe (rim is ctar.y + 36) */
+        float ground     = ctar.y - 16.0f;          /* channel floor beneath us (ctar.y = floor + 16) */
+        float alt_target = ground + RIDE_H;          /* hold a fixed clearance above the ground */
         /* The FORWARD axis (x) must track tightly: smoothing it would lag the
          * camera ~v*tau behind the path and out of the streamed window, into
          * stale cells (walls misrendering / sliding back / blocking the view).
@@ -401,24 +405,24 @@ int main(int argc, char **argv) {
              * lagging altitude can't float up to the cross-section view), and
              * leashed near the centre so it never drifts out to the curving
              * walls. Rim sits at ctar.y + 36. */
-            float min_y = ctar.y - 6.0f;     /* off the floor/lava       */
-            float max_y = ctar.y + 30.0f;    /* below the rim            */
+            float min_y = ground + CANYON_ALT_MIN_CLR;   /* off the lava floor */
+            float max_y = ground + CANYON_ALT_MAX_CLR;   /* below the rim      */
             if (cam.y < min_y) cam.y = min_y;
             if (cam.y > max_y) cam.y = max_y;
-            float lat = 24.0f;               /* lateral leash from the channel centre */
+            float lat = CANYON_LAT_LEASH;    /* lateral leash from the channel centre */
             if (cam.z > ctar.z + lat) cam.z = ctar.z + lat;
             if (cam.z < ctar.z - lat) cam.z = ctar.z - lat;
         } else {
             unsigned cc = ((unsigned)((int)ffloor(cam.z) & MAPMASK)) * MAPSZ
                         +  (unsigned)((int)ffloor(cam.x) & MAPMASK);
-            if (cam.y < (float)Fmap[cc] + 14.0f) cam.y = (float)Fmap[cc] + 14.0f;
-            if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - 8.0f) cam.y = (float)Cmap[cc] - 8.0f;
+            if (cam.y < (float)Fmap[cc] + CANYON_FLOOR_CLR) cam.y = (float)Fmap[cc] + CANYON_FLOOR_CLR;
+            if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - CANYON_CEIL_CLR) cam.y = (float)Cmap[cc] - CANYON_CEIL_CLR;
         }
 
         /* look AHEAD and gently down INTO the canyon, with a gimbal-damped
          * aim so the drone glides instead of twitching with the path */
-        V3 look = path_point(dist + 34.0f);
-        look.y += 2.0f;                                      /* look ~level down the canyon axis */
+        V3 look = path_point(dist + CANYON_LOOK_AHEAD);
+        look.y += CANYON_LOOK_UP;                            /* look ~level down the canyon axis */
         V3 want_fwd = vnorm(vsub(look, cam));
         if (wrapped) camfwd = want_fwd;                      /* don't ease across the seam */
         camfwd = vnorm(vadd(camfwd, vmul(vsub(want_fwd, camfwd), AIM_K)));
@@ -428,16 +432,16 @@ int main(int argc, char **argv) {
         V3 ta = vsub(path_point(dist + 4.0f), kpos);
         V3 tb = vsub(path_point(dist + 8.0f), path_point(dist + 4.0f));
         float turn = ta.x * tb.z - ta.z * tb.x;              /* signed curvature */
-        float bank = turn * 0.03f;                           /* subtle lean, stays centred */
-        if (bank >  0.45f) bank = 0.45f;
-        if (bank < -0.45f) bank = -0.45f;
-        roll += (bank - roll) * 0.08f;                       /* smooth the bank */
+        float bank = turn * CANYON_BANK_K;                   /* subtle lean, stays centred */
+        if (bank >  CANYON_BANK_MAX) bank = CANYON_BANK_MAX;
+        if (bank < -CANYON_BANK_MAX) bank = -CANYON_BANK_MAX;
+        roll += (bank - roll) * CANYON_ROLL_SMOOTH;          /* smooth the bank */
         float cr = fcos(roll), sr = fsin(roll);
         V3 right = vadd(vmul(right0, cr), vmul(up0, sr));
         V3 up    = vsub(vmul(up0, cr), vmul(right0, sr));
 
-        float fov = 1.12f + vfeel * 0.0010f;                 /* widen with speed, capped */
-        if (fov > 1.40f) fov = 1.40f;
+        float fov = CANYON_FOV_BASE + vfeel * CANYON_FOV_K;  /* widen with speed, capped */
+        if (fov > CANYON_FOV_MAX) fov = CANYON_FOV_MAX;
         step_sum += render_fb(cam, fwd, right, up, fov);
         frames++;
         load_mode7();

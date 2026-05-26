@@ -34,6 +34,7 @@ typedef struct {
 
     vec3_q16  light;            /* unit light direction (diffuse)        */
     q16_16_t  fog_range;        /* depth at which fog reaches its floor  */
+    q16_16_t  max_t;            /* hard ray-march distance cap (draw distance) */
 
     /* output palette layout: index = base[material] + shade(0..ramp-1). */
     int rock_base, snow_base, lava_base, ramp;
