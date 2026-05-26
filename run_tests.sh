@@ -91,10 +91,9 @@ run trashfs_dirs     storage  src/storage/trashfs.c src/storage/trashdrive.c
 
 # ---- video ----
 # ppu is headless (renders to a memory framebuffer); the present shim
-# (present_gl_win32.c) is a GUI layer with no unit test — visual only.
+# (present_gl_win32.c) and the r3d polygon renderer are GUI/visual layers
+# with no unit test — exercised by demo_r3d.
 run ppu              video  src/video/ppu.c
-run course           video  src/video/course.c
-run hfcast           video  src/video/hfcast.c
 
 # ---- audio ----
 RB=src/containers/ring_buffer.c
