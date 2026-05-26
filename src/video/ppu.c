@@ -333,12 +333,17 @@ static void render_mode7(const PpuState *p, uint32_t *fb) {
             int dy = (int)y + vofs - cy;
             int tx = ((a * dx + b * dy) >> 8) + cx;
             int ty = ((c * dx + d * dy) >> 8) + cy;
-            unsigned wx = (unsigned)tx & 1023u;   /* wrap the 1024x1024 texture */
-            unsigned wy = (unsigned)ty & 1023u;
-            unsigned tile = p->vram[((wy >> 3) * 128u + (wx >> 3)) & 0x7FFFu] & 0xFFu;
-            unsigned val  = (p->vram[(tile * 64u + (wy & 7u) * 8u + (wx & 7u)) & 0x7FFFu] >> 8) & 0xFFu;
 
-            uint16_t out = (val != 0u) ? p->cgram[val] : p->cgram[0];
+            uint16_t out;
+            if (p->m7_over_transparent && ((unsigned)tx >= 1024u || (unsigned)ty >= 1024u)) {
+                out = p->cgram[0];                /* outside the plane -> backdrop, no wrap */
+            } else {
+                unsigned wx = (unsigned)tx & 1023u;   /* wrap the 1024x1024 texture */
+                unsigned wy = (unsigned)ty & 1023u;
+                unsigned tile = p->vram[((wy >> 3) * 128u + (wx >> 3)) & 0x7FFFu] & 0xFFu;
+                unsigned val  = (p->vram[(tile * 64u + (wy & 7u) * 8u + (wx & 7u)) & 0x7FFFu] >> 8) & 0xFFu;
+                out = (val != 0u) ? p->cgram[val] : p->cgram[0];
+            }
             if (p->obj_on_main && obj_op[x]) out = obj_col[x];  /* sprites over Mode 7 */
             row[x] = color_to_fb(out, eff_bright);
         }

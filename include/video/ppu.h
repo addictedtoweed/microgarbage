@@ -123,6 +123,8 @@ typedef struct {
     int16_t  m7a, m7b, m7c, m7d;
     int16_t  m7x, m7y;
     int16_t  m7hofs, m7vofs;
+    bool     m7_over_transparent; /* M7SEL: texels outside the 1024x1024 plane are
+                                   * transparent (backdrop) instead of wrapping */
 
     /* Hardware memory, identical to the real chip.
      *   oam[0..511]   = low table: 4 bytes/sprite x 128:
