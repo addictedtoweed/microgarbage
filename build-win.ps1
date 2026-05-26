@@ -78,6 +78,27 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ----------------------------------------------------------------
+# Toolchain bootstrap. A PowerShell not launched from an MSYS2 shell
+# usually has neither the mingw compiler on PATH nor a space-free TMP.
+# Fix both so the build works out of the box on a standard MSYS2 install
+# (no effect when the toolchain is already set up).
+# ----------------------------------------------------------------
+if (-not (Get-Command $Cc -ErrorAction SilentlyContinue) -and
+    -not (Get-Command "gcc" -ErrorAction SilentlyContinue)) {
+    $mingw = "C:\msys64\mingw64\bin"
+    if (Test-Path (Join-Path $mingw "gcc.exe")) {
+        $env:PATH = "$mingw;C:\msys64\usr\bin;" + $env:PATH
+    }
+}
+# mingw gcc writes intermediates under %TEMP%; if that path has a space
+# (e.g. a user name with a space) gcc fails. Redirect to a space-free dir.
+if ($env:TEMP -match '\s') {
+    $mgtmp = Join-Path $env:SystemDrive "mg_tmp"
+    New-Item -ItemType Directory -Force $mgtmp | Out-Null
+    $env:TMP = $mgtmp; $env:TEMP = $mgtmp; $env:TMPDIR = $mgtmp
+}
+
+# ----------------------------------------------------------------
 # Locate repo root (this script lives at the repo root) and the
 # 05_shell example.
 # ----------------------------------------------------------------

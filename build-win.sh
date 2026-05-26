@@ -102,6 +102,22 @@ fi
 
 # Host compiler: default to mingw-w64. Must target native Windows.
 CC="${CC:-x86_64-w64-mingw32-gcc}"
+
+# A shell not launched inside MSYS2's mingw64 environment may have no
+# compiler on PATH; add the standard MSYS2 location so the build works
+# out of the box (no effect if a compiler is already on PATH).
+if ! command -v "$CC" >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 \
+   && [ -x /c/msys64/mingw64/bin/gcc.exe ]; then
+    PATH="/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH"
+fi
+# If the prefixed default isn't present but a native 'gcc' is, use it
+# (MSYS2's mingw-w64-x86_64-gcc provides plain 'gcc'). An explicit CC stands.
+if ! command -v "$CC" >/dev/null 2>&1 && [ "$CC" = "x86_64-w64-mingw32-gcc" ] \
+   && command -v gcc >/dev/null 2>&1 \
+   && gcc -dumpmachine 2>/dev/null | grep -qE 'mingw|w64.*windows'; then
+    step "host compiler '$CC' not found; using native 'gcc'"
+    CC=gcc
+fi
 if ! command -v "$CC" >/dev/null 2>&1; then
     die "host compiler '$CC' not found.
       Install mingw-w64:
