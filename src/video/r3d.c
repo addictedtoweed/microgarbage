@@ -26,7 +26,8 @@ static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ?
 static inline int min3(int a, int b, int c) { int m = a < b ? a : b; return m < c ? m : c; }
 static inline int max3(int a, int b, int c) { int m = a > b ? a : b; return m > c ? m : c; }
 
-void r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
+long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
+    long tests = 0;                                       /* per-pixel edge tests (cost proxy) */
     const int npix  = fbw * fbh;
     const int use_z = (npix <= R3D_MAX_PIXELS);            /* else fall back to overwrite */
     for (int i = 0; i < npix; i++) fb[i] = 0;              /* clear to sky */
@@ -107,6 +108,7 @@ void r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
         for (int y = miny; y <= maxy; y++) {
             int64_t depth = (int64_t)za + dzdx * (int64_t)(minx - ax) + dzdy * (int64_t)(y - ay);
             for (int x = minx; x <= maxx; x++, depth += dzdx) {
+                tests++;
                 int w0 = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
                 int w1 = (cx2 - bx) * (y - by) - (cy2 - by) * (x - bx);
                 int w2 = (ax - cx2) * (y - cy2) - (ay - cy2) * (x - cx2);
@@ -123,4 +125,5 @@ void r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
             }
         }
     }
+    return tests;
 }

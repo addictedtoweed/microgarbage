@@ -60,8 +60,10 @@ typedef struct {
     int              nobjs;
 } R3dScene;
 
-/* Render the scene into fb (fbw*fbh, 8bpp palette indices; index 0 = sky). */
-void r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh);
+/* Render the scene into fb (fbw*fbh, 8bpp palette indices; index 0 = sky).
+ * Returns the number of per-pixel edge tests performed — the dominant fill
+ * term, a proxy for estimating on-cart render cycles. */
+long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh);
 
 #ifdef __cplusplus
 }
