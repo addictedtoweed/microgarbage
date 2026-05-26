@@ -18,22 +18,29 @@ track. Playback runtime is `src/video/tests/demo_fmv.c`.
 
 ## Encode (one command)
 
-`encode_fmv.sh` pipes ffmpeg straight into the encoder (no multi-GB temp), so
-the whole movie is fine — the `.fmv` just gets big (~320 MB for full BBB; SD
-is cheap). It builds `fmv_encode` itself if needed.
+`encode_fmv.sh` (bash) and `encode_fmv.ps1` (Windows PowerShell) both **build
+the tools** — the encoder and the host player — and then encode. ffmpeg is
+piped straight into the encoder (no multi-GB temp), so the whole movie is fine;
+the `.fmv` just gets big (~320 MB for full BBB; SD is cheap). Only ffmpeg + a C
+compiler (MSYS2 mingw gcc on Windows) are required.
 
 ```sh
+# bash (MSYS2 / Linux):
 tools/encode_fmv.sh movie.mp4              # whole video  -> movie.fmv + movie.pcm
 tools/encode_fmv.sh movie.mp4 -t 6         # first 6 seconds
 tools/encode_fmv.sh movie.mp4 -o intro     # -> intro.fmv + intro.pcm
 ```
+```powershell
+# Windows PowerShell (auto-adds mingw gcc, runs the binary pipe through cmd,
+# sets a space-free TMP for gcc):
+.\tools\encode_fmv.ps1 movie.mp4
+.\tools\encode_fmv.ps1 movie.mp4 -Seconds 6 -Out intro
+```
 
-Outputs land in the current directory. Then play (build the runtime once):
+Outputs land in the current directory; the scripts also build `build/demo_fmv`
+so you can play it right away:
 
 ```sh
-gcc -Wall -Wextra -Wpedantic -std=c11 -Iinclude -o build/demo_fmv \
-    src/video/ppu.c src/video/present_gl_win32.c \
-    src/video/tests/demo_fmv.c -lopengl32 -lgdi32 -luser32 -lwinmm
 ./build/demo_fmv intro.fmv intro.pcm
 ```
 
