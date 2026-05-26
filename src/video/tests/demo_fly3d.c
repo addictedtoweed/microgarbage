@@ -107,7 +107,7 @@ static V3 path_pt(float th) {
 static void gen_course(void) {
     for (int i = 0; i < MAPSZ * MAPSZ; i++) { Fmap[i] = WALL_H; Cmap[i] = OPEN_CEIL; Mmap[i] = MAT_ROCK; }
 
-    const float CORR = 13.0f;                       /* channel half-width */
+    const float CORR = 20.0f;                       /* channel half-width (wider canyon) */
     for (float th = 0.0f; th < 6.28318531f; th += 0.004f) {
         float seg = th / 6.28318531f * 8.0f;        /* 8 stretches around the loop */
         int   s = (int)seg & 7;
@@ -128,9 +128,9 @@ static void gen_course(void) {
                 if (fl < 0) fl = 0;
                 if (fl < Fmap[cell]) {                            /* carve the channel */
                     Fmap[cell] = (uint8_t)fl;
-                    Mmap[cell] = (d < CORR * 0.45f) ? MAT_LAVA     /* lava channel bottom */
-                               : (fl > 170)         ? MAT_SNOW     /* snow on high wall tops */
-                               :                      MAT_ROCK;
+                    Mmap[cell] = (d < 5.0f && !open) ? MAT_LAVA    /* narrow lava river (not whole floor) */
+                               : (fl > 170)          ? MAT_SNOW    /* snow on high wall tops */
+                               :                       MAT_ROCK;   /* rock floor either side of the river */
                 }
                 if (tunnel) {
                     int cl = (int)(p.y + 30.0f);
