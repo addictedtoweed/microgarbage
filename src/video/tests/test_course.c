@@ -185,7 +185,7 @@ static void test_eval_long(void) {
         CourseNode n;
         course_eval_long(7u, x, &n);
         ASSERT(n.z > 100.0f && n.z < 156.0f);          /* gentle meander around centre */
-        ASSERT(n.y >= 30.0f && n.y <= 50.0f);          /* ~level */
+        ASSERT(n.y >= 30.0f && n.y <= 130.0f);         /* slow descent/climb, in range */
         ASSERT(n.width > 20.0f);
     }
     course_eval_long(7u, 0.0f, &prev);                 /* smooth: tiny step => tiny change */

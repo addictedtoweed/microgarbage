@@ -198,8 +198,17 @@ static long render_fb(V3 cam, V3 fwd, V3 right, V3 up, float fov) {
     sc.rock_mat = MAT_ROCK; sc.snow_mat = MAT_SNOW; sc.lava_mat = MAT_LAVA;
     sc.sky_h = q16_from_int(90);     /* terrain tops out ~80; above it (going up) is sky */
 
+    /* The map is toroidal (period MAPSZ). The camera's world-x grows without
+     * bound on an endless run; wrap it (and z) into [0,MAPSZ) BEFORE the Q16.16
+     * conversion, or large world coords overflow Q16.16 (~32768) and lose
+     * sub-cell precision first — the "gets more mangled the longer it runs"
+     * crawl. The march adds the (small) ray offset and masks, so this is exact
+     * and consistent with the toroidal bake. Directions are unaffected. */
+    float wcx = cam.x - ffloor(cam.x / (float)MAPSZ) * (float)MAPSZ;
+    float wcz = cam.z - ffloor(cam.z / (float)MAPSZ) * (float)MAPSZ;
+
     HfCamera hc;
-    hc.pos   = vec3_q16_make(q16_from_float(cam.x),   q16_from_float(cam.y),   q16_from_float(cam.z));
+    hc.pos   = vec3_q16_make(q16_from_float(wcx),     q16_from_float(cam.y),   q16_from_float(wcz));
     hc.right = vec3_q16_make(q16_from_float(right.x), q16_from_float(right.y), q16_from_float(right.z));
     hc.up    = vec3_q16_make(q16_from_float(up.x),    q16_from_float(up.y),    q16_from_float(up.z));
     hc.fwd   = vec3_q16_make(q16_from_float(fwd.x),   q16_from_float(fwd.y),   q16_from_float(fwd.z));
@@ -307,10 +316,9 @@ int main(int argc, char **argv) {
 
     V3    cam = path_point(0.0f); cam.y += 10.0f;
     float roll = 0.0f;
-    const float LAG    = 0.04f;     /* altitude ease toward a CONSTANT cruise height */
+    const float LAG    = 0.12f;     /* altitude follow — tight (floor is slow, so no bounce) */
     const float POS_K  = 0.04f;     /* heavy lateral smoothing: a near-straight rail */
     const float AIM_K  = 0.06f;     /* gimbal smoothing of the look direction */
-    const float CAM_ALT = path_point(0.0f).y + 34.0f;   /* fixed altitude => no floor bounce */
     V3    camfwd = vnorm(vsub(path_point(26.0f), path_point(0.0f)));  /* smoothed aim vector */
 
     /* Song-locked baseline + a GENTLE leash offset (the rubber-band). The
@@ -319,7 +327,7 @@ int main(int argc, char **argv) {
      * sample position. The offset is a small simulated lead/lag; real
      * brake/accelerate input replaces it, clamped to a leash so it can
      * never drift the timeline. */
-    const float OFF_AMP = 2.5f;     /* lead/lag amplitude (map units) — subtle */
+    const float OFF_AMP = 0.0f;     /* simulated lead/lag off => dead-steady forward (drone) */
     const float OFF_W   = 0.5f;     /* lead/lag rate (rad/s)          */
     const float STREAM_SPEED = 380.0f;   /* units/sec for the endless run (fast) */
     const float cruise  = g_stream ? STREAM_SPEED
@@ -372,24 +380,42 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* DRONE rail: hold a near-straight line down the canyon at a CONSTANT
-         * altitude (no floor bounce), easing only slightly toward the path so
-         * it drifts the way Kestrel is flying — a small movement window, not a
-         * weave. The camera flies above the rim, so the slack can't clip walls. */
-        cam.x += (ctar.x - cam.x) * POS_K;
+        /* DRONE rail: a near-straight line down the canyon, easing only slightly
+         * toward the path (a small movement window, not a weave). Altitude
+         * FOLLOWS the floor's slow descent/climb (heavily smoothed, so the slow
+         * elevation comes through but fast bumps don't bounce). Flies above the
+         * rim, so the lateral slack can't clip walls. */
+        float alt_target = ctar.y + 6.0f;   /* mid-canyon (rim is ctar.y + 24) */
+        /* The FORWARD axis (x) must track tightly: smoothing it would lag the
+         * camera ~v*tau behind the path and out of the streamed window, into
+         * stale cells (walls misrendering / sliding back / blocking the view).
+         * Only the lateral (z, the weave) and altitude are smoothed. */
+        if (g_stream) cam.x = ctar.x;
+        else          cam.x += (ctar.x - cam.x) * POS_K;
         cam.z += (ctar.z - cam.z) * POS_K;
-        cam.y += (CAM_ALT - cam.y) * LAG;
-        if (wrapped) { cam.x = ctar.x; cam.z = ctar.z; cam.y = CAM_ALT; roll = 0.0f; }
+        cam.y += (alt_target - cam.y) * LAG;
+        if (wrapped) { cam.x = ctar.x; cam.z = ctar.z; cam.y = alt_target; roll = 0.0f; }
 
-        unsigned cc = ((unsigned)((int)ffloor(cam.z) & MAPMASK)) * MAPSZ
-                    +  (unsigned)((int)ffloor(cam.x) & MAPMASK);
-        if (cam.y < (float)Fmap[cc] + 14.0f) cam.y = (float)Fmap[cc] + 14.0f;
-        if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - 8.0f) cam.y = (float)Cmap[cc] - 8.0f;
+        if (g_stream) {
+            /* stay INSIDE the canyon: above the lava AND below the rim, so a
+             * lagging altitude on a fast descent can't float up to rim level
+             * (which shows the canyon's cross-section from above). Rim sits at
+             * ctar.y + 24, so cap a few units under it. */
+            float min_y = ctar.y - 6.0f;     /* off the floor/lava */
+            float max_y = ctar.y + 18.0f;    /* below the rim -> always in-canyon */
+            if (cam.y < min_y) cam.y = min_y;
+            if (cam.y > max_y) cam.y = max_y;
+        } else {
+            unsigned cc = ((unsigned)((int)ffloor(cam.z) & MAPMASK)) * MAPSZ
+                        +  (unsigned)((int)ffloor(cam.x) & MAPMASK);
+            if (cam.y < (float)Fmap[cc] + 14.0f) cam.y = (float)Fmap[cc] + 14.0f;
+            if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - 8.0f) cam.y = (float)Cmap[cc] - 8.0f;
+        }
 
         /* look AHEAD and gently down INTO the canyon, with a gimbal-damped
          * aim so the drone glides instead of twitching with the path */
         V3 look = path_point(dist + 34.0f);
-        look.y += 14.0f;                                     /* gentle downward look from the higher vantage */
+        look.y += 2.0f;                                      /* look ~level down the canyon axis */
         V3 want_fwd = vnorm(vsub(look, cam));
         if (wrapped) camfwd = want_fwd;                      /* don't ease across the seam */
         camfwd = vnorm(vadd(camfwd, vmul(vsub(want_fwd, camfwd), AIM_K)));
