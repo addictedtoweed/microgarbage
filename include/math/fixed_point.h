@@ -89,6 +89,21 @@ static inline int16_t fx_sat16_(int64_t v) {
     return (int16_t)v;
 }
 
+/* Floor of the integer square root of a 64-bit value, with no FPU and
+ * no division: the classic restoring bit-by-bit method, one step per
+ * two bits. The building block for q16_sqrt / q16_rsqrt and vector
+ * normalize. Branch-predictable; ~24 iterations for a 48-bit input. */
+static inline uint32_t fx_isqrt64(uint64_t x) {
+    uint64_t res = 0, bit = (uint64_t)1 << 62;   /* top even power of two */
+    while (bit > x) bit >>= 2;
+    while (bit != 0) {
+        if (x >= res + bit) { x -= res + bit; res = (res >> 1) + bit; }
+        else                  res >>= 1;
+        bit >>= 2;
+    }
+    return (uint32_t)res;
+}
+
 /* ============================================================
  *  Q15 — int16, 15 fractional bits
  * ============================================================ */
@@ -190,6 +205,25 @@ static inline q16_16_t q16_mac(q16_16_t a, q16_16_t b, q16_16_t c) {
 }
 static inline q16_16_t q16_reciprocal(q16_16_t x) {
     return (q16_16_t)(((int64_t)Q16_ONE << Q16_FRAC_BITS) / x);
+}
+
+/* sqrt(x) in Q16.16. x must be >= 0. Exact for perfect squares,
+ * floor-rounded otherwise. No FPU, no divide (~24 shift/compare steps).
+ * Valid for the full positive Q16.16 range. */
+static inline q16_16_t q16_sqrt(q16_16_t x) {
+    if (x <= 0) return 0;
+    return (q16_16_t)fx_isqrt64((uint64_t)(uint32_t)x << Q16_FRAC_BITS);
+}
+
+/* 1/sqrt(x) in Q16.16 (reciprocal square root). x must be > 0.
+ * Identity: (2^24 / sqrt(x_raw)) == sqrt(2^48 / x_raw), so this is one
+ * 64-bit divide + one isqrt — no FPU, no Newton iteration. This is the
+ * per-pixel normalize hot path. Precision is excellent for small x and
+ * degrades to ~1% for very large x; vec3_q16_normalize uses the same
+ * trick on a 64-bit length^2 so it stays correct past the Q16.16 range. */
+static inline q16_16_t q16_rsqrt(q16_16_t x) {
+    if (x <= 0) return Q16_MAX;
+    return (q16_16_t)fx_isqrt64(((uint64_t)1 << 48) / (uint64_t)(uint32_t)x);
 }
 
 static inline q16_16_t q16_sat_add(q16_16_t a, q16_16_t b) { return fx_sat32_((int64_t)a + b); }

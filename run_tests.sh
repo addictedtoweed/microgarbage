@@ -70,6 +70,9 @@ run spsc_ring_stress containers  src/containers/spsc_ring.c -lpthread
 run bits             math
 run fixed_point      math  src/math/fixed_point.c
 run fast_div         math  src/math/fast_div.c
+run vec3_q16         math                       # header-only (fixed_point.h + vec3_q16.h)
+run trig_q16         math  src/math/trig_q16.c
+run mat_q16          math  src/math/trig_q16.c   # mat rotation ctors call CORDIC trig
 
 # ---- memory ----
 run bump             memory  src/memory/bump.c
