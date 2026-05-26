@@ -11,9 +11,12 @@
  *  grid: world RAM is vertices+indices (KB), scratch is sized to the
  *  scene, and "draw distance" is just how much geometry you submit.
  *
- *  v1: backface cull + painter's-algorithm depth sort (far first);
- *  near-crossing triangles are dropped. Near-plane clipping and a
- *  z-buffer (for interpenetrating geometry) are follow-ups.
+ *  Backface cull + a per-pixel z-buffer (depth = 1/z, interpolated from
+ *  per-triangle gradients), so terrain and placed objects occlude each
+ *  other correctly regardless of size or draw order — no depth sorting
+ *  needed for opaque geometry. Near-crossing triangles are dropped
+ *  (near-plane clipping is a follow-up); a depth sort would only return
+ *  for translucent passes (e.g. glowing lava).
  *
  *  Public domain (CC0). No warranty.
  * ============================================================ */

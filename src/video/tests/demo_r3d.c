@@ -24,8 +24,13 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define FBW 128
-#define FBH 112
+/* Resolution is bounded by the SNES vblank DMA budget: the 8bpp framebuffer
+ * is 1 byte/pixel into the Mode-7 char data each frame, so fbw*fbh bytes must
+ * fit. NTSC vblank (auto-joypad disabled) = 38*1364/8 = 6479 B/vblank, so
+ * 60fps <= 6479 B, 30fps <= 12958 B. Dims must be x8 (tiles) and
+ * (fbw/8)*(fbh/8) <= 256. 120x104 = 12480 B fits 30fps; 96x64 = 6144 B = 60fps. */
+#define FBW 120
+#define FBH 104
 #define BGR555(r,g,b) ((uint16_t)((r) | ((g) << 5) | ((b) << 10)))
 #define CUBE_BASE 1
 #define CUBE_RAMP 24
