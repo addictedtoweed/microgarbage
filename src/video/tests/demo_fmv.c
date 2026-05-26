@@ -19,6 +19,7 @@
 #ifndef FMV_HEADLESS
 #include "video/present.h"
 #include <windows.h>
+#include <mmsystem.h>
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +36,15 @@
 #define CHR_W  0x2000      /* CHR base (word, 8KB-aligned) */
 #define BLANK_TILE NTILES  /* tile 780 = zeroed = backdrop, for the margins */
 
+/* SNES NTSC DMA budget, for the HUD */
+#define NTSC_LINES  262
+#define LINE_CYC    1364
+#define STD_ACTIVE  224
+#define LETTERBOX   (STD_ACTIVE - VH)         /* 16 forced-blank lines    */
+#define VBLANK_STD  (NTSC_LINES - STD_ACTIVE) /* 38 normal vblank lines   */
+#define BLANK_LINES (LETTERBOX + VBLANK_STD)  /* 54 lines of DMA / 60Hz   */
+#define DMA_WIN     (BLANK_LINES*LINE_CYC/8)  /* bytes/60Hz (no joypad read) */
+
 static PpuState P;
 static uint32_t FB[PPU_SCREEN_W * PPU_SCREEN_H];
 static uint8_t *clip;          /* whole .fmv in memory */
@@ -46,11 +56,11 @@ static void load_frame(int f) {
     const uint8_t *tm = blk + 8*16*2;
     const uint8_t *ch = tm + NTILES*2;
     memcpy(P.cgram, cg, 8*16*2);                          /* 128 palette entries */
-    for (int i = 0; i < 1024; i++) P.vram[TMAP_W + i] = BLANK_TILE;   /* blank the nametable */
-    for (int r = 0; r < TH; r++)
+    for (int i = 0; i < 1024; i++) P.vram[TMAP_W + i] = BLANK_TILE;   /* blank -> black backdrop */
+    for (int r = 0; r < TH; r++)                                      /* centered: 8px margin all round */
         for (int c = 0; c < TW; c++) {
             int s = (r*TW + c) * 2;
-            P.vram[TMAP_W + r*32 + c] = (uint16_t)(tm[s] | (tm[s+1] << 8));
+            P.vram[TMAP_W + (r+1)*32 + (c+1)] = (uint16_t)(tm[s] | (tm[s+1] << 8));
         }
     memcpy(&P.vram[CHR_W], ch, NTILES*32);                /* 12480 words of CHR */
 }
@@ -102,21 +112,93 @@ static double now_sec(void) {
     LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)f.QuadPart;
 }
+
+/* ---- audio = master clock (sidecar raw PCM: s16le, stereo, AUDIO_RATE) ---- */
+#define AUDIO_RATE 44100        /* CD quality, matching the mixer's 16-bit signed output */
+static HWAVEOUT g_hwo;
+static WAVEHDR  g_hdr;
+static char    *g_pcm;
+static DWORD    g_total;        /* sample-frames in the clip */
+static int      g_audio;
+
+static int load_audio(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); return 0; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    g_pcm = malloc(sz);
+    if (fread(g_pcm, 1, sz, f) != (size_t)sz) { fclose(f); return 0; }
+    fclose(f);
+    g_total = (DWORD)(sz / 4);                       /* stereo s16 = 4 bytes/frame */
+    WAVEFORMATEX wf; memset(&wf, 0, sizeof wf);
+    wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = 2; wf.nSamplesPerSec = AUDIO_RATE;
+    wf.wBitsPerSample = 16; wf.nBlockAlign = 4; wf.nAvgBytesPerSec = AUDIO_RATE * 4;
+    if (waveOutOpen(&g_hwo, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        fprintf(stderr, "waveOutOpen failed\n"); return 0;
+    }
+    memset(&g_hdr, 0, sizeof g_hdr); g_hdr.lpData = g_pcm; g_hdr.dwBufferLength = (DWORD)sz;
+    waveOutPrepareHeader(g_hwo, &g_hdr, sizeof g_hdr);
+    waveOutWrite(g_hwo, &g_hdr, sizeof g_hdr);
+    g_audio = 1;
+    printf("audio: %s (%.1fs @ %d Hz stereo) = master clock\n", path, (double)g_total/AUDIO_RATE, AUDIO_RATE);
+    return 1;
+}
+static int audio_video_frame(void) {                 /* current video frame from the play cursor */
+    MMTIME mt; mt.wType = TIME_SAMPLES;
+    waveOutGetPosition(g_hwo, &mt, sizeof mt);
+    DWORD pos = (mt.wType == TIME_SAMPLES) ? mt.u.sample
+              : (mt.wType == TIME_BYTES)   ? mt.u.cb / 4 : 0;
+    if (pos >= g_total) {                             /* clip ended -> loop audio + video together */
+        waveOutReset(g_hwo); g_hdr.dwFlags &= ~WHDR_DONE;
+        waveOutWrite(g_hwo, &g_hdr, sizeof g_hdr); pos = 0;
+    }
+    int vf = (int)((long long)pos * fps / AUDIO_RATE);
+    return vf < 0 ? 0 : vf >= nframes ? nframes - 1 : vf;
+}
+static void audio_shutdown(void) {
+    if (!g_audio) return;
+    waveOutReset(g_hwo); waveOutUnprepareHeader(g_hwo, &g_hdr, sizeof g_hdr);
+    waveOutClose(g_hwo); free(g_pcm);
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: demo_fmv <clip.fmv>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "usage: demo_fmv <clip.fmv> [audio.pcm]\n"); return 1; }
     if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - FMV")) return 1;
     if (!load_clip(argv[1])) return 1;
+    if (argc >= 3) load_audio(argv[2]);
     setup();
     fflush(stdout);
 
-    double t0 = now_sec();
-    int last = -1;
+    double t0 = now_sec(), report = t0;
+    int last = -1; unsigned frames = 0; double hostfps = 0;
+    int vbpf = (60 + fps - 1) / fps;                  /* 60Hz windows per video frame (3 @20fps) */
     while (!present_should_close()) {
-        double t = now_sec() - t0;
-        int vf = (int)(t * fps) % nframes;
+        double now = now_sec();
+        int vf;
+        if (g_audio) vf = audio_video_frame();        /* audio drives video */
+        else vf = (int)((now - t0) * fps) % nframes;
         if (vf != last) { load_frame(vf); ppu_render(&P, FB); last = vf; }
+
+        int need = BLOCK, avail = vbpf * DMA_WIN;
+        char ov[512];
+        snprintf(ov, sizeof ov,
+            "SNES PPU emulated (Mode 1, 4bpp) - FMV streamed from coprocessor\n"
+            "video res     : %d x %d   (4bpp, 8 palettes/frame, uncompressed)\n"
+            "lines rendered: %d active / %d total\n"
+            "blank window  : %d lines (%d forced-blank + %d vblank, no joypad read)\n"
+            "DMA bandwidth : %d B / 60Hz frame   (%d*%d/8)\n"
+            "DMA @%d fps    : %d B need | %d avail (%d windows) -> %s\n"
+            "framerate     : %d fps video | %.1f host present | audio %s\n"
+            "keys          : I info | V vsync | F filter | F11 fullscreen | Esc quit",
+            VW, VH, VH, NTSC_LINES,
+            BLANK_LINES, LETTERBOX, VBLANK_STD,
+            DMA_WIN, BLANK_LINES, LINE_CYC,
+            fps, need, avail, vbpf, (need <= avail ? "FITS" : "OVER"),
+            fps, hostfps, g_audio ? "ON (44.1kHz)" : "off (pass a .pcm)");
+        present_set_overlay(ov);
         present_frame(FB);
+        frames++;
+        if (now - report >= 1.0) { hostfps = (double)frames / (now - report); report = now; frames = 0; }
     }
+    audio_shutdown();
     present_shutdown();
     free(clip);
     return 0;

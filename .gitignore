@@ -64,7 +64,9 @@ meson-info/
 *.rgb
 *.fmv
 *.ppm
-/fmv_encode.exe
+*.pcm
+fmv_encode
+fmv_encode.exe
 
 # Audio assets dropped into host_files for local testing (e.g. a song
 # streamed via /host/music.wav). These are user-supplied and often

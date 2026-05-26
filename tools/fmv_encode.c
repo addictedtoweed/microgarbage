@@ -4,7 +4,8 @@
  * of 15 colors + 1 shared backdrop, each 8x8 tile assigned to its best palette,
  * pixels quantized to 4bpp with ordered dither.
  *
- *   gcc -Wall -O2 -o fmv_encode src/video/tests/fmv_encode.c
+ *   gcc -Wall -O2 -o tools/fmv_encode tools/fmv_encode.c
+ *   # ...or just use tools/encode_fmv.sh, which builds + runs this for you.
  *   # one frame -> fmv_frame.bin + fmv_preview.ppm:
  *   ./fmv_encode
  *   ./fmv_encode bbb.rgb
@@ -24,6 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 #define W 240
 #define H 208
@@ -127,9 +132,7 @@ static void median_cut(Col *px, int n, int k, Col *out) {
 
 /* ---- quantize the current img into palette/bg/tilepal/chr (+ mse) ---- */
 static void quantize(void) {
-    long sr=0,sg=0,sb=0;
-    for (int i=0;i<W*H;i++){ sr+=img[i].r; sg+=img[i].g; sb+=img[i].b; }
-    bg = (Col){(int)(sr/(W*H)),(int)(sg/(W*H)),(int)(sb/(W*H))};
+    bg = (Col){0, 0, 0};        /* black backdrop: free black letterbox + true black shadows */
 
     for (int t=0;t<NTILES;t++){ Col px[64]; tile_pixels(t,px);
         long ar=0,ag=0,ab=0; for(int i=0;i<64;i++){ar+=px[i].r;ag+=px[i].g;ab+=px[i].b;}
@@ -210,14 +213,20 @@ int main(int argc, char **argv) {
                n, argv[3], BLOCK, (long)16 + (long)n*BLOCK, (double)n/FPS, FPS);
         return 0;
     }
-    if (argc >= 3) {                                    /* in.rgb out.fmv [nframes] */
-        FILE *in = fopen(argv[1], "rb"); if (!in) { perror(argv[1]); return 1; }
-        FILE *o  = fopen(argv[2], "wb"); if (!o)  { perror(argv[2]); return 1; }
+    if (argc >= 3) {                                    /* in.rgb (or "-" stdin) -> out.fmv [nframes] */
+        FILE *in;
+        if (!strcmp(argv[1], "-")) {
+#ifdef _WIN32
+            _setmode(_fileno(stdin), _O_BINARY);        /* raw bytes, not text mode */
+#endif
+            in = stdin;
+        } else { in = fopen(argv[1], "rb"); if (!in) { perror(argv[1]); return 1; } }
+        FILE *o = fopen(argv[2], "wb"); if (!o) { perror(argv[2]); return 1; }
         hdr(o, 0);                                      /* nframes patched at end */
         int maxf = (argc > 3) ? atoi(argv[3]) : (1<<30), nf = 0;
         while (nf < maxf && read_frame(in)) { quantize(); write_block(o); if (nf==0) write_preview("fmv_preview.ppm"); nf++; }
         fseek(o, 12, SEEK_SET); w32(o, nf);
-        fclose(o); fclose(in);
+        fclose(o); if (in != stdin) fclose(in);
         printf("encoded %d frames -> %s  (%d B/frame, total %ld B, %.1fs @ %dfps)\n",
                nf, argv[2], BLOCK, (long)16 + (long)nf*BLOCK, (double)nf/FPS, FPS);
         return 0;
