@@ -54,6 +54,9 @@ static struct {
     GLuint          tex;
     bool            vsync;          /* swap interval currently on?           */
     PFN_wglSwapIntervalEXT swap_interval;  /* loaded fn ptr, or NULL         */
+    GLuint          font_base;      /* wglUseFontBitmaps display-list base, 0 = none */
+    bool            overlay_on;     /* host debug overlay visible (I key)    */
+    char            overlay[512];   /* multi-line overlay text               */
     char            renderer[128];  /* GL_RENDERER string (HW vs software GL) */
     LONG_PTR        saved_style;    /* windowed style, for fullscreen toggle */
     WINDOWPLACEMENT saved_place;
@@ -72,6 +75,60 @@ static void apply_filter(void) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
 }
 
+/* Draw the host overlay text (top-left) over the finished scene. Uses an
+ * ortho pixel projection across the whole client area; a translucent dark
+ * box backs the green monospace text for readability. */
+static void draw_overlay(int cw, int ch) {
+    if (!g.overlay_on || !g.font_base || !g.overlay[0]) return;
+
+    int lines = 1, maxlen = 0, cur = 0;
+    for (const char *p = g.overlay; ; p++) {
+        if (*p == '\n' || *p == '\0') {
+            if (cur > maxlen) maxlen = cur;
+            cur = 0;
+            if (*p == '\0') break;
+            lines++;
+        } else cur++;
+    }
+    const int lh = 17, pad = 6, cwid = 9;       /* line height, padding, glyph advance (px) */
+    int boxw = maxlen * cwid + pad * 2;
+    int boxh = lines * lh + pad * 2;
+    int bx = 6, by = ch - 6 - boxh;
+
+    glViewport(0, 0, cw, ch);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glOrtho(0, cw, 0, ch, -1, 1);
+    glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
+    glDisable(GL_TEXTURE_2D);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.6f);
+    glBegin(GL_QUADS);
+        glVertex2i(bx, by); glVertex2i(bx + boxw, by);
+        glVertex2i(bx + boxw, by + boxh); glVertex2i(bx, by + boxh);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(0.55f, 1.0f, 0.65f);
+    glListBase(g.font_base);
+    int x = bx + pad, y = by + boxh - pad - 12;
+    const char *p = g.overlay;
+    while (*p) {
+        char line[160]; int n = 0;
+        while (*p && *p != '\n' && n < 159) line[n++] = *p++;
+        glRasterPos2i(x, y);
+        glCallLists(n, GL_UNSIGNED_BYTE, line);
+        y -= lh;
+        if (*p == '\n') p++;
+    }
+
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glEnable(GL_TEXTURE_2D);
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+}
+
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CLOSE:
@@ -87,6 +144,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case 'F': present_set_filter(g.filter == PRESENT_FILTER_NEAREST
                                      ? PRESENT_FILTER_LINEAR : PRESENT_FILTER_NEAREST); break;
         case 'V': present_set_vsync(!g.vsync); break;
+        case 'I': g.overlay_on = !g.overlay_on; break;
         default: break;
         }
         return 0;
@@ -157,6 +215,25 @@ bool present_init(int fb_w, int fb_h, const char *title) {
         const char *s = rs ? (const char *)rs : "(unknown)";
         strncpy(g.renderer, s, sizeof g.renderer - 1u);
         g.renderer[sizeof g.renderer - 1u] = '\0';
+    }
+
+    /* bitmap font for the host debug overlay (monochrome glyph display lists
+     * baked from a GDI monospace font; drawn with glBitmap, no texture). */
+    {
+        HFONT font = CreateFontA(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        if (font) {
+            HGDIOBJ old = SelectObject(g.hdc, font);
+            g.font_base = glGenLists(256);
+            if (g.font_base && !wglUseFontBitmapsA(g.hdc, 0, 256, g.font_base)) {
+                glDeleteLists(g.font_base, 256);
+                g.font_base = 0;
+            }
+            SelectObject(g.hdc, old);
+            DeleteObject(font);
+        }
+        g.overlay_on = true;
     }
 
     glGenTextures(1, &g.tex);
@@ -230,6 +307,7 @@ void present_frame(const uint32_t *framebuffer) {
         glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f,  1.0f);
     glEnd();
 
+    draw_overlay(cw, ch);            /* host debug HUD, over the emulated scene */
     SwapBuffers(g.hdc);
 }
 
@@ -284,6 +362,13 @@ void present_set_vsync(bool on) {
     if (g.swap_interval(on ? 1 : 0) != FALSE) g.vsync = on;  /* reflect the new state */
 }
 
+void present_set_overlay(const char *text) {
+    if (!g.inited) return;
+    if (!text) { g.overlay[0] = '\0'; return; }
+    strncpy(g.overlay, text, sizeof g.overlay - 1u);
+    g.overlay[sizeof g.overlay - 1u] = '\0';
+}
+
 void present_set_filter(PresentFilter filter) {
     if (!g.inited) return;
     g.filter = filter;
@@ -292,6 +377,7 @@ void present_set_filter(PresentFilter filter) {
 
 void present_shutdown(void) {
     if (!g.inited) return;
+    if (g.font_base) glDeleteLists(g.font_base, 256);
     if (g.tex)   glDeleteTextures(1, &g.tex);
     wglMakeCurrent(NULL, NULL);
     if (g.hglrc) wglDeleteContext(g.hglrc);
@@ -317,6 +403,7 @@ void present_set_fullscreen(bool on) { (void)on; }
 void present_set_aspect(PresentAspect aspect) { (void)aspect; }
 void present_set_filter(PresentFilter filter) { (void)filter; }
 void present_set_vsync(bool on) { (void)on; }
+void present_set_overlay(const char *text) { (void)text; }
 void present_shutdown(void) { }
 
 #endif

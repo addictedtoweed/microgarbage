@@ -31,6 +31,11 @@
  * (fbw/8)*(fbh/8) <= 256. 120x104 = 12480 B fits 30fps; 96x64 = 6144 B = 60fps. */
 #define FBW 120
 #define FBH 104
+/* SNES NTSC vblank DMA budget, for the host HUD overlay. */
+#define NTSC_LINES     262
+#define LINE_CYCLES    1364
+#define VBLANK_LINES   (NTSC_LINES - PPU_SCREEN_H)        /* 38 visible-mode vblank lines */
+#define DMA_PER_VBLANK (VBLANK_LINES * LINE_CYCLES / 8)   /* bytes (joypad auto-read off) */
 #define BGR555(r,g,b) ((uint16_t)((r) | ((g) << 5) | ((b) << 10)))
 #define CUBE_BASE 1
 #define CUBE_RAMP 24
@@ -150,23 +155,43 @@ static double now_sec(void) {
 int main(void) {
     if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - r3d polygon test")) return 1;
     printf("GL: %s\nr3d: spinning flat-shaded cube (%dx%d -> Mode 7)\n", present_gl_renderer(), FBW, FBH);
+    printf("keys: I = info overlay, V = vsync, F11 = fullscreen\n");
     fflush(stdout);
 
     build_palette();
     build_scene();
     double t0 = now_sec(), report = t0;
     unsigned frames = 0;
+    double fps = 0.0;
     while (!present_should_close()) {
         float t = (float)(now_sec() - t0);
         spin(q16_from_double(t * 0.7), q16_from_double(t * 0.5));
         r3d_render(&scene, fbuf, FBW, FBH);
         load_mode7();
         ppu_render(&P, FB);
+
+        int need = FBW * FBH, avail = 2 * DMA_PER_VBLANK;   /* 30 fps = 2 vblanks */
+        char ov[512];
+        snprintf(ov, sizeof ov,
+            "SNES PPU emulated (Mode 7) - geometry on host coprocessor\n"
+            "rendered bitmap : %d x %d   (8bpp = %d B)\n"
+            "display out     : %d x %d   (Mode 7 stretch)\n"
+            "active lines    : %d / %d   (vblank = %d lines)\n"
+            "DMA / vblank    : %d B   (%d*%d/8, joypad-read off)\n"
+            "DMA / frame     : %d need | %d avail @30fps -> %s\n"
+            "render rate     : %.1f fps (host)",
+            FBW, FBH, need,
+            PPU_SCREEN_W, PPU_SCREEN_H,
+            PPU_SCREEN_H, NTSC_LINES, VBLANK_LINES,
+            DMA_PER_VBLANK, VBLANK_LINES, LINE_CYCLES,
+            need, avail, (need <= avail ? "FITS" : "OVER"),
+            fps);
+        present_set_overlay(ov);
         present_frame(FB);
         frames++;
         double now = now_sec();
-        if (now - report >= 1.0) { printf("  %.1f fps\n", (double)frames / (now - report));
-            fflush(stdout); report = now; frames = 0; }
+        if (now - report >= 1.0) { fps = (double)frames / (now - report);
+            printf("  %.1f fps\n", fps); fflush(stdout); report = now; frames = 0; }
     }
     present_shutdown();
     return 0;

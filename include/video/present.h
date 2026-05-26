@@ -75,6 +75,11 @@ void present_set_aspect(PresentAspect aspect);
 void present_set_filter(PresentFilter filter);
 void present_set_vsync(bool on);    /* enable/disable swap-interval vsync at runtime */
 
+/* HOST debug overlay (drawn OVER the emulated PPU output, not part of it):
+ * a multi-line monospace string in the top-left. NULL/"" clears it. Bound to
+ * the I key (toggle). For showing resolution / DMA budget / fps to onlookers. */
+void present_set_overlay(const char *text);
+
 /* Diagnostics (valid after present_init).
  *  present_vsync_requested(): true if vsync was successfully enabled via
  *    WGL_EXT_swap_control. False means the swap interval couldn't be set
