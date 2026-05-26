@@ -253,8 +253,8 @@ void course_generate_long(uint32_t seed, float length_x, float mapsz, CourseDef 
         out->node[i].lava  = open ? 0.0f : (4.0f + r2 * 5.0f);
 
         rng = rng*1664525u + 1013904223u;
-        zvel += ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 2.0f;   /* faint random steer */
-        zvel += (mapsz * 0.5f - z) * 0.05f;            /* firm pull to centre: nearly straight */
+        zvel += ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 1.5f;   /* very faint steer */
+        zvel += (mapsz * 0.5f - z) * 0.06f;            /* strong pull to centre: ~straight */
         if (zvel >  6.0f) zvel =  6.0f;
         if (zvel < -6.0f) zvel = -6.0f;
         z += zvel;
@@ -313,5 +313,73 @@ void course_bake_strip(const CourseDef *c, uint8_t *floor, uint8_t *ceiling,
                 }
             }
         }
+    }
+}
+
+/* Stamp one node's corridor into the maps (toroidal in both axes). */
+static void stamp_corridor(uint8_t *floor, uint8_t *ceiling, uint8_t *material,
+                           int mapsz, unsigned mask, const CourseNode *nd) {
+    int rad = (int)nd->width;
+    if (rad < 1) rad = 1;
+    float w2 = nd->width * nd->width;
+    float lava2 = nd->lava * nd->lava;
+    int cx0 = (int)nd->x, cz0 = (int)nd->z;
+    for (int dz = -rad; dz <= rad; dz++) {
+        for (int dx = -rad; dx <= rad; dx++) {
+            float d2 = (float)(dx * dx + dz * dz);
+            if (d2 > w2) continue;
+            unsigned cell = (((unsigned)(cz0 + dz) & mask) * (unsigned)mapsz)
+                          +  ((unsigned)(cx0 + dx) & mask);
+            float u2 = (w2 > 0.0f) ? d2 / w2 : 0.0f;
+            uint8_t fl = clamp_u8(nd->y + u2 * nd->wall);
+            if (fl < floor[cell]) {
+                floor[cell] = fl;
+                material[cell] = (nd->lava > 0.0f && d2 < lava2) ? COURSE_MAT_LAVA
+                               : (fl > 170)                      ? COURSE_MAT_SNOW
+                               :                                   COURSE_MAT_ROCK;
+            }
+            if (nd->ceil > 0.0f) {
+                uint8_t cl = clamp_u8(nd->y + nd->ceil);
+                if (cl < ceiling[cell]) ceiling[cell] = cl;
+            }
+        }
+    }
+}
+
+void course_eval_long(uint32_t seed, float x, CourseNode *out) {
+    /* seed -> phase offsets so different seeds give different runs */
+    float p1 = (float)(seed         & 0xFF) * 0.0246f;
+    float p2 = (float)((seed >> 8)  & 0xFF) * 0.0246f;
+    float p3 = (float)((seed >> 16) & 0xFF) * 0.0246f;
+
+    out->x     = x;
+    out->z     = 128.0f + 7.0f * fsin_(x * 0.011f + p1)
+                        + 3.0f * fsin_(x * 0.027f + p2);   /* gentle, low-amplitude meander */
+    out->y     = 40.0f  + 3.0f * fsin_(x * 0.019f + p3);   /* ~level */
+    out->width = 34.0f  + 6.0f * fsin_(x * 0.013f + p1);   /* 28..40 */
+    out->wall  = 26.0f  + 6.0f * fsin_(x * 0.021f + p2);   /* edge ~ rim */
+    out->ceil  = 0.0f;                                     /* open (tunnels: TODO) */
+    float gate = fsin_(x * 0.006f + p3);                   /* slow open/lava alternation */
+    out->lava  = (gate > 0.25f) ? (5.0f + 3.0f * fsin_(x * 0.05f)) : 0.0f;
+}
+
+void course_bake_strip_proc(uint32_t seed, uint8_t *floor, uint8_t *ceiling,
+                            uint8_t *material, int mapsz, int x_lo, int x_hi) {
+    unsigned mask = (unsigned)(mapsz - 1);
+
+    for (int xc = x_lo; xc < x_hi; xc++) {                 /* clear strip columns to rim */
+        unsigned xm = (unsigned)xc & mask;
+        for (int z = 0; z < mapsz; z++) {
+            unsigned idx = (unsigned)z * (unsigned)mapsz + xm;
+            floor[idx]    = (uint8_t)COURSE_WALL_H;
+            ceiling[idx]  = (uint8_t)COURSE_OPEN_CEIL;
+            material[idx] = COURSE_MAT_ROCK;
+        }
+    }
+    const float WMAX = 52.0f;
+    for (float x = (float)x_lo - WMAX; x <= (float)x_hi + WMAX; x += 0.5f) {
+        CourseNode nd;
+        course_eval_long(seed, x, &nd);
+        stamp_corridor(floor, ceiling, material, mapsz, mask, &nd);
     }
 }

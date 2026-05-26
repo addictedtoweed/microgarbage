@@ -103,6 +103,18 @@ void course_generate_long(uint32_t seed, float length_x, float mapsz, CourseDef 
 void course_bake_strip(const CourseDef *c, uint8_t *floor, uint8_t *ceiling,
                        uint8_t *material, int mapsz, int x_lo, int x_hi);
 
+/* ---- infinite procedural path (endless streaming) --------- */
+
+/* The long course as a PURE FUNCTION of world-x: smooth seed-seeded sine
+ * layers, no node array and no bounds, so it can be sampled at ANY x and
+ * the flight runs forever. (The cart evaluates this per strip.) */
+void course_eval_long(uint32_t seed, float x, CourseNode *out);
+
+/* Bake one world-x strip [x_lo,x_hi) (toroidal in x) from the procedural
+ * path — the infinite-streaming counterpart of course_bake_strip. */
+void course_bake_strip_proc(uint32_t seed, uint8_t *floor, uint8_t *ceiling,
+                            uint8_t *material, int mapsz, int x_lo, int x_hi);
+
 #ifdef __cplusplus
 }
 #endif

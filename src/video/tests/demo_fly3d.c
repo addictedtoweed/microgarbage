@@ -105,6 +105,8 @@ static V3 vnorm(V3 a) { float inv = 1.0f / fsqrt(a.x * a.x + a.y * a.y + a.z * a
  * uses at level-load). */
 static CourseDef g_course;
 static CourseArc g_arc;        /* distance<->param table, built once at load */
+static bool      g_stream = false;   /* infinite procedural-stream mode */
+static uint32_t  g_seed   = 1234u;   /* seed for the procedural stream   */
 
 /* Built-in fallback: a gentle, near-level lava-canyon descent. The floor
  * stays roughly level relative to the rim (COURSE_WALL_H) so the camera —
@@ -117,7 +119,7 @@ static void build_default_course(CourseDef *c) {
     for (int i = 0; i < 7; i++) {
         float f = (float)i / 6.0f;
         c->node[i].x = 36.0f + 184.0f * f;
-        c->node[i].z = 128.0f + 5.0f * fsin(f * 3.0f);    /* faint bends, nearly straight */
+        c->node[i].z = 128.0f + 3.0f * fsin(f * 3.0f);    /* barely-there bends */
         c->node[i].y = 40.0f + 2.5f * fsin(f * 5.0f);     /* ~level, minimal bob */
         c->node[i].width = 34.0f;
         c->node[i].wall  = 28.0f;                          /* edge ~68 ~ rim 70 */
@@ -246,6 +248,18 @@ static V3 ride_d(float d) {
     return ride(course_param_at_distance(&g_arc, d));
 }
 
+/* Camera-height path point at distance d. In stream mode the path is the
+ * infinite procedural function of world-x (x == d, the ribbon is ~straight);
+ * otherwise it's the finite spline via the arc table. */
+static V3 path_point(float d) {
+    if (g_stream) {
+        CourseNode n;
+        course_eval_long(g_seed, d, &n);
+        return v3(d, n.y + 16.0f, n.z);
+    }
+    return ride_d(d);
+}
+
 int main(int argc, char **argv) {
     if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - course flythrough")) return 1;
     printf("GL renderer : %s\n", present_gl_renderer());
@@ -261,12 +275,10 @@ int main(int argc, char **argv) {
     const float STREAM_LEAD = 200.0f; /* bake this far ahead of the camera (must be < MAPSZ) */
 
     if (argc > 1 && strncmp(argv[1], "stream", 6) == 0) {
-        uint32_t seed = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
-        course_generate_long(seed, GEN_VEL * 60.0f, (float)MAPSZ, &g_course);
+        g_seed   = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
+        g_stream = true;             /* endless procedural path — no node array, runs forever */
         streaming = true;
-        SONG_SEC = 11.0f;            /* fast cruise down the canyon, one pass before it wraps */
-        printf("course: streamed long ribbon seed=%u, %d nodes (~60s, sliding window)\n",
-               seed, g_course.count);
+        printf("course: endless procedural canyon, seed=%u (sliding window)\n", g_seed);
     } else if (argc > 1 && strncmp(argv[1], "gen", 3) == 0) {
         uint32_t seed = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
         course_generate(seed, SONG_SEC, GEN_VEL, (float)MAPSZ, &g_course);
@@ -279,24 +291,27 @@ int main(int argc, char **argv) {
         printf("course: built-in canyon (arg: a .course file, 'gen [seed]', or 'stream [seed]')\n");
     }
 
-    course_build_arc(&g_course, &g_arc);
-    if (streaming) {
-        baked_to = ride_d(0.0f).x + STREAM_LEAD;   /* prime the window at the start */
-        course_bake_strip(&g_course, Fmap, Cmap, Mmap, MAPSZ, 0, (int)baked_to);
+    float total = 0.0f;
+    if (g_stream) {
+        baked_to = path_point(0.0f).x + STREAM_LEAD;   /* prime the window at the start */
+        course_bake_strip_proc(g_seed, Fmap, Cmap, Mmap, MAPSZ, 0, (int)baked_to);
+        printf("endless run; %dx%d raycast -> Mode 7 stretch.\n", FBW, FBH);
     } else {
+        course_build_arc(&g_course, &g_arc);
         course_bake(&g_course, Fmap, Cmap, Mmap, MAPSZ);
+        total = g_arc.total;
+        printf("course length: %.0f units; %dx%d raycast -> Mode 7 stretch; %.0fs run.\n",
+               total, FBW, FBH, SONG_SEC);
     }
-    float total = g_arc.total;
-    printf("course length: %.0f units; %dx%d raycast -> Mode 7 stretch; %.0fs run.\n",
-           total, FBW, FBH, SONG_SEC);
     fflush(stdout);
 
-    V3    cam = ride_d(0.0f); cam.y += 10.0f;
+    V3    cam = path_point(0.0f); cam.y += 10.0f;
     float roll = 0.0f;
-    const float LAG   = 0.045f;     /* altitude smoothing: hold a steady drone height */
-    const float POS_K = 0.07f;      /* lateral smoothing: a smooth line through the bends */
-    const float AIM_K = 0.10f;      /* gimbal smoothing of the look direction */
-    V3    camfwd = vnorm(vsub(ride_d(26.0f), ride_d(0.0f)));  /* smoothed aim vector */
+    const float LAG    = 0.04f;     /* altitude ease toward a CONSTANT cruise height */
+    const float POS_K  = 0.04f;     /* heavy lateral smoothing: a near-straight rail */
+    const float AIM_K  = 0.06f;     /* gimbal smoothing of the look direction */
+    const float CAM_ALT = path_point(0.0f).y + 34.0f;   /* fixed altitude => no floor bounce */
+    V3    camfwd = vnorm(vsub(path_point(26.0f), path_point(0.0f)));  /* smoothed aim vector */
 
     /* Song-locked baseline + a GENTLE leash offset (the rubber-band). The
      * clock is wall-time here (CONTINUOUS, so motion stays smooth at any
@@ -306,7 +321,9 @@ int main(int argc, char **argv) {
      * never drift the timeline. */
     const float OFF_AMP = 2.5f;     /* lead/lag amplitude (map units) — subtle */
     const float OFF_W   = 0.5f;     /* lead/lag rate (rad/s)          */
-    const float cruise  = (total > 0.0f) ? total / SONG_SEC : 0.0f;  /* units/sec */
+    const float STREAM_SPEED = 380.0f;   /* units/sec for the endless run (fast) */
+    const float cruise  = g_stream ? STREAM_SPEED
+                                   : (total > 0.0f ? total / SONG_SEC : 0.0f);  /* units/sec */
 
     double t_start = now_sec(), report = t_start;
     int    last_lap = -1;
@@ -316,51 +333,53 @@ int main(int argc, char **argv) {
     while (!present_should_close()) {
         double now = now_sec();
         float  song_t = (float)(now - t_start);              /* CONTINUOUS clock (s) */
-        float  prog   = song_t / SONG_SEC;
-        int    lap    = (int)ffloor(prog);
-        float  baseline = (prog - (float)lap) * total;        /* clock-locked DISTANCE */
-        float  offset   = OFF_AMP * fsin(song_t * OFF_W);     /* gentle lead/lag */
-        float  dist = baseline + offset;
-        if (total > 0.0f) {
+        float  offset = OFF_AMP * fsin(song_t * OFF_W);      /* gentle lead/lag */
+        float  dist;
+        bool   wrapped = false;
+
+        if (g_stream) {
+            dist = cruise * song_t + offset;                 /* grows forever — endless run */
+        } else {
+            float prog   = song_t / SONG_SEC;
+            int   lap    = (int)ffloor(prog);
+            float baseline = (prog - (float)lap) * total;     /* clock-locked DISTANCE */
+            dist = baseline + offset;
             while (dist >= total) dist -= total;
             while (dist < 0.0f)   dist += total;
-        }
-
-        bool wrapped = false;
-        if (lap != last_lap) {                                /* run looped to the start */
-            if (last_lap >= 0) {
-                printf("  course end #%d at %.2fs (every %.1fs)\n", lap, song_t, SONG_SEC);
-                fflush(stdout);
-                wrapped = true;
+            if (lap != last_lap) {                            /* run looped to the start */
+                if (last_lap >= 0) {
+                    printf("  course end #%d at %.2fs (every %.1fs)\n", lap, song_t, SONG_SEC);
+                    fflush(stdout);
+                    wrapped = true;
+                }
+                last_lap = lap;
             }
-            last_lap = lap;
         }
 
         /* felt speed (units/sec): steady cruise + the gentle lead/lag rate */
         float vfeel = cruise + OFF_AMP * OFF_W * fcos(song_t * OFF_W);
         if (vfeel < 0.0f) vfeel = 0.0f;
 
-        V3 kpos = ride_d(dist);
+        V3 kpos = path_point(dist);
         float back = 3.0f + vfeel * 0.045f;
-        V3 ctar = ride_d(dist - back);
-        ctar.y += 28.0f;                                     /* ~floor+44: a drone hovering above the rim */
+        V3 ctar = path_point(dist - back);                   /* trailing centre (lateral target) */
 
-        if (streaming) {                                     /* scroll the map window */
-            if (wrapped) baked_to = 0.0f;                    /* re-establish at the start */
+        if (streaming) {                                     /* scroll the map window forward */
             if (ctar.x + STREAM_LEAD > baked_to) {
-                course_bake_strip(&g_course, Fmap, Cmap, Mmap, MAPSZ,
-                                  (int)baked_to, (int)(ctar.x + STREAM_LEAD));
+                course_bake_strip_proc(g_seed, Fmap, Cmap, Mmap, MAPSZ,
+                                       (int)baked_to, (int)(ctar.x + STREAM_LEAD));
                 baked_to = ctar.x + STREAM_LEAD;
             }
         }
 
-        /* DRONE follow: ease toward the trailing centre point on all axes
-         * (a smooth line through the bends) with a steady altitude. The lag
-         * is small vs the corridor half-width, so it won't reach the walls. */
+        /* DRONE rail: hold a near-straight line down the canyon at a CONSTANT
+         * altitude (no floor bounce), easing only slightly toward the path so
+         * it drifts the way Kestrel is flying — a small movement window, not a
+         * weave. The camera flies above the rim, so the slack can't clip walls. */
         cam.x += (ctar.x - cam.x) * POS_K;
         cam.z += (ctar.z - cam.z) * POS_K;
-        cam.y += (ctar.y - cam.y) * LAG;
-        if (wrapped) { cam = ctar; roll = 0.0f; }            /* snap across the wrap seam */
+        cam.y += (CAM_ALT - cam.y) * LAG;
+        if (wrapped) { cam.x = ctar.x; cam.z = ctar.z; cam.y = CAM_ALT; roll = 0.0f; }
 
         unsigned cc = ((unsigned)((int)ffloor(cam.z) & MAPMASK)) * MAPSZ
                     +  (unsigned)((int)ffloor(cam.x) & MAPMASK);
@@ -369,7 +388,7 @@ int main(int argc, char **argv) {
 
         /* look AHEAD and gently down INTO the canyon, with a gimbal-damped
          * aim so the drone glides instead of twitching with the path */
-        V3 look = ride_d(dist + 34.0f);
+        V3 look = path_point(dist + 34.0f);
         look.y += 14.0f;                                     /* gentle downward look from the higher vantage */
         V3 want_fwd = vnorm(vsub(look, cam));
         if (wrapped) camfwd = want_fwd;                      /* don't ease across the seam */
@@ -377,8 +396,8 @@ int main(int argc, char **argv) {
         V3 fwd = camfwd;
         V3 right0 = vnorm(vcross(fwd, v3(0.0f, 1.0f, 0.0f)));
         V3 up0 = vcross(right0, fwd);
-        V3 ta = vsub(ride_d(dist + 4.0f), kpos);
-        V3 tb = vsub(ride_d(dist + 8.0f), ride_d(dist + 4.0f));
+        V3 ta = vsub(path_point(dist + 4.0f), kpos);
+        V3 tb = vsub(path_point(dist + 8.0f), path_point(dist + 4.0f));
         float turn = ta.x * tb.z - ta.z * tb.x;              /* signed curvature */
         float bank = turn * 0.03f;                           /* subtle lean, stays centred */
         if (bank >  0.45f) bank = 0.45f;

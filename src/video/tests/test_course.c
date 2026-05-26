@@ -173,6 +173,31 @@ static void test_bake_strip(void) {
     ASSERT_EQ_INT(0, (int)Floor[cell(20, 128)]);                 /* outside strip: untouched */
 }
 
+/* Procedural infinite path: bounded + level + deterministic + smooth,
+ * and evaluable arbitrarily far out (no bounds). */
+static void test_eval_long(void) {
+    CourseNode a, b, prev;
+    course_eval_long(7u, 1000.0f, &a);
+    course_eval_long(7u, 1000.0f, &b);
+    ASSERT(a.z == b.z && a.y == b.y);                 /* deterministic */
+
+    for (float x = 1.0f; x <= 50000.0f; x += 250.0f) { /* bounded + level arbitrarily far out */
+        CourseNode n;
+        course_eval_long(7u, x, &n);
+        ASSERT(n.z > 100.0f && n.z < 156.0f);          /* gentle meander around centre */
+        ASSERT(n.y >= 30.0f && n.y <= 50.0f);          /* ~level */
+        ASSERT(n.width > 20.0f);
+    }
+    course_eval_long(7u, 0.0f, &prev);                 /* smooth: tiny step => tiny change */
+    for (float x = 1.0f; x <= 400.0f; x += 1.0f) {
+        CourseNode n;
+        course_eval_long(7u, x, &n);
+        float dz = n.z - prev.z; if (dz < 0) dz = -dz;
+        ASSERT(dz < 1.0f);
+        prev = n;
+    }
+}
+
 int main(void) {
     TEST_SUITE("course");
     RUN(test_sample_passes_through_nodes);
@@ -182,5 +207,6 @@ int main(void) {
     RUN(test_generate);
     RUN(test_generate_long);
     RUN(test_bake_strip);
+    RUN(test_eval_long);
     return TEST_SUITE_RESULT();
 }
