@@ -57,6 +57,15 @@ meson-info/
 *.uf2
 *.dfu
 
+# FMV test artifacts: source video, raw frames, encoded clips, previews,
+# and the host encoder binary — large and/or generated, never committed.
+*.mov
+*.mp4
+*.rgb
+*.fmv
+*.ppm
+/fmv_encode.exe
+
 # Audio assets dropped into host_files for local testing (e.g. a song
 # streamed via /host/music.wav). These are user-supplied and often
 # copyrighted — never commit them. The engine hand-rolls test WAVs at
