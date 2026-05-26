@@ -385,7 +385,7 @@ int main(int argc, char **argv) {
          * FOLLOWS the floor's slow descent/climb (heavily smoothed, so the slow
          * elevation comes through but fast bumps don't bounce). Flies above the
          * rim, so the lateral slack can't clip walls. */
-        float alt_target = ctar.y + 6.0f;   /* mid-canyon (rim is ctar.y + 24) */
+        float alt_target = ctar.y + 8.0f;   /* low in the half-pipe (rim is ctar.y + 36) */
         /* The FORWARD axis (x) must track tightly: smoothing it would lag the
          * camera ~v*tau behind the path and out of the streamed window, into
          * stale cells (walls misrendering / sliding back / blocking the view).
@@ -397,14 +397,17 @@ int main(int argc, char **argv) {
         if (wrapped) { cam.x = ctar.x; cam.z = ctar.z; cam.y = alt_target; roll = 0.0f; }
 
         if (g_stream) {
-            /* stay INSIDE the canyon: above the lava AND below the rim, so a
-             * lagging altitude on a fast descent can't float up to rim level
-             * (which shows the canyon's cross-section from above). Rim sits at
-             * ctar.y + 24, so cap a few units under it. */
-            float min_y = ctar.y - 6.0f;     /* off the floor/lava */
-            float max_y = ctar.y + 18.0f;    /* below the rim -> always in-canyon */
+            /* stay INSIDE the half-pipe: above the lava, below the rim (so a
+             * lagging altitude can't float up to the cross-section view), and
+             * leashed near the centre so it never drifts out to the curving
+             * walls. Rim sits at ctar.y + 36. */
+            float min_y = ctar.y - 6.0f;     /* off the floor/lava       */
+            float max_y = ctar.y + 30.0f;    /* below the rim            */
             if (cam.y < min_y) cam.y = min_y;
             if (cam.y > max_y) cam.y = max_y;
+            float lat = 24.0f;               /* lateral leash from the channel centre */
+            if (cam.z > ctar.z + lat) cam.z = ctar.z + lat;
+            if (cam.z < ctar.z - lat) cam.z = ctar.z - lat;
         } else {
             unsigned cc = ((unsigned)((int)ffloor(cam.z) & MAPMASK)) * MAPSZ
                         +  (unsigned)((int)ffloor(cam.x) & MAPMASK);

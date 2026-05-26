@@ -353,12 +353,10 @@ void course_eval_long(uint32_t seed, float x, CourseNode *out) {
     float p3 = (float)((seed >> 16) & 0xFF) * 0.0246f;
 
     out->x     = x;
-    out->z     = 128.0f + 3.0f * fsin_(x * 0.011f + p1)
-                        + 1.0f * fsin_(x * 0.027f + p2);   /* barely-there meander */
-    out->y     = 72.0f  + 12.0f * fsin_(x * 0.0016f + p3); /* GENTLE roll (big swings made the
-                                                            * horizon creep up/down each cycle) */
-    out->width = 50.0f  + 8.0f * fsin_(x * 0.013f + p1);   /* wider corridor (42..58 half-width) */
-    out->wall  = 36.0f  + 4.0f * fsin_(x * 0.021f + p2);   /* taller walls, edge ~ rim */
+    out->z     = 128.0f;                                   /* dead straight — a half-pipe to fly down */
+    out->y     = 72.0f  + 12.0f * fsin_(x * 0.0016f + p3); /* gentle roll (big swings creep the horizon) */
+    out->width = 64.0f  + 6.0f * fsin_(x * 0.013f + p1);   /* WIDE half-pipe (58..70 half-width) */
+    out->wall  = 54.0f  + 4.0f * fsin_(x * 0.021f + p2);   /* TALL walls curving up to the rim */
     out->ceil  = 0.0f;                                     /* open (tunnels: TODO) */
     float gate = fsin_(x * 0.006f + p3);                   /* slow open/lava alternation */
     out->lava  = (gate > 0.25f) ? (5.0f + 3.0f * fsin_(x * 0.05f)) : 0.0f;
@@ -368,7 +366,7 @@ void course_bake_strip_proc(uint32_t seed, uint8_t *floor, uint8_t *ceiling,
                             uint8_t *material, int mapsz, int x_lo, int x_hi) {
     unsigned mask = (unsigned)(mapsz - 1);
 
-    const float RIM = 40.0f;                               /* canyon depth: rim above the floor (taller) */
+    const float RIM = 52.0f;                               /* canyon depth: rim above the floor (tall half-pipe) */
     for (int xc = x_lo; xc < x_hi; xc++) {                 /* clear columns to a rim that TRACKS
                                                             * the floor, so it descends with it */
         unsigned xm = (unsigned)xc & mask;
