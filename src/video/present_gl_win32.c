@@ -139,8 +139,6 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         switch (wp) {
         case VK_ESCAPE: g.should_close = true; break;
         case VK_F11:    present_set_fullscreen(!g.fullscreen); break;
-        case 'A': present_set_aspect(g.aspect == PRESENT_ASPECT_4_3
-                                     ? PRESENT_ASPECT_SQUARE : PRESENT_ASPECT_4_3); break;
         case 'F': present_set_filter(g.filter == PRESENT_FILTER_NEAREST
                                      ? PRESENT_FILTER_LINEAR : PRESENT_FILTER_NEAREST); break;
         case 'V': present_set_vsync(!g.vsync); break;

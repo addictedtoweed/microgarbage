@@ -51,6 +51,8 @@
 
 #define NP 8                 /* cross-section points */
 #define NS 7                 /* cross-section segments */
+#define MAX_OBJS 32          /* canyon + visible lava-rocks */
+#define ROCK_SP  60.0f       /* lava-rock spacing along x   */
 #define RINGS 200           /* long draw distance: each new far ring is ~focal/RINGS px tall */
 #define SEG   6              /* ring spacing along x */
 /* SWAG per-op cycle costs for the on-cart coprocessor estimate (M7, Q16). */
@@ -74,17 +76,32 @@ static uint16_t g_tris[(RINGS - 1) * NS * 2 * 3];
 static uint8_t  g_tribase[(RINGS - 1) * NS * 2];
 static int      g_ntris;
 static R3dMesh   mesh;
-static R3dObject obj;
 static R3dScene  scene;
 
-static float fsin_(float x) {
-    const float PI = 3.14159265f, T = 6.2831853f;
-    while (x >  PI) x -= T;
-    while (x < -PI) x += T;
+/* a small faceted rock (irregular octahedron) — the lava-rocks */
+static vec3_q16 rock_v[6];                              /* filled in build_scene */
+static const uint16_t rock_t[24] = {                    /* CCW-outward */
+    2,4,0, 2,1,4, 2,5,1, 2,0,5,  3,0,4, 3,4,1, 3,1,5, 3,5,0
+};
+static R3dMesh   g_rockmesh;
+static R3dObject g_objs[MAX_OBJS];                      /* [0]=canyon, [1..]=rocks */
+static vec3_q16  g_cam_r, g_cam_u, g_cam_f;             /* camera basis (fixed look) */
+
+/* Place the camera at eye (0, RIDE_H+dy, dz), keeping the forward look — so
+ * the arrows shift the viewpoint within the canyon for parallax. */
+static void set_camera(float dy, float dz) {
+    scene.view = affine3_q16_view(
+        vec3_q16_make(0, q16_from_double((double)RIDE_H + dy), q16_from_double(dz)),
+        g_cam_r, g_cam_u, g_cam_f);
+}
+
+static float ffloor_(float x) { int i = (int)x; return (x < 0.0f && (float)i != x) ? (float)(i - 1) : (float)i; }
+static float fwrap_(float x) { const float T = 6.2831853f; return x - T * ffloor_(x * (1.0f / T) + 0.5f); }
+static float fsin_(float x) {                     /* O(1) range reduce — args grow unbounded */
+    x = fwrap_(x);
     float a = x < 0 ? -x : x;
     return 1.2732395f * x - 0.4052847f * x * a;
 }
-static float ffloor_(float x) { int i = (int)x; return (x < 0.0f && (float)i != x) ? (float)(i - 1) : (float)i; }
 
 static uint16_t lerp555(uint16_t a, uint16_t b, int num, int den) {
     int ar = a & 31, ag = (a >> 5) & 31, ab = (a >> 10) & 31;
@@ -137,13 +154,20 @@ static void build_scene(void) {
     mesh.verts = g_verts; mesh.nverts = RINGS * NP;
     mesh.tris  = g_tris;  mesh.ntris  = g_ntris;
     mesh.tri_base = g_tribase;
-    obj.mesh = &mesh; obj.xform = affine3_q16_identity();
 
-    scene.view = affine3_q16_view(
-        vec3_q16_make(0, q16_from_int(RIDE_H), 0),                                   /* eye */
-        vec3_q16_make(0, 0, Q16_ONE),                                                /* right = +z */
-        vec3_q16_make(q16_from_double(0.177), q16_from_double(0.984), 0),            /* up        */
-        vec3_q16_make(q16_from_double(0.984), q16_from_double(-0.177), 0));          /* fwd = +x, tilt down */
+    /* rock mesh (irregular radii -> faceted look) */
+    static const double rr[6][3] = { {3,0,0}, {-2.5,0,0}, {0,2,0}, {0,-2,0}, {0,0,2.8}, {0,0,-2.4} };
+    for (int i = 0; i < 6; i++)
+        rock_v[i] = vec3_q16_make(q16_from_double(rr[i][0]), q16_from_double(rr[i][1]), q16_from_double(rr[i][2]));
+    g_rockmesh.verts = rock_v; g_rockmesh.nverts = 6;
+    g_rockmesh.tris = rock_t;  g_rockmesh.ntris = 8; g_rockmesh.tri_base = NULL;
+
+    g_objs[0].mesh = &mesh; g_objs[0].xform = affine3_q16_identity();
+
+    g_cam_r = vec3_q16_make(0, 0, Q16_ONE);                                          /* right = +z */
+    g_cam_u = vec3_q16_make(q16_from_double(0.177), q16_from_double(0.984), 0);      /* up         */
+    g_cam_f = vec3_q16_make(q16_from_double(0.984), q16_from_double(-0.177), 0);     /* fwd = +x, tilt down */
+    set_camera(0.0f, 0.0f);
     scene.focal   = q16_from_int(100);
     scene.near_z  = q16_from_double(0.5);
     scene.light   = vec3_q16_normalize(vec3_q16_make(q16_from_double(0.3), q16_from_double(0.6), q16_from_double(0.5)));
@@ -151,7 +175,33 @@ static void build_scene(void) {
     scene.diffuse = q16_from_double(0.65);
     scene.base    = ROCK_BASE;
     scene.ramp    = RAMP;
-    scene.objs    = &obj; scene.nobjs = 1;
+    scene.objs    = g_objs; scene.nobjs = 1;
+}
+
+/* place the lava-rocks visible ahead of the camera as scene objects [1..],
+ * tumbling and scattered across the lava channel; scrolls with the canyon. */
+static void place_objects(float cam_x) {
+    int no = 1;                                         /* [0] = canyon */
+    float draw = (float)((RINGS - 1) * SEG);
+    int k0 = (int)ffloor_(cam_x / ROCK_SP);
+    for (int k = k0; no < MAX_OBJS; k++) {
+        float relx = (float)k * ROCK_SP - cam_x;
+        if (relx < 1.0f) continue;                      /* at/behind the camera */
+        if (relx > draw) break;
+        unsigned h = (unsigned)k * 2654435761u;
+        float z = (((float)((h >> 16) & 0xFFu) / 255.0f) * 2.0f - 1.0f) * (LAVA_HW - 2.0f);
+        float ang = cam_x * 0.015f + (float)k * 1.3f;
+        affine3_q16 rot = affine3_q16_from_rotation(
+            mat3_q16_mul(mat3_q16_rotation_y(q16_from_double(fwrap_(ang))),
+                         mat3_q16_rotation_x(q16_from_double(fwrap_(ang * 0.6f)))));
+        g_objs[no].mesh  = &g_rockmesh;
+        g_objs[no].xform = affine3_q16_compose(
+            affine3_q16_from_translation(vec3_q16_make(q16_from_double(relx),
+                                                       q16_from_double(0.8), q16_from_double(z))),
+            rot);
+        no++;
+    }
+    scene.nobjs = no;
 }
 
 #ifndef CANYON_HEADLESS
@@ -179,11 +229,13 @@ static void load_mode7(void) {
 int main(void) {
     build_scene();
     gen_verts(20.0f);
+    place_objects(20.0f);
     long px = r3d_render(&scene, fbuf, FBW, FBH);
-    double est = (mesh.nverts * (double)EST_CYC_VERT + g_ntris * (double)EST_CYC_TRI
-                + px * (double)EST_CYC_PIX) / 1e6;
-    printf("RINGS=%d  draw~%d units  %d verts  %d tris  %ld px-tests  ~%.2f M cyc/frame (of 16M)\n",
-           RINGS, (RINGS - 1) * SEG, mesh.nverts, g_ntris, px, est);
+    int tv = mesh.nverts + (scene.nobjs - 1) * g_rockmesh.nverts;
+    int tt = g_ntris    + (scene.nobjs - 1) * g_rockmesh.ntris;
+    double est = (tv * (double)EST_CYC_VERT + tt * (double)EST_CYC_TRI + px * (double)EST_CYC_PIX) / 1e6;
+    printf("RINGS=%d draw~%d  %d objs  %d verts  %d tris  %ld px  ~%.2f M cyc/frame (of 16M)\n",
+           RINGS, (RINGS - 1) * SEG, scene.nobjs, tv, tt, px, est);
     for (int y = 0; y < FBH; y += 3) {
         for (int x = 0; x < FBW; x += 2) {
             uint8_t v = fbuf[y * FBW + x];
@@ -204,42 +256,61 @@ static double now_sec(void) {
 }
 int main(void) {
     if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - r3d canyon")) return 1;
-    printf("GL: %s\nr3d canyon mesh (%dx%d -> Mode 7). keys: I info, V vsync\n",
+    printf("GL: %s\nr3d canyon (%dx%d -> Mode 7)\n"
+           "keys: arrows = move camera  |  A/Z = faster/slower  |  I = info  V = vsync\n",
            present_gl_renderer(), FBW, FBH);
     fflush(stdout);
 
     build_scene();
-    double t0 = now_sec(), report = t0;
+    double t0 = now_sec(), report = t0, prev = t0;
     unsigned frames = 0;
     double fps = 0.0;
-    const float SPEED = 38.0f;
+    float cam_x = 0.0f, speed = 76.0f, dy = 0.0f, dz = 0.0f;
     while (!present_should_close()) {
-        float t = (float)(now_sec() - t0);
-        gen_verts(t * SPEED);
+        double now = now_sec();
+        float dt = (float)(now - prev); prev = now;
+        if (dt > 0.1f) dt = 0.1f;                        /* clamp hitches */
+
+        float mv = 40.0f * dt;                           /* camera move within a bounding box */
+        if (GetAsyncKeyState(VK_UP)    & 0x8000) dy += mv;
+        if (GetAsyncKeyState(VK_DOWN)  & 0x8000) dy -= mv;
+        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) dz += mv;
+        if (GetAsyncKeyState(VK_LEFT)  & 0x8000) dz -= mv;
+        if (dy >  18.0f) dy =  18.0f; else if (dy <  -6.0f) dy =  -6.0f;
+        if (dz >  18.0f) dz =  18.0f; else if (dz < -18.0f) dz = -18.0f;
+        if (GetAsyncKeyState('A') & 0x8000) speed += 120.0f * dt;   /* faster */
+        if (GetAsyncKeyState('Z') & 0x8000) speed -= 120.0f * dt;   /* slower */
+        if (speed < 8.0f) speed = 8.0f; else if (speed > 220.0f) speed = 220.0f;
+        cam_x += speed * dt;
+
+        set_camera(dy, dz);
+        gen_verts(cam_x);
+        place_objects(cam_x);
         long px = r3d_render(&scene, fbuf, FBW, FBH);
         load_mode7();
         ppu_render(&P, FB);
 
         int need = FBW * FBH, avail = 2 * DMA_PER_VBLANK;
-        double est_cyc = (mesh.nverts * (double)EST_CYC_VERT
-                        + g_ntris    * (double)EST_CYC_TRI
-                        + px         * (double)EST_CYC_PIX) / 1e6;
+        int tv = mesh.nverts + (scene.nobjs - 1) * g_rockmesh.nverts;
+        int tt = g_ntris    + (scene.nobjs - 1) * g_rockmesh.ntris;
+        double est_cyc = (tv * (double)EST_CYC_VERT + tt * (double)EST_CYC_TRI
+                        + px * (double)EST_CYC_PIX) / 1e6;
         char ov[640];
         snprintf(ov, sizeof ov,
             "SNES PPU emulated (Mode 7) - geometry on host coprocessor\n"
             "rendered bitmap : %d x %d   (8bpp = %d B)\n"
             "display out     : %d x %d   (Mode 7 stretch)\n"
             "DMA / frame     : %d need | %d avail @30fps -> %s\n"
-            "geometry        : %d verts | %d tris | %ld px-tests\n"
+            "geometry        : %d verts | %d tris | %ld px-tests (%d objs)\n"
             "coproc est      : ~%.2f M cyc/frame  (M7 480MHz/30fps = 16M)\n"
+            "controls        : arrows move | A/Z speed=%.0f | dy=%.0f dz=%.0f\n"
             "render rate     : %.1f fps (host, GPU-bound - ignore)",
             FBW, FBH, need, PPU_SCREEN_W, PPU_SCREEN_H,
             need, avail, (need <= avail ? "FITS" : "OVER"),
-            mesh.nverts, g_ntris, px, est_cyc, fps);
+            tv, tt, px, scene.nobjs, est_cyc, speed, dy, dz, fps);
         present_set_overlay(ov);
         present_frame(FB);
         frames++;
-        double now = now_sec();
         if (now - report >= 1.0) { fps = (double)frames / (now - report);
             printf("  %.1f fps | %d tris | %ld px | ~%.2fM cyc\n", fps, g_ntris, px, est_cyc);
             fflush(stdout); report = now; frames = 0; }

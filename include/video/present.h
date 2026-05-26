@@ -68,8 +68,9 @@ void present_frame(const uint32_t *framebuffer);
 /* True once the user asked to close (window X or Esc). */
 bool present_should_close(void);
 
-/* Runtime toggles. Also bound to keys: F11 fullscreen, A aspect, F filter,
- * V vsync. */
+/* Runtime toggles. Also bound to keys: F11 fullscreen, F filter, V vsync.
+ * (Aspect has no key — set it via present_set_aspect — so apps are free to
+ * use A for their own controls.) */
 void present_set_fullscreen(bool on);
 void present_set_aspect(PresentAspect aspect);
 void present_set_filter(PresentFilter filter);
