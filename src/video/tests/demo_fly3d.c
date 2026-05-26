@@ -33,6 +33,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 /* no <math.h> (resolves to the repo math aggregator under -Iinclude) */
 
@@ -102,6 +103,7 @@ static V3 vnorm(V3 a) { float inv = 1.0f / fsqrt(a.x * a.x + a.y * a.y + a.z * a
  * The maps are baked from it by course_bake() (the same baker the cart
  * uses at level-load). */
 static CourseDef g_course;
+static CourseArc g_arc;        /* distance<->param table, built once at load */
 
 /* Built-in fallback: a closed canyon loop (canyon / open / tunnel mix). */
 static void build_default_course(CourseDef *c) {
@@ -260,6 +262,17 @@ static V3 ride(float s) {
     return v3(n.x, n.y + 16.0f, n.z);
 }
 
+/* Ride by DISTANCE along the path (arc-length), wrapping the loop, so the
+ * camera advances at an even pace regardless of node spacing. */
+static V3 ride_d(float d) {
+    float total = g_arc.total;
+    if (total > 0.0f) {
+        while (d >= total) d -= total;
+        while (d < 0.0f)   d += total;
+    }
+    return ride(course_param_at_distance(&g_arc, d));
+}
+
 int main(int argc, char **argv) {
     if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - course flythrough")) return 1;
     printf("GL renderer : %s\n", present_gl_renderer());
@@ -268,19 +281,29 @@ int main(int argc, char **argv) {
     P.mode = 7;
     build_palette();
 
-    if (argc > 1 && load_course(argv[1], &g_course))
+    const float SONG_SEC = 12.0f;   /* one lap of the course = this many seconds */
+    const float GEN_VEL  = 34.0f;   /* tuned cruise velocity for generated courses */
+
+    if (argc > 1 && strncmp(argv[1], "gen", 3) == 0) {
+        uint32_t seed = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 0) : 1234u;
+        course_generate(seed, SONG_SEC, GEN_VEL, (float)MAPSZ, &g_course);
+        printf("course: generated seed=%u, %d nodes (~%.0fs @ vel %.0f)\n",
+               seed, g_course.count, SONG_SEC, GEN_VEL);
+    } else if (argc > 1 && load_course(argv[1], &g_course)) {
         printf("course: %s (%d nodes, %s)\n", argv[1], g_course.count, g_course.loop ? "loop" : "linear");
-    else {
+    } else {
         build_default_course(&g_course);
-        printf("course: built-in canyon loop (pass a .course file as arg 1 to load one)\n");
+        printf("course: built-in canyon loop (arg: a .course file, or 'gen [seed]')\n");
     }
     course_bake(&g_course, Fmap, Cmap, Mmap, MAPSZ);
-    float len = course_length(&g_course);
-    printf("%dx%d raycast -> Mode 7 stretch; chase cam, speed-distance + banking.\n", FBW, FBH);
+    course_build_arc(&g_course, &g_arc);
+    float total = g_arc.total;
+    printf("course length: %.0f units; %dx%d raycast -> Mode 7 stretch; clock-locked %.0fs lap.\n",
+           total, FBW, FBH, SONG_SEC);
     fflush(stdout);
 
-    float kth = 0.0f;                                 /* Kestrel's path param */
-    V3    cam = ride(0.0f); cam.y += 10.0f;
+    float dist = 0.0f;                                /* Kestrel's distance along the path */
+    V3    cam = ride_d(0.0f); cam.y += 10.0f;
     float roll = 0.0f;
     const float LAG = 0.08f;
 
@@ -288,9 +311,9 @@ int main(int argc, char **argv) {
      * The clock here is a stand-in (emulated-frame time); on the cart it
      * becomes the audio sample position, so the run ends exactly on the
      * song's landmark. The offset is a SIMULATED brake/accelerate (no
-     * controller in the demo) clamped to a leash + sprung to centre. */
-    const float SONG_SEC = 12.0f;   /* one lap of the course = this many seconds */
-    const float LEASH    = 0.45f;   /* surge/brake authority (path-param units)  */
+     * controller in the demo), in DISTANCE units, clamped to a leash and
+     * sprung back to the baseline so it can never accumulate drift. */
+    const float LEASH = 26.0f;      /* surge/brake authority (map units) */
     float offset = 0.0f, prev_off = 0.0f;
     int   last_lap = -1;
 
@@ -309,17 +332,19 @@ int main(int argc, char **argv) {
             float song_t = (float)f / (float)SNES_NTSC_HZ;       /* stand-in clock (s) */
             float prog   = song_t / SONG_SEC;
             int   lap    = (int)ffloor(prog);
-            float baseline = (prog - (float)lap) * len;          /* clock-locked position */
+            float baseline = (prog - (float)lap) * total;        /* clock-locked DISTANCE */
 
             float input = fsin(song_t * 1.7f);                   /* simulated brake/accel */
-            offset += input * 0.012f;
+            offset += input * 0.35f;
             offset -= offset * 0.05f;                            /* spring back to baseline */
             if (offset >  LEASH) offset =  LEASH;
             if (offset < -LEASH) offset = -LEASH;
 
-            kth = baseline + offset;                             /* leashed around the clock */
-            while (kth >= len)  kth -= len;
-            while (kth < 0.0f)  kth += len;
+            dist = baseline + offset;                            /* leashed around the clock */
+            if (total > 0.0f) {
+                while (dist >= total) dist -= total;
+                while (dist < 0.0f)   dist += total;
+            }
 
             if (lap != last_lap) {                               /* a lap landed on the clock */
                 if (last_lap >= 0) {
@@ -331,14 +356,18 @@ int main(int argc, char **argv) {
             }
             acc -= target_dt; stepped = true;
         }
-        float speed_feel = 0.015f + (offset - prev_off) * 2.0f;  /* surge/brake -> camera rush */
-        if (speed_feel < 0.0f) speed_feel = 0.0f;
-        prev_off = offset;
         if (stepped) {
-            V3 kpos = ride(kth);
+            V3 kpos = ride_d(dist);
+            /* felt speed (units/sec): clock cruise + the leash surge */
+            float cruise = (total > 0.0f) ? total / SONG_SEC : 0.0f;
+            float surge  = (offset - prev_off) * (float)SNES_NTSC_HZ;
+            float vfeel  = cruise + surge;
+            if (vfeel < 0.0f) vfeel = 0.0f;
+            prev_off = offset;
+
             /* chase target trails Kestrel; farther back when surging */
-            float back = 0.9f + speed_feel * 22.0f;
-            V3 ctar = ride(kth - back * 0.06f);
+            float back = 3.0f + vfeel * 0.045f;
+            V3 ctar = ride_d(dist - back);
             ctar.y += 9.0f;
             cam = vadd(cam, vmul(vsub(ctar, cam), LAG));     /* damped follow */
 
@@ -349,12 +378,12 @@ int main(int argc, char **argv) {
             if (Cmap[cc] < 254 && cam.y > (float)Cmap[cc] - 4.0f) cam.y = (float)Cmap[cc] - 4.0f;
 
             /* look ahead along the path; bank into the curve */
-            V3 look = ride(kth + 0.10f);
+            V3 look = ride_d(dist + 8.0f);
             V3 fwd = vnorm(vsub(look, cam));
             V3 right0 = vnorm(vcross(fwd, v3(0.0f, 1.0f, 0.0f)));
             V3 up0 = vcross(right0, fwd);
-            V3 ta = vsub(ride(kth + 0.05f), kpos);
-            V3 tb = vsub(ride(kth + 0.10f), ride(kth + 0.05f));
+            V3 ta = vsub(ride_d(dist + 4.0f), kpos);
+            V3 tb = vsub(ride_d(dist + 8.0f), ride_d(dist + 4.0f));
             float turn = ta.x * tb.z - ta.z * tb.x;          /* signed curvature */
             float bank = turn * 0.06f;
             if (bank >  0.8f) bank = 0.8f;
@@ -364,7 +393,7 @@ int main(int argc, char **argv) {
             V3 right = vadd(vmul(right0, cr), vmul(up0, sr));
             V3 up    = vsub(vmul(up0, cr), vmul(right0, sr));
 
-            float fov = 1.05f + speed_feel * 6.0f;           /* widen FOV when surging */
+            float fov = 1.05f + vfeel * 0.0045f;             /* widen FOV when surging */
             step_sum += render_fb(cam, fwd, right, up, fov);
             frames++;
             load_mode7();

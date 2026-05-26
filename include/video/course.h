@@ -65,6 +65,29 @@ void course_sample(const CourseDef *c, float s, CourseNode *out);
 void course_bake(const CourseDef *c, uint8_t *floor, uint8_t *ceiling,
                  uint8_t *material, int mapsz);
 
+/* ---- arc-length: even-pace / time<->distance mapping ------- */
+
+/* Total 3D arc-length of the course path (map units). */
+float course_total_distance(const CourseDef *c);
+
+/* Precomputed distance<->param table (built once at load). */
+#define COURSE_ARC_SAMPLES 1024
+typedef struct {
+    float cum[COURSE_ARC_SAMPLES + 1];  /* cumulative distance at uniform param samples */
+    float plen;                          /* param length (= course_length)               */
+    float total;                         /* total 3D arc-length                           */
+} CourseArc;
+void  course_build_arc(const CourseDef *c, CourseArc *a);
+float course_param_at_distance(const CourseArc *a, float dist);  /* distance -> param s */
+
+/* ---- procedural generation -------------------------------- */
+
+/* Generate a linear, descending course from `seed`, targeting a total
+ * arc-length near velocity*duration_sec, kept within [margin, mapsz-margin].
+ * (Long courses that exceed the map are the streaming case — TODO.) */
+void course_generate(uint32_t seed, float duration_sec, float velocity,
+                     float mapsz, CourseDef *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,11 +1,32 @@
 /* ============================================================
  *  course.c — spline sampling + map baking for flight courses.
  *  See include/video/course.h. Portable: no stdio, no libm
- *  (radius tests use squared distance, so no sqrt needed).
+ *  (baking uses squared distance; arc-length + the generator use
+ *  the libm-free fsqrt_/fsin_/fcos_ below — no <math.h>).
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "video/course.h"
+
+/* ---- libm-free float helpers (this module avoids <math.h>) ---- */
+#define COURSE_PI 3.14159265358979f
+
+static float fsqrt_(float v) {
+    if (v <= 0.0f) return 0.0f;
+    float g = v;                          /* Newton's method, plenty of iters */
+    for (int i = 0; i < 12; i++) g = 0.5f * (g + v / g);
+    return g;
+}
+static float fsin_(float x) {
+    while (x >  COURSE_PI) x -= 2.0f * COURSE_PI;
+    while (x < -COURSE_PI) x += 2.0f * COURSE_PI;
+    const float B = 4.0f / COURSE_PI, C = -4.0f / (COURSE_PI * COURSE_PI);
+    float ax = (x < 0.0f) ? -x : x;
+    float y = B * x + C * x * ax;
+    float ay = (y < 0.0f) ? -y : y;
+    return 0.225f * (y * ay - y) + y;     /* one refinement pass */
+}
+static float fcos_(float x) { return fsin_(x + COURSE_PI * 0.5f); }
 
 float course_length(const CourseDef *c) {
     if (!c || c->count <= 0) return 0.0f;
@@ -102,5 +123,103 @@ void course_bake(const CourseDef *c, uint8_t *floor, uint8_t *ceiling,
                 }
             }
         }
+    }
+}
+
+/* ---- arc-length -------------------------------------------- */
+
+float course_total_distance(const CourseDef *c) {
+    if (!c || c->count <= 0) return 0.0f;
+    float plen = course_length(c);
+    int N = COURSE_ARC_SAMPLES;
+    CourseNode p0; course_sample(c, 0.0f, &p0);
+    float tot = 0.0f;
+    for (int i = 1; i <= N; i++) {
+        CourseNode p;
+        course_sample(c, plen * (float)i / (float)N, &p);
+        float dx = p.x - p0.x, dy = p.y - p0.y, dz = p.z - p0.z;
+        tot += fsqrt_(dx*dx + dy*dy + dz*dz);
+        p0 = p;
+    }
+    return tot;
+}
+
+void course_build_arc(const CourseDef *c, CourseArc *a) {
+    int N = COURSE_ARC_SAMPLES;
+    a->plen = course_length(c);
+    a->cum[0] = 0.0f;
+    if (!c || c->count <= 0) {
+        for (int i = 1; i <= N; i++) a->cum[i] = 0.0f;
+        a->total = 0.0f;
+        return;
+    }
+    CourseNode p0; course_sample(c, 0.0f, &p0);
+    for (int i = 1; i <= N; i++) {
+        CourseNode p;
+        course_sample(c, a->plen * (float)i / (float)N, &p);
+        float dx = p.x - p0.x, dy = p.y - p0.y, dz = p.z - p0.z;
+        a->cum[i] = a->cum[i-1] + fsqrt_(dx*dx + dy*dy + dz*dz);
+        p0 = p;
+    }
+    a->total = a->cum[N];
+}
+
+float course_param_at_distance(const CourseArc *a, float dist) {
+    int N = COURSE_ARC_SAMPLES;
+    if (dist <= 0.0f)      return 0.0f;
+    if (dist >= a->total)  return a->plen;
+    int lo = 0, hi = N;                       /* binary search the cumulative table */
+    while (hi - lo > 1) {
+        int mid = (lo + hi) >> 1;
+        if (a->cum[mid] <= dist) lo = mid; else hi = mid;
+    }
+    float seg = a->cum[hi] - a->cum[lo];
+    float t = (seg > 0.0f) ? (dist - a->cum[lo]) / seg : 0.0f;
+    return ((float)lo + t) / (float)N * a->plen;
+}
+
+/* ---- procedural generation --------------------------------- */
+
+void course_generate(uint32_t seed, float duration_sec, float velocity,
+                     float mapsz, CourseDef *out) {
+    const float spacing = 24.0f;               /* ~distance between control nodes */
+    float target = velocity * duration_sec;    /* desired total arc-length        */
+    int count = (int)(target / spacing) + 2;
+    if (count < 4) count = 4;
+    if (count > COURSE_MAX_NODES) count = COURSE_MAX_NODES;
+    out->count = count;
+    out->loop  = false;
+
+    uint32_t rng = seed ? seed : 0x9E3779B9u;
+    float margin = 30.0f, lo = margin, hi = mapsz - margin;
+    float x = mapsz * 0.5f, z = margin + 6.0f; /* start near one edge */
+    float heading = 1.30f;                     /* radians, angled into the map */
+
+    for (int i = 0; i < count; i++) {
+        float frac = (count > 1) ? (float)i / (float)(count - 1) : 0.0f;
+
+        rng = rng*1664525u + 1013904223u; float r1 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
+        rng = rng*1664525u + 1013904223u; float r2 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
+        rng = rng*1664525u + 1013904223u; float r3 = (float)((rng >> 8) & 0xFFFF) / 65535.0f;
+        int open   = (r1 < 0.22f);             /* open sky, no lava */
+        int tunnel = (r1 > 0.82f);             /* low ceiling */
+
+        out->node[i].x     = x;
+        out->node[i].z     = z;
+        out->node[i].y     = 158.0f - 120.0f * frac;            /* descend high -> low */
+        out->node[i].width = 15.0f + r2 * 11.0f;                /* corridor 15..26 */
+        out->node[i].wall  = open ? (40.0f + r3 * 22.0f) : (108.0f + r3 * 48.0f);
+        out->node[i].ceil  = tunnel ? (26.0f + r3 * 16.0f) : 0.0f;
+        out->node[i].lava  = open ? 0.0f : (3.0f + r2 * 5.0f);
+
+        rng = rng*1664525u + 1013904223u;
+        float turn = ((float)((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 0.85f;
+        heading += turn;
+        x += fcos_(heading) * spacing;
+        z += fsin_(heading) * spacing;
+        if (x < lo) { x = lo; heading = COURSE_PI - heading; }  /* reflect, stay in-bounds */
+        if (x > hi) { x = hi; heading = COURSE_PI - heading; }
+        if (z < lo) { z = lo; heading = -heading; }
+        if (z > hi) { z = hi; heading = -heading; }
     }
 }

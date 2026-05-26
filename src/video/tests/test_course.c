@@ -80,10 +80,72 @@ static void test_bake_tunnel_and_open(void) {
     ASSERT_EQ_INT((int)COURSE_OPEN_CEIL, (int)Ceil[cell(100, 70)]);
 }
 
+/* Arc-length table is monotonic, totals the segment lengths, and maps
+ * distance -> param so the endpoints and midpoint land where expected. */
+static void test_arclen_maps_distance(void) {
+    CourseDef c;
+    memset(&c, 0, sizeof c);
+    c.count = 2; c.loop = false;
+    /* straight run along z from 60->120 at x=60: ~60 units, no y change */
+    c.node[0] = mk(60, 60, 50, 16, 100, 0, 4);
+    c.node[1] = mk(60, 120, 50, 16, 100, 0, 4);
+
+    float total = course_total_distance(&c);
+    ASSERT(total > 55.0f && total < 65.0f);          /* ~60 units */
+
+    static CourseArc arc;                            /* large: keep off the stack */
+    course_build_arc(&c, &arc);
+    ASSERT(arc.total > 55.0f && arc.total < 65.0f);
+    for (int i = 1; i <= COURSE_ARC_SAMPLES; i++)     /* cumulative is non-decreasing */
+        ASSERT(arc.cum[i] >= arc.cum[i-1]);
+
+    ASSERT(course_param_at_distance(&arc, 0.0f) == 0.0f);
+    ASSERT(course_param_at_distance(&arc, arc.total) == arc.plen);
+    /* halfway in distance => about halfway in z (straight line) */
+    float s = course_param_at_distance(&arc, arc.total * 0.5f);
+    CourseNode o; course_sample(&c, s, &o);
+    ASSERT(o.z > 86.0f && o.z < 94.0f);
+}
+
+/* Generator: deterministic, in-bounds, descends, and total arc-length
+ * grows with the requested duration. */
+static void test_generate(void) {
+    CourseDef a, b, a2;
+    course_generate(1234u, 8.0f, 30.0f, 256.0f, &a);
+    course_generate(1234u, 8.0f, 30.0f, 256.0f, &a2);
+    course_generate(1234u, 2.0f, 30.0f, 256.0f, &b);
+
+    ASSERT(a.count >= 4 && a.count <= COURSE_MAX_NODES);
+    ASSERT(!a.loop);
+
+    /* deterministic: same seed/args -> identical nodes */
+    ASSERT_EQ_INT(a.count, a2.count);
+    for (int i = 0; i < a.count; i++) {
+        ASSERT((int)a.node[i].x == (int)a2.node[i].x);
+        ASSERT((int)a.node[i].z == (int)a2.node[i].z);
+    }
+
+    /* in-bounds and descending high -> low */
+    for (int i = 0; i < a.count; i++) {
+        ASSERT(a.node[i].x >= 29.0f && a.node[i].x <= 227.0f);
+        ASSERT(a.node[i].z >= 29.0f && a.node[i].z <= 227.0f);
+    }
+    ASSERT(a.node[0].y > a.node[a.count-1].y);
+
+    /* longer duration -> longer course */
+    ASSERT(a.count > b.count);
+    ASSERT(course_total_distance(&a) > course_total_distance(&b));
+
+    /* bakes without blowing up */
+    course_bake(&a, Floor, Ceil, Mat, SZ);
+}
+
 int main(void) {
     TEST_SUITE("course");
     RUN(test_sample_passes_through_nodes);
     RUN(test_bake_carves_channel);
     RUN(test_bake_tunnel_and_open);
+    RUN(test_arclen_maps_distance);
+    RUN(test_generate);
     return TEST_SUITE_RESULT();
 }
