@@ -284,6 +284,16 @@ int main(int argc, char **argv) {
     float roll = 0.0f;
     const float LAG = 0.08f;
 
+    /* Song-locked baseline + leashed player offset (the rubber-band).
+     * The clock here is a stand-in (emulated-frame time); on the cart it
+     * becomes the audio sample position, so the run ends exactly on the
+     * song's landmark. The offset is a SIMULATED brake/accelerate (no
+     * controller in the demo) clamped to a leash + sprung to centre. */
+    const float SONG_SEC = 12.0f;   /* one lap of the course = this many seconds */
+    const float LEASH    = 0.45f;   /* surge/brake authority (path-param units)  */
+    float offset = 0.0f, prev_off = 0.0f;
+    int   last_lap = -1;
+
     const double target_dt = 1.0 / SNES_NTSC_HZ;
     double last = now_sec(), acc = 0.0, report = last;
     unsigned f = 0, frames = 0;
@@ -294,18 +304,40 @@ int main(int argc, char **argv) {
         acc += tnow - last; last = tnow;
         if (acc > 0.25) acc = 0.25;
         bool stepped = false;
-        float speed = 0.0f;
         while (acc >= target_dt) {
-            /* speed varies: accelerate/brake along the run */
-            speed = 0.020f + 0.012f * fsin((float)f * 0.012f);
-            kth += speed;
-            if (kth >= len) kth -= len;              /* loop the preview */
-            acc -= target_dt; stepped = true; f++;
+            f++;
+            float song_t = (float)f / (float)SNES_NTSC_HZ;       /* stand-in clock (s) */
+            float prog   = song_t / SONG_SEC;
+            int   lap    = (int)ffloor(prog);
+            float baseline = (prog - (float)lap) * len;          /* clock-locked position */
+
+            float input = fsin(song_t * 1.7f);                   /* simulated brake/accel */
+            offset += input * 0.012f;
+            offset -= offset * 0.05f;                            /* spring back to baseline */
+            if (offset >  LEASH) offset =  LEASH;
+            if (offset < -LEASH) offset = -LEASH;
+
+            kth = baseline + offset;                             /* leashed around the clock */
+            while (kth >= len)  kth -= len;
+            while (kth < 0.0f)  kth += len;
+
+            if (lap != last_lap) {                               /* a lap landed on the clock */
+                if (last_lap >= 0) {
+                    printf("  course end #%d at %.2fs (clock-locked every %.1fs)\n",
+                           lap, song_t, SONG_SEC);
+                    fflush(stdout);
+                }
+                last_lap = lap;
+            }
+            acc -= target_dt; stepped = true;
         }
+        float speed_feel = 0.015f + (offset - prev_off) * 2.0f;  /* surge/brake -> camera rush */
+        if (speed_feel < 0.0f) speed_feel = 0.0f;
+        prev_off = offset;
         if (stepped) {
             V3 kpos = ride(kth);
-            /* chase target trails Kestrel; farther back when faster */
-            float back = 0.9f + speed * 22.0f;
+            /* chase target trails Kestrel; farther back when surging */
+            float back = 0.9f + speed_feel * 22.0f;
             V3 ctar = ride(kth - back * 0.06f);
             ctar.y += 9.0f;
             cam = vadd(cam, vmul(vsub(ctar, cam), LAG));     /* damped follow */
@@ -332,7 +364,7 @@ int main(int argc, char **argv) {
             V3 right = vadd(vmul(right0, cr), vmul(up0, sr));
             V3 up    = vsub(vmul(up0, cr), vmul(right0, sr));
 
-            float fov = 1.05f + speed * 6.0f;                /* widen FOV with speed */
+            float fov = 1.05f + speed_feel * 6.0f;           /* widen FOV when surging */
             step_sum += render_fb(cam, fwd, right, up, fov);
             frames++;
             load_mode7();
