@@ -9,14 +9,21 @@
  *   # one frame -> fmv_frame.bin + fmv_preview.ppm:
  *   ./fmv_encode
  *   ./fmv_encode bbb.rgb
- *   # a clip (raw RGB24 stream, W*H*3 per frame) -> a .fmv container:
- *   ffmpeg -i bbb.mp4 -t 6 -vf scale=240:208,fps=20 -f rawvideo -pix_fmt rgb24 bbb_clip.rgb
- *   ./fmv_encode bbb_clip.rgb out.fmv
- *   # a synthetic test clip (no source needed):
+ *   # a clip (raw RGB24 stream, W*H*3 per frame) + audio (s16le stereo) -> .fmv:
+ *   ffmpeg -i bbb.mp4 -t 6 -vf scale=240:208,fps=20 -f rawvideo -pix_fmt rgb24 bbb.rgb
+ *   ffmpeg -i bbb.mp4 -t 6 -vn -ar 44100 -ac 2 -f s16le bbb.pcm
+ *   ./fmv_encode bbb.rgb out.fmv bbb.pcm        # omit the .pcm for silent audio
+ *   # a synthetic test clip (no source needed; silent audio):
  *   ./fmv_encode synth 40 synth.fmv
  *
- * .fmv = [ "FMV1", u16 w, u16 h, u16 fps, u16 reserved, u32 nframes ]
- *        then nframes blocks of [ CGRAM 256B | tilemap NTILES*2 | CHR NTILES*32 ].
+ * .fmv (FMV2) = 32B header, then nframes interleaved audio+video units:
+ *   header: "FMV2", u16 w,h,fps,audio_channels, u32 nframes, u32 audio_rate,
+ *           u16 audio_bits, u16 _, u32 audio_bytes_per_frame, u32 _
+ *   unit:   [ audio chunk (audio_bytes_per_frame) | video block (BLOCK) ]
+ *           audio first so the real-time mixer gets priority when streamed off
+ *           SD: one sequential read per frame demuxes to the mixer + the PPU.
+ *   video block = [ CGRAM 256B | tilemap NTILES*2 | CHR NTILES*32 ] = 26776 B.
+ *   audio chunk = RATE/FPS sample-frames of s16le stereo = 8820 B @ 44100/20.
  *
  * v1 quantizer: k-means group tiles by average color into 8 palettes, then
  * median-cut each group to 15 colors. Public domain (CC0).
@@ -40,7 +47,13 @@
 #define PCOL 15            /* usable colors per palette (1..15); 0 = shared backdrop */
 #define DITHER 18
 #define FPS 20
+#define RATE  44100        /* audio sample rate (CD); must divide evenly by FPS */
+#define ACH   2            /* audio channels (stereo) */
+#define ABITS 16           /* audio bits/sample (s16le, matches the mixer)      */
 #define BLOCK (NPAL*16*2 + NTILES*2 + NTILES*32)   /* 256 + 1560 + 24960 = 26776 */
+#define ABYTES (RATE/FPS*ACH*(ABITS/8))            /* audio bytes per video frame = 8820 */
+#define HDRSZ 32
+_Static_assert(RATE % FPS == 0, "RATE must divide evenly by FPS for an exact A/V interleave");
 
 typedef struct { int r, g, b; } Col;
 
@@ -201,19 +214,33 @@ static void write_preview(const char *path) {
 }
 static void w16(FILE *f, unsigned v){ fputc(v&0xFF,f); fputc((v>>8)&0xFF,f); }
 static void w32(FILE *f, unsigned v){ fputc(v&0xFF,f); fputc((v>>8)&0xFF,f); fputc((v>>16)&0xFF,f); fputc((v>>24)&0xFF,f); }
-static void hdr(FILE *o, unsigned nframes){ fwrite("FMV1",1,4,o); w16(o,W); w16(o,H); w16(o,FPS); w16(o,0); w32(o,nframes); }
+static void hdr(FILE *o, unsigned nframes){     /* 32-byte FMV2 header */
+    fwrite("FMV2",1,4,o);
+    w16(o,W); w16(o,H); w16(o,FPS); w16(o,ACH);
+    w32(o,nframes);                             /* offset 12, patched at end */
+    w32(o,RATE); w16(o,ABITS); w16(o,0);
+    w32(o,ABYTES); w32(o,0);
+}
+/* one frame's worth of audio: ABYTES from af (or silence if af==NULL/short),
+   written before its video block so the mixer leads when streamed. */
+static void write_audio(FILE *o, FILE *af){
+    static unsigned char abuf[ABYTES];
+    size_t got = af ? fread(abuf,1,ABYTES,af) : 0;
+    if (got < (size_t)ABYTES) memset(abuf+got, 0, ABYTES-got);
+    fwrite(abuf,1,ABYTES,o);
+}
 
 int main(int argc, char **argv) {
-    if (argc >= 4 && !strcmp(argv[1], "synth")) {       /* synth N out.fmv */
+    if (argc >= 4 && !strcmp(argv[1], "synth")) {       /* synth N out.fmv (silent audio) */
         int n = atoi(argv[2]); FILE *o = fopen(argv[3], "wb"); if (!o) { perror(argv[3]); return 1; }
         hdr(o, n);
-        for (int i = 0; i < n; i++) { synth(i); quantize(); write_block(o); if (i==0) write_preview("fmv_preview.ppm"); }
+        for (int i = 0; i < n; i++) { synth(i); quantize(); write_audio(o,NULL); write_block(o); if (i==0) write_preview("fmv_preview.ppm"); }
         fclose(o);
-        printf("synth: %d frames -> %s  (%d B/frame, total %ld B, %.1fs @ %dfps)\n",
-               n, argv[3], BLOCK, (long)16 + (long)n*BLOCK, (double)n/FPS, FPS);
+        printf("synth: %d frames -> %s  (%d+%d B/frame, total %ld B, %.1fs @ %dfps, silent)\n",
+               n, argv[3], ABYTES, BLOCK, (long)HDRSZ + (long)n*(ABYTES+BLOCK), (double)n/FPS, FPS);
         return 0;
     }
-    if (argc >= 3) {                                    /* in.rgb (or "-" stdin) -> out.fmv [nframes] */
+    if (argc >= 3) {            /* VIDEO(-=stdin) out.fmv [AUDIO.pcm] [-n N] */
         FILE *in;
         if (!strcmp(argv[1], "-")) {
 #ifdef _WIN32
@@ -222,13 +249,19 @@ int main(int argc, char **argv) {
             in = stdin;
         } else { in = fopen(argv[1], "rb"); if (!in) { perror(argv[1]); return 1; } }
         FILE *o = fopen(argv[2], "wb"); if (!o) { perror(argv[2]); return 1; }
+        FILE *af = NULL; int maxf = (1<<30);
+        for (int i = 3; i < argc; i++) {                /* optional audio path and/or -n N */
+            if (!strcmp(argv[i], "-n") && i+1 < argc) maxf = atoi(argv[++i]);
+            else if (strcmp(argv[i], "none") != 0) { af = fopen(argv[i], "rb"); if (!af) perror(argv[i]); }
+        }
         hdr(o, 0);                                      /* nframes patched at end */
-        int maxf = (argc > 3) ? atoi(argv[3]) : (1<<30), nf = 0;
-        while (nf < maxf && read_frame(in)) { quantize(); write_block(o); if (nf==0) write_preview("fmv_preview.ppm"); nf++; }
+        int nf = 0;
+        while (nf < maxf && read_frame(in)) { quantize(); write_audio(o,af); write_block(o); if (nf==0) write_preview("fmv_preview.ppm"); nf++; }
         fseek(o, 12, SEEK_SET); w32(o, nf);
-        fclose(o); if (in != stdin) fclose(in);
-        printf("encoded %d frames -> %s  (%d B/frame, total %ld B, %.1fs @ %dfps)\n",
-               nf, argv[2], BLOCK, (long)16 + (long)nf*BLOCK, (double)nf/FPS, FPS);
+        fclose(o); if (in != stdin) fclose(in); if (af) fclose(af);
+        printf("encoded %d frames -> %s  (%d+%d B/frame, total %ld B, %.1fs @ %dfps, audio %s)\n",
+               nf, argv[2], ABYTES, BLOCK, (long)HDRSZ + (long)nf*(ABYTES+BLOCK), (double)nf/FPS, FPS,
+               af ? "embedded" : "silent");
         return 0;
     }
 

@@ -49,9 +49,15 @@ static PpuState P;
 static uint32_t FB[PPU_SCREEN_W * PPU_SCREEN_H];
 static uint8_t *clip;          /* whole .fmv in memory */
 static int nframes, fps = 20;
+static long g_hdrsz = 16, g_unit = BLOCK;   /* header bytes; per-frame stride   */
+static long g_abytes = 0;                   /* audio bytes/frame (0 = FMV1/none)*/
+static int  g_arate = 44100, g_ach = 2, g_abits = 16;   /* embedded-audio format */
+#define RD16(o) ((unsigned)(clip[o] | (clip[(o)+1]<<8)))
+#define RD32(o) ((uint32_t)(clip[o] | (clip[(o)+1]<<8) | (clip[(o)+2]<<16) | ((uint32_t)clip[(o)+3]<<24)))
 
 static void load_frame(int f) {
-    const uint8_t *blk = clip + 16 + (long)f * BLOCK;
+    /* FMV2 unit = [audio g_abytes | video BLOCK]; skip the audio to reach video */
+    const uint8_t *blk = clip + g_hdrsz + (long)f * g_unit + g_abytes;
     const uint8_t *cg = blk;
     const uint8_t *tm = blk + 8*16*2;
     const uint8_t *ch = tm + NTILES*2;
@@ -83,11 +89,18 @@ static int load_clip(const char *path) {
     clip = malloc(sz);
     if (fread(clip, 1, sz, f) != (size_t)sz) { fclose(f); return 0; }
     fclose(f);
-    if (memcmp(clip, "FMV1", 4) != 0) { fprintf(stderr, "not a .fmv\n"); return 0; }
-    fps     = clip[8] | (clip[9] << 8);
-    nframes = clip[12] | (clip[13]<<8) | (clip[14]<<16) | (clip[15]<<24);
+    if (memcmp(clip, "FMV2", 4) == 0) {          /* muxed: audio interleaved per frame */
+        fps = RD16(8); g_ach = RD16(10); nframes = RD32(12);
+        g_arate = RD32(16); g_abits = RD16(20); g_abytes = RD32(24);
+        g_hdrsz = 32; g_unit = g_abytes + BLOCK;
+    } else if (memcmp(clip, "FMV1", 4) == 0) {   /* legacy: video-only, optional .pcm sidecar */
+        fps = RD16(8); nframes = RD32(12);
+        g_hdrsz = 16; g_unit = BLOCK; g_abytes = 0;
+    } else { fprintf(stderr, "not a .fmv\n"); return 0; }
     if (fps < 1) fps = 20;
-    printf("%s: %d frames @ %d fps (%.1fs), %d B/frame\n", path, nframes, fps, (double)nframes/fps, BLOCK);
+    printf("%s: %s, %d frames @ %d fps (%.1fs), %d B video/frame%s\n",
+           path, g_abytes ? "FMV2" : "FMV1", nframes, fps, (double)nframes/fps, BLOCK,
+           g_abytes ? ", audio embedded" : "");
     return nframes > 0;
 }
 
@@ -113,44 +126,63 @@ static double now_sec(void) {
     return (double)c.QuadPart / (double)f.QuadPart;
 }
 
-/* ---- audio = master clock (sidecar raw PCM: s16le, stereo, AUDIO_RATE) ---- */
-#define AUDIO_RATE 44100        /* CD quality, matching the mixer's 16-bit signed output */
+/* ---- audio = master clock ------------------------------------------------
+ * FMV2 carries the audio interleaved per frame (de-interleaved here into one
+ * waveOut buffer); legacy FMV1 takes an optional sidecar raw-PCM file. Either
+ * way the play cursor drives the video frame. */
 static HWAVEOUT g_hwo;
 static WAVEHDR  g_hdr;
 static char    *g_pcm;
-static DWORD    g_total;        /* sample-frames in the clip */
+static DWORD    g_total;        /* sample-frames queued */
 static int      g_audio;
+static int      g_arate_play = 44100;   /* rate actually opened (for the cursor->frame map) */
 
-static int load_audio(const char *path) {
-    FILE *f = fopen(path, "rb"); if (!f) { perror(path); return 0; }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    g_pcm = malloc(sz);
-    if (fread(g_pcm, 1, sz, f) != (size_t)sz) { fclose(f); return 0; }
-    fclose(f);
-    g_total = (DWORD)(sz / 4);                       /* stereo s16 = 4 bytes/frame */
+static int start_audio_mem(char *pcm, long bytes, int rate, int ch, int bits) {
+    int frb = ch * (bits / 8); if (frb < 1) frb = 4;
+    g_pcm = pcm; g_total = (DWORD)(bytes / frb); g_arate_play = rate;
     WAVEFORMATEX wf; memset(&wf, 0, sizeof wf);
-    wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = 2; wf.nSamplesPerSec = AUDIO_RATE;
-    wf.wBitsPerSample = 16; wf.nBlockAlign = 4; wf.nAvgBytesPerSec = AUDIO_RATE * 4;
+    wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = (WORD)ch; wf.nSamplesPerSec = rate;
+    wf.wBitsPerSample = (WORD)bits; wf.nBlockAlign = (WORD)frb; wf.nAvgBytesPerSec = rate * frb;
     if (waveOutOpen(&g_hwo, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
-        fprintf(stderr, "waveOutOpen failed\n"); return 0;
+        fprintf(stderr, "waveOutOpen failed\n"); free(pcm); return 0;
     }
-    memset(&g_hdr, 0, sizeof g_hdr); g_hdr.lpData = g_pcm; g_hdr.dwBufferLength = (DWORD)sz;
+    memset(&g_hdr, 0, sizeof g_hdr); g_hdr.lpData = g_pcm; g_hdr.dwBufferLength = (DWORD)bytes;
     waveOutPrepareHeader(g_hwo, &g_hdr, sizeof g_hdr);
     waveOutWrite(g_hwo, &g_hdr, sizeof g_hdr);
     g_audio = 1;
-    printf("audio: %s (%.1fs @ %d Hz stereo) = master clock\n", path, (double)g_total/AUDIO_RATE, AUDIO_RATE);
+    printf("audio: %.1fs @ %d Hz %dch/%d-bit = master clock\n", (double)g_total/rate, rate, ch, bits);
     return 1;
 }
+/* FMV2: gather the per-frame audio chunks (which the loader interleaved before
+ * each video block) into one contiguous PCM buffer for waveOut. */
+static int start_audio_embedded(void) {
+    if (g_abytes <= 0 || nframes <= 0) return 0;
+    long bytes = (long)nframes * g_abytes;
+    char *buf = malloc(bytes); if (!buf) return 0;
+    for (int f = 0; f < nframes; f++)
+        memcpy(buf + (long)f*g_abytes, clip + g_hdrsz + (long)f*g_unit, g_abytes);
+    return start_audio_mem(buf, bytes, g_arate, g_ach, g_abits);
+}
+/* legacy FMV1: a raw s16le 44100 stereo .pcm sitting next to a video-only clip */
+static int load_audio_sidecar(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); return 0; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz);
+    if (fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); free(buf); return 0; }
+    fclose(f);
+    return start_audio_mem(buf, sz, 44100, 2, 16);
+}
 static int audio_video_frame(void) {                 /* current video frame from the play cursor */
+    int frb = g_ach * (g_abits / 8); if (frb < 1) frb = 4;
     MMTIME mt; mt.wType = TIME_SAMPLES;
     waveOutGetPosition(g_hwo, &mt, sizeof mt);
     DWORD pos = (mt.wType == TIME_SAMPLES) ? mt.u.sample
-              : (mt.wType == TIME_BYTES)   ? mt.u.cb / 4 : 0;
+              : (mt.wType == TIME_BYTES)   ? mt.u.cb / frb : 0;
     if (pos >= g_total) {                             /* clip ended -> loop audio + video together */
         waveOutReset(g_hwo); g_hdr.dwFlags &= ~WHDR_DONE;
         waveOutWrite(g_hwo, &g_hdr, sizeof g_hdr); pos = 0;
     }
-    int vf = (int)((long long)pos * fps / AUDIO_RATE);
+    int vf = (int)((long long)pos * fps / g_arate_play);
     return vf < 0 ? 0 : vf >= nframes ? nframes - 1 : vf;
 }
 static void audio_shutdown(void) {
@@ -160,10 +192,11 @@ static void audio_shutdown(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: demo_fmv <clip.fmv> [audio.pcm]\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "usage: demo_fmv <clip.fmv>   (FMV2 carries audio; FMV1 takes an optional <audio.pcm>)\n"); return 1; }
     if (!present_init(PPU_SCREEN_W, PPU_SCREEN_H, "microgarbage - FMV")) return 1;
     if (!load_clip(argv[1])) return 1;
-    if (argc >= 3) load_audio(argv[2]);
+    if (g_abytes > 0)   start_audio_embedded();        /* FMV2: audio rides in the clip */
+    else if (argc >= 3) load_audio_sidecar(argv[2]);   /* FMV1: optional sidecar .pcm */
     setup();
     fflush(stdout);
 
@@ -178,6 +211,7 @@ int main(int argc, char **argv) {
         if (vf != last) { load_frame(vf); ppu_render(&P, FB); last = vf; }
 
         int need = BLOCK, avail = vbpf * DMA_WIN;
+        const char *astat = !g_audio ? "off" : g_abytes > 0 ? "embedded (master)" : "sidecar (master)";
         char ov[512];
         snprintf(ov, sizeof ov,
             "SNES PPU emulated (Mode 1, 4bpp) - FMV streamed from coprocessor\n"
@@ -192,7 +226,7 @@ int main(int argc, char **argv) {
             BLANK_LINES, LETTERBOX, VBLANK_STD,
             DMA_WIN, BLANK_LINES, LINE_CYC,
             fps, need, avail, vbpf, (need <= avail ? "FITS" : "OVER"),
-            fps, hostfps, g_audio ? "ON (44.1kHz)" : "off (pass a .pcm)");
+            fps, hostfps, astat);
         present_set_overlay(ov);
         present_frame(FB);
         frames++;
