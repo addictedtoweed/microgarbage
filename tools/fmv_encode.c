@@ -25,8 +25,10 @@
  *   video block = [ CGRAM 256B | tilemap NTILES*2 | CHR NTILES*32 ] = 26776 B.
  *   audio chunk = RATE/FPS sample-frames of s16le stereo = 8820 B @ 44100/20.
  *
- * v1 quantizer: k-means group tiles by average color into 8 palettes, then
- * median-cut each group to 15 colors. Public domain (CC0).
+ * v2 quantizer: seed by clustering tiles on average color, then iteratively
+ * reassign each tile to the palette that quantizes it best (true per-pixel
+ * error, not average) and rebuild; Lloyd-refine each palette's 15 colors.
+ * Public domain (CC0).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,12 @@
 #define NPAL 8
 #define PCOL 15            /* usable colors per palette (1..15); 0 = shared backdrop */
 #define DITHER 18
+#ifndef REFINE_PASSES
+#define REFINE_PASSES 3    /* v2: tile<->palette reassignment passes (quality vs encode time) */
+#endif
+#ifndef COLOR_LLOYD
+#define COLOR_LLOYD   4    /* v2: Lloyd iterations refining each palette's 15 colors */
+#endif
 #define FPS 20
 #define RATE  44100        /* audio sample rate (CD); must divide evenly by FPS */
 #define ACH   2            /* audio channels (stereo) */
@@ -65,7 +73,18 @@ static Col     tileavg[NTILES];
 static uint8_t chr[NTILES][32];
 static double  mse;
 
-static const int bayer4[16] = { 0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5 };
+/* 8x8 ordered-dither matrix (0..63): finer gradient steps than 4x4, still a
+   fixed per-position threshold so it stays flicker-free frame to frame. */
+static const int bayer8[64] = {
+     0,32, 8,40, 2,34,10,42,
+    48,16,56,24,50,18,58,26,
+    12,44, 4,36,14,46, 6,38,
+    60,28,52,20,62,30,54,22,
+     3,35,11,43, 1,33, 9,41,
+    51,19,59,27,49,17,57,25,
+    15,47, 7,39,13,45, 5,37,
+    63,31,55,23,61,29,53,21
+};
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static long cdist(Col a, Col b) {
@@ -143,6 +162,36 @@ static void median_cut(Col *px, int n, int k, Col *out) {
     }
 }
 
+/* total quantization error of a tile's 64 pixels against one 15-color palette
+   (the shared black backdrop is always a free candidate). */
+static long tile_err(const Col *px, const Col *pal) {
+    long e = 0;
+    for (int i = 0; i < 64; i++) {
+        long d = cdist(px[i], bg);
+        for (int k = 0; k < PCOL; k++) { long dd = cdist(px[i], pal[k]); if (dd < d) d = dd; }
+        e += d;
+    }
+    return e;
+}
+/* (re)build palette c from its member tiles: median-cut to seed the 15 colors,
+   then Lloyd-refine them on the real pixels (skipping ones that fall to bg). */
+static void build_palette(int c) {
+    static Col pool[NTILES*64]; int n = 0;
+    for (int t = 0; t < NTILES; t++)
+        if (tilepal[t]==c) { Col px[64]; tile_pixels(t,px); memcpy(pool+n,px,64*sizeof(Col)); n+=64; }
+    median_cut(pool, n, PCOL, palette[c]);
+    for (int it = 0; it < COLOR_LLOYD && n > 0; it++) {
+        long sr[PCOL]={0}, sg[PCOL]={0}, sb[PCOL]={0}; int cn[PCOL]={0};
+        for (int i = 0; i < n; i++) {
+            int bk=0; long bd=cdist(pool[i],palette[c][0]);
+            for (int k=1;k<PCOL;k++){ long d=cdist(pool[i],palette[c][k]); if(d<bd){bd=d;bk=k;} }
+            if (cdist(pool[i], bg) < bd) continue;          /* this pixel belongs to the backdrop */
+            sr[bk]+=pool[i].r; sg[bk]+=pool[i].g; sb[bk]+=pool[i].b; cn[bk]++;
+        }
+        for (int k=0;k<PCOL;k++) if(cn[k]) palette[c][k]=(Col){(int)(sr[k]/cn[k]),(int)(sg[k]/cn[k]),(int)(sb[k]/cn[k])};
+    }
+}
+
 /* ---- quantize the current img into palette/bg/tilepal/chr (+ mse) ---- */
 static void quantize(void) {
     bg = (Col){0, 0, 0};        /* black backdrop: free black letterbox + true black shadows */
@@ -151,6 +200,7 @@ static void quantize(void) {
         long ar=0,ag=0,ab=0; for(int i=0;i<64;i++){ar+=px[i].r;ag+=px[i].g;ab+=px[i].b;}
         tileavg[t]=(Col){(int)(ar/64),(int)(ag/64),(int)(ab/64)}; }
 
+    /* seed: cluster tiles by average color into NPAL groups (cheap starting point) */
     Col cen[NPAL];
     for (int c=0;c<NPAL;c++) cen[c]=tileavg[c*NTILES/NPAL];
     for (int it=0; it<10; it++) {
@@ -161,18 +211,33 @@ static void quantize(void) {
             for(int t=0;t<NTILES;t++) if(tilepal[t]==c){cr+=tileavg[t].r;cg+=tileavg[t].g;cb+=tileavg[t].b;n++;}
             if(n) cen[c]=(Col){(int)(cr/n),(int)(cg/n),(int)(cb/n)}; }
     }
+    for (int c=0;c<NPAL;c++) build_palette(c);
 
-    static Col pool[NTILES*64];
-    for (int c=0;c<NPAL;c++){ int n=0;
-        for(int t=0;t<NTILES;t++) if(tilepal[t]==c){ Col px[64]; tile_pixels(t,px); memcpy(pool+n,px,64*sizeof(Col)); n+=64; }
-        median_cut(pool,n,PCOL,palette[c]); }
+    /* refine: reassign each tile to the palette that quantizes it best (true
+       per-pixel error), rebuild, and keep all NPAL palettes earning their keep
+       by re-seeding any that empty out. Stops when no tile moves. */
+    for (int pass=0; pass<REFINE_PASSES; pass++) {
+        int changed=0;
+        for (int t=0;t<NTILES;t++){ Col px[64]; tile_pixels(t,px);
+            long best=-1; int bc=tilepal[t];
+            for(int c=0;c<NPAL;c++){ long e=tile_err(px,palette[c]); if(best<0||e<best){best=e;bc=c;} }
+            if (bc!=tilepal[t]){ tilepal[t]=bc; changed++; } }
+        int cnt[NPAL]={0}; for(int t=0;t<NTILES;t++) cnt[tilepal[t]]++;
+        for (int c=0;c<NPAL;c++) if(cnt[c]==0){            /* steal the worst-fit tile from a fuller group */
+            long worst=-1; int wt=-1;
+            for(int t=0;t<NTILES;t++) if(cnt[tilepal[t]]>1){ Col px[64]; tile_pixels(t,px);
+                long e=tile_err(px,palette[tilepal[t]]); if(e>worst){worst=e;wt=t;} }
+            if(wt>=0){ cnt[tilepal[wt]]--; tilepal[wt]=c; cnt[c]++; changed++; } }
+        for (int c=0;c<NPAL;c++) build_palette(c);
+        if (!changed) break;
+    }
 
     mse = 0;
     for (int t=0;t<NTILES;t++){ int p=tilepal[t], tx=(t%TW)*TS, ty=(t/TW)*TS;
         memset(chr[t],0,32);
         for(int yy=0;yy<TS;yy++) for(int xx=0;xx<TS;xx++){
             Col c=img[(ty+yy)*W+(tx+xx)];
-            int d=(bayer4[((ty+yy)&3)*4+((tx+xx)&3)]-8)*DITHER/8;
+            int d=(bayer8[((ty+yy)&7)*8+((tx+xx)&7)]-32)*DITHER/32;
             Col cd={clampi(c.r+d,0,255),clampi(c.g+d,0,255),clampi(c.b+d,0,255)};
             int bi=0; long bd=cdist(cd,bg);
             for(int k=0;k<PCOL;k++){ long dd=cdist(cd,palette[p][k]); if(dd<bd){bd=dd;bi=k+1;} }
@@ -203,7 +268,7 @@ static void write_preview(const char *path) {
     for (int t=0;t<NTILES;t++){ int p=tilepal[t], tx=(t%TW)*TS, ty=(t/TW)*TS;
         for(int yy=0;yy<TS;yy++) for(int xx=0;xx<TS;xx++){
             Col c=img[(ty+yy)*W+(tx+xx)];
-            int d=(bayer4[((ty+yy)&3)*4+((tx+xx)&3)]-8)*DITHER/8;
+            int d=(bayer8[((ty+yy)&7)*8+((tx+xx)&7)]-32)*DITHER/32;
             Col cd={clampi(c.r+d,0,255),clampi(c.g+d,0,255),clampi(c.b+d,0,255)};
             int bi=0; long bd=cdist(cd,bg);
             for(int k=0;k<PCOL;k++){ long dd=cdist(cd,palette[p][k]); if(dd<bd){bd=dd;bi=k+1;} }
