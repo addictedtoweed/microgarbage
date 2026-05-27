@@ -11,7 +11,7 @@
 /* Scratch sized to the scene's working set (not to the world). */
 #define R3D_MAX_VERTS  4096
 #define R3D_MAX_TRIS   4096
-#define R3D_MAX_PIXELS (128 * 128)   /* z-buffer cap (the low-res Mode-7 framebuffer) */
+#define R3D_MAX_PIXELS (256 * 224)   /* z-buffer cap: full screen, so the 240x208 4bpp path z-tests too */
 
 static vec3_q16 g_vv[R3D_MAX_VERTS];   /* view-space vertices         */
 static int      g_sx[R3D_MAX_VERTS];   /* projected screen x (pixels) */
@@ -19,14 +19,26 @@ static int      g_sy[R3D_MAX_VERTS];   /* projected screen y (pixels) */
 static uint8_t  g_behind[R3D_MAX_VERTS];
 static int32_t  g_zbuf[R3D_MAX_PIXELS];/* per-pixel 1/z (Q16); larger = nearer */
 
-typedef struct { int a, b, c; uint8_t color; } R3dTri;
+typedef struct { int a, b, c; uint8_t color, base; uint16_t pos; } R3dTri;
 static R3dTri   g_tris[R3D_MAX_TRIS];
+
+/* 8x8 ordered (Bayer) threshold matrix, 0..63 — the dithered shade path
+ * spreads a face's continuous brightness across the two neighbouring ramp
+ * indices (the Star-Fox "more colours than the palette" trick). */
+static const uint8_t r3d_bayer8[64] = {
+     0,32, 8,40, 2,34,10,42,  48,16,56,24,50,18,58,26,
+    12,44, 4,36,14,46, 6,38,  60,28,52,20,62,30,54,22,
+     3,35,11,43, 1,33, 9,41,  51,19,59,27,49,17,57,25,
+    15,47, 7,39,13,45, 5,37,  63,31,55,23,61,29,53,21,
+};
 
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static inline int min3(int a, int b, int c) { int m = a < b ? a : b; return m < c ? m : c; }
 static inline int max3(int a, int b, int c) { int m = a > b ? a : b; return m > c ? m : c; }
 
-long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
+/* core: dither=0 reproduces the flat-shaded Mode-7 output exactly; dither=1
+ * ordered-dithers each face's brightness between adjacent ramp indices. */
+static long r3d_render_x(const R3dScene *s, uint8_t *fb, int fbw, int fbh, int dither) {
     long tests = 0;                                       /* per-pixel edge tests (cost proxy) */
     const int npix  = fbw * fbh;
     const int use_z = (npix <= R3D_MAX_PIXELS);            /* else fall back to overwrite */
@@ -77,8 +89,15 @@ long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
             shade = clampi(shade, 0, s->ramp - 1);
             int base = m->tri_base ? (int)m->tri_base[ti] : s->base;
 
+            /* ramp position in Q8 for the dither path (bright * (ramp-1)). */
+            int maxpos = (s->ramp - 1) << 8;
+            int pos = (int)(((int64_t)bright * (s->ramp - 1)) >> 8);
+            pos = clampi(pos, 0, maxpos);
+
             g_tris[nt].a = a; g_tris[nt].b = b; g_tris[nt].c = c;
             g_tris[nt].color = (uint8_t)(base + shade);
+            g_tris[nt].base  = (uint8_t)base;
+            g_tris[nt].pos   = (uint16_t)pos;
             nt++;
         }
     }
@@ -116,14 +135,26 @@ long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
                                       : (w0 <= 0 && w1 <= 0 && w2 <= 0);
                 if (!inside) continue;
                 int idx = y * fbw + x;
+                uint8_t out = t->color;
+                if (dither) {                              /* ordered-dither the face brightness */
+                    int sh = ((int)t->pos + (r3d_bayer8[(y & 7) * 8 + (x & 7)] << 2)) >> 8;
+                    out = (uint8_t)(t->base + clampi(sh, 0, s->ramp - 1));
+                }
                 if (use_z) {
                     int32_t d = (int32_t)depth;            /* inside => within the vertex 1/z range */
-                    if (d > g_zbuf[idx]) { g_zbuf[idx] = d; fb[idx] = t->color; }
+                    if (d > g_zbuf[idx]) { g_zbuf[idx] = d; fb[idx] = out; }
                 } else {
-                    fb[idx] = t->color;
+                    fb[idx] = out;
                 }
             }
         }
     }
     return tests;
+}
+
+long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
+    return r3d_render_x(s, fb, fbw, fbh, 0);   /* flat-shaded (Mode-7 path, unchanged) */
+}
+long r3d_render_dither(const R3dScene *s, uint8_t *fb, int fbw, int fbh) {
+    return r3d_render_x(s, fb, fbw, fbh, 1);   /* dithered ramp (4bpp tiled path) */
 }

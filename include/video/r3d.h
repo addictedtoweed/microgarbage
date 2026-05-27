@@ -65,6 +65,11 @@ typedef struct {
  * term, a proxy for estimating on-cart render cycles. */
 long r3d_render(const R3dScene *s, uint8_t *fb, int fbw, int fbh);
 
+/* Same pipeline, but ordered-dithers each face's brightness between the two
+ * neighbouring ramp indices (Star-Fox-style shade expansion) — for the 4bpp
+ * tiled path. r3d_render() above stays flat for the Mode-7 path. */
+long r3d_render_dither(const R3dScene *s, uint8_t *fb, int fbw, int fbh);
+
 #ifdef __cplusplus
 }
 #endif
