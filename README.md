@@ -1,4 +1,14 @@
-# John's Cavalcade of Embedded Garbage
+   *                                                        
+ (  `                 (                  )                  
+ )\))(  (     (       )\ )      ) (   ( /(    ) (  (    (   
+((_)()\ )\  ( )(   ( (()/(   ( /( )(  )\())( /( )\))(  ))\  
+(_()((_|(_) )(()\  )\ /(_))_ )(_)|()\((_)\ )(_)|(_))\ /((_) 
+|  \/  |(_)((_|(_)((_|_)) __((_)_ ((_) |(_|(_)_ (()(_|_))   
+| |\/| || / _| '_/ _ \ | (_ / _` | '_| '_ Y _` / _` |/ -_)  
+|_|  |_||_\__|_| \___/  \___\__,_|_| |_.__|__,_\__, |\___|  
+                                               |___/        
+											   
+#Powered by AI slop and shamelessness
 
 A small library of reusable C modules for embedded and bare-metal
 projects. Public domain (CC0). No warranty.
