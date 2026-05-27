@@ -15,6 +15,7 @@
  *  To keep it self-contained and avoid surprises, the whole file is
  *  guarded so that an accidental compile on native Windows is a
  *  no-op rather than a double-definition.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #if !defined(_WIN32) || defined(__CYGWIN__)

@@ -1,4 +1,5 @@
-/* Tests for music_player. */
+/* Tests for music_player.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "audio/music_player.h"

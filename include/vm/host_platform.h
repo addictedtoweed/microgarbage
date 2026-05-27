@@ -42,6 +42,7 @@
  *  Copy platform_stub.c, implement the functions for your target,
  *  and build with it instead of platform_posix/win. See
  *  docs/host_platform.md.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 #ifndef VM_HOST_PLATFORM_H
 #define VM_HOST_PLATFORM_H

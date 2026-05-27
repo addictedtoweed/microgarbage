@@ -10,6 +10,7 @@
  *    cc -std=c11 -Iinclude -o t \
  *       src/audio/tests/test_audio_file_stream.c src/audio/audio_file_stream.c \
  *       src/audio/audio_wav_read.c
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "audio/audio_file_stream.h"

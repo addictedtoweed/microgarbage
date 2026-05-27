@@ -8,7 +8,8 @@
  *
  * Used by the test suite to verify the dispatcher handles call
  * conventions correctly. Build via build.sh; the host doesn't
- * use this guest directly. */
+ * use this guest directly.
+ * Public domain (CC0). No warranty. */
 
 #define SYS_EXIT 93
 

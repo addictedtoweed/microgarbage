@@ -1,4 +1,5 @@
-/* Tests for fixed_point. */
+/* Tests for fixed_point.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "math/fixed_point.h"

@@ -10,6 +10,8 @@
  * mailbox — all allocated from the local arena by
  * vm_system_load_vm. The producer and consumer cooperate via the
  * mailbox ABI (SYS_SEND / SYS_RECV / SYS_WHITELIST_ADD).
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "vm/vm_system.h"

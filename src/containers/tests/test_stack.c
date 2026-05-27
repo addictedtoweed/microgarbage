@@ -1,4 +1,5 @@
-/* Tests for stack. */
+/* Tests for stack.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/stack.h"

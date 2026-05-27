@@ -4,6 +4,7 @@
  *  Strategy: redirect stdout to a temp file, drive the syscalls
  *  via vm_ecall_dispatch, then inspect the captured output for
  *  the expected escape sequences and characters.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #define _POSIX_C_SOURCE 200809L

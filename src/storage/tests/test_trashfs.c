@@ -4,6 +4,8 @@
  *   cc -std=c11 -Wall -Wextra -Wpedantic -Iinclude -Isrc/storage \
  *      -o test_trashfs src/storage/tests/test_trashfs.c src/storage/trashfs.c
  *   ./test_trashfs
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "test_runner.h"

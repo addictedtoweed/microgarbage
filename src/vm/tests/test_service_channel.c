@@ -26,6 +26,7 @@
  *    cc -std=c11 -Iinclude -o t \
  *       src/vm/tests/test_service_channel.c src/vm/service_channel.c \
  *       src/vm/channel_thread.c src/containers/spsc_ring.c -lpthread
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "vm/service_channel.h"

@@ -1,4 +1,5 @@
-/* Tests for avlhash (hash table with AVL-tree buckets, one node pool). */
+/* Tests for avlhash (hash table with AVL-tree buckets, one node pool).
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/avlhash.h"

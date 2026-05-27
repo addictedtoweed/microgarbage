@@ -18,6 +18,7 @@
  *      Ctrl-C in a real console (cmd/PowerShell); signal() covers
  *      kill -INT and CRT emulation. This is why Ctrl-C works in a
  *      real console — see the long bug hunt that established it.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #if defined(_WIN32) && !defined(__CYGWIN__)

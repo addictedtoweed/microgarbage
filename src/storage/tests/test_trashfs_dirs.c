@@ -1,5 +1,6 @@
 /* Tests for trashfs hierarchical directories: mkdir/rmdir, nested
- * paths, "." and "..", and path-aware open/unlink/opendir. */
+ * paths, "." and "..", and path-aware open/unlink/opendir.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "storage/trashfs.h"

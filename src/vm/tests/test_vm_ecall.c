@@ -2,7 +2,8 @@
  *
  * Uses tiny mock handlers (record-call, write-fixed-value) to
  * verify routing, registration, and fallback behavior without
- * needing the real handlers. */
+ * needing the real handlers.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_ecall.h"

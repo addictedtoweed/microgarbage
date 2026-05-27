@@ -13,6 +13,8 @@
  * machine (same boundary as channel_win32 / waveout).
  *
  * Link: -lrt -lpthread on POSIX.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "test_runner.h"

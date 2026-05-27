@@ -1,4 +1,5 @@
-/* Tests for ring_buffer. */
+/* Tests for ring_buffer.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/ring_buffer.h"

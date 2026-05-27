@@ -2,7 +2,8 @@
  *   Loads:    LB, LH, LW, LBU, LHU
  *   Stores:   SB, SH, SW
  *   Branches: BEQ, BNE, BLT, BGE, BLTU, BGEU
- *   Jumps:    JAL, JALR */
+ *   Jumps:    JAL, JALR
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_core.h"

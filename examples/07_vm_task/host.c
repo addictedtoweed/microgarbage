@@ -13,6 +13,8 @@
  * single-thread-ownership invariant the VM core requires.
  *
  * Build:  ./build.sh run     Link: -lrt -lpthread (POSIX)
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "vm/presched.h"

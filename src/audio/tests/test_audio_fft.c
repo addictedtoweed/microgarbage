@@ -12,6 +12,7 @@
  *    cc -std=c11 -lm -Iinclude -o t \
  *       src/audio/tests/test_audio_fft.c src/audio/audio_fft.c \
  *       src/audio/audio_fft_kernel.c
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "audio/audio_fft.h"

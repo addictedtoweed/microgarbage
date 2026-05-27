@@ -1,4 +1,5 @@
-/* Tests for vm_mailbox. */
+/* Tests for vm_mailbox.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_mailbox.h"

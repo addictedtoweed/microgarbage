@@ -13,6 +13,8 @@
  * Build (Windows/mingw):
  *   gcc -std=c11 -I include -o build/t_spawn.exe \
  *       src/vm/tests/test_presched_spawn.c src/vm/presched.c -lpthread
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "vm/presched.h"

@@ -10,6 +10,7 @@
  *  The strength of these tests is breadth, not depth: any algorithmic
  *  bug in the magic-number computation will show up as soon as the
  *  test hits a divisor/dividend combination that triggers it.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "test_runner.h"

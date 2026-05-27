@@ -1,4 +1,5 @@
-/* Tests for fifo_queue. */
+/* Tests for fifo_queue.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/fifo_queue.h"

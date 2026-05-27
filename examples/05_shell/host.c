@@ -19,6 +19,8 @@
  * No external dependencies beyond the standard -Iinclude: the
  * filesystem is the native trashfs (src/storage/trashfs.c). See the
  * build.sh in this directory for the full link line.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define _POSIX_C_SOURCE 200809L

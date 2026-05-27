@@ -1,7 +1,8 @@
 /* Tests for bump allocator (caller-provided-region path).
  *
  * The slab-backed path (bump_init_from_slab) is exercised when
- * slab_stack is built; for now we test the standalone path. */
+ * slab_stack is built; for now we test the standalone path.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "memory/bump.h"

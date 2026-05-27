@@ -1,4 +1,5 @@
-/* Tests for tree (BST/AVL over a node pool, shared in-order walk). */
+/* Tests for tree (BST/AVL over a node pool, shared in-order walk).
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/tree.h"

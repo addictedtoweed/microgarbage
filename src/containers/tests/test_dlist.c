@@ -1,4 +1,5 @@
-/* Tests for dlist (doubly-linked list over a node pool). */
+/* Tests for dlist (doubly-linked list over a node pool).
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/dlist.h"

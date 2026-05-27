@@ -6,7 +6,8 @@
  *   - High-half products for the three MULH variants
  *   - Sign mixing in MULHSU
  *   - Divide-by-zero (returns -1 for DIV/DIVU, dividend for REM/REMU)
- *   - Signed-overflow INT32_MIN / -1 (returns INT32_MIN; REM returns 0) */
+ *   - Signed-overflow INT32_MIN / -1 (returns INT32_MIN; REM returns 0)
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_core.h"

@@ -9,6 +9,8 @@
  *
  * Compared to 01_hello, this guest never exits on its own — it
  * loops forever. The host bounds runtime via a cycle cap.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_WRITE 64

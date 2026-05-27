@@ -5,7 +5,8 @@
  *
  * Each test encodes one (or a few) instructions by hand, points
  * the VM's code region at them, sets up rs1/rs2 values, runs
- * vm_step, and checks rd. */
+ * vm_step, and checks rd.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_core.h"

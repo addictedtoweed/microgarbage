@@ -1,4 +1,5 @@
-/* Tests for bitset (fixed-size bit set over caller word storage). */
+/* Tests for bitset (fixed-size bit set over caller word storage).
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/bitset.h"

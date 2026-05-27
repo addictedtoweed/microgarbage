@@ -12,6 +12,8 @@
  * the real write path. It deliberately mirrors the format the library
  * reads, so a passing read test proves the read path against a
  * known-correct on-disk image.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "test_runner.h"

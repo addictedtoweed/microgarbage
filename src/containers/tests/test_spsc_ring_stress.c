@@ -27,6 +27,7 @@
  *  it fills and drains many times — exercising the full/empty
  *  boundaries and wrap-around under contention, with both sides
  *  spinning (retry on full / empty) the way the real channel will.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "containers/spsc_ring.h"

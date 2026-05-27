@@ -20,6 +20,8 @@
  *
  * Build:  ./build.sh        (or ./build.sh run)
  * Link:   -lrt -lpthread on POSIX.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "vm/presched.h"

@@ -1,4 +1,5 @@
-/* Tests for audio_mixer, stage 2. */
+/* Tests for audio_mixer, stage 2.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "audio/audio_mixer.h"

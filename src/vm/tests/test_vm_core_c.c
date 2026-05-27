@@ -6,7 +6,8 @@
  * effect is right, the expansion was right.
  *
  * The fixture uses PC increments of 2 so that step boundaries
- * line up with the compressed encoding. */
+ * line up with the compressed encoding.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_core.h"

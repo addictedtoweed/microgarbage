@@ -3,7 +3,8 @@
  *   ECALL
  *   EBREAK
  *   CSRRW, CSRRS, CSRRC (register-source variants)
- *   CSRRWI, CSRRSI, CSRRCI (immediate-source variants) */
+ *   CSRRWI, CSRRSI, CSRRCI (immediate-source variants)
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_core.h"

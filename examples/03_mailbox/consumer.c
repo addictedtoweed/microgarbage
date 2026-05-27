@@ -10,6 +10,8 @@
  * sends will succeed. The producer handles the race window where
  * it tries to send before the whitelist is set up (it gets -EPERM,
  * yields, and retries).
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_WHITELIST_ADD  1075

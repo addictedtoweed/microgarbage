@@ -2,7 +2,8 @@
  *
  * Verifies that bump_init_from_slab correctly requests memory from
  * a slab allocator, allocates from the resulting region, and frees
- * the region back on destroy. */
+ * the region back on destroy.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "memory/bump.h"

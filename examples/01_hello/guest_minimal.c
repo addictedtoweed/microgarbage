@@ -12,7 +12,8 @@
  * retire, then ECALL traps, then the handler sets halted.
  *
  * Not loaded by host.c — that uses guest.c (the actual "hello
- * world" demo). */
+ * world" demo).
+ * Public domain (CC0). No warranty. */
 
 #define SYS_EXIT 93
 

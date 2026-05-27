@@ -22,6 +22,8 @@
  * Reading the bytes: 0x1B is ESC, 0x5B is '[', 0x41 is 'A' — so
  * up arrow is the 3-byte sequence ESC [ A, matching xterm
  * convention. PuTTY uses the same sequences.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_READ   63

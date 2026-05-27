@@ -1,4 +1,5 @@
-/* Tests for math/bits.h — clz / ctz / popcount (builtin + fallback). */
+/* Tests for math/bits.h — clz / ctz / popcount (builtin + fallback).
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "math/bits.h"

@@ -10,6 +10,8 @@
  * files — no plant_file scaffolding. Round-tripping create -> write
  * -> read proves the write path against the (already-tested) read
  * path.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "test_runner.h"

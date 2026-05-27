@@ -38,6 +38,7 @@
  *    - sleep busy-spins a tiny bounded amount (so a run loop that
  *      relies on sleep doesn't peg the CPU AND doesn't hang)
  *    - the stop hook never raises (host runs until power-off)
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "vm/host_platform.h"

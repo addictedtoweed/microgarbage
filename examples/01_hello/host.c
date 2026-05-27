@@ -9,6 +9,8 @@
  *
  * After this example, look at 02_counter for guests that yield
  * cooperatively and 03_mailbox for multi-guest IPC.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #include "vm/vm_system.h"

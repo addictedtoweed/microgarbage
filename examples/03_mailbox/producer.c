@@ -15,6 +15,8 @@
  * bytes are unused (the mailbox slot size is fixed at 32 bytes by
  * default). A real protocol would have a header, type tag, etc.,
  * but this is the simplest thing that works.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_SEND  1072

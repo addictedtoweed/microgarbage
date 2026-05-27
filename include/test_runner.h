@@ -21,6 +21,7 @@
  *  return from the test function on first failure. The runner
  *  keeps going to the next test, so one bad assertion doesn't
  *  hide the rest of the report.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #ifndef TEST_RUNNER_H

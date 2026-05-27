@@ -6,6 +6,8 @@
  *   - Cycle cap is much higher (the guest never exits on its own)
  *   - vm_system_step in a loop rather than vm_system_run, so we
  *     can check the SIGINT flag between scheduling decisions
+ *
+ * Public domain (CC0). No warranty.
  */
 
 /* For sigaction. */

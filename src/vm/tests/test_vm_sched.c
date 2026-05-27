@@ -5,7 +5,8 @@
  * through the router, and trap handling.
  *
  * The scheduler doesn't own the VmCpu structs — the tests own
- * them as locals. Same for code buffers. */
+ * them as locals. Same for code buffers.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_sched.h"

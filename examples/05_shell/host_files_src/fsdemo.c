@@ -3,6 +3,8 @@
  * namespace. /host is read-only; /td0 (tmpfs) is writable.
  *
  * Run from the shell:  run /host/fsdemo.elf
+ *
+ * Public domain (CC0). No warranty.
  */
 #include "vm_runtime.h"
 #include "fs.h"

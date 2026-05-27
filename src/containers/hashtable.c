@@ -1,6 +1,7 @@
 /* ============================================================
  *  hashtable.c — implementation of the generic hash table.
  *  See hashtable.h for the public contract.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "containers/hashtable.h"

@@ -10,6 +10,7 @@
  *       -Iinclude -o t \
  *       src/audio/tests/test_audio_arbiter.c src/audio/audio_arbiter.c \
  *       src/audio/audio_pool.c
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "audio/audio_arbiter.h"

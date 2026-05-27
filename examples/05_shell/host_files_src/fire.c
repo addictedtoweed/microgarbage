@@ -18,6 +18,7 @@
  *
  *  Drop-in guest: lives in host_files_src/, built automatically to
  *  /host/fire.elf. Run from the shell with:  fire
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include <stdint.h>

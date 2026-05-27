@@ -20,6 +20,7 @@
  *  This template is a working LOOPBACK: whatever the guest writes,
  *  it can read back. Useful to compile-test the wiring before you
  *  have real I/O. Replace the MyCtx buffer with your real source.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "vm/vm_host_transport.h"

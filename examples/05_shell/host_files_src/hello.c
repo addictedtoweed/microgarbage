@@ -11,6 +11,8 @@
  *
  * The child shares the shell's stdio, so this output appears
  * on the user's terminal interleaved with the shell's prompts.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_WRITE 64

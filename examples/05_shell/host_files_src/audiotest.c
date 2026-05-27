@@ -11,6 +11,7 @@
  *  It does NOT itself make the host's speakers play — that needs the
  *  platform audio-output backend (ring -> sound device), which is
  *  separate. This confirms the control path is wired correctly.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "vm_runtime.h"

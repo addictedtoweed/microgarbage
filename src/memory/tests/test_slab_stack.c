@@ -1,4 +1,5 @@
-/* Tests for slab_stack allocator. */
+/* Tests for slab_stack allocator.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "memory/slab_stack.h"

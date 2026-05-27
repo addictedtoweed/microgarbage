@@ -18,6 +18,7 @@
  *       src/audio/audio_pool_stream.c src/audio/audio_pool.c \
  *       src/audio/music_player.c src/audio/audio_mixer.c \
  *       src/containers/ring_buffer.c
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "audio/audio_pool_stream.h"

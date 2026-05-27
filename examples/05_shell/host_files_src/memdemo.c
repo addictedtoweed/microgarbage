@@ -32,6 +32,8 @@
  * The 'allocs' and 'frees' counts both ticked up to 3: the guest
  * called SYS_ALLOC three times, freed once explicitly, and the
  * host freed the other two implicitly during unload.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_WRITE 64

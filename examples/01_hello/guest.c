@@ -12,6 +12,8 @@
  *       -Wl,-T,../common/guest.ld -o build/guest.elf guest.c
  *
  * The build.sh in this directory does this for you.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 /* Syscall numbers. See include/vm/vm_ecall.h for the full ABI. */

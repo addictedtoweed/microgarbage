@@ -3,7 +3,8 @@
  * Most tests build a small ELF in memory, load it, run it, and
  * check the result. The ELF synthesizer is the same pattern as
  * test_vm_loader.c. Programs are hand-assembled small enough to
- * fit a few syscalls and check a register state. */
+ * fit a few syscalls and check a register state.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_system.h"

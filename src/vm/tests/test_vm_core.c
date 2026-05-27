@@ -3,7 +3,8 @@
  * Instruction-semantics tests are added in subsequent chunks
  * as RV32I / RV32M / RVC support comes online. These tests
  * cover only the plumbing: region translation, fetch path,
- * step-loop control flow. */
+ * step-loop control flow.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_core.h"

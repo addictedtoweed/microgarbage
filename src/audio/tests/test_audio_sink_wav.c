@@ -9,6 +9,7 @@
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
  *       src/audio/tests/test_audio_sink_wav.c src/audio/audio_sink_wav.c
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "audio/audio_sink.h"

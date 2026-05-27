@@ -7,6 +7,8 @@
  * it just computes. The preemptive scheduler interrupts it externally
  * via the systick. That is the whole point of Step 4: a VM task needs no
  * cooperation to share the CPU.
+ *
+ * Public domain (CC0). No warranty.
  */
 #define SYS_EXIT 93
 

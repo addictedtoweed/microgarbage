@@ -10,6 +10,7 @@
  *  explicit ELF path is given on the command line, so a distributed
  *  host.exe runs standalone with no external shell.elf. An explicit
  *  path still loads from disk with COPY_RAM (for development).
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 #ifndef SHELL_EMBEDDED_H
 #define SHELL_EMBEDDED_H

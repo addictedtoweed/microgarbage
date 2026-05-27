@@ -9,6 +9,8 @@
  * then exits with status 0. Useful for verifying that the
  * spawned VM has its own stack and can do real work, not just
  * print a static string.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 #define SYS_WRITE 64

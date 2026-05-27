@@ -5,7 +5,8 @@
  *   vm_handle_critical_enter
  *   vm_handle_critical_exit
  *
- * Plus the bulk-installer vm_ecall_install_cpu_handlers. */
+ * Plus the bulk-installer vm_ecall_install_cpu_handlers.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_ecall.h"

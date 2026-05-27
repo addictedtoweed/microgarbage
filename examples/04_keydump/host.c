@@ -14,6 +14,8 @@
  * example, press 'q' (the guest exits and the host follows). If
  * you wedge the terminal somehow, use 'reset' from another shell
  * or close and reopen the terminal.
+ *
+ * Public domain (CC0). No warranty.
  */
 
 /* For sigaction (only as fallback for non-tty input where ISIG

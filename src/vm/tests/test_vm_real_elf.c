@@ -12,7 +12,8 @@
  *   ecall
  *
  * Expected behavior: load succeeds, run terminates with VM
- * halted, all instructions retired correctly. */
+ * halted, all instructions retired correctly.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_system.h"

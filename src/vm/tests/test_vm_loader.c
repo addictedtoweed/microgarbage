@@ -3,7 +3,8 @@
  * We don't need real RV32 ELF fixtures on disk — instead we
  * synthesize valid (and deliberately invalid) ELF images in
  * memory using a small helper. This lets us test every error
- * path with exactly the malformed shape we want. */
+ * path with exactly the malformed shape we want.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "vm/vm_loader.h"

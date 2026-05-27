@@ -30,6 +30,7 @@
  *  freed by allocator B. ht_destroy uses the table's own stored
  *  free function, so this is automatic — just don't try to share
  *  pointers across tables with different allocators.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #ifndef HASHTABLE_H

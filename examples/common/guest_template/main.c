@@ -9,6 +9,8 @@
  *          needs only a RISC-V cross compiler.
  * Run:     copy the resulting app.elf where your host can load it
  *          (e.g. a microgarbage shell's /host dir), then `run app.elf`.
+ *
+ * Public domain (CC0). No warranty.
  */
 #include "vm_runtime.h"   /* host hooks: SYS_*, _vm_sysN, exit, spawn, time, rand */
 #include <stdio.h>        /* mini-libc: printf/puts/fopen... routed to the host  */

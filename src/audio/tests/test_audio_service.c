@@ -17,6 +17,7 @@
  *       src/audio/music_player.c src/containers/ring_buffer.c \
  *       src/containers/spsc_ring.c src/vm/service_channel.c \
  *       src/vm/channel_thread.c -lpthread
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "audio/audio_service.h"

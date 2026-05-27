@@ -10,6 +10,7 @@
  *  Build:
  *    cc -std=c11 -Iinclude -o t \
  *       src/containers/tests/test_spsc_ring.c src/containers/spsc_ring.c
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "containers/spsc_ring.h"

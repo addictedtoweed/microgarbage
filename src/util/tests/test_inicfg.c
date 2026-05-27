@@ -3,6 +3,7 @@
  *
  *  These exercise the public API only. The parser is small
  *  enough that we don't need to peek at internals.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #include "util/inicfg.h"

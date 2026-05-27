@@ -21,6 +21,7 @@
  *
  *  Portable C11: works under Linux, Cygwin, and mingw alike, so the
  *  build doesn't depend on xxd/python being installed.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 #include <stdio.h>
 #include <stdlib.h>

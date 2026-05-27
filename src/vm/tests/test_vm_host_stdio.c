@@ -6,7 +6,8 @@
  * then reading the file back to check the output.
  *
  * Some of the tests load real ELFs from disk; they must run
- * from the repository root so paths resolve. */
+ * from the repository root so paths resolve.
+ * Public domain (CC0). No warranty. */
 
 /* For dup, dup2, getpid — must precede any system header. */
 #define _POSIX_C_SOURCE 200809L

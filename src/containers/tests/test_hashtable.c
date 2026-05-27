@@ -1,4 +1,5 @@
-/* Tests for the generic hash table module. */
+/* Tests for the generic hash table module.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "containers/hashtable.h"

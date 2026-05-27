@@ -1,4 +1,5 @@
-/* Tests for trashdrive. */
+/* Tests for trashdrive.
+ * Public domain (CC0). No warranty. */
 
 #include "test_runner.h"
 #include "storage/trashdrive.h"

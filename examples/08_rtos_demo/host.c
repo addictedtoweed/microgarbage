@@ -14,6 +14,8 @@
  * SYS_EXIT.
  *
  * Build:  ./build.sh run        Link: -lpthread (+ -lrt on Linux)
+ *
+ * Public domain (CC0). No warranty.
  */
 #include "vm/presched.h"
 #include "vm/vm_core.h"

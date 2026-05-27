@@ -6,6 +6,8 @@
  *
  * Uses the shared guest SDK: vm_runtime provides _start (which calls
  * main), and puts() routes to the host over SYS_WRITE.
+ *
+ * Public domain (CC0). No warranty.
  */
 #include "vm_runtime.h"
 #include <stdio.h>          /* puts -> SYS_WRITE */

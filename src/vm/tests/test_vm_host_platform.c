@@ -6,6 +6,7 @@
  *  directly via vm_ecall_dispatch. No actual guest code runs;
  *  the tests assemble syscall args into cpu->regs and read back
  *  the result + any data written into the fake data region.
+ *  Public domain (CC0). No warranty.
  * ============================================================ */
 
 #define _POSIX_C_SOURCE 200809L
