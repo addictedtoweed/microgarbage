@@ -20,10 +20,12 @@ TM        = $212C      ; main-screen layer enable
 
 ; --- CPU / DMA ($42xx, $43xx) ---
 NMITIMEN  = $4200      ; b7 NMI enable, b0 auto-joypad read
+JOYSER0   = $4016      ; manual joypad serial port 1 (write latch / read bits)
+JOYSER1   = $4017      ; manual joypad serial port 2
 RDNMI     = $4210      ; read to acknowledge NMI (b7 = vblank flag)
 HVBJOY    = $4212      ; b7 vblank, b0 auto-joypad busy
-JOY1L     = $4218      ; auto-joypad pad 1 low
-JOY1H     = $4219      ; auto-joypad pad 1 high
+JOY1L     = $4218      ; auto-joypad pad 1 low  (unused when auto-read is off)
+JOY1H     = $4219      ; auto-joypad pad 1 high (unused when auto-read is off)
 MDMAEN    = $420B      ; general-DMA enable (1 bit per channel)
 
 ; DMA channel 0 registers (others at +$10)

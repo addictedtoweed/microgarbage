@@ -19,11 +19,14 @@ bidirectional by convention:
   address it reads**. The copro watches the address bus and decodes the access;
   the returned byte is don't-care. No write/feedback pins.
 
-The joypad is forwarded through **two page-aligned 256-byte ports**
-(`JOYPORT_LO`/`HI`): the kernel reads `base + pad-byte` with an 8-bit index, so
-the access can never cross the page (no 65816 indexed dummy-read) and the copro
-latches exactly one clean address per port. Boot uses a single read-strobe
-(`STROBE_BOOTED`).
+Auto-joypad read is disabled. The kernel bit-bangs `$4016`/`$4017` itself in
+active display (the moment NMI returns from the vblank DMA burst), reading up
+to **four pads in parallel** via the standard multitap-capable protocol. Each
+pad is then forwarded to the copro through **eight page-aligned 256-byte
+ports** (`JOYPORT_P[0..3]_LO/HI`): the kernel reads `base + pad-byte` with an
+8-bit index, so the access can never cross the page (no 65816 indexed dummy-
+read) and the copro latches exactly one clean address per port. Boot uses a
+single read-strobe (`STROBE_BOOTED`).
 
 The copro **holds the SNES in reset** after power-on until the boot window is
 primed, so the very first fetch already sees a valid boot image.
@@ -46,9 +49,10 @@ vectors) — everything below it is fair game as the data channel.
 ## Per-frame loop (`kernel.s`, runs from WRAM)
 
 ```
-post joypad -> read JOYPORT_LO+lo, JOYPORT_HI+hi   (the reads ARE the message,
-                                                    and ack the previous frame)
-wait for ST_FRAME_RDY                              (copro staged the payload)
+(NMI just returned from vblank DMA -- we're at the start of active display)
+read joypads     -> bit-bang $4016/$4017 (4 pads, multitap-capable)
+post 4 pads      -> 8 read-strobes at JOYPORT_P[0..3]_LO/HI  (acks prev frame)
+wait FRAME_RDY                                              (copro staged it)
 arm DMA burst; next vblank NMI runs it (CGRAM/tilemap/CHR -> PPU); repeat
 ```
 
@@ -98,8 +102,9 @@ real; the rest is marked `TODO`.
 - Addresses in `copro.inc` (data-window bank, port/status offsets) are
   **placeholders** — confirm against the mapper's decode.
 - VRAM DMA (tilemap + CHR), OAM, and double-buffered base-flipping are TODO.
-- Joypad currently uses SNES auto-read (costs ~3 vblank lines); switch to a
-  manual read outside the burst to reclaim the full DMA budget.
+- *(done)* Manual joypad read in active display (`read_joypads` in `kernel.s`)
+  with auto-read disabled — the full 54-line forced-blank window is now
+  available for the DMA burst.
 - Per-frame lockstep assumed (SNES blocks on the copro each frame). `ST_FRAME_RDY`
   is a single bit; a frame counter would avoid a clear-race if it ever bites.
 - Read-as-signal relies on the copro only acting on reads in the port region —

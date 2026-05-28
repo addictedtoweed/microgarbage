@@ -36,18 +36,32 @@ COPRO_DATA      = $0000         ; per-frame PPU payload the SNES DMAs (copro-lai
 COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
 
 ; SNES -> copro: WRITE-FREE. The copro decodes which address we READ.
-; The joypad ports are PAGE-ALIGNED, so reading base+byte with an 8-bit index
-; can never cross the page (no 65816 indexed dummy-read) -- one clean bus
-; access per port that the copro latches. Two ports carry the 16-bit pad;
-; the returned data is don't-care.
-JOYPORT_LO      = $7C00         ; [read base + pad-lo]  copro latches A0-A7
-JOYPORT_HI      = $7D00         ; [read base + pad-hi]  copro latches A0-A7
+; Eight PAGE-ALIGNED joypad ports carry 4 pads x 2 bytes (multitap-capable).
+; Reading base+byte with an 8-bit index can never cross the page (no 65816
+; indexed dummy-read), so each access is a single clean bus read the copro
+; latches as the pad's byte. Pad layout:
+;     P0 = port 1 main         P1 = port 2 main
+;     P2 = port 1 multitap #2  P3 = port 2 multitap #2
+JOYPORT_P0_LO   = $7000         ; [read base + pad0 lo]  -> copro latches A0-A7
+JOYPORT_P0_HI   = $7100
+JOYPORT_P1_LO   = $7200
+JOYPORT_P1_HI   = $7300
+JOYPORT_P2_LO   = $7400
+JOYPORT_P2_HI   = $7500
+JOYPORT_P3_LO   = $7600
+JOYPORT_P3_HI   = $7700
 STROBE_BOOTED   = $7E00         ; [read] boot.s -> copro: running from RAM, go runtime
 
 ; long (24-bit) forms so reads hit COPRO_BANK with DBR left at $00
 COPRO_STATUS_L  = (COPRO_BANK << 16) | COPRO_STATUS
-JOYPORT_LO_L    = (COPRO_BANK << 16) | JOYPORT_LO
-JOYPORT_HI_L    = (COPRO_BANK << 16) | JOYPORT_HI
+JOYPORT_P0_LO_L = (COPRO_BANK << 16) | JOYPORT_P0_LO
+JOYPORT_P0_HI_L = (COPRO_BANK << 16) | JOYPORT_P0_HI
+JOYPORT_P1_LO_L = (COPRO_BANK << 16) | JOYPORT_P1_LO
+JOYPORT_P1_HI_L = (COPRO_BANK << 16) | JOYPORT_P1_HI
+JOYPORT_P2_LO_L = (COPRO_BANK << 16) | JOYPORT_P2_LO
+JOYPORT_P2_HI_L = (COPRO_BANK << 16) | JOYPORT_P2_HI
+JOYPORT_P3_LO_L = (COPRO_BANK << 16) | JOYPORT_P3_LO
+JOYPORT_P3_HI_L = (COPRO_BANK << 16) | JOYPORT_P3_HI
 STROBE_BOOTED_L = (COPRO_BANK << 16) | STROBE_BOOTED
 
 ; status bits (read at COPRO_STATUS)
@@ -72,3 +86,8 @@ PL_CHR_LEN      = 24960
 RAMVEC_NMI      = $0200         ; RAM kernel installs its NMI handler addr here
 RAMVEC_IRQ      = $0202         ; ...and its IRQ handler
 KFRAME_FLAG     = $0210         ; main loop <-> NMI: 1 = run the DMA burst
+PADS            = $0220         ; 4 pads x 16 bits = 8 bytes (PADS+0..+7); see
+                                ; read_joypads in kernel.s for layout. Order
+                                ; mirrors auto-joypad register format ($4218):
+                                ;   bit 15..4 = B Y Sel St U D L R A X L R
+                                ;   bit  3..0 = signature (0 for std pad)
