@@ -31,7 +31,18 @@
     sep #$20
     .a8
 
-    stz KFRAME_FLAG
+    ; --- BG setup (Mode 1, BG1 4bpp; tilemap at $0000, CHR at $1000) ---
+    lda #$01
+    sta BGMODE
+    stz BG1SC               ; BG1 tilemap word addr 0, 32x32 size
+    lda #$01
+    sta BG12NBA             ; BG1 char base = 1  (= word $1000)
+    sta TM                  ; main-screen enable = BG1 only
+
+    ; --- DMA channel 0 source-bank constant (the only field shared across
+    ;     every list slot; BBAD/DMAP/A1T/DAS come from the slot itself). ---
+    lda #COPRO_BANK
+    sta A1B0
 
     lda #$0F
     sta INIDISP             ; screen on, full brightness
@@ -81,18 +92,10 @@
     rep #$10
     .i16
 
-    ; 2) wait for the copro to report the frame payload is staged
-@wait:
-    lda f:COPRO_STATUS_L
-    and #ST_FRAME_RDY
-    beq @wait
-
-    ; 4) arm the DMA burst; the next vblank NMI runs it and clears the flag
-    lda #$01
-    sta KFRAME_FLAG
-@spin:
-    lda KFRAME_FLAG
-    bne @spin
+    ; 3) sleep until the next vblank. NMI fires, reads COPRO_DMACTRL, and
+    ;    dispatches whichever DMAs the copro requested (or none if it wrote
+    ;    $00). After RTI we land back here in active display and loop.
+    wai
     bra @loop
 .endproc
 
@@ -110,36 +113,87 @@
     .a8
     lda RDNMI               ; acknowledge NMI
 
-    lda KFRAME_FLAG
-    beq @out                ; nothing staged this vblank
+    ; --- frame_ready gate ----------------------------------------------
+    ; The copro writes COPRO_FRAME_RDY to a non-zero value once it has
+    ; finished staging the per-frame payload AND the DMA list. 0 here
+    ; means "nothing to do this vblank; just RTI and the previous frame
+    ; stays on screen."
+    lda f:COPRO_FRAME_RDY_L
+    beq @out
 
     ; (Real hardware: assert/extend forced blank for the letterbox lines so the
-    ;  whole 54-line window is DMA-able — see the DMA-budget notes.)
+    ;  whole 54-line window is DMA-able -- see the DMA-budget notes. TODO.)
 
-    ; ---- CGRAM: 256 B  COPRO_BANK:PL_CGRAM -> $2122  (concrete example) ----
-    stz CGADD               ; CGRAM word address 0
-    lda #$00
-    sta DMAP0               ; pattern 0 (1 reg), A-bus increments, A->B
-    lda #<CGDATA
-    sta BBAD0               ; B-bus = $2122
+    ; --- walk the 8-slot DMA list -------------------------------------
+    ; For each slot whose bbus byte is non-zero: program channel 0 from
+    ; the slot, write the prep value to the corresponding PPU dest
+    ; register (CGADD/VMADD/OAMADDR), and fire MDMAEN bit 0. Channel 0
+    ; is reused across slots -- SNES DMA channels never run in parallel
+    ; anyway, so this is functionally identical to using 8 channels.
+    rep #$10
+    .i16
+    ldx #0
+@slot:
+    cpx #(8 * 8)            ; processed all 8 slots? -> done
+    beq @done
+
+    lda f:COPRO_DMA_LIST_L+0,x    ; bbus (0 => empty slot, skip)
+    beq @next
+    sta BBAD0
+    lda f:COPRO_DMA_LIST_L+1,x    ; dmap
+    sta DMAP0
     rep #$20
     .a16
-    lda #PL_CGRAM
-    sta A1T0L               ; A-bus address
-    lda #PL_CGRAM_LEN
-    sta DAS0L               ; byte count
+    lda f:COPRO_DMA_LIST_L+2,x    ; src
+    sta A1T0L
+    lda f:COPRO_DMA_LIST_L+4,x    ; size
+    sta DAS0L
     sep #$20
     .a8
-    lda #COPRO_BANK
-    sta A1B0                ; A-bus bank
+
+    ; prep dispatch: write the slot's +6..+7 value to whichever PPU dest
+    ; register the bbus byte names. Unknown bbus values fall through with
+    ; no prep written -- the copro is trusted to put a valid byte here.
+    lda BBAD0
+    cmp #<CGDATA            ; $22 -> CGADD (low byte only; CGRAM is word-addressed but the reg is 8-bit)
+    bne @check_v
+    lda f:COPRO_DMA_LIST_L+6,x
+    sta CGADD
+    bra @fire
+@check_v:
+    cmp #<VMDATAL           ; $18 -> set VMAIN word-step, write VMADDL/H
+    bne @check_o
+    lda #$80
+    sta VMAIN
+    rep #$20
+    .a16
+    lda f:COPRO_DMA_LIST_L+6,x
+    sta VMADDL
+    sep #$20
+    .a8
+    bra @fire
+@check_o:
+    cmp #<OAMDATA           ; $04 -> write OAMADDL/H
+    bne @fire
+    rep #$20
+    .a16
+    lda f:COPRO_DMA_LIST_L+6,x
+    sta OAMADDL
+    sep #$20
+    .a8
+
+@fire:
     lda #$01
-    sta MDMAEN              ; fire channel 0
+    sta MDMAEN              ; fire channel 0; CPU pauses until this slot completes
 
-    ; ---- TODO: tilemap + CHR -> VRAM ($2118 via VMAIN/VMADDL/H, BBAD=$18),
-    ;            OAM later, then flip BG1SC/BG12NBA bases for double-buffering.
+@next:
+    ; advance to the next slot (entry size = 8 bytes)
+    .repeat 8
+    inx
+    .endrepeat
+    bra @slot
 
-    stz KFRAME_FLAG         ; the loop's next joypad post acks the frame to the copro
-
+@done:
 @out:
     rep #$30
     .a16

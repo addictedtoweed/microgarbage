@@ -33,7 +33,37 @@
 COPRO_BANK      = $C0           ; HiROM full-window bank
 
 COPRO_DATA      = $0000         ; per-frame PPU payload the SNES DMAs (copro-laid)
+COPRO_FRAME_RDY = $7800         ; [read]  1 byte: 0 = skip this frame, else process the list
+COPRO_DMA_LIST  = $7808         ; [read]  8 slots * 8 bytes = $7808-$7847 (see below)
 COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
+
+; --- per-frame DMA dispatch ------------------------------------------
+; The kernel checks COPRO_FRAME_RDY in NMI; 0 means the copro is mid-stage
+; (do nothing this vblank, the previous frame stays on screen). When the
+; copro finishes staging it writes a non-zero byte there, and the kernel
+; walks the 8-slot DMA list, programming channel 0 from each slot and
+; firing one MDMAEN per slot.
+;
+; Each slot is 8 bytes:
+;     +0  bbus  -- $21xx low byte (the PPU register the DMA writes to):
+;                    $22 = CGDATA   -- prep writes the byte to CGADD ($2121)
+;                    $18 = VMDATAL  -- prep writes the word to VMADDL/H + sets VMAIN=$80
+;                    $04 = OAMDATA  -- prep writes the word to OAMADDL/H
+;                  0 means "empty slot, skip" -- the kernel doesn't fire it.
+;     +1  dmap  -- SNES DMAP byte (bit 7 direction; bits 0-2 transfer pattern;
+;                  bit 4 fixed-A; etc.). Typical copro values:
+;                    $00 = 1-byte-to-1-reg, A increments (CGRAM, OAM)
+;                    $01 = 2-bytes-to-2-regs (lo/hi), A increments (VRAM)
+;     +2-3  src  -- source offset within COPRO_BANK (16-bit; bank is implicit).
+;     +4-5  size -- byte count (DAS, 16-bit).
+;     +6-7  prep -- pre-transfer value the kernel writes to the PPU dest register
+;                  (CGADD = low byte; VMADD = 16-bit word addr; OAMADDR = 16-bit).
+;
+; The kernel walks all 8 slots every "frame_ready" vblank, processing the ones
+; where bbus != 0. Slots are independent: putting CGRAM in slot 0, tilemap in
+; slot 1, and CHR in slot 2 (the FMV case) is the same shape as putting all
+; three OAM updates into slots 0-2 (a sprite-only scene). The copro composes
+; whatever it needs each frame.
 
 ; SNES -> copro: WRITE-FREE. The copro decodes which address we READ.
 ; Eight PAGE-ALIGNED joypad ports carry 4 pads x 2 bytes (multitap-capable).
@@ -53,7 +83,9 @@ JOYPORT_P3_HI   = $7700
 STROBE_BOOTED   = $7E00         ; [read] boot.s -> copro: running from RAM, go runtime
 
 ; long (24-bit) forms so reads hit COPRO_BANK with DBR left at $00
-COPRO_STATUS_L  = (COPRO_BANK << 16) | COPRO_STATUS
+COPRO_STATUS_L    = (COPRO_BANK << 16) | COPRO_STATUS
+COPRO_FRAME_RDY_L = (COPRO_BANK << 16) | COPRO_FRAME_RDY
+COPRO_DMA_LIST_L  = (COPRO_BANK << 16) | COPRO_DMA_LIST
 JOYPORT_P0_LO_L = (COPRO_BANK << 16) | JOYPORT_P0_LO
 JOYPORT_P0_HI_L = (COPRO_BANK << 16) | JOYPORT_P0_HI
 JOYPORT_P1_LO_L = (COPRO_BANK << 16) | JOYPORT_P1_LO
@@ -66,10 +98,10 @@ STROBE_BOOTED_L = (COPRO_BANK << 16) | STROBE_BOOTED
 
 ; status bits (read at COPRO_STATUS)
 ST_KERNEL_RDY   = $80           ; boot:    kernel blob staged in the window
-ST_FRAME_RDY    = $01           ; runtime: next frame's payload is staged
-; (the kernel's per-frame joypad post doubles as "prev frame consumed, go" --
-;  no separate ack strobe needed. A frame counter would beat a single RDY bit
-;  if the clear-race ever bites; TODO.)
+; runtime frame-ready signalling moved to the COPRO_DMACTRL byte: a non-zero
+; value there means "do these DMAs", zero means "skip this frame". The kernel's
+; per-frame joypad post doubles as "prev frame consumed, go" so the copro can
+; safely restage the payload + control byte for the next frame.
 
 ; --- per-frame DMA payload layout inside COPRO_DATA ----------
 ; matches the 4bpp Mode-1 plan: CGRAM | tilemap | CHR  (OAM later)
@@ -85,7 +117,7 @@ PL_CHR_LEN      = 24960
 ;   $0200-$02FF kernel vars    $0400-$1FFF kernel code (copied here)
 RAMVEC_NMI      = $0200         ; RAM kernel installs its NMI handler addr here
 RAMVEC_IRQ      = $0202         ; ...and its IRQ handler
-KFRAME_FLAG     = $0210         ; main loop <-> NMI: 1 = run the DMA burst
+                                ; $0210-$021F: free (was DMA_CACHE in the bitmask design)
 PADS            = $0220         ; 4 pads x 16 bits = 8 bytes (PADS+0..+7); see
                                 ; read_joypads in kernel.s for layout. Order
                                 ; mirrors auto-joypad register format ($4218):

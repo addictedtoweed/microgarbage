@@ -52,9 +52,32 @@ vectors) — everything below it is fair game as the data channel.
 (NMI just returned from vblank DMA -- we're at the start of active display)
 read joypads     -> bit-bang $4016/$4017 (4 pads, multitap-capable)
 post 4 pads      -> 8 read-strobes at JOYPORT_P[0..3]_LO/HI  (acks prev frame)
-wait FRAME_RDY                                              (copro staged it)
-arm DMA burst; next vblank NMI runs it (CGRAM/tilemap/CHR -> PPU); repeat
+wai              -> sleep until next vblank
+(at vblank) NMI:
+    read COPRO_FRAME_RDY -- if 0, RTI (previous frame stays on screen)
+    walk COPRO_DMA_LIST (8 slots * 8 bytes):
+        if slot.bbus == 0: skip
+        else:
+            program channel 0: BBAD0/DMAP0/A1T0/DAS0  (A1B0=COPRO_BANK preset)
+            prep (based on bbus):
+                $22 (CGDATA)  -> write CGADD = slot.prep low byte
+                $18 (VMDATAL) -> VMAIN=$80; VMADDL/H = slot.prep
+                $04 (OAMDATA) -> OAMADDL/H = slot.prep
+            sta MDMAEN          ; fire channel 0; CPU paused until slot done
 ```
+
+The protocol is **frame-ready flag + DMA descriptor list**: the copro stages the
+per-frame payload at `COPRO_DATA`, fills `COPRO_DMA_LIST` with up to 8 descriptors
+(bbus / dmap / src / size / prep), then writes `COPRO_FRAME_RDY` to a non-zero
+value to signal "list is complete, go." Each descriptor names one DMA -- the
+copro composes whatever combination of CGRAM / VRAM / OAM transfers it needs
+each frame. The kernel marshalls the list every vblank; channel 0 is reused
+across slots (SNES DMA channels never run in parallel anyway, so reusing is
+functionally identical to using all 8). Reads are idempotent: if the copro
+doesn't update before the next vblank, the kernel re-runs the same list and
+the picture is unchanged.
+
+See `copro.inc` for the 8-byte descriptor layout.
 
 The vblank DMA is where the letterbox forced-blank budget applies (54-line
 window @208 active → fits a 26,776 B frame over 3 vblanks @20 fps).
@@ -96,17 +119,27 @@ custom mapper is wired in.
 
 ## Status / open items
 
-This is a **stub**: control flow, handshake, and one concrete DMA (CGRAM) are
-real; the rest is marked `TODO`.
+This is a **stub**: control flow, handshake, joypad path, and the full DMA
+dispatch (CGRAM / VRAM / OAM, generic per-slot from a copro-staged list) are
+real; the higher-level frame composition is what's left.
 
 - Addresses in `copro.inc` (data-window bank, port/status offsets) are
   **placeholders** — confirm against the mapper's decode.
-- VRAM DMA (tilemap + CHR), OAM, and double-buffered base-flipping are TODO.
 - *(done)* Manual joypad read in active display (`read_joypads` in `kernel.s`)
   with auto-read disabled — the full 54-line forced-blank window is now
   available for the DMA burst.
-- Per-frame lockstep assumed (SNES blocks on the copro each frame). `ST_FRAME_RDY`
-  is a single bit; a frame counter would avoid a clear-race if it ever bites.
+- *(done)* Per-frame DMA dispatch via the **frame-ready flag + 8-slot list**
+  protocol (`COPRO_FRAME_RDY` + `COPRO_DMA_LIST`). Main loop is `wai`-driven;
+  NMI walks the slots and programs channel 0 from each. Supersedes the earlier
+  bitmask `COPRO_DMACTRL` design.
+- **Double-buffering** is TODO: the copro currently puts each frame's data at
+  the same VRAM addresses; flipping `BG1SC` / `BG12NBA` between two banks each
+  frame is a small extension on top of the list (the copro just varies the
+  slot `prep` values).
+- **Letterbox forced-blank extension** is TODO — needed for the full 26.8 KB
+  FMV block (which doesn't fit a standard 38-line vblank). The DMA dispatch is
+  in place; this just needs an IRQ at line ~209 to assert `INIDISP.7` and a
+  matching clear before line 9 of the next frame.
 - Read-as-signal relies on the copro only acting on reads in the port region —
   safe because the kernel runs from WRAM (prefetch never hits the cart) and the
   DMA-source range is kept disjoint from the ports.
