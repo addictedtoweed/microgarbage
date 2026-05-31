@@ -22,11 +22,9 @@
 #include "mg_actor.h"
 #include "mg_gfx.h"
 #include "mg_bg.h"
+#include "mg_mode7.h"
+#include "mg_hdma.h"
 
-/* The remaining headers land as the implementation pass continues:
- *   mg_mode7.h    Mode 7 (separate header)
- *   mg_hdma.h     per-scanline tables
- *   mg_audio.h    SFX + streaming wrappers
- */
+/* Still pending: mg_audio.h - SFX + streaming wrappers. */
 
 #endif /* MG_GAME_H */
