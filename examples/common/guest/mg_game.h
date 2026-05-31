@@ -18,10 +18,10 @@
 #include "mg_panic.h"
 #include "mg_frame.h"
 #include "mg_input.h"
+#include "mg_sprite.h"
+#include "mg_actor.h"
 
 /* The remaining headers land as the implementation pass continues:
- *   mg_sprite.h   sprites + slot allocator + snapshot
- *   mg_actor.h    sub-pixel actor wrapping multiple sprites
  *   mg_bg.h       BG layers + tilemap (shadow + direct)
  *   mg_mode7.h    Mode 7 (separate header)
  *   mg_hdma.h     per-scanline tables
