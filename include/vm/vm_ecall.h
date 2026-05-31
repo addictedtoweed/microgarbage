@@ -302,6 +302,89 @@
 #define SYS_AUDIO_STREAM_WAV   1170  /* (path) → voice; host streams a long .wav   */
 /* 1171..1175 reserved for audio */
 
+/* --- Cart coprocessor staging (1180..1199) ---
+ *
+ * The mgapi cart runtime stages per-frame PPU payload into the 64 KB
+ * cart window the SNES side sees. Guests use these to drive an
+ * actual SNES (via bsnes-plus mapper on Windows, real cart bus on the
+ * M7). NOT installed by vm_system_init; the embedder calls
+ * vm_host_install_copro from inside mgapi_vm_init. */
+#define SYS_COPRO_STAGE_PAYLOAD   1180  /* (window_off, guest_buf, size) → 0/-errno */
+#define SYS_COPRO_STAGE_DMA_SLOT  1181  /* (slot, bbus, dmap, src, size, prep) → 0   */
+#define SYS_COPRO_FRAME_COMMIT    1182  /* (frame_ready_byte) → 0                    */
+#define SYS_COPRO_READ_PADS       1183  /* (out_buf_4xu16) → 0; latest joypads       */
+#define SYS_COPRO_WAIT_VBLANK     1184  /* () → 0; blocks until frame consumed       */
+
+/* L2 allocator (1185..1189): the system-wide bulk-storage pool that
+ * lives in the upper half of SHARED (0xE000_0000+). The handler
+ * returns a guest VA the caller can dereference directly — the VM
+ * translates 0xE000_0000-range accesses into the L2 backing. */
+#define SYS_L2_ALLOC              1185  /* (size, align) → guest VA, or 0 (OOM)      */
+#define SYS_L2_FREE               1186  /* (guest_va) → 0                            */
+#define SYS_L2_STATS              1187  /* (out_struct_ptr) → 0/-errno               */
+
+/* Cart reset awareness (1188..1189):
+ * RESET_COUNT lets the guest detect "the SNES was reset" by polling a
+ * monotonically-incrementing counter. The handler bumps it each time
+ * mgapi_cart_reset_begin runs; guests compare against a snapshot from
+ * the prior iteration to decide whether to reload state.
+ *
+ * RESET_ACK is reserved for a future opt-in "guest is ready, release
+ * reset early" handshake; not implemented yet. */
+#define SYS_COPRO_RESET_COUNT     1188  /* () → uint32 reset counter (always non-neg) */
+#define SYS_COPRO_RESET_ACK       1189  /* RESERVED for future use                    */
+
+/* --- Game-facing cart API (1190..1219), spec at docs/game-api.md ---
+ *
+ * The mg_* guest library (examples/common/guest/mg_*.{h,c}) wraps these
+ * with the customer-facing names (mg_sprite_set, mg_bg_set_tile, etc.).
+ * Game programmers don't call SYS_MG_* directly. See docs/game-api.md
+ * for the full contract and rationale for each shape decision.
+ *
+ * Result semantics: calls that DMA return MgResult (0 = MG_OK,
+ * negative = MG_ERR_*). Calls that mutate shadow buffers (sprite_set
+ * and similar) have no DMA cost and return 0 unconditionally. */
+
+/* OAM (1190..1199) — sprites + slot allocator + snapshot. */
+#define SYS_MG_SPRITE_SET         1190  /* (slot, *MgSprite) → 0           */
+#define SYS_MG_SPRITE_MOVE        1191  /* (slot, x, y) → 0                */
+#define SYS_MG_SPRITE_HIDE        1192  /* (slot) → 0                      */
+#define SYS_MG_SPRITE_GET         1193  /* (slot, *out_MgSprite) → 0       */
+#define SYS_MG_SPRITES_CLEAR_ALL  1194  /* () → 0                          */
+#define SYS_MG_SPRITE_SIZES       1195  /* (MgSpriteSizes pair) → 0        */
+#define SYS_MG_SPRITE_CHR_BASE    1196  /* (base0_word, base1_word) → 0    */
+#define SYS_MG_SPRITE_ALLOC       1197  /* (count) → first slot or -1      */
+#define SYS_MG_SPRITE_FREE        1198  /* (first, count) → 0              */
+#define SYS_MG_OAM_SNAP_RESTORE   1199  /* (op, *buf_544): op 0=snap 1=rst */
+
+/* BG (1200..1209) — modes, tilemap shadow + direct, scroll, effects. */
+#define SYS_MG_BG_MODE            1200  /* (MgBgMode) → 0                  */
+#define SYS_MG_BG_SETUP           1201  /* (layer, tmap_w, size, chr_w)→0  */
+#define SYS_MG_BG_ENABLE          1202  /* (layer, main_bit | sub_bit) → 0 */
+#define SYS_MG_BG_SET_TILE        1203  /* (layer, x, y, cell_word) → 0    */
+#define SYS_MG_BG_GET_TILE        1204  /* (layer, x, y, *out_cell) → 0    */
+#define SYS_MG_BG_BLIT            1205  /* (layer, x, y, *cells, n) → 0    */
+#define SYS_MG_BG_UPLOAD          1206  /* (layer, x, y, *cells, n) → res  */
+#define SYS_MG_BG_SCROLL          1207  /* (layer, hx, vy) → 0             */
+#define SYS_MG_BG_MOSAIC          1208  /* (size, layer_mask) → 0          */
+#define SYS_MG_BG_MAIN_PRIORITY   1209  /* (layer, hi_flag) → 0            */
+
+/* Mode 7 + HDMA (1210..1214). */
+#define SYS_MG_MODE7_SET          1210  /* (*MgMode7Params) → 0            */
+#define SYS_MG_MODE7_WRAP         1211  /* (MgMode7Wrap) → 0               */
+#define SYS_MG_HDMA_SETUP         1212  /* (*MgHdmaCfg) → 0                */
+#define SYS_MG_HDMA_UPLOAD        1213  /* (channel, *table, len) → res    */
+#define SYS_MG_HDMA_ENABLE        1214  /* (channel, on_bit) → 0           */
+
+/* GFX (1215..1218) + panic (1219). */
+#define SYS_MG_CHR_UPLOAD         1215  /* (vram_word, *src, bytes) → res  */
+#define SYS_MG_PALETTE_WRITE      1216  /* (start, count, *src, fmt) → 0
+                                         *   fmt: 0=bgr555 word source,
+                                         *        1=rgb24 byte source.    */
+#define SYS_MG_PALETTE_SNAP_RESTORE 1217 /* (op, *buf_512): 0=snap, 1=rst */
+#define SYS_MG_PACK_CHR           1218  /* (*dst, *src_linear, tiles, bpp) */
+#define SYS_MG_PANIC              1219  /* (*msg_cstr) → noreturn          */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

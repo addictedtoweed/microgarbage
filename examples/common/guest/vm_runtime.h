@@ -114,6 +114,48 @@
 #define SYS_COPRO_RESET_COUNT       1188
 #define SYS_COPRO_RESET_ACK         1189
 
+/* Game-facing cart API (1190..1219). Wrapped by the mg_* library at
+ * examples/common/guest/mg_*.{h,c}; game code uses the mg_* names, not
+ * these. Specs: docs/game-api.md. */
+
+/* OAM (1190..1199). */
+#define SYS_MG_SPRITE_SET           1190
+#define SYS_MG_SPRITE_MOVE          1191
+#define SYS_MG_SPRITE_HIDE          1192
+#define SYS_MG_SPRITE_GET           1193
+#define SYS_MG_SPRITES_CLEAR_ALL    1194
+#define SYS_MG_SPRITE_SIZES         1195
+#define SYS_MG_SPRITE_CHR_BASE      1196
+#define SYS_MG_SPRITE_ALLOC         1197
+#define SYS_MG_SPRITE_FREE          1198
+#define SYS_MG_OAM_SNAP_RESTORE     1199
+
+/* BG (1200..1209). */
+#define SYS_MG_BG_MODE              1200
+#define SYS_MG_BG_SETUP             1201
+#define SYS_MG_BG_ENABLE            1202
+#define SYS_MG_BG_SET_TILE          1203
+#define SYS_MG_BG_GET_TILE          1204
+#define SYS_MG_BG_BLIT              1205
+#define SYS_MG_BG_UPLOAD            1206
+#define SYS_MG_BG_SCROLL            1207
+#define SYS_MG_BG_MOSAIC            1208
+#define SYS_MG_BG_MAIN_PRIORITY     1209
+
+/* Mode 7 + HDMA (1210..1214). */
+#define SYS_MG_MODE7_SET            1210
+#define SYS_MG_MODE7_WRAP           1211
+#define SYS_MG_HDMA_SETUP           1212
+#define SYS_MG_HDMA_UPLOAD          1213
+#define SYS_MG_HDMA_ENABLE          1214
+
+/* GFX (1215..1218) + panic (1219). */
+#define SYS_MG_CHR_UPLOAD           1215
+#define SYS_MG_PALETTE_WRITE        1216
+#define SYS_MG_PALETTE_SNAP_RESTORE 1217
+#define SYS_MG_PACK_CHR             1218
+#define SYS_MG_PANIC                1219
+
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
  * Clobber a0 (return), preserve a1..a6 (they're used as inputs).
