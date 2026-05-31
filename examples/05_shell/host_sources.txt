@@ -31,6 +31,7 @@ src/containers/ring_buffer.c
 # --- host extras: fs / storage / config / transports ---
 src/host/platform_win.c
 src/vm/vm_host_fs.c
+src/vm/vm_host_fs_spawn.c
 src/storage/trashfs.c
 src/util/inicfg.c
 examples/05_shell/host_tcp.c

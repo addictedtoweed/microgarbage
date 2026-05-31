@@ -151,7 +151,8 @@ else
 fi
 
 # vm_host_fs: trashfs RAM disk + host-passthrough backends (no FatFs).
-run vm_host_fs   vm  $VM_CORE src/vm/vm_host_fs.c src/storage/trashfs.c
+# vm_host_fs_spawn.c holds SYS_SPAWN_AND_WAIT (split for the size cap).
+run vm_host_fs   vm  $VM_CORE src/vm/vm_host_fs.c src/vm/vm_host_fs_spawn.c src/storage/trashfs.c
 
 # vm_real_elf needs prebuilt guest ELFs from examples/01_hello/build/.
 if [ -f examples/01_hello/build/guest_minimal.elf ]; then
