@@ -20,12 +20,12 @@
 #include "mg_input.h"
 #include "mg_sprite.h"
 #include "mg_actor.h"
+#include "mg_gfx.h"
+#include "mg_bg.h"
 
 /* The remaining headers land as the implementation pass continues:
- *   mg_bg.h       BG layers + tilemap (shadow + direct)
  *   mg_mode7.h    Mode 7 (separate header)
  *   mg_hdma.h     per-scanline tables
- *   mg_gfx.h      CHR upload + palette + bgr555 packer
  *   mg_audio.h    SFX + streaming wrappers
  */
 
