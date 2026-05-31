@@ -77,7 +77,7 @@
 #define SYS_SPAWN_AND_WAIT          1104
 #define SYS_TTY_SET_RAW             1105
 
-/* T.1 platform services */
+/* Platform services */
 #define SYS_FORMAT_AND_WRITE        1108
 #define SYS_FORMAT_TO_BUF           1109
 #define SYS_REALTIME_NOW            1110
@@ -97,6 +97,22 @@
 #define SYS_AUDIO_FFT_ENABLE        1168
 #define SYS_AUDIO_LOAD_WAV          1169
 #define SYS_AUDIO_STREAM_WAV        1170
+
+/* Cart-coprocessor staging (must match host vm_ecall.h 1180..1184) */
+#define SYS_COPRO_STAGE_PAYLOAD     1180
+#define SYS_COPRO_STAGE_DMA_SLOT    1181
+#define SYS_COPRO_FRAME_COMMIT      1182
+#define SYS_COPRO_READ_PADS         1183
+#define SYS_COPRO_WAIT_VBLANK       1184
+
+/* L2 allocator (must match host vm_ecall.h 1185..1187) */
+#define SYS_L2_ALLOC                1185
+#define SYS_L2_FREE                 1186
+#define SYS_L2_STATS                1187
+
+/* Cart reset awareness (must match host vm_ecall.h 1188..1189) */
+#define SYS_COPRO_RESET_COUNT       1188
+#define SYS_COPRO_RESET_ACK         1189
 
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
