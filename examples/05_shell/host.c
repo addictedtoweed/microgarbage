@@ -100,6 +100,10 @@ static TrashfsVolume g_trashfs_vol;
  * host_util.c. Platform primitives (time, sleep) come from the
  * host platform layer — see include/vm/host_platform.h. */
 
+/* argv parsing (HostCli + parse + range-checked override apply)
+ * lives in host_cli.c; main() calls the three-line sequence below. */
+#include "host_cli.h"
+
 /* PTY transport now lives in host_pty.c — main() calls
  * pty_install() via the prototype in host_pty.h. */
 
@@ -116,130 +120,31 @@ int main(int argc, char **argv) {
      * binary launched from cmd doesn't pop an extra window. */
     vm_host_stdio_win32_attach_console_if_native();
 #endif
-    /* ----- Parse args -----
+    /* ----- Parse args ----- 
      *
      * Usage: host [options] [shell.elf]
      *
-     * Options:
-     *   --config=<path>     Load config from <path>. Default is
-     *                       ./vm.cfg if present (silently skipped
-     *                       if missing). Use this to point at a
-     *                       different config file.
-     *   --no-config         Skip even a present ./vm.cfg. Useful
-     *                       for testing CLI-only behavior.
-     *   --local-kb=<N>      Local-slab size in KB (overrides config).
-     *   --shared-kb=<N>     Shared-slab size in KB (overrides config).
-     *   --max-vms=<N>       Max concurrent VMs (overrides config).
-     *   --spawn-data-kb=<N> Per-spawn data region size in KB.
-     *   --raw=on|off        Toggle raw-mode stdin.
-     *   --host-fs=<path>    Mount <path> as /host inside the shell.
-     *                       The guest can then read/run files via
-     *                       /host/<name>. Default: ./host_files
-     *   --host-fs-rw        Make the /host mount writable. Default
-     *                       is read-only for safety.
-     *   --no-host-fs        Disable the /host mount entirely.
-     *   --tcp=<port>        Listen on a TCP port; PuTTY (Raw/Telnet)
-     *                       or nc connects to localhost:<port>.
-     *                       Repeatable for multiple sessions.
-     *   --pty               Route stdio through a POSIX pty
-     *                       (Linux/Cygwin); attach with screen.
-     *
-     * Layering: built-in defaults < config file < CLI.
-     *
-     * Positional: the path to shell.elf. Defaults to build/shell.elf.
-     */
-    const char *elf_path     = NULL;
-    const char *host_fs_root = "host_files";   /* default — created if missing */
-    bool host_fs_root_explicit = false;        /* set by CLI/config? */
-    bool host_fs_writable    = false;
-    bool host_fs_disabled    = false;
-    bool        want_pty     = false;
-    /* U.7b: collect up to MAX_TCP_PORTS --tcp= ports for multi-session. */
-#define MAX_TCP_PORTS 16
-    int         tcp_ports[MAX_TCP_PORTS];
-    int         n_tcp_ports  = 0;
-    const char *cfg_path     = NULL;
-    bool        no_config    = false;
+     * Options live in host_cli.{h,c}: that owns the parser, the
+     * --help text, range-checking of integer overrides, and the
+     * HostCli struct that bundles every flag. We alias the fields
+     * back into locals so the bring-up code below reads the same
+     * as it did before the cli cut. */
+    HostCli cli;
+    host_cli_set_defaults(&cli);
+    if (!host_cli_parse(argc, argv, &cli)) return 1;
 
-    /* CLI overrides for HostConfig fields. These are "unset" until
-     * the user passes the flag, so they only fire after we've
-     * loaded the config file (which gets the chance to set them
-     * first). Sentinel values: -1 for ints, -1 for tri-state bool. */
-    long cli_local_kb       = -1;
-    long cli_shared_kb      = -1;
-    long cli_max_vms        = -1;
-    long cli_spawn_data_kb  = -1;
-    int  cli_raw_mode       = -1;   /* 0=off, 1=on, -1=unset */
+    const char *elf_path              = cli.elf_path;
+    const char *host_fs_root          = cli.host_fs_root;
+    bool        host_fs_root_explicit = cli.host_fs_root_explicit;
+    bool        host_fs_writable      = cli.host_fs_writable;
+    bool        host_fs_disabled      = cli.host_fs_disabled;
+    bool        want_pty              = cli.want_pty;
+    int         n_tcp_ports           = cli.n_tcp_ports;
+    const int  *tcp_ports             = cli.tcp_ports;
+    const char *cfg_path              = cli.cfg_path;
+    bool        no_config             = cli.no_config;
 
-    for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--config=", 9) == 0) {
-            cfg_path = argv[i] + 9;
-        } else if (strcmp(argv[i], "--no-config") == 0) {
-            no_config = true;
-        } else if (strncmp(argv[i], "--local-kb=", 11) == 0) {
-            cli_local_kb = strtol(argv[i] + 11, NULL, 10);
-        } else if (strncmp(argv[i], "--shared-kb=", 12) == 0) {
-            cli_shared_kb = strtol(argv[i] + 12, NULL, 10);
-        } else if (strncmp(argv[i], "--max-vms=", 10) == 0) {
-            cli_max_vms = strtol(argv[i] + 10, NULL, 10);
-        } else if (strncmp(argv[i], "--spawn-data-kb=", 16) == 0) {
-            cli_spawn_data_kb = strtol(argv[i] + 16, NULL, 10);
-        } else if (strncmp(argv[i], "--raw=", 6) == 0) {
-            const char *v = argv[i] + 6;
-            if (strcmp(v, "on") == 0 || strcmp(v, "true") == 0 ||
-                strcmp(v, "yes") == 0 || strcmp(v, "1") == 0) {
-                cli_raw_mode = 1;
-            } else if (strcmp(v, "off") == 0 || strcmp(v, "false") == 0 ||
-                       strcmp(v, "no") == 0 || strcmp(v, "0") == 0) {
-                cli_raw_mode = 0;
-            } else {
-                fprintf(stderr, "host: --raw expects on|off (got '%s')\n", v);
-                return 1;
-            }
-        } else if (strncmp(argv[i], "--host-fs=", 10) == 0) {
-            host_fs_root = argv[i] + 10;
-            host_fs_root_explicit = true;
-        } else if (strcmp(argv[i], "--host-fs-rw") == 0) {
-            host_fs_writable = true;
-        } else if (strcmp(argv[i], "--no-host-fs") == 0) {
-            host_fs_disabled = true;
-        } else if (strcmp(argv[i], "--pty") == 0) {
-            want_pty = true;
-        } else if (strncmp(argv[i], "--tcp=", 6) == 0) {
-            long p = strtol(argv[i] + 6, NULL, 10);
-            if (p < 1 || p > 65535) {
-                fprintf(stderr, "host: --tcp port out of range (1..65535)\n");
-                return 1;
-            }
-            if (n_tcp_ports >= MAX_TCP_PORTS) {
-                fprintf(stderr, "host: too many --tcp ports (max %d)\n",
-                        MAX_TCP_PORTS);
-                return 1;
-            }
-            tcp_ports[n_tcp_ports++] = (int)p;
-        } else if (argv[i][0] == '-') {
-            fprintf(stderr, "host: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "  --config=<path>     load config from <path>\n");
-            fprintf(stderr, "  --no-config         skip ./vm.cfg even if present\n");
-            fprintf(stderr, "  --local-kb=<N>      local-slab size in KB\n");
-            fprintf(stderr, "  --shared-kb=<N>     shared-slab size in KB\n");
-            fprintf(stderr, "  --max-vms=<N>       max concurrent VMs\n");
-            fprintf(stderr, "  --spawn-data-kb=<N> per-spawn data region in KB\n");
-            fprintf(stderr, "  --raw=on|off        toggle raw-mode stdin\n");
-            fprintf(stderr, "  --host-fs=<path>    mount path as /host (default: ./host_files)\n");
-            fprintf(stderr, "  --host-fs-rw        allow writes to /host (default: read-only)\n");
-            fprintf(stderr, "  --no-host-fs        disable /host mount\n");
-            fprintf(stderr, "  --pty               route stdio through a POSIX pty (Linux/Cygwin)\n");
-            fprintf(stderr, "  --tcp=<port>        listen on TCP port; first client gets the shell\n");
-            return 1;
-        } else if (!elf_path) {
-            elf_path = argv[i];
-        } else {
-            fprintf(stderr, "host: extra positional argument '%s'\n", argv[i]);
-            return 1;
-        }
-    }
-    /* No explicit ELF path → use the baked-in shell image (XIP).
+    /* No explicit ELF path -> use the baked-in shell image (XIP).
      * An explicit path still loads from disk (COPY_RAM) for dev. */
     bool use_embedded = (elf_path == NULL);
     if (use_embedded && shell_elf_len == 0) {
@@ -251,12 +156,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ----- Load HostConfig: defaults -> vm.cfg -> CLI overrides -----
-     *
-     * If --no-config was passed, we skip even the implicit default
-     * file. If --config=<path> was passed, missing file is an error
-     * (user asked for that file explicitly). Without --config, a
-     * missing ./vm.cfg is fine. */
+    /* ----- Load HostConfig: defaults -> vm.cfg -> CLI overrides ----- */
     HostConfig hc;
     host_config_set_defaults(&hc);
     if (!no_config) {
@@ -265,42 +165,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "host: --no-config and --config are mutually exclusive\n");
         return 1;
     }
-    /* CLI overrides last. Each cli_* is range-checked here so
-     * an out-of-range value still fails cleanly (instead of being
-     * silently clamped or wrapping). */
-    if (cli_local_kb >= 0) {
-        if (cli_local_kb < 32 || cli_local_kb > (long)(LOCAL_BYTES / 1024)) {
-            fprintf(stderr, "host: --local-kb=%ld out of range (32..%llu)\n",
-                    cli_local_kb, (unsigned long long)(LOCAL_BYTES / 1024));
-            return 1;
-        }
-        hc.local_bytes = (size_t)cli_local_kb * 1024;
-    }
-    if (cli_shared_kb >= 0) {
-        if (cli_shared_kb < 8 || cli_shared_kb > (long)(SHARED_BYTES / 1024)) {
-            fprintf(stderr, "host: --shared-kb=%ld out of range (8..%llu)\n",
-                    cli_shared_kb, (unsigned long long)(SHARED_BYTES / 1024));
-            return 1;
-        }
-        hc.shared_bytes = (size_t)cli_shared_kb * 1024;
-    }
-    if (cli_max_vms >= 0) {
-        if (cli_max_vms < 1 || cli_max_vms > 16) {
-            fprintf(stderr, "host: --max-vms=%ld out of range (1..16)\n",
-                    cli_max_vms);
-            return 1;
-        }
-        hc.max_vms = (uint16_t)cli_max_vms;
-    }
-    if (cli_spawn_data_kb >= 0) {
-        if (cli_spawn_data_kb < 1 || cli_spawn_data_kb > 256) {
-            fprintf(stderr, "host: --spawn-data-kb=%ld out of range (1..256)\n",
-                    cli_spawn_data_kb);
-            return 1;
-        }
-        hc.spawn_data_kb = (uint16_t)cli_spawn_data_kb;
-    }
-    if (cli_raw_mode != -1) hc.raw_mode = (cli_raw_mode != 0);
+    if (!host_cli_apply_to_config(&cli, &hc)) return 1;
 
 #ifndef PTY_MODE_SUPPORTED
     if (want_pty) {
