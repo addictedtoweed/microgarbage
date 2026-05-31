@@ -15,16 +15,16 @@
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 
-#include "vm/vm_host_tui.h"
-#include "vm/vm_ecall.h"
-#include "vm/vm_core.h"
-#include "vm/vm_host_stdio.h"
-#include "vm/vm_host_transport.h"
-
-#include <stdint.h>
+/* vm_host_tui_internal.h pulls in vm/vm_host_tui.h, vm/vm_core.h,
+ * vm/vm_host_transport.h, and vm/vm_system.h; we just need the
+ * extra ones here. */
 #include "vm_host_tui_internal.h"
 
+#include "vm/vm_ecall.h"
+#include "vm/vm_host_stdio.h"
+
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
