@@ -124,7 +124,7 @@ enum {
     VM_TUI_OP_CLEAR_CLIP  = 11,  /* no payload */
     VM_TUI_OP_PUTC        = 12,  /* { c(u8) } — write at current cursor */
     VM_TUI_OP_PUTS        = 13,  /* { len(u16), bytes[len] } */
-    /* 14-31 reserved for future ops within T.3 */
+    /* 14-31 reserved for future ops */
 };
 
 /* ============================================================

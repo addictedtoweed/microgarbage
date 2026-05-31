@@ -618,32 +618,19 @@ static const BoxStyle g_box_ascii = {
     .bl = "+", .br = "+",
 };
 
-/* For canvas-cell representation: each box character lives in
- * one HostCell. The 'c' field is just the first ASCII byte
- * (single-style box drawing uses '-', '|', '+' on ASCII;
- * non-ASCII glyphs encode their full UTF-8 in a separate
- * mapping at emit time). For T.3 we use a simplification:
- * ASCII box style only fully cell-encodes; single/double
- * style fall back to ASCII at the cell level but emit the
- * Unicode glyph at present time.
+/* Box-draw cells use ASCII-equivalent glyphs ('-', '|', '+') in
+ * the canvas regardless of the requested style. This keeps the
+ * cell format compact (single byte for c) at the cost of single-
+ * and double-line styles rendering as ASCII rather than Unicode.
  *
- * To keep the cell format compact (single byte for c), we
- * tag the cell's `flags` with a small "box-style" value when
- * the cell came from a box draw. At emit time we look at the
- * flag and pick the appropriate Unicode glyph.
- *
- * Simpler approach for T.3: just use ASCII in the cell, and
- * let the guest call box_single/box_double if they want the
- * fancier output via direct present. To keep this short, we
- * use ASCII-equivalent chars in the canvas — emit doesn't
- * need a special path. We use single-byte ASCII for all
- * box draws; the guest can call BOX with style=2 (ASCII) for
- * 100% fidelity, or accept that single/double become ASCII
- * in this simplified initial version. (Full Unicode box
- * support is on the T.3a backlog.) */
+ * TODO: revisit when the cell format gets a UTF-8 escape hatch — at
+ * that point box style can survive into present time and the three
+ * styles emit different glyphs. For now guests that need true
+ * Unicode boxes can present them via direct calls rather than
+ * routing through the canvas. */
 static void apply_box_ascii_only(int row, int col, int h, int w,
                                    const BoxStyle *style) {
-    (void)style;   /* T.3: we emit ASCII only at the cell level */
+    (void)style;   /* canvas cells are always ASCII */
     if (h < 2 || w < 2) return;
     HostCell corner = make_cell('+', g_pen_fg, g_pen_bg, g_pen_attrs);
     HostCell hbar   = make_cell('-', g_pen_fg, g_pen_bg, g_pen_attrs);
