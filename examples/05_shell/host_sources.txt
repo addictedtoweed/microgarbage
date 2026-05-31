@@ -28,11 +28,16 @@ src/memory/slab_stack.c
 src/containers/fifo_queue.c
 src/containers/ring_buffer.c
 
-# --- host extras: fs / storage / config ---
+# --- host extras: fs / storage / config / transports ---
 src/host/platform_win.c
 src/vm/vm_host_fs.c
 src/storage/trashfs.c
 src/util/inicfg.c
+examples/05_shell/host_tcp.c
+examples/05_shell/host_pty.c
+examples/05_shell/host_audio.c
+examples/05_shell/host_config.c
+examples/05_shell/host_util.c
 
 # --- intercore channel + audio service (native-Windows transport) ---
 # channel_win32.c is the Win32 transport (CreateThread + CONDITION_VARIABLE),
