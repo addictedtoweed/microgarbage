@@ -1,24 +1,22 @@
-﻿/* 05_shell/host.c — run the file-system shell guest.
+﻿/* 05_shell/host.c — bring up the file-system shell guest.
  *
- * Sets up the full stack:
- *   - trashfs RAM disk, mounted as /td0 (format-on-start)
- *   - VmSystem with stdio bridge and file syscalls installed
- *   - shell.elf loaded as the sole VM
+ * main() orchestrates the per-concern modules (host_*.{h,c}); see
+ * each module's header for its contract. The pieces, in install
+ * order:
  *
- * Then runs the scheduler until the shell calls SYS_EXIT (or
- * Ctrl-C from the user).
+ *   host_cli       parse argv into a HostCli
+ *   host_config    layer defaults + vm.cfg + CLI overrides
+ *   host_audio     start the AudioService worker + sink
+ *   host_pty       optional POSIX pty transport (--pty)
+ *   host_tcp       TCP socket transport (--tcp=<port>)
+ *   host_runloop   multi-session TCP accept/reap/step loop
+ *   host_mounts    install /td0 + /host (or vm.cfg's mounts)
+ *   host_util      mkdir / exe-dir / load_file / no-console warning
  *
- * Stdio routing:
- *   default        process stdin/stdout/stderr (current behavior)
- *   --tcp=<port>   listen on a TCP port; PuTTY (Raw/Telnet) or nc
- *                  connects to localhost:<port>. Repeatable for
- *                  multiple concurrent sessions. Cross-platform.
- *   --pty          POSIX pseudoterminal (Linux/Cygwin); attach with
- *                  screen/minicom. POSIX-only.
- *
- * No external dependencies beyond the standard -Iinclude: the
- * filesystem is the native trashfs (src/storage/trashfs.c). See the
- * build.sh in this directory for the full link line.
+ * Static storage in this file: the shared + local slab regions
+ * (sized at compile time from host_config.h), the trashfs RAM disk,
+ * and the trashfs volume struct. Everything else flows through
+ * the modules.
  *
  * Public domain (CC0). No warranty.
  */
@@ -31,28 +29,38 @@
 #  define _DEFAULT_SOURCE
 #endif
 
-/* host_tcp.h pulls in <winsock2.h>/<ws2tcpip.h> on Windows; it must
- * come before any later <windows.h> to win the v1/v2 race (windows.h
- * pulls winsock.h v1 which conflicts with v2). It also brings the
- * TCP_MODE_SUPPORTED define and the tcp_sock_t typedef the run loop
- * uses to seed the TcpCtx array below. */
+/* host_tcp.h MUST come before any header that might transitively
+ * pull <windows.h>, because it pulls <winsock2.h> first to win
+ * the v1/v2 race (windows.h drags winsock.h v1 which conflicts
+ * with v2). All other module headers go below. */
 #include "host_tcp.h"
 
+/* Project headers (vm + storage + util). */
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_transport.h"
 #include "vm/vm_host_fs.h"
 #include "vm/vm_host_platform.h"
-#include "vm/host_platform.h"
-#include "shell_embedded.h"
 #include "vm/vm_host_tui.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_core.h"
+#include "vm/host_platform.h"
+#include "vm/host_compat.h"
 #include "storage/trashfs.h"
-#include "util/inicfg.h"
-/* audio/threading headers used to live here; they're now pulled in
- * only by host_audio.c, which is the sole consumer. */
+#include "shell_embedded.h"
 
+/* Local modules. host_tcp.h is up top for the winsock ordering; the
+ * rest go here alphabetical to keep "what does this depend on?"
+ * scannable. */
+#include "host_audio.h"
+#include "host_cli.h"
+#include "host_config.h"
+#include "host_mounts.h"
+#include "host_pty.h"
+#include "host_runloop.h"
+#include "host_util.h"
+
+/* Standard C / POSIX. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -64,58 +72,18 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "vm/host_compat.h"
-
-/* PTY (host_pty.h) and TCP (host_tcp.h) transports are now in their
- * own modules. host_pty.h owns the PTY_MODE_SUPPORTED feature gate.
- * host_tcp.h is included at the very top of this file so winsock2
- * wins the v1/v2 race against any later <windows.h> pull-in. */
-#include "host_pty.h"
-
-/* Small leaf helpers (host_mkdir / host_exe_dir / load_file /
- * warn_if_no_real_console) live in host_util.c. */
-#include "host_util.h"
-
-/* HostConfig + vm.cfg loader now live in host_config.c. The
- * SHARED_BYTES / LOCAL_BYTES caps below come from host_config.h
- * so the storage arrays and the validator agree. */
-#include "host_config.h"
+/* ---- Static storage backing main()'s install sequence ---- */
 
 static uint8_t g_shared[SHARED_BYTES];
 static uint8_t g_local[LOCAL_BYTES];
 
-/* trashfs RAM disk — the default writable volume, mounted as /td0. The
- * filesystem owns this region directly (no block-device layer). 128 KB
- * here; on a real target, size to available internal RAM / PSRAM. */
+/* trashfs RAM disk — the default writable volume, mounted as /td0.
+ * 128 KB here; on a real target, size to available internal RAM
+ * / PSRAM. The filesystem owns this region directly (no block-
+ * device layer). */
 #define TRASHFS_REGION_BYTES (128 * 1024)
-static uint8_t g_trashfs_region[TRASHFS_REGION_BYTES];
+static uint8_t       g_trashfs_region[TRASHFS_REGION_BYTES];
 static TrashfsVolume g_trashfs_vol;
-
-/* Audio service (worker thread + waveOut sink + AudioFileReader)
- * now lives in host_audio.c; main() calls host_audio_start / _stop
- * via the prototypes in host_audio.h. */
-#include "host_audio.h"
-
-/* host_exe_dir / warn_if_no_real_console / load_file now live in
- * host_util.c. Platform primitives (time, sleep) come from the
- * host platform layer — see include/vm/host_platform.h. */
-
-/* argv parsing (HostCli + parse + range-checked override apply)
- * lives in host_cli.c; main() calls the three-line sequence below. */
-#include "host_cli.h"
-
-/* Mount-table installer: walks HostConfig.mounts[] (or defaults to
- * /td0 + /host) and installs each one. host_mounts.c. */
-#include "host_mounts.h"
-
-/* Multi-session TCP run loop (setup / run / teardown). host_runloop.c. */
-#include "host_runloop.h"
-
-/* PTY transport now lives in host_pty.c — main() calls
- * pty_install() via the prototype in host_pty.h. */
-
-/* TCP transport now lives in host_tcp.c — only its prototypes
- * are visible here, via host_tcp.h at the top of the file. */
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
@@ -296,11 +264,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Stdio handlers are always installed: they consult the
-     * per-VM transport table (U.6) for every byte. For the single-
-     * instance --pty transport we also set a process-default
-     * transport. For multi-instance TCP, we bind per-VM after each
-     * connection is accepted and a shell is spawned. */
+    /* Stdio handlers are always installed: they consult the per-VM
+     * transport table for every byte. For the single-instance --pty
+     * transport we also set a process-default transport. For multi-
+     * instance TCP, we bind per-VM after each connection is accepted
+     * and a shell is spawned. */
     {
         VmHostStdioConfig sio = {0};
         sio.raw_mode = (want_pty || n_tcp_ports > 0)

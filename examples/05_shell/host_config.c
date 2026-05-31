@@ -10,7 +10,6 @@
 #include "util/inicfg.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 void host_config_set_defaults(HostConfig *hc) {

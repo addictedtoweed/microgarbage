@@ -98,8 +98,9 @@ typedef struct {
 
 /* Lifecycle */
 
-/* Reset hc to the historical hardcoded defaults so a host launched
- * with no config or flags behaves identically to the M.1b version. */
+/* Reset hc to built-in defaults: 4 VMs, 64 KB spawn data, raw stdin,
+ * no mount overrides. A host launched with no config or flags lands
+ * here and behaves identically to the original hardcoded version. */
 void host_config_set_defaults(HostConfig *hc);
 
 /* Attempt to load vm.cfg from `path`. If `path` is NULL, tries

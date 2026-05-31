@@ -19,7 +19,6 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <sys/ioctl.h>
-#include <stdlib.h>
 
 /* Single-instance: only one pty per host process. */
 static int g_pty_master_fd = -1;
