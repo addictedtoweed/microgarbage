@@ -104,6 +104,13 @@ static TrashfsVolume g_trashfs_vol;
  * lives in host_cli.c; main() calls the three-line sequence below. */
 #include "host_cli.h"
 
+/* Mount-table installer: walks HostConfig.mounts[] (or defaults to
+ * /td0 + /host) and installs each one. host_mounts.c. */
+#include "host_mounts.h"
+
+/* Multi-session TCP run loop (setup / run / teardown). host_runloop.c. */
+#include "host_runloop.h"
+
 /* PTY transport now lives in host_pty.c — main() calls
  * pty_install() via the prototype in host_pty.h. */
 
@@ -404,281 +411,38 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    /* 6b. Mounts.
-     *
-     * If vm.cfg's [mount.<name>] sections were used, hc.mount_count
-     * is non-zero and those become the mounts. Otherwise we set up
-     * the built-in defaults: /td0 (the RAM-backed trashfs volume)
-     * and /host (a passthrough to host_fs_root, unless
-     * --no-host-fs was passed).
-     *
-     * The shell defaults its cwd to /td0. If a custom config
-     * doesn't include a td0, the shell's first `pwd` will show a
-     * non-resolvable cwd — but that's the user's choice.
-     *
-     * Multiple writable volumes aren't supported yet: there's one
-     * static trashfs region backing. A configured td<N> reuses it,
-     * and the size_kb override is ignored (the region size is
-     * compile-time). Per-mount backing regions are a later step. */
-
-    if (hc.mount_count == 0) {
-        /* No mount section in vm.cfg — use built-in defaults: the
-         * trashfs RAM disk as /td0 (default cwd) + /host passthrough. */
-        if (!vm_host_fs_mount_trashfs("td0", &g_trashfs_vol)) {
-            fprintf(stderr, "host: vm_host_fs_mount_trashfs('td0') failed\n");
-            return 1;
-        }
-
-        if (!host_fs_disabled) {
-            struct stat st;
-            if (stat(host_fs_root, &st) != 0) {
-                if (host_mkdir(host_fs_root, 0755) != 0) {
-                    fprintf(stderr, "host: warning — could not create '%s' "
-                            "for /host mount: %s\n",
-                            host_fs_root, strerror(errno));
-                    fprintf(stderr, "host: /host will be disabled\n");
-                    host_fs_disabled = true;
-                }
-            }
-            if (!host_fs_disabled) {
-                if (!vm_host_fs_mount_host("host", host_fs_root,
-                                           host_fs_writable)) {
-                    fprintf(stderr, "host: warning — "
-                            "vm_host_fs_mount_host('%s') failed\n",
-                            host_fs_root);
-                    fprintf(stderr, "host: /host will be disabled\n");
-                } else {
-                    fprintf(stderr, "host: /host mounted from '%s' "
-                            "(%s)\n",
-                            host_fs_root,
-                            host_fs_writable ? "read/write" : "read-only");
-                }
-            }
-        }
-    } else {
-        /* Config-driven mount setup. */
-        bool any_td_mounted = false;
-        for (unsigned i = 0; i < hc.mount_count; i++) {
-            const HostMount *m = &hc.mounts[i];
-            if (m->kind == HOST_MOUNT_TMPFS || m->kind == HOST_MOUNT_SD) {
-                /* tmpfs and sd both map to the single trashfs RAM disk
-                 * today. On hardware they'll diverge (tmpfs stays in
-                 * RAM; sd uses the SD card driver). For now: enforce
-                 * one writable volume until multi-volume support. */
-                if (any_td_mounted) {
-                    fprintf(stderr, "host: vm.cfg: multiple writable mounts "
-                            "(tmpfs/sd) not supported yet (ignoring "
-                            "mount.%s)\n", m->name);
-                    continue;
-                }
-                if (!vm_host_fs_mount_trashfs(m->name, &g_trashfs_vol)) {
-                    fprintf(stderr, "host: vm_host_fs_mount_trashfs('%s') "
-                            "failed\n", m->name);
-                    return 1;
-                }
-                const char *kind_str =
-                    (m->kind == HOST_MOUNT_TMPFS) ? "tmpfs" : "sd";
-                fprintf(stderr, "host: /%s mounted (%s via trashfs, %u KB"
-                        "%s)\n", m->name, kind_str,
-                        (unsigned)(TRASHFS_REGION_BYTES / 1024),
-                        m->size_kb ? "; size_kb override ignored" : "");
-                any_td_mounted = true;
-            } else {
-                /* HOST. Path is required. */
-                if (m->path[0] == '\0') {
-                    fprintf(stderr, "host: vm.cfg: [mount.%s] type=host "
-                            "needs a 'path' setting\n", m->name);
-                    return 1;
-                }
-                struct stat st;
-                if (stat(m->path, &st) != 0) {
-                    if (host_mkdir(m->path, 0755) != 0) {
-                        fprintf(stderr, "host: vm.cfg: [mount.%s] "
-                                "cannot create '%s': %s\n",
-                                m->name, m->path, strerror(errno));
-                        return 1;
-                    }
-                }
-                if (!vm_host_fs_mount_host(m->name, m->path, m->writable)) {
-                    fprintf(stderr, "host: vm.cfg: [mount.%s] "
-                            "vm_host_fs_mount_host('%s') failed\n",
-                            m->name, m->path);
-                    return 1;
-                }
-                fprintf(stderr, "host: /%s mounted from '%s' (%s)\n",
-                        m->name, m->path,
-                        m->writable ? "read/write" : "read-only");
-            }
-        }
+    /* 6b. Install the mount table (host_mounts.c). The mount installer
+     * is leaf-shaped: it takes the loaded HostConfig + the static
+     * trashfs region + the /host CLI knobs, prints one line per
+     * mount, and returns. */
+    if (!host_mounts_install(&hc, &g_trashfs_vol,
+                             TRASHFS_REGION_BYTES / 1024,
+                             host_fs_root, host_fs_writable,
+                             host_fs_disabled)) {
+        return 1;
     }
 
     /* ============================================================
      *  7+8. Load shells and run.
      *
      *  Two modes:
-     *
-     *   (a) Multi-session TCP: one or more --tcp= ports. We create
-     *       a session pool, set up N non-blocking listeners, and
-     *       enter the run loop. As each client connects we spawn a
-     *       shell VM bound to that connection's transport. The loop
-     *       runs until all spawned shells have exited AND no
-     *       listeners remain that could still produce a client.
-     *
-     *   (b) Single session: pty / default stdio. Load one
-     *       shell, run until it exits. (The transport was already
-     *       set as the process default above.)
+     *   (a) Multi-session TCP: one shell VM per --tcp= port,
+     *       reaping + reaccepting per slot. Lives in host_runloop.c.
+     *   (b) Single session: pty / default stdio. Load one shell,
+     *       step until it halts.
      * ============================================================ */
 
 #ifdef TCP_MODE_SUPPORTED
     if (n_tcp_ports > 0) {
-        /* Session pool sized to the number of ports. Lives on the
-         * stack of main() — fine on a dev host; an MCU build would
-         * use a static or SDRAM-placed array. */
-        static VmTuiSession tui_pool[MAX_TCP_PORTS];
-        vm_host_tui_set_pool(tui_pool, (unsigned)n_tcp_ports);
-
-        /* Per-port transport contexts + structs. */
-        static TcpCtx          tcp_ctxs[MAX_TCP_PORTS];
-        static VmHostTransport tcp_transports[MAX_TCP_PORTS];
-        /* Per-slot runtime state. A slot cycles:
-         *   LISTENING (no client) -> accept -> ACTIVE (shell running)
-         *   -> shell exits -> back to LISTENING.
-         * slot_vm holds the shell's vm_id while ACTIVE. The host runs
-         * until Ctrl-C (g_stop); ports stay open for reconnection. */
-        bool     slot_active[MAX_TCP_PORTS] = {0};
-        uint16_t slot_vm[MAX_TCP_PORTS];
-        for (int i = 0; i < MAX_TCP_PORTS; i++) slot_vm[i] = UINT16_MAX;
-
-        for (int i = 0; i < n_tcp_ports; i++) {
-            tcp_ctxs[i].listen_fd = tcp_listen(tcp_ports[i]);
-            tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
-            tcp_ctxs[i].port      = tcp_ports[i];
-            tcp_ctxs[i].prev_was_cr = 0;
-            tcp_ctxs[i].iac_state = 0;
-            tcp_ctxs[i].iac_verb  = 0;
-            if (tcp_ctxs[i].listen_fd == TCP_SOCK_INVALID) {
-                fprintf(stderr, "host: failed to listen on port %d\n",
-                        tcp_ports[i]);
-                return 1;
-            }
-            tcp_transports[i].read_nonblock = tcp_t_read;
-            tcp_transports[i].write         = tcp_t_write;
-            tcp_transports[i].flush         = tcp_t_flush;
-            tcp_transports[i].set_raw       = tcp_t_set_raw;
-            tcp_transports[i].close         = tcp_t_close;
-            tcp_transports[i].is_terminal   = true;
-            tcp_transports[i].ctx           = &tcp_ctxs[i];
-            fprintf(stderr, "host: listening on TCP port %d "
-                    "(connect: nc localhost %d)\n",
-                    tcp_ports[i], tcp_ports[i]);
+        static HostRunloopTcp rl;
+        if (!host_runloop_tcp_setup(&rl, tcp_ports, n_tcp_ports)) {
+            return 1;
         }
-        fprintf(stderr, "host: %d session(s) ready; connect clients now.\n",
-                n_tcp_ports);
-        fprintf(stderr,
-            "host: PuTTY — connection type Raw OR Telnet both work\n"
-            "      (the host absorbs Telnet negotiation). For the\n"
-            "      cleanest line editing, under Terminal set\n"
-            "      'Local echo' = Force off and 'Local line editing'\n"
-            "      = Force off, else PuTTY echoes your own keystrokes\n"
-            "      and buffers lines instead of sending keys live.\n");
-        fprintf(stderr, "host: ports stay open — reconnect any time. "
-                        "Ctrl-C to stop the host.\n");
-        fflush(stderr);
-
-        for (;;) {
-            if (host_platform_stop_requested()) {
-                fprintf(stderr, "\nhost: stop requested, shutting down.\n");
-                break;
-            }
-
-            /* 1. Reap exited shells: a slot whose VM is gone (the
-             *    reap in vm_system_step unloaded it) goes back to
-             *    LISTENING so its port accepts a new client. */
-            for (int i = 0; i < n_tcp_ports; i++) {
-                if (!slot_active[i]) continue;
-                if (vm_sched_get(sys.sched, slot_vm[i]) == NULL) {
-                    /* Shell for this port has exited. Close the client
-                     * socket and reopen the slot for reconnection. */
-                    if (tcp_ctxs[i].client_fd != TCP_SOCK_INVALID) {
-                        tcp_close(tcp_ctxs[i].client_fd);
-                        tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
-                    }
-                    tcp_ctxs[i].prev_was_cr = 0;
-                    tcp_ctxs[i].iac_state   = 0;
-                    slot_active[i] = false;
-                    slot_vm[i]     = UINT16_MAX;
-                    fprintf(stderr, "host: [:%d] session ended; "
-                            "port open for reconnection\n", tcp_ctxs[i].port);
-                    fflush(stderr);
-                }
-            }
-
-            /* 2. Accept new clients on idle slots and spawn a shell. */
-            for (int i = 0; i < n_tcp_ports; i++) {
-                if (slot_active[i]) continue;
-                if (tcp_try_accept(&tcp_ctxs[i])) {
-                    VmLoadVmResult lr = vm_system_load_vm(
-                        &sys, elf, elf_size, 16 * 1024,
-                        elf_backing, elf_backing);
-                    if (lr.code != VM_SYS_OK) {
-                        fprintf(stderr, "host: [:%d] load failed (code=%d)\n",
-                                tcp_ctxs[i].port, lr.code);
-                        tcp_close(tcp_ctxs[i].client_fd);
-                        tcp_ctxs[i].client_fd = TCP_SOCK_INVALID;
-                        continue;
-                    }
-                    slot_active[i] = true;
-                    slot_vm[i]     = (uint16_t)lr.assigned_vm_id;
-                    vm_host_set_transport_for_vm(lr.assigned_vm_id,
-                                                 &tcp_transports[i]);
-                    fprintf(stderr, "host: [:%d] shell spawned (vm %u)\n",
-                            tcp_ctxs[i].port, (unsigned)lr.assigned_vm_id);
-                    fflush(stderr);
-                }
-            }
-
-            /* 3. Run the scheduler one step if any shell is live;
-             *    otherwise sleep briefly so we don't busy-spin while
-             *    waiting for connections (and so Ctrl-C is responsive
-             *    — a hot loop can delay signal handling on Cygwin). */
-            int n_active = 0;
-            for (int i = 0; i < n_tcp_ports; i++) if (slot_active[i]) n_active++;
-
-            if (n_active > 0) {
-                VmSchedStepResult r = vm_system_step(&sys);
-                if (r != VM_SCHED_RAN) {
-                    /* IDLE (all shells blocked on input) or ALL_HALTED
-                     * (nothing ran this step) — yield the CPU briefly.
-                     * Without this the loop spins at 100% when sessions
-                     * are connected but idle, which both wastes a core
-                     * and makes SIGINT sluggish under Cygwin. */
-                    host_platform_sleep_ms(5);
-                }
-            } else {
-                host_platform_sleep_ms(10);
-            }
-        }
-
-        /* Tear down all transports + listeners. */
-        for (int i = 0; i < n_tcp_ports; i++) {
-            if (tcp_transports[i].close) {
-                tcp_transports[i].close(&tcp_transports[i]);
-            }
-            if (tcp_ctxs[i].listen_fd != TCP_SOCK_INVALID) {
-                tcp_close(tcp_ctxs[i].listen_fd);
-                tcp_ctxs[i].listen_fd = TCP_SOCK_INVALID;
-            }
-        }
-        tcp_global_shutdown();
-
-#ifdef HOST_AUDIO_SUPPORTED
-        host_audio_stop();
+        host_runloop_tcp_run(&rl, &sys, elf, elf_size, 16, elf_backing);
+        host_runloop_tcp_teardown(&rl);
+    } else
 #endif
-        vm_system_destroy(&sys);
-        free(elf_owned);   /* NULL for the embedded/XIP image — safe */
-        return 0;
-    }
-#endif  /* TCP_MODE_SUPPORTED */
+    {
 
     /* ----- Single-session path (pty / default stdio) ----- */
 
@@ -712,7 +476,9 @@ int main(int argc, char **argv) {
             host_platform_sleep_ms(5);
         }
     }
+    }  /* end single-session else branch */
 
+    /* Shared shutdown for both TCP and single-session paths. */
 #ifdef HOST_AUDIO_SUPPORTED
     host_audio_stop();
 #endif

@@ -39,6 +39,8 @@ examples/05_shell/host_audio.c
 examples/05_shell/host_config.c
 examples/05_shell/host_util.c
 examples/05_shell/host_cli.c
+examples/05_shell/host_mounts.c
+examples/05_shell/host_runloop.c
 
 # --- intercore channel + audio service (native-Windows transport) ---
 # channel_win32.c is the Win32 transport (CreateThread + CONDITION_VARIABLE),
