@@ -202,10 +202,10 @@ typedef enum {
 
 typedef struct {
     char     c;        /* ASCII or first byte of UTF-8. Multi-byte
-                        * support is via packing the codepoint
-                        * into c + extending the cell — not done
-                        * in round L; box-drawing helpers emit
-                        * UTF-8 directly during present. */
+                        * support would mean packing the codepoint
+                        * into c + extending the cell — not done;
+                        * box-drawing helpers emit UTF-8 directly
+                        * during present. */
     uint16_t fg;       /* TuiColor value (0-15 or DEFAULT_COLOR) */
     uint16_t bg;
     uint8_t  attrs;    /* TuiAttr bitmask */
@@ -332,19 +332,19 @@ void tui_clear_clip(void);     /* full canvas */
 /* ============================================================
  *  Canvas access
  *
- *  All drawing in round L writes into a static back-buffer
- *  canvas. The terminal sees nothing until tui_present().
+ *  All drawing writes into a static back-buffer canvas. The
+ *  terminal sees nothing until tui_present().
  * ============================================================ */
 
 /* The fundamental drawing primitive: stamp one cell on the
- * canvas. Round L's tui_set_cell ignores the alpha flag on the
- * input (you can't write "transparent" to a canvas — there's no
+ * canvas. tui_set_cell ignores the alpha flag on its input —
+ * you can't write "transparent" to a canvas (there's no
  * underlying layer); use it on tiles instead. */
 void tui_set_cell(int row, int col, char c,
                   TuiColor fg, TuiColor bg, unsigned attrs);
 
 /* Move the (notional) cursor for subsequent tui_putc/tui_puts.
- * In round L this is library-tracked, not terminal-tracked. */
+ * Library-tracked, not terminal-tracked. */
 void tui_move(int row, int col);
 
 /* Write one character at the current notional cursor. */
@@ -408,8 +408,8 @@ typedef unsigned int TuiTileId;
 TuiTileId tui_tile_create(int rows, int cols);
 
 /* Release a tile slot. The arena memory it occupied isn't
- * reclaimed in round L — but the slot ID becomes reusable, so a
- * game that creates and destroys many small tiles still works. */
+ * reclaimed — but the slot ID becomes reusable, so a game that
+ * creates and destroys many small tiles still works. */
 void tui_tile_destroy(TuiTileId tile);
 
 /* Set a cell within a tile. */

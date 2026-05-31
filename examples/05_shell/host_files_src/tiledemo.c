@@ -1,4 +1,4 @@
-/* tiledemo.c — demonstrates host-side tiles (round T.3b).
+/* tiledemo.c — demonstrates host-side tiles.
  *
  * Creates a few colored tiles, blits them in a pattern, sleeps,
  * exits. Validates that:

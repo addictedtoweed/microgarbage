@@ -456,7 +456,7 @@ static void test_poll_event_function_keys(void) {
 }
 
 /* ============================================================
- *  Tile tests (T.3b)
+ *  Tile tests
  * ============================================================ */
 
 static void test_tile_create_returns_handle(void) {

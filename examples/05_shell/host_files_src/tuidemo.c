@@ -5,16 +5,16 @@
  * SYS_TUI_SHUTDOWN directly via tiny inline syscall stubs — no
  * tui library linked.
  *
- * After the host's TUI service was added in round T.3, this is a
- * ~700 byte ELF (vs ~20 KB for an equivalent guest with the
- * guest-side TUI library).
+ * With the host-side TUI service doing the drawing, this is a
+ * ~700 byte ELF (vs ~20 KB for an equivalent guest that linked
+ * the old client-side TUI library).
  *
  * Public domain (CC0).
  */
 
 #include <stdint.h>
 
-/* T.3 platform syscall numbers — match host's vm_ecall.h. */
+/* Platform syscall numbers — match host's vm_ecall.h. */
 #define SYS_EXIT             93
 #define SYS_SLEEP_TICKS    1045
 #define SYS_TUI_INIT       1132

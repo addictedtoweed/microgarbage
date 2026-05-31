@@ -32,11 +32,10 @@
  *  Module state
  * ============================================================ */
 
-/* Output transport hook (round U.1). If set, canvas output goes
- * through this function. As of round U.2, the active transport
- * (vm_host_transport.h) takes precedence over this hook — the
- * hook remains for backward compatibility with hosts that
- * haven't migrated to the full transport interface. */
+/* Legacy output transport hook. If set, canvas output goes through
+ * this function. The active VmHostTransport (vm_host_transport.h)
+ * takes precedence — the hook remains for hosts that haven't
+ * migrated to the full transport interface. */
 static VmTuiOutputFn g_out_fn  = NULL;
 static void         *g_out_ctx = NULL;
 
@@ -55,13 +54,11 @@ static void             hflush_stdout_if_default(void);
 static void             hwrite(int fd, const void *p, size_t n);
 
 /* ============================================================
- *  Round U.5: per-VM TUI session state
+ *  Per-VM TUI session state
  *
- *  All TUI state that USED to be process-global lives here in
- *  VmTuiSession. For U.5 there is exactly one instance (g_session),
- *  so behavior is bit-identical to pre-U.5. U.6 will make this an
- *  array keyed by (vm_id, transport) so multiple shells can each
- *  drive their own independent canvas + input parser.
+ *  All per-shell TUI state lives in VmTuiSession. The pool of
+ *  sessions is keyed by (vm_id) so multiple shells can each drive
+ *  their own independent canvas + input parser.
  *
  *  Why this layout:
  *    - Each session owns a back+front buffer pair (~42 KB each).
@@ -75,7 +72,7 @@ static void             hwrite(int fd, const void *p, size_t n);
  *      TCP socket is irrelevant, etc.).
  *
  *  What stays global (intentionally):
- *    - g_out_fn / g_out_ctx           — legacy U.1 hook fallback
+ *    - g_out_fn / g_out_ctx           — legacy hook fallback
  *    - g_out_buf / g_out_pos          — write cache (just a buffer
  *                                        between hwrite calls)
  *    - g_tile_arena / g_tile_slots    — already vm-keyed via the
@@ -83,9 +80,8 @@ static void             hwrite(int fd, const void *p, size_t n);
  *                                        are pooled across all VMs
  *
  *  The forward decl `cur_session()` returns the current session
- *  for the calling context. In U.5 it always returns &g_session;
- *  in U.6 it does a (vm_id → session) lookup. ECALL handlers will
- *  migrate to using it instead of touching g_session directly.
+ *  for the calling context: a (vm_id -> session) lookup that
+ *  ECALL handlers use instead of touching session state directly.
  * ============================================================ */
 
 /* HostCell is the header's VmTuiHostCell; alias to keep the
@@ -97,7 +93,7 @@ typedef VmTuiHostCell HostCell;
  * also come from the header. */
 
 /* ============================================================
- *  Session pool (round U.7)
+ *  Session pool
  *
  *  The host provides the backing storage for sessions via
  *  vm_host_tui_set_pool(pool, count). This matches the platform's
@@ -110,8 +106,8 @@ typedef VmTuiHostCell HostCell;
  *    MCU bare:   static VmTuiSession pool[2];     (~222 KB internal)
  *
  *  If the host never calls set_pool, we fall back to a single
- *  built-in session (g_fallback_session) so existing single-shell
- *  demos work unchanged — they get exactly the U.5/U.6 behavior.
+ *  built-in session (g_fallback_session) so single-shell demos
+ *  work unchanged.
  *
  *  Session-to-VM binding: each session's owner_vm records which VM
  *  owns it. cur_session() resolves the session for the VM that's
@@ -233,11 +229,11 @@ static inline void tui_leave(void)           { g_current_vm = UINT16_MAX; }
  *  forward decls at the top can resolve.
  * ============================================================ */
 
-/* Resolve the transport for the currently-active session.
- * In U.5 single-session this returns the default. In U.6 it
- * looks up per-VM via the session's owner_vm. When no session
- * has an owner yet (TUI never initialized), falls back to the
- * default transport so init-time output still works. */
+/* Resolve the transport for the currently-active session: prefer
+ * the per-VM binding (looked up via the session's owner_vm) and
+ * fall back to the process default. When no session has an owner
+ * yet (TUI never initialized), falls back to the default transport
+ * so init-time output still works. */
 static VmHostTransport *hresolve_transport(void) {
     VmTuiSession *s = cur_session();
     if (s->owner_vm != UINT16_MAX) {
@@ -248,8 +244,8 @@ static VmHostTransport *hresolve_transport(void) {
 }
 
 /* Flush stdout only when we're using it. When a transport (or
- * the U.1 hook) is in play, stdout isn't on the output path at
- * all — fflushing it would be a no-op at best and could mix
+ * the legacy hook) is in play, stdout isn't on the output path
+ * at all — fflushing it would be a no-op at best and could mix
  * unrelated stdio writes into our canvas frame at worst. */
 static void hflush_stdout_if_default(void) {
     if (hresolve_transport()) return;
@@ -280,15 +276,13 @@ static void hwrite(int fd, const void *p, size_t n) {
 static void do_shutdown(void);
 static void tui_atexit_shutdown_all(void);
 
-/* Compatibility shims (round U.5, repointed in U.7): the code
- * below uses the old global names extensively (~160 references).
- * In U.5 they aliased a single g_session. In U.7 they resolve
- * through cur_session(), which returns the session owned by the
- * VM currently in a TUI ECALL (tracked by g_current_vm).
+/* Session-state accessor shims: the code below uses old global
+ * names extensively (~160 references). They resolve through
+ * cur_session(), which returns the session owned by the VM
+ * currently in a TUI ECALL (tracked by g_current_vm).
  *
- * This is the trick that kept U.7 from becoming a 160-site manual
- * edit: the access SYNTAX stays `g_owner_vm`, but the TARGET is
- * now per-VM. Correctness rests on g_current_vm being set (via
+ * This lets the access SYNTAX stay `g_owner_vm` while the TARGET
+ * is per-VM. Correctness rests on g_current_vm being set (via
  * tui_enter) before any of these are touched — which every ECALL
  * handler does at its top.
  *
@@ -375,12 +369,10 @@ static void canvas_clear(void) {
  * ============================================================ */
 
 static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
-    /* Round U.7: each VM gets its OWN session. Allocate (or find)
-     * this VM's session and make it current before touching any
-     * shim-macro state. The old "one global canvas, -EBUSY for
-     * everyone else" lock is gone — multiple VMs can each own a
-     * session simultaneously, one per transport. The only refusal
-     * now is pool exhaustion. */
+    /* Each VM gets its OWN session. Allocate (or find) this VM's
+     * session and make it current before touching any shim-macro
+     * state. Multiple VMs can each own a session simultaneously,
+     * one per transport; the only refusal here is pool exhaustion. */
     tui_enter(vm_id);
     VmTuiSession *s = session_alloc(vm_id);
     if (!s) {
@@ -396,9 +388,9 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
      * terminal so the parent shell doesn't inherit alt-screen,
      * raw mode, mouse reporting, or hidden cursor.
      *
-     * U.7: the atexit hook shuts down ALL active sessions, not
-     * just the "current" one — at process exit there may be
-     * several, and g_current_vm is meaningless. */
+     * The atexit hook shuts down ALL active sessions, not just the
+     * "current" one — at process exit there may be several, and
+     * g_current_vm is meaningless. */
     static bool atexit_registered = false;
     if (!atexit_registered) {
         atexit(tui_atexit_shutdown_all);
@@ -463,8 +455,8 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
      * mode, the user's keypresses would echo onto the screen
      * over our rendering.
      *
-     * Round U.6: prefer this SESSION's transport->set_raw so that
-     * two simultaneous TUI sessions on different transports each
+     * Prefer this SESSION's transport->set_raw so that two
+     * simultaneous TUI sessions on different transports each
      * manipulate their own line discipline independently. Falls
      * back to the legacy global stdio raw-mode toggle when no
      * session-bound transport supports set_raw. */
@@ -510,9 +502,9 @@ static void do_shutdown(void) {
      * shell gets a normal cooked-mode terminal back when we
      * exit. If the caller already had it raw, leave it.
      *
-     * U.6: like do_init, prefer the session's transport->set_raw
-     * if available so we toggle the same line discipline we
-     * toggled on at init. */
+     * Like do_init, prefer the session's transport->set_raw if
+     * available so we toggle the same line discipline we toggled
+     * on at init. */
     if (g_raw_mode_we_set) {
         VmHostTransport *t = hresolve_transport();
         if (t && t->set_raw) {
@@ -1015,10 +1007,11 @@ static void do_present_diff(void) {
  *  machine. Decoded events are written to the guest's buffer
  *  via the VmTuiEventRecord wire format.
  *
- *  Ported from the guest-side tui.c (round L) — same architecture:
- *  IN_STATE_GROUND / IN_STATE_ESC / IN_STATE_CSI / IN_STATE_CSI_O,
- *  CSI parameter list, SGR mouse (mode 1006), arrows, function
- *  keys F1-F12, modifiers via the second CSI parameter.
+ *  Architecture mirrors the original guest-side parser in
+ *  examples/common/guest/tui.c: IN_STATE_GROUND / IN_STATE_ESC /
+ *  IN_STATE_CSI / IN_STATE_CSI_O, CSI parameter list, SGR mouse
+ *  (mode 1006), arrows, function keys F1-F12, modifiers via the
+ *  second CSI parameter.
  *
  *  Local event struct (host-side intermediate representation).
  *  Mapped to VmTuiEventRecord wire format at SYS_TUI_POLL_EVENT
@@ -1075,10 +1068,10 @@ static void in_buf_refill(void) {
     if (g_in_head == g_in_tail) g_in_head = g_in_tail = 0;
     unsigned avail = IN_BUF_CAP - g_in_tail;
     if (avail == 0) return;
-    /* Round U.6: pull bytes from THIS session's transport, not
-     * whatever the process default is. Falls back to the legacy
-     * stdio helper if no transport is bound to this session
-     * (which then itself consults the default). */
+    /* Pull bytes from THIS session's transport rather than the
+     * process default. Falls back to the legacy stdio helper if
+     * no transport is bound to this session (which then itself
+     * consults the default). */
     VmHostTransport *t = hresolve_transport();
     int r;
     if (t && t->read_nonblock) {
@@ -1389,7 +1382,7 @@ unsigned vm_host_tui_test_inject_input_(const void *bytes, unsigned n) {
 }
 
 /* ============================================================
- *  Tile subsystem (round T.3b)
+ *  Tile subsystem
  *
  *  Storage:
  *    g_tile_arena   one shared cell pool, served bump-style

@@ -108,12 +108,11 @@ typedef struct VmHostTransport {
 /* ============================================================
  *  Active transport
  *
- *  The default (process-global) transport is set via
- *  vm_host_set_transport. Most single-session demos use only this.
- *
- *  Round U.6 added per-VM bindings so multi-session hosts can give
- *  each shell VM its own transport. Lookup precedence at every I/O
- *  site is:
+ *  Two binding scopes coexist. The default (process-global) transport
+ *  is set via vm_host_set_transport; most single-session demos use
+ *  only this. Multi-session hosts also give each shell VM its own
+ *  transport via vm_host_set_transport_for_vm. Lookup precedence at
+ *  every I/O site is:
  *
  *      1. per-VM binding (vm_host_set_transport_for_vm)
  *      2. process default (vm_host_set_transport)
@@ -126,8 +125,8 @@ typedef struct VmHostTransport {
 VmHostTransport *vm_host_set_transport(VmHostTransport *t);
 VmHostTransport *vm_host_get_transport(void);
 
-/* Per-VM transport binding (round U.6). Pass NULL for `t` to
- * unbind a VM so it falls back to the process default. */
+/* Per-VM transport binding. Pass NULL for `t` to unbind a VM so it
+ * falls back to the process default. */
 VmHostTransport *vm_host_set_transport_for_vm(uint16_t vm_id,
                                               VmHostTransport *t);
 VmHostTransport *vm_host_get_transport_for_vm(uint16_t vm_id);

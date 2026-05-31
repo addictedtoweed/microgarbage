@@ -1,14 +1,14 @@
 /* lib/tui.c — guest-side shim for the host TUI service.
  *
- * As of round T.4, the canvas and SGR-emit logic live in the
- * host. This file is now a thin command-buffer builder + flush.
- * The public API (tui_init, tui_set_cell, etc.) is unchanged so
- * existing guests (snake.c, future tetris.c) compile without
- * modification.
+ * The canvas and SGR-emit logic live in the host; this file is
+ * a thin command-buffer builder + flush. The public API
+ * (tui_init, tui_set_cell, etc.) is preserved for source
+ * compatibility with guests written against the old client-side
+ * library.
  *
- * Size impact: this file used to be ~1100 lines + ~80 KB of
- * canvas BSS per guest. Now it's ~300 lines and ~2 KB of
- * command-buffer BSS.
+ * Size impact: the original client-side library was ~1100 lines
+ * + ~80 KB of canvas BSS per guest. This shim is ~300 lines and
+ * ~2 KB of command-buffer BSS.
  *
  * Tiles: the tile API is preserved for source compatibility but
  * implemented entirely guest-side as small in-RAM cell arrays.
@@ -296,7 +296,7 @@ void tui_text_block(int row, int col, int h, int w, const char *text) {
      * 'use current pen' — but that's not implemented; we pass
      * VM_TUI_DEFAULT_COLOR (256) which renders as terminal default.
      *
-     * For T.4 we keep text_block simple: it emits with default
+     * text_block is intentionally simple: it emits with default
      * colors. Guests that want colored text blocks use tui_set_fg/bg
      * before each line + tui_move + tui_puts. */
     int r = row;
@@ -343,11 +343,11 @@ void tui_box_ascii(int row, int col, int h, int w) {
 }
 
 /* ============================================================
- *  Tiles — backed by host SYS_TUI_TILE_* syscalls (T.3b)
+ *  Tiles — backed by host SYS_TUI_TILE_* syscalls
  *
- *  Round T.3b moved tile storage into the host. The guest-side
- *  arena is gone; the per-VM tile slot table and shared cell
- *  arena live in vm_host_tui. Handles are opaque u32 values.
+ *  Tile storage lives in the host: the per-VM tile slot table
+ *  and shared cell arena live in vm_host_tui. Handles are
+ *  opaque u32 values from the guest's perspective.
  * ============================================================ */
 
 #define SYS_TUI_TILE_CREATE          1139

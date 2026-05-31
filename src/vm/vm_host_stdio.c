@@ -88,11 +88,12 @@ static int   g_out_fd = -1;
 static int   g_err_fd = -1;
 
 /* ============================================================
- *  Active transport (round U.2; per-VM in round U.6)
+ *  Active transport
  *
- *  U.2 introduced a single process-global transport pointer. U.6
- *  extends this to a per-VM table so multiple shells, each bound
- *  to a different transport, can coexist in one host process.
+ *  Two scopes coexist: a single process-global transport pointer
+ *  for single-session demos, and a per-VM table so multiple shells
+ *  — each bound to a different transport — can coexist in one host
+ *  process.
  *
  *  Lookup precedence (highest first):
  *    1. g_transport_by_vm[vm_id]  — set via set_transport_for_vm
@@ -100,10 +101,9 @@ static int   g_err_fd = -1;
  *    3. NULL                      — falls through to legacy stdio
  *                                   path (g_in_file/g_out_file)
  *
- *  The single-arg `vm_host_set_transport(t)` API still works and
- *  sets the default. Single-session demos (no per-VM bindings) see
- *  identical behavior to U.5. Multi-session hosts call
- *  `vm_host_set_transport_for_vm(vm_id, t)` for each session.
+ *  Single-session demos use only vm_host_set_transport (or nothing
+ *  and rely on stdio). Multi-session hosts call
+ *  vm_host_set_transport_for_vm(vm_id, t) for each session.
  * ============================================================ */
 
 static VmHostTransport *g_default_transport = NULL;
@@ -284,10 +284,10 @@ static bool disable_raw_mode(void) {
  * if the fd is not a tty / Windows console or no stdio was
  * installed. */
 bool vm_host_stdio_set_raw_mode(bool enable) {
-    /* Round U.2/U.6: this helper still operates on the DEFAULT
-     * transport. Per-VM raw-mode toggles are done by the TUI
-     * module reading its session's transport directly; this
-     * fallback path handles non-TUI callers (legacy code).
+    /* This helper operates on the DEFAULT transport. Per-VM
+     * raw-mode toggles are done by the TUI module reading its
+     * session's transport directly; this fallback path handles
+     * non-TUI callers (legacy code).
      * Transports that don't supply set_raw fall through to the
      * termios path on g_in_file. */
     VmHostTransport *t = g_default_transport;
@@ -321,10 +321,10 @@ bool vm_host_stdio_set_raw_mode(bool enable) {
 }
 
 int vm_host_stdio_read_bytes_nonblock(void *buf, unsigned cap) {
-    /* Round U.2: prefer the transport if one is installed. This
-     * is the path the TUI host service uses for input — when a
-     * pipe or TCP transport is active, this is how mouse/keyboard
-     * bytes reach the input parser. */
+    /* Prefer the transport if one is installed. This is the path
+     * the TUI host service uses for input — when a pipe or TCP
+     * transport is active, this is how mouse/keyboard bytes reach
+     * the input parser. */
     {
         VmHostTransport *t = g_default_transport;
         if (t && t->read_nonblock) {
@@ -424,10 +424,10 @@ static void handle_write(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Round U.2/U.6: if a transport is bound to this VM (or a
-     * process-default transport is set), it owns stdout AND
-     * stderr (they're the same byte sink as far as the user is
-     * concerned). Route through it before the FILE/fd fallback.
+    /* If a transport is bound to this VM (or a process-default
+     * transport is set), it owns stdout AND stderr (they're the
+     * same byte sink as far as the user is concerned). Route
+     * through it before the FILE/fd fallback.
      * The transport's `write` is best-effort and may write less
      * than `n`; we propagate the count to the guest. */
     VmHostTransport *vt = vm_host_get_transport_for_vm(cpu->vm_id);
@@ -516,9 +516,8 @@ static void handle_fflush(VmCpu *cpu, void *system) {
     if (!cpu) return;
     uint32_t fd = cpu->regs[VM_REG_A0];
 
-    /* Round U.2/U.6: defer to per-VM transport if installed.
-     * fd 0/1/2 are all the same byte sink as far as the transport's
-     * concerned. */
+    /* Defer to per-VM transport if installed. fd 0/1/2 are all
+     * the same byte sink as far as the transport's concerned. */
     VmHostTransport *vt = vm_host_get_transport_for_vm(cpu->vm_id);
     if (vt && vt->flush) {
         if (fd <= 2) {
@@ -610,8 +609,8 @@ static void handle_read(VmCpu *cpu, void *system) {
         return;
     }
 
-    /* Round U.2/U.6: if a transport is bound to this VM, it owns
-     * stdin. Same routing pattern as handle_write. */
+    /* If a transport is bound to this VM, it owns stdin. Same
+     * routing pattern as handle_write. */
     if (fd == 0 && vt && vt->read_nonblock) {
         if (n == 0) {
             cpu->regs[VM_REG_A0] = 0;

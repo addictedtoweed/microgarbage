@@ -7,11 +7,11 @@
  *
  *  Why
  *  -----------------------------------------------------------
- *  Before round T.3 the TUI library lived in each guest ELF:
- *  ~10 KB of code + ~42 KB of canvas BSS per guest using it.
- *  With the canvas in the host, that cost drops to ~200 bytes
- *  per guest (command-buffer builders), and the canvas state is
- *  paid once host-side regardless of how many guests use TUI.
+ *  The old design put the TUI library in each guest ELF: ~10 KB
+ *  of code + ~42 KB of canvas BSS per guest using it. With the
+ *  canvas in the host, that cost drops to ~200 bytes per guest
+ *  (command-buffer builders), and the canvas state is paid once
+ *  host-side regardless of how many guests use TUI.
  *
  *  Ownership model
  *  -----------------------------------------------------------
@@ -192,7 +192,7 @@ typedef struct {
 } VmTuiEventRecord;
 
 /* ============================================================
- *  Session (round U.5/U.7)
+ *  Session
  *
  *  All per-session TUI state. The host provides backing storage
  *  for one or more of these via vm_host_tui_set_pool(); each VM
@@ -272,7 +272,7 @@ bool vm_host_install_tui(VmSystem *sys);
 void vm_host_tui_release_for_vm(uint16_t vm_id);
 
 /* ============================================================
- *  Session pool (round U.7)
+ *  Session pool
  *
  *  Provide backing storage for sessions. The host owns the
  *  memory; the TUI module never allocates. Call once at startup,
@@ -288,8 +288,7 @@ void vm_host_tui_release_for_vm(uint16_t vm_id);
  *                vm_host_tui_set_pool(pool, 2);
  *
  *  If never called, the module falls back to a single built-in
- *  session — exactly the pre-U.7 single-shell behavior. So
- *  existing demos that don't call this keep working unchanged.
+ *  session — the single-shell behaviour existing demos rely on.
  *
  *  Sessions are allocated lazily: a VM gets a slot on its first
  *  SYS_TUI_INIT and releases it at SYS_TUI_SHUTDOWN or VM exit.
@@ -299,7 +298,7 @@ void vm_host_tui_release_for_vm(uint16_t vm_id);
 void vm_host_tui_set_pool(VmTuiSession *pool, unsigned count);
 
 /* ============================================================
- *  Output transport hook (round U.1)
+ *  Output transport hook
  *
  *  By default the TUI writes its canvas output (escape sequences
  *  + cells) to file descriptor 1 via the POSIX write() syscall.
@@ -325,7 +324,7 @@ typedef int (*VmTuiOutputFn)(const void *buf, size_t n, void *ctx);
 void vm_host_tui_set_output(VmTuiOutputFn fn, void *ctx);
 
 /* ============================================================
- *  Tile subsystem (round T.3b)
+ *  Tile subsystem
  *
  *  Tiles are per-VM sub-canvases. Each VM has up to
  *  VM_TUI_TILES_PER_VM slots; cells come from a shared host
