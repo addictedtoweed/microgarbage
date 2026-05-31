@@ -24,7 +24,9 @@
 #include "mg_bg.h"
 #include "mg_mode7.h"
 #include "mg_hdma.h"
+#include "mg_audio.h"
 
-/* Still pending: mg_audio.h - SFX + streaming wrappers. */
+/* The full mg_* API surface is now available from this single
+ * include. See docs/game-api.md for the design and rationale. */
 
 #endif /* MG_GAME_H */
