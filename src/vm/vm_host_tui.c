@@ -1,4 +1,4 @@
-/* ============================================================
+﻿/* ============================================================
  *  vm_host_tui.c — terminal-canvas service for guest VMs
  *
  *  See vm/vm_host_tui.h for the public contract.
@@ -22,6 +22,8 @@
 #include "vm/vm_host_transport.h"
 
 #include <stdint.h>
+#include "vm_host_tui_internal.h"
+
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
@@ -45,13 +47,7 @@ void vm_host_tui_set_output(VmTuiOutputFn fn, void *ctx) {
 }
 
 /* hresolve_transport, hflush_stdout_if_default, and hwrite are
- * defined AFTER the VmTuiSession declaration further down — they
- * reference g_session.owner_vm and so need that struct in scope.
- * Forward declarations let the rest of this header-level code
- * compile in any order. */
-static VmHostTransport *hresolve_transport(void);
-static void             hflush_stdout_if_default(void);
-static void             hwrite(int fd, const void *p, size_t n);
+ * declared in vm_host_tui_internal.h and defined further down. */
 
 /* ============================================================
  *  Per-VM TUI session state
@@ -84,13 +80,11 @@ static void             hwrite(int fd, const void *p, size_t n);
  *  ECALL handlers use instead of touching session state directly.
  * ============================================================ */
 
-/* HostCell is the header's VmTuiHostCell; alias to keep the
- * ~100 references in this file unchanged. */
-typedef VmTuiHostCell HostCell;
-
-/* The VmTuiSession struct now lives in vm_host_tui.h (the host
- * needs its size to declare a pool). IN_BUF_CAP / MAX_CSI_PARAMS
- * also come from the header. */
+/* HostCell + the g_* session-state shims come from
+ * vm_host_tui_internal.h, included at the top of this file.
+ * The VmTuiSession struct itself lives in vm_host_tui.h (the
+ * host needs its size to declare a pool). IN_BUF_CAP /
+ * MAX_CSI_PARAMS also come from the public header. */
 
 /* ============================================================
  *  Session pool
@@ -120,11 +114,13 @@ static VmTuiSession  g_fallback_session;
 static VmTuiSession *g_pool       = NULL;
 static unsigned      g_pool_count = 0;
 
-/* The VM currently executing a TUI ECALL. Set at the top of every
- * handler (see TUI_ENTER). UINT16_MAX when no handler is active —
- * which only happens during the atexit/unload paths, where we use
- * the most-recently-active session. */
-static uint16_t g_current_vm = UINT16_MAX;
+/* The VM currently executing a TUI ECALL. Set by tui_enter at the
+ * top of every handler, cleared by tui_leave on exit. UINT16_MAX
+ * when no handler is active — which only happens during the atexit
+ * / unload paths, where we use the most-recently-active session.
+ *
+ * Declared extern in vm_host_tui_internal.h; lives here. */
+uint16_t vm_host_tui_g_current_vm = UINT16_MAX;
 
 /* One-time init of a session to its default (cleared) state. */
 static void session_reset(VmTuiSession *s) {
@@ -207,10 +203,13 @@ static VmTuiSession *session_alloc(uint16_t vm_id) {
 /* The session for whichever VM is currently in a TUI ECALL.
  * Falls back to the fallback session (or pool slot 0) when no
  * handler context is active or the VM has no session yet — this
- * keeps init-time and teardown-time accesses safe. */
-static VmTuiSession *cur_session(void) {
-    if (g_current_vm != UINT16_MAX) {
-        VmTuiSession *s = session_find(g_current_vm);
+ * keeps init-time and teardown-time accesses safe.
+ *
+ * Declared in vm_host_tui_internal.h; non-static so the split-off
+ * input parser / tile subsystem can reach it through the g_* shims. */
+VmTuiSession *cur_session(void) {
+    if (vm_host_tui_g_current_vm != UINT16_MAX) {
+        VmTuiSession *s = session_find(vm_host_tui_g_current_vm);
         if (s) return s;
     }
     /* No active session for the current VM. Return a stable
@@ -219,9 +218,7 @@ static VmTuiSession *cur_session(void) {
     return g_pool ? &g_pool[0] : &g_fallback_session;
 }
 
-/* Set/clear the current-VM context. Called at handler entry/exit. */
-static inline void tui_enter(uint16_t vm_id) { g_current_vm = vm_id; }
-static inline void tui_leave(void)           { g_current_vm = UINT16_MAX; }
+/* tui_enter/tui_leave are inline in vm_host_tui_internal.h. */
 
 /* ============================================================
  *  Transport-routing helpers (used by every hwrite-callsite
@@ -234,7 +231,7 @@ static inline void tui_leave(void)           { g_current_vm = UINT16_MAX; }
  * fall back to the process default. When no session has an owner
  * yet (TUI never initialized), falls back to the default transport
  * so init-time output still works. */
-static VmHostTransport *hresolve_transport(void) {
+VmHostTransport *hresolve_transport(void) {
     VmTuiSession *s = cur_session();
     if (s->owner_vm != UINT16_MAX) {
         VmHostTransport *t = vm_host_get_transport_for_vm(s->owner_vm);
@@ -247,7 +244,7 @@ static VmHostTransport *hresolve_transport(void) {
  * the legacy hook) is in play, stdout isn't on the output path
  * at all — fflushing it would be a no-op at best and could mix
  * unrelated stdio writes into our canvas frame at worst. */
-static void hflush_stdout_if_default(void) {
+void hflush_stdout_if_default(void) {
     if (hresolve_transport()) return;
     if (g_out_fn) return;
     fflush(stdout);
@@ -258,7 +255,7 @@ static void hflush_stdout_if_default(void) {
  * `fd` argument is the no-transport fallback target (always 1
  * in practice). When a transport is installed, output routes
  * through transport->write regardless of `fd`. */
-static void hwrite(int fd, const void *p, size_t n) {
+void hwrite(int fd, const void *p, size_t n) {
     VmHostTransport *t = hresolve_transport();
     if (t && t->write) {
         (void)t->write(t, p, (unsigned)n);
@@ -276,52 +273,23 @@ static void hwrite(int fd, const void *p, size_t n) {
 static void do_shutdown(void);
 static void tui_atexit_shutdown_all(void);
 
-/* Session-state accessor shims: the code below uses old global
- * names extensively (~160 references). They resolve through
- * cur_session(), which returns the session owned by the VM
- * currently in a TUI ECALL (tracked by g_current_vm).
- *
- * This lets the access SYNTAX stay `g_owner_vm` while the TARGET
- * is per-VM. Correctness rests on g_current_vm being set (via
- * tui_enter) before any of these are touched — which every ECALL
- * handler does at its top.
+/* g_* session-state shims live in vm_host_tui_internal.h so the
+ * split-off input parser and tile subsystem share one definition.
+ * They resolve through cur_session(), which returns the session
+ * owned by the VM currently in a TUI ECALL.
  *
  * Care: any local named after a shim macro silently rewrites.
  * Checked at refactor time; no collisions. */
-#define g_owner_vm           (cur_session()->owner_vm)
-#define g_initialized        (cur_session()->initialized)
-#define g_flags              (cur_session()->flags)
-#define g_rows               (cur_session()->rows)
-#define g_cols               (cur_session()->cols)
-#define g_raw_mode_we_set    (cur_session()->raw_mode_we_set)
-#define g_pen_fg             (cur_session()->pen_fg)
-#define g_pen_bg             (cur_session()->pen_bg)
-#define g_pen_attrs          (cur_session()->pen_attrs)
-#define g_cur_row            (cur_session()->cur_row)
-#define g_cur_col            (cur_session()->cur_col)
-#define g_clip_r             (cur_session()->clip_r)
-#define g_clip_c             (cur_session()->clip_c)
-#define g_clip_h             (cur_session()->clip_h)
-#define g_clip_w             (cur_session()->clip_w)
-#define g_canvas             (cur_session()->canvas)
-#define g_front              (cur_session()->front)
-#define g_front_valid        (cur_session()->front_valid)
-#define g_in_buf             (cur_session()->in_buf)
-#define g_in_head            (cur_session()->in_head)
-#define g_in_tail            (cur_session()->in_tail)
-#define g_in_state           (cur_session()->in_state)
-#define g_csi_params         (cur_session()->csi_params)
-#define g_csi_n_params       (cur_session()->csi_n_params)
-#define g_csi_curr           (cur_session()->csi_curr)
-#define g_csi_has_curr       (cur_session()->csi_has_curr)
-#define g_csi_intermediate   (cur_session()->csi_intermediate)
-#define g_esc_idle_polls     (cur_session()->esc_idle_polls)
 
 /* ============================================================
  *  Internal: bounds + drawable check
  * ============================================================ */
 
-static bool in_canvas(int row, int col) {
+/* in_canvas / drawable are non-static (declared in
+ * vm_host_tui_internal.h) so the split-off tile module can use
+ * them for blit/grab bounds checks. in_clip stays static — only
+ * draw paths inside this file consult the clip rect. */
+bool in_canvas(int row, int col) {
     return row >= 1 && row <= g_rows && col >= 1 && col <= g_cols;
 }
 
@@ -330,7 +298,7 @@ static bool in_clip(int row, int col) {
            col >= g_clip_c && col < g_clip_c + g_clip_w;
 }
 
-static bool drawable(int row, int col) {
+bool drawable(int row, int col) {
     return in_canvas(row, col) && in_clip(row, col);
 }
 
@@ -417,8 +385,7 @@ static int do_init(uint16_t vm_id, int rows, int cols, unsigned flags) {
     canvas_clear();
     memset(g_front, 0, sizeof(g_front));
 
-    /* Reset input parser state (defined later in this file). */
-    extern void vm_host_tui_input_reset_(void);
+    /* Reset input parser state (declared in vm_host_tui_internal.h). */
     vm_host_tui_input_reset_();
 
     /* Terminal setup. Each flag is best-effort: if writes fail
@@ -999,596 +966,11 @@ static void do_present_diff(void) {
     copy_back_to_front();
 }
 
-/* ============================================================
- *  Input parser
- *
- *  Reads bytes from host stdin (non-blocking), maintains a small
- *  ring buffer, and runs a CSI / SS3 / escape-sequence state
- *  machine. Decoded events are written to the guest's buffer
- *  via the VmTuiEventRecord wire format.
- *
- *  Architecture mirrors the original guest-side parser in
- *  examples/common/guest/tui.c: IN_STATE_GROUND / IN_STATE_ESC /
- *  IN_STATE_CSI / IN_STATE_CSI_O, CSI parameter list, SGR mouse
- *  (mode 1006), arrows, function keys F1-F12, modifiers via the
- *  second CSI parameter.
- *
- *  Local event struct (host-side intermediate representation).
- *  Mapped to VmTuiEventRecord wire format at SYS_TUI_POLL_EVENT
- *  return.
- * ============================================================ */
+/* Input parser (state machine + ring drain) now lives in
+ * vm_host_tui_input.c. Shared via vm_host_tui_internal.h. */
 
-typedef struct {
-    uint8_t kind;       /* VM_TUI_EVK_* */
-    int     key;        /* decoded key (or VM_TUI_KEY_*) */
-    int     mods;       /* TUI_MOD_* bitmask */
-    int     row;        /* mouse coord (1-indexed) */
-    int     col;
-    int     button;     /* VM_TUI_MB_* */
-    bool    press;      /* mouse press vs release */
-    bool    drag;       /* mouse motion-with-button-held */
-} InEvent;
-
-/* Mod flags from the CSI second parameter — same encoding the
- * guest tui.h uses (shift=1, alt=2, ctrl=4). */
-#define MOD_SHIFT (1u << 0)
-#define MOD_ALT   (1u << 1)
-#define MOD_CTRL  (1u << 2)
-
-/* IN_BUF_CAP is referenced by the session struct definition above
- * (as VM_TUI_IN_BUF_CAP). We keep this alias for the in-buf
- * helpers below, which use IN_BUF_CAP throughout. */
-#define IN_BUF_CAP VM_TUI_IN_BUF_CAP
-
-enum {
-    IN_STATE_GROUND = 0,
-    IN_STATE_ESC,
-    IN_STATE_CSI,
-    IN_STATE_CSI_O,
-};
-
-/* MAX_CSI_PARAMS aliases the session-struct constant. */
-#define MAX_CSI_PARAMS VM_TUI_MAX_CSI_PARAMS
-
-static int in_buf_used(void) { return (int)(g_in_tail - g_in_head); }
-
-static int in_buf_peek(unsigned offset) {
-    if (g_in_head + offset >= g_in_tail) return -1;
-    return g_in_buf[g_in_head + offset];
-}
-
-static int in_buf_pop(void) {
-    if (g_in_head >= g_in_tail) return -1;
-    int b = g_in_buf[g_in_head++];
-    if (g_in_head == g_in_tail) g_in_head = g_in_tail = 0;
-    return b;
-}
-
-static void in_buf_refill(void) {
-    if (g_in_head == g_in_tail) g_in_head = g_in_tail = 0;
-    unsigned avail = IN_BUF_CAP - g_in_tail;
-    if (avail == 0) return;
-    /* Pull bytes from THIS session's transport rather than the
-     * process default. Falls back to the legacy stdio helper if
-     * no transport is bound to this session (which then itself
-     * consults the default). */
-    VmHostTransport *t = hresolve_transport();
-    int r;
-    if (t && t->read_nonblock) {
-        r = t->read_nonblock(t, g_in_buf + g_in_tail, avail);
-    } else {
-        r = vm_host_stdio_read_bytes_nonblock(g_in_buf + g_in_tail, avail);
-    }
-    if (r > 0) g_in_tail += (unsigned)r;
-}
-
-static void csi_reset(void) {
-    g_csi_n_params = 0;
-    g_csi_curr = 0;
-    g_csi_has_curr = false;
-    g_csi_intermediate = 0;
-}
-
-static void csi_commit_param(void) {
-    if (g_csi_has_curr && g_csi_n_params < MAX_CSI_PARAMS) {
-        g_csi_params[g_csi_n_params++] = g_csi_curr;
-    }
-    g_csi_curr = 0;
-    g_csi_has_curr = false;
-}
-
-static int csi_mod_decode(int m) {
-    int out = 0;
-    if (m <= 1) return out;
-    m -= 1;
-    if (m & 1) out |= MOD_SHIFT;
-    if (m & 2) out |= MOD_ALT;
-    if (m & 4) out |= MOD_CTRL;
-    return out;
-}
-
-static void make_key(InEvent *ev, int key, int mods) {
-    ev->kind = VM_TUI_EVK_KEY;
-    ev->key  = key;
-    ev->mods = mods;
-}
-
-static bool finish_mouse(char final, InEvent *out) {
-    if (g_csi_n_params < 3) {
-        csi_reset(); g_in_state = IN_STATE_GROUND;
-        return false;
-    }
-    int b = g_csi_params[0];
-    int col = g_csi_params[1];
-    int row = g_csi_params[2];
-
-    int button;
-    bool drag = false;
-
-    if (b & 64) {
-        if ((b & 3) == 0) button = VM_TUI_MB_WHEEL_UP;
-        else if ((b & 3) == 1) button = VM_TUI_MB_WHEEL_DOWN;
-        else { csi_reset(); g_in_state = IN_STATE_GROUND; return false; }
-    } else {
-        switch (b & 3) {
-            case 0: button = VM_TUI_MB_LEFT;   break;
-            case 1: button = VM_TUI_MB_MIDDLE; break;
-            case 2: button = VM_TUI_MB_RIGHT;  break;
-            default:
-                /* (b & 3) == 3: "no button". In any-motion tracking
-                 * (xterm mode 1003) the terminal reports bare cursor
-                 * movement with this code and the motion bit (32)
-                 * set. Treat it as a motion event with no button —
-                 * this is exactly what a move-to-steer UI needs.
-                 * Without this, every bare-motion report was dropped
-                 * and the cursor-following game saw nothing. */
-                button = VM_TUI_MB_NONE;
-                break;
-        }
-        if (b & 32) drag = true;
-    }
-
-    int mods = 0;
-    if (b & 4)  mods |= MOD_SHIFT;
-    if (b & 8)  mods |= MOD_ALT;
-    if (b & 16) mods |= MOD_CTRL;
-
-    out->kind   = VM_TUI_EVK_MOUSE;
-    out->row    = row;
-    out->col    = col;
-    out->button = button;
-    out->mods   = mods;
-    out->press  = (final == 'M');
-    out->drag   = drag;
-
-    csi_reset(); g_in_state = IN_STATE_GROUND;
-    return true;
-}
-
-static bool finish_csi(char final, InEvent *out) {
-    csi_commit_param();
-
-    /* Mouse sequence: CSI < ... M-or-m */
-    if (g_csi_intermediate == '<' && (final == 'M' || final == 'm')) {
-        return finish_mouse(final, out);
-    }
-
-    int mods = (g_csi_n_params >= 2) ? csi_mod_decode(g_csi_params[1]) : 0;
-    int sym = 0;
-    switch (final) {
-        case 'A': sym = VM_TUI_KEY_UP;    break;
-        case 'B': sym = VM_TUI_KEY_DOWN;  break;
-        case 'C': sym = VM_TUI_KEY_RIGHT; break;
-        case 'D': sym = VM_TUI_KEY_LEFT;  break;
-        case 'H': sym = VM_TUI_KEY_HOME;  break;
-        case 'F': sym = VM_TUI_KEY_END;   break;
-    }
-    if (sym) {
-        make_key(out, sym, mods);
-        csi_reset(); g_in_state = IN_STATE_GROUND;
-        return true;
-    }
-
-    if (final == '~' && g_csi_n_params >= 1) {
-        int p = g_csi_params[0];
-        switch (p) {
-            case 1:  sym = VM_TUI_KEY_HOME; break;
-            case 2:  sym = VM_TUI_KEY_INSERT; break;
-            case 3:  sym = VM_TUI_KEY_DELETE; break;
-            case 4:  sym = VM_TUI_KEY_END; break;
-            case 5:  sym = VM_TUI_KEY_PAGE_UP; break;
-            case 6:  sym = VM_TUI_KEY_PAGE_DOWN; break;
-            case 15: sym = VM_TUI_KEY_F1 + 4; break;       /* F5 */
-            case 17: sym = VM_TUI_KEY_F1 + 5; break;
-            case 18: sym = VM_TUI_KEY_F1 + 6; break;
-            case 19: sym = VM_TUI_KEY_F1 + 7; break;
-            case 20: sym = VM_TUI_KEY_F1 + 8; break;
-            case 21: sym = VM_TUI_KEY_F1 + 9; break;
-            case 23: sym = VM_TUI_KEY_F1 + 10; break;
-            case 24: sym = VM_TUI_KEY_F1 + 11; break;
-        }
-        if (sym) {
-            make_key(out, sym, mods);
-            csi_reset(); g_in_state = IN_STATE_GROUND;
-            return true;
-        }
-    }
-
-    csi_reset(); g_in_state = IN_STATE_GROUND;
-    return false;
-}
-
-static bool finish_csi_o(char final, InEvent *out) {
-    int sym = 0;
-    switch (final) {
-        case 'A': sym = VM_TUI_KEY_UP; break;
-        case 'B': sym = VM_TUI_KEY_DOWN; break;
-        case 'C': sym = VM_TUI_KEY_RIGHT; break;
-        case 'D': sym = VM_TUI_KEY_LEFT; break;
-        case 'H': sym = VM_TUI_KEY_HOME; break;
-        case 'F': sym = VM_TUI_KEY_END; break;
-        case 'P': sym = VM_TUI_KEY_F1; break;
-        case 'Q': sym = VM_TUI_KEY_F1 + 1; break;
-        case 'R': sym = VM_TUI_KEY_F1 + 2; break;
-        case 'S': sym = VM_TUI_KEY_F1 + 3; break;
-    }
-    g_in_state = IN_STATE_GROUND;
-    if (sym) {
-        make_key(out, sym, 0);
-        return true;
-    }
-    return false;
-}
-
-/* Pump the state machine; produces at most one event. Returns
- * true if an event was produced. */
-static bool poll_input(InEvent *out) {
-    out->kind = VM_TUI_EVK_NONE;
-    in_buf_refill();
-
-    while (in_buf_used() > 0) {
-        int b;
-        switch (g_in_state) {
-            case IN_STATE_GROUND:
-                b = in_buf_pop();
-                if (b == 0x1b) {
-                    g_in_state = IN_STATE_ESC;
-                    g_esc_idle_polls = 0;
-                    break;
-                }
-                switch (b) {
-                    case '\r':
-                    case '\n':
-                        make_key(out, VM_TUI_KEY_ENTER, 0);
-                        return true;
-                    case '\t':
-                        make_key(out, VM_TUI_KEY_TAB, 0);
-                        return true;
-                    case 0x7F:
-                    case 0x08:
-                        make_key(out, VM_TUI_KEY_BACKSPACE, 0);
-                        return true;
-                    default:
-                        make_key(out, b, 0);
-                        return true;
-                }
-                break;
-
-            case IN_STATE_ESC:
-                b = in_buf_pop();
-                if (b == '[') {
-                    g_in_state = IN_STATE_CSI;
-                    csi_reset();
-                } else if (b == 'O') {
-                    g_in_state = IN_STATE_CSI_O;
-                } else {
-                    g_in_state = IN_STATE_GROUND;
-                    if (b >= 0x20 && b < 0x7F) {
-                        make_key(out, b, MOD_ALT);
-                        return true;
-                    }
-                }
-                break;
-
-            case IN_STATE_CSI:
-                b = in_buf_peek(0);
-                if (b < 0) return false;
-                if (b >= '0' && b <= '9') {
-                    in_buf_pop();
-                    g_csi_curr = g_csi_curr * 10 + (b - '0');
-                    g_csi_has_curr = true;
-                    break;
-                }
-                if (b == ';') {
-                    in_buf_pop();
-                    csi_commit_param();
-                    break;
-                }
-                if (b == '<' || b == '?') {
-                    in_buf_pop();
-                    g_csi_intermediate = (char)b;
-                    break;
-                }
-                if (b >= 0x40 && b <= 0x7E) {
-                    in_buf_pop();
-                    if (finish_csi((char)b, out)) return true;
-                    break;
-                }
-                in_buf_pop();
-                csi_reset();
-                g_in_state = IN_STATE_GROUND;
-                break;
-
-            case IN_STATE_CSI_O:
-                b = in_buf_pop();
-                if (finish_csi_o((char)b, out)) return true;
-                break;
-        }
-    }
-
-    /* Bare ESC: after two consecutive polls with no follow-up
-     * bytes, treat as ESC-key-pressed. */
-    if (g_in_state == IN_STATE_ESC) {
-        g_esc_idle_polls++;
-        if (g_esc_idle_polls >= 2) {
-            g_in_state = IN_STATE_GROUND;
-            g_esc_idle_polls = 0;
-            make_key(out, VM_TUI_KEY_ESCAPE, 0);
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/* Marshal a host-side InEvent into the guest-visible wire
- * record. The structure layout is fixed by vm_host_tui.h. */
-static void marshal_event(const InEvent *src, VmTuiEventRecord *dst) {
-    memset(dst, 0, sizeof(*dst));
-    dst->kind   = src->kind;
-    dst->key    = (uint16_t)src->key;
-    dst->mods   = (uint8_t)src->mods;
-    dst->button = (uint8_t)src->button;
-    dst->row    = (uint16_t)src->row;
-    dst->col    = (uint16_t)src->col;
-    uint8_t flags = 0;
-    if (src->press) flags |= VM_TUI_EVF_PRESS;
-    if (src->drag)  flags |= VM_TUI_EVF_DRAG;
-    dst->flags = flags;
-}
-
-/* Public-named-but-internal: reset the input parser. Called by
- * do_init via an extern forward declaration so do_init can sit
- * above the parser globals without re-ordering everything. */
-void vm_host_tui_input_reset_(void) {
-    g_in_head = 0; g_in_tail = 0;
-    g_in_state = IN_STATE_GROUND;
-    csi_reset();
-    g_esc_idle_polls = 0;
-}
-
-/* Test-only: inject bytes into the input ring buffer as if they
- * arrived from stdin. Returns the number of bytes accepted (0
- * if the buffer is full). Used by test_vm_host_tui.c to exercise
- * the parser without a real TTY. */
-unsigned vm_host_tui_test_inject_input_(const void *bytes, unsigned n) {
-    const uint8_t *b = (const uint8_t *)bytes;
-    if (g_in_head == g_in_tail) g_in_head = g_in_tail = 0;
-    unsigned avail = IN_BUF_CAP - g_in_tail;
-    if (n > avail) n = avail;
-    for (unsigned i = 0; i < n; i++) g_in_buf[g_in_tail + i] = b[i];
-    g_in_tail += n;
-    return n;
-}
-
-/* ============================================================
- *  Tile subsystem
- *
- *  Storage:
- *    g_tile_arena   one shared cell pool, served bump-style
- *                   with no per-tile free (matches the guest-
- *                   side tile arena's behavior). VM unload
- *                   compacts the arena by reclaiming every
- *                   range that belonged to the dead VM.
- *
- *    g_tile_slots   one row per (vm, slot) pair. Each row holds
- *                   the slot's metadata plus the arena range
- *                   it occupies.
- *
- *  Handle encoding:
- *    bits 31..16  generation counter (wraps; aliasing is
- *                 effectively impossible inside a 16-bit window)
- *    bits 15..8   vm_id
- *    bits  7..0   slot index within the VM
- *
- *  The vm_id bits are baked into the handle so a guest can't
- *  pass another VM's handle and operate on its tiles.
- * ============================================================ */
-
-typedef struct {
-    bool     in_use;
-    uint16_t generation;
-    uint16_t rows, cols;
-    uint32_t arena_off;     /* byte offset into g_tile_arena */
-    uint32_t arena_len;     /* bytes (rows * cols * sizeof(HostCell)) */
-} TileSlot;
-
-static HostCell  g_tile_arena[VM_TUI_TILE_ARENA_BYTES / sizeof(HostCell)];
-static uint32_t  g_tile_arena_used = 0;
-static TileSlot  g_tile_slots[VM_SCHED_MAX_VMS][VM_TUI_TILES_PER_VM];
-
-static uint32_t pack_handle(uint16_t vm_id, uint8_t slot, uint16_t gen) {
-    return ((uint32_t)gen << 16) | ((uint32_t)vm_id << 8) | slot;
-}
-
-/* Returns a pointer to the slot, or NULL if the handle is bad.
- * Checks: vm_id matches the caller, slot is in range, slot is
- * in_use, generation matches. */
-static TileSlot *resolve_handle(uint16_t caller_vm, uint32_t handle) {
-    uint8_t  slot   = (uint8_t)(handle & 0xff);
-    uint16_t hvm    = (uint16_t)((handle >> 8) & 0xff);
-    uint16_t gen    = (uint16_t)(handle >> 16);
-    if (hvm != caller_vm) return NULL;
-    if (slot >= VM_TUI_TILES_PER_VM) return NULL;
-    TileSlot *s = &g_tile_slots[caller_vm][slot];
-    if (!s->in_use) return NULL;
-    if (s->generation != gen) return NULL;
-    return s;
-}
-
-static HostCell *tile_cells(TileSlot *s) {
-    return &g_tile_arena[s->arena_off / sizeof(HostCell)];
-}
-
-/* Allocate a tile of the given dimensions for vm_id. Returns
- * handle on success, or 0 if no slot or no arena. (0 is never
- * a valid handle — slot 0 with generation 0 is excluded by
- * forcing the initial generation to 1.) */
-static uint32_t tile_create(uint16_t vm_id, int rows, int cols) {
-    if (rows <= 0 || cols <= 0) return 0;
-    if (rows > VM_TUI_MAX_ROWS || cols > VM_TUI_MAX_COLS) return 0;
-
-    uint32_t need = (uint32_t)rows * (uint32_t)cols * (uint32_t)sizeof(HostCell);
-    if (g_tile_arena_used + need > sizeof(g_tile_arena)) return 0;
-
-    /* Find a free slot. */
-    uint8_t slot = 0xff;
-    for (uint8_t i = 0; i < VM_TUI_TILES_PER_VM; i++) {
-        if (!g_tile_slots[vm_id][i].in_use) { slot = i; break; }
-    }
-    if (slot == 0xff) return 0;
-
-    TileSlot *s = &g_tile_slots[vm_id][slot];
-    s->in_use = true;
-    s->generation = (uint16_t)(s->generation + 1);
-    if (s->generation == 0) s->generation = 1;    /* never give out gen=0 */
-    s->rows = (uint16_t)rows;
-    s->cols = (uint16_t)cols;
-    s->arena_off = g_tile_arena_used;
-    s->arena_len = need;
-    g_tile_arena_used += need;
-
-    /* Initialize as fully transparent cells. */
-    HostCell *cells = tile_cells(s);
-    HostCell blank = {0};
-    blank.c = ' ';
-    blank.fg = VM_TUI_DEFAULT_COLOR;
-    blank.bg = VM_TUI_DEFAULT_COLOR;
-    blank.attrs = 0;
-    blank.flags = VM_TUI_CELL_TRANSPARENT;
-    for (uint32_t i = 0; i < (uint32_t)rows * (uint32_t)cols; i++) {
-        cells[i] = blank;
-    }
-
-    return pack_handle(vm_id, slot, s->generation);
-}
-
-static int32_t tile_destroy(uint16_t vm_id, uint32_t handle) {
-    TileSlot *s = resolve_handle(vm_id, handle);
-    if (!s) return -VM_EBADF;
-    s->in_use = false;
-    /* Arena memory is not reclaimed individually; we'll compact
-     * on full release_for_vm. */
-    return 0;
-}
-
-/* Release all tiles for one VM and reclaim their arena bytes.
- * Called from vm_host_tui_release_for_vm. */
-static void tile_release_for_vm(uint16_t vm_id) {
-    for (uint8_t i = 0; i < VM_TUI_TILES_PER_VM; i++) {
-        g_tile_slots[vm_id][i].in_use = false;
-    }
-    /* Compact the arena: walk all VMs and move surviving allocations
-     * down. This is O(total tiles * arena_size) in the worst case,
-     * but tile creates/destroys are rare events. */
-    uint32_t new_used = 0;
-    for (uint16_t v = 0; v < VM_SCHED_MAX_VMS; v++) {
-        for (uint8_t i = 0; i < VM_TUI_TILES_PER_VM; i++) {
-            TileSlot *s = &g_tile_slots[v][i];
-            if (!s->in_use) continue;
-            if (s->arena_off != new_used) {
-                memmove(&g_tile_arena[new_used / sizeof(HostCell)],
-                        &g_tile_arena[s->arena_off / sizeof(HostCell)],
-                        s->arena_len);
-                s->arena_off = new_used;
-            }
-            new_used += s->arena_len;
-        }
-    }
-    g_tile_arena_used = new_used;
-}
-
-static int32_t tile_set(TileSlot *s, int row, int col,
-                         char c, uint16_t fg, uint16_t bg, uint8_t attrs) {
-    if (row < 1 || row > s->rows || col < 1 || col > s->cols) return 0;
-    HostCell *cells = tile_cells(s);
-    HostCell *cell = &cells[(row - 1) * s->cols + (col - 1)];
-    cell->c = c;
-    cell->fg = fg;
-    cell->bg = bg;
-    cell->attrs = attrs;
-    cell->flags = 0;
-    return 0;
-}
-
-static void tile_fill(TileSlot *s, char c, uint16_t fg, uint16_t bg, uint8_t attrs) {
-    HostCell *cells = tile_cells(s);
-    HostCell tmpl = { .c = c, .fg = fg, .bg = bg, .attrs = attrs, .flags = 0 };
-    uint32_t n = (uint32_t)s->rows * (uint32_t)s->cols;
-    for (uint32_t i = 0; i < n; i++) cells[i] = tmpl;
-}
-
-static int32_t tile_set_transparent(TileSlot *s, int row, int col) {
-    if (row < 1 || row > s->rows || col < 1 || col > s->cols) return 0;
-    HostCell *cells = tile_cells(s);
-    cells[(row - 1) * s->cols + (col - 1)].flags |= VM_TUI_CELL_TRANSPARENT;
-    return 0;
-}
-
-static int32_t tile_blit(TileSlot *s, int dest_row, int dest_col) {
-    HostCell *cells = tile_cells(s);
-    for (int r = 0; r < s->rows; r++) {
-        for (int c = 0; c < s->cols; c++) {
-            HostCell *src = &cells[r * s->cols + c];
-            if (src->flags & VM_TUI_CELL_TRANSPARENT) continue;
-            int dr = dest_row + r;
-            int dc = dest_col + c;
-            if (!drawable(dr, dc)) continue;
-            g_canvas[dr - 1][dc - 1] = *src;
-            /* Clear transparent bit on the canvas — it has no
-             * meaning on canvas cells. */
-            g_canvas[dr - 1][dc - 1].flags = 0;
-        }
-    }
-    return 0;
-}
-
-static int32_t tile_grab(TileSlot *s, int src_row, int src_col, int h, int w) {
-    /* Copy a rectangle from the canvas into the tile, clamping
-     * to both the tile dims and canvas bounds. Cells outside
-     * the canvas become transparent in the destination. */
-    if (h > s->rows) h = s->rows;
-    if (w > s->cols) w = s->cols;
-    HostCell *cells = tile_cells(s);
-    for (int r = 0; r < h; r++) {
-        for (int c = 0; c < w; c++) {
-            HostCell *dst = &cells[r * s->cols + c];
-            int sr = src_row + r;
-            int sc = src_col + c;
-            if (in_canvas(sr, sc)) {
-                *dst = g_canvas[sr - 1][sc - 1];
-                dst->flags = 0;   /* never transparent after grab */
-            } else {
-                dst->c = ' ';
-                dst->fg = VM_TUI_DEFAULT_COLOR;
-                dst->bg = VM_TUI_DEFAULT_COLOR;
-                dst->attrs = 0;
-                dst->flags = VM_TUI_CELL_TRANSPARENT;
-            }
-        }
-    }
-    return 0;
-}
+/* Tile subsystem (storage + tile_create/destroy/blit/grab/etc
+ * primitives) now lives in vm_host_tui_tile.c. */
 
 /* ============================================================
  *  ECALL handlers
@@ -1656,7 +1038,7 @@ static void handle_tui_poll_event(VmCpu *cpu, void *system) {
     }
 
     InEvent ev = {0};
-    if (!poll_input(&ev)) {
+    if (!vm_host_tui_poll_input(&ev)) {
         cpu->regs[VM_REG_A0] = 0;
         return;
     }
@@ -1668,7 +1050,7 @@ static void handle_tui_poll_event(VmCpu *cpu, void *system) {
         cpu->regs[VM_REG_A0] = (uint32_t)-VM_EFAULT;
         return;
     }
-    marshal_event(&ev, rec);
+    vm_host_tui_marshal_event(&ev, rec);
     cpu->regs[VM_REG_A0] = 1;
 }
 
@@ -1705,161 +1087,10 @@ static void handle_tui_flush_draw(VmCpu *cpu, void *system) {
     else       cpu->regs[VM_REG_A0] = 0;
 }
 
-/* ============================================================
- *  Tile ECALL handlers
- * ============================================================ */
-
-static void handle_tile_create(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    int rows = (int)cpu->regs[VM_REG_A0];
-    int cols = (int)cpu->regs[VM_REG_A1];
-    uint32_t h = tile_create(cpu->vm_id, rows, cols);
-    if (h == 0) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_ENOMEM;
-        return;
-    }
-    cpu->regs[VM_REG_A0] = h;
-}
-
-static void handle_tile_destroy(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    int32_t r = tile_destroy(cpu->vm_id, cpu->regs[VM_REG_A0]);
-    cpu->regs[VM_REG_A0] = (uint32_t)r;
-}
-
-/* TILE_SET arg layout:
- *   a0 = handle
- *   a1 = (row << 16) | col
- *   a2 = (c << 8) | attrs
- *   a3 = fg
- *   a4 = bg
- */
-static void handle_tile_set(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    uint32_t handle = cpu->regs[VM_REG_A0];
-    uint32_t rc     = cpu->regs[VM_REG_A1];
-    uint32_t ca     = cpu->regs[VM_REG_A2];
-    uint16_t fg     = (uint16_t)cpu->regs[VM_REG_A3];
-    uint16_t bg     = (uint16_t)cpu->regs[VM_REG_A4];
-
-    TileSlot *s = resolve_handle(cpu->vm_id, handle);
-    if (!s) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF; return; }
-
-    int row = (int)(rc >> 16);
-    int col = (int)(rc & 0xffff);
-    char c  = (char)((ca >> 8) & 0xff);
-    uint8_t attrs = (uint8_t)(ca & 0xff);
-
-    cpu->regs[VM_REG_A0] = (uint32_t)tile_set(s, row, col, c, fg, bg, attrs);
-}
-
-/* TILE_FILL arg layout:
- *   a0 = handle
- *   a1 = (c << 8) | attrs
- *   a2 = fg
- *   a3 = bg
- */
-static void handle_tile_fill(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    uint32_t handle = cpu->regs[VM_REG_A0];
-    uint32_t ca     = cpu->regs[VM_REG_A1];
-    uint16_t fg     = (uint16_t)cpu->regs[VM_REG_A2];
-    uint16_t bg     = (uint16_t)cpu->regs[VM_REG_A3];
-
-    TileSlot *s = resolve_handle(cpu->vm_id, handle);
-    if (!s) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF; return; }
-
-    char c = (char)((ca >> 8) & 0xff);
-    uint8_t attrs = (uint8_t)(ca & 0xff);
-    tile_fill(s, c, fg, bg, attrs);
-    cpu->regs[VM_REG_A0] = 0;
-}
-
-static void handle_tile_set_transparent(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    uint32_t handle = cpu->regs[VM_REG_A0];
-    int row = (int)cpu->regs[VM_REG_A1];
-    int col = (int)cpu->regs[VM_REG_A2];
-    TileSlot *s = resolve_handle(cpu->vm_id, handle);
-    if (!s) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF; return; }
-    cpu->regs[VM_REG_A0] = (uint32_t)tile_set_transparent(s, row, col);
-}
-
-static void handle_tile_blit(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    uint32_t handle = cpu->regs[VM_REG_A0];
-    int dest_row = (int)cpu->regs[VM_REG_A1];
-    int dest_col = (int)cpu->regs[VM_REG_A2];
-    TileSlot *s = resolve_handle(cpu->vm_id, handle);
-    if (!s) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF; return; }
-    cpu->regs[VM_REG_A0] = (uint32_t)tile_blit(s, dest_row, dest_col);
-}
-
-/* TILE_GRAB arg layout:
- *   a0 = handle
- *   a1 = (src_row << 16) | src_col
- *   a2 = (h << 16) | w
- */
-static void handle_tile_grab(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    uint32_t handle = cpu->regs[VM_REG_A0];
-    uint32_t rc     = cpu->regs[VM_REG_A1];
-    uint32_t hw     = cpu->regs[VM_REG_A2];
-    TileSlot *s = resolve_handle(cpu->vm_id, handle);
-    if (!s) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF; return; }
-    int src_row = (int)(rc >> 16);
-    int src_col = (int)(rc & 0xffff);
-    int h = (int)(hw >> 16);
-    int w = (int)(hw & 0xffff);
-    cpu->regs[VM_REG_A0] = (uint32_t)tile_grab(s, src_row, src_col, h, w);
-}
-
-static void handle_tile_dims(VmCpu *cpu, void *system) {
-    (void)system;
-    tui_enter(cpu->vm_id);
-    if (g_owner_vm != cpu->vm_id) {
-        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBUSY;
-        return;
-    }
-    TileSlot *s = resolve_handle(cpu->vm_id, cpu->regs[VM_REG_A0]);
-    if (!s) { cpu->regs[VM_REG_A0] = (uint32_t)-VM_EBADF; return; }
-    cpu->regs[VM_REG_A0] = ((uint32_t)s->rows << 16) | (uint32_t)s->cols;
-}
+/* SYS_TUI_TILE_* ECALL handlers now live in vm_host_tui_tile.c
+ * alongside the primitives. Registered via
+ * vm_host_tui_install_tile_handlers, called from the install
+ * chain below. */
 
 /* ============================================================
  *  Installation
@@ -1890,24 +1121,9 @@ bool vm_host_install_tui(VmSystem *sys) {
     if (!vm_ecall_register(sys->ecall_router, SYS_TUI_FLUSH_DRAW,
                            handle_tui_flush_draw)) goto fail_poll;
 
-    /* Tile handlers. Failures unwind back through the same fail
-     * chain. */
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_CREATE,
-                           handle_tile_create)) goto fail_flush;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_DESTROY,
-                           handle_tile_destroy)) goto fail_tcreate;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_SET,
-                           handle_tile_set)) goto fail_tdestroy;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_FILL,
-                           handle_tile_fill)) goto fail_tset;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_SET_TRANSPARENT,
-                           handle_tile_set_transparent)) goto fail_tfill;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_BLIT,
-                           handle_tile_blit)) goto fail_tstrans;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_GRAB,
-                           handle_tile_grab)) goto fail_tblit;
-    if (!vm_ecall_register(sys->ecall_router, SYS_TUI_TILE_DIMS,
-                           handle_tile_dims)) goto fail_tgrab;
+    /* Tile handlers live in vm_host_tui_tile.c. They have their own
+     * 8-step register/unregister chain inside that file. */
+    if (!vm_host_tui_install_tile_handlers(sys)) goto fail_flush;
 
     /* Register the auto-release hook so a guest that exits without
      * calling SYS_TUI_SHUTDOWN doesn't permanently lock the canvas
@@ -1916,13 +1132,6 @@ bool vm_host_install_tui(VmSystem *sys) {
 
     return true;
 
-fail_tgrab:    vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_GRAB);
-fail_tblit:    vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_BLIT);
-fail_tstrans:  vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_SET_TRANSPARENT);
-fail_tfill:    vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_FILL);
-fail_tset:     vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_SET);
-fail_tdestroy: vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_DESTROY);
-fail_tcreate:  vm_ecall_unregister(sys->ecall_router, SYS_TUI_TILE_CREATE);
 fail_flush:    vm_ecall_unregister(sys->ecall_router, SYS_TUI_FLUSH_DRAW);
 fail_poll:     vm_ecall_unregister(sys->ecall_router, SYS_TUI_POLL_EVENT);
 fail_diff:     vm_ecall_unregister(sys->ecall_router, SYS_TUI_PRESENT_DIFF);
@@ -1934,7 +1143,7 @@ fail:          return false;
 }
 
 void vm_host_tui_release_for_vm(uint16_t vm_id) {
-    tile_release_for_vm(vm_id);
+    vm_host_tui_tile_release_for_vm(vm_id);
     /* Resolve this VM's session before consulting/clearing it. */
     tui_enter(vm_id);
     if (session_find(vm_id) && g_owner_vm == vm_id) {

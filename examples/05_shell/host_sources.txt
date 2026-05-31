@@ -23,6 +23,8 @@ src/vm/vm_host_stdio.c
 src/vm/vm_host_stdio_win32.c
 src/vm/vm_host_platform.c
 src/vm/vm_host_tui.c
+src/vm/vm_host_tui_input.c
+src/vm/vm_host_tui_tile.c
 src/memory/bump.c
 src/memory/slab_stack.c
 src/containers/fifo_queue.c

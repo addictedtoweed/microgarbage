@@ -125,7 +125,7 @@ run audio_service    audio  src/audio/audio_service.c src/audio/audio_arbiter.c 
 # Cygwin/POSIX uses the POSIX paths inside vm_host_stdio.c directly.
 VM_CORE="src/vm/vm_core.c src/vm/vm_loader.c src/vm/vm_ecall.c src/vm/vm_ecall_handlers.c \
          src/vm/vm_mailbox.c src/vm/vm_sched.c src/vm/vm_sched_ops_coop.c src/vm/vm_sched_ops_pre.c \
-         src/vm/vm_system.c src/vm/vm_host_stdio.c src/vm/vm_host_platform.c src/vm/vm_host_tui.c \
+         src/vm/vm_system.c src/vm/vm_host_stdio.c src/vm/vm_host_platform.c src/vm/vm_host_tui.c src/vm/vm_host_tui_input.c src/vm/vm_host_tui_tile.c \
          src/memory/bump.c src/memory/slab_stack.c \
          src/containers/fifo_queue.c src/containers/ring_buffer.c"
 if [ "$NATIVE_WIN" = 1 ]; then VM_CORE="$VM_CORE src/vm/vm_host_stdio_win32.c"; fi
