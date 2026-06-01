@@ -108,8 +108,29 @@ int main(int argc, char **argv) {
     /* Unbuffer stdout so output isn't lost if the DLL crashes mid-run. */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    const char *dll_path = (argc > 1) ? argv[1] : "build\\mgapi\\mgapi.dll";
-    const char *sfc_path = (argc > 2) ? argv[2] : "snes\\build\\snes_smoke.sfc";
+    /* CLI shape: mgapi_host_test [dll] [sfc] [--tcp <port>]
+     *
+     * With --tcp <port> the binary runs the usual self-test, then
+     * keeps stepping the runtime forever so a PuTTY session can
+     * raw-connect to localhost:<port> and drive the shell. Without
+     * --tcp it runs the tests and exits (the original behaviour). */
+    const char *dll_path = "build\\mgapi\\mgapi.dll";
+    const char *sfc_path = "snes\\build\\snes_smoke.sfc";
+    uint16_t    tcp_port = 0;
+    int pos = 1;
+    while (pos < argc) {
+        if (strcmp(argv[pos], "--tcp") == 0 && pos + 1 < argc) {
+            int p = atoi(argv[pos + 1]);
+            if (p > 0 && p < 65536) tcp_port = (uint16_t)p;
+            pos += 2;
+        } else if (argv[pos][0] != '-') {
+            if (pos == 1) dll_path = argv[pos];
+            else if (pos == 2) sfc_path = argv[pos];
+            pos++;
+        } else {
+            pos++;   /* unknown -flag, skip */
+        }
+    }
 
     printf("mgapi_host_test\n");
     printf("  dll: %s\n  sfc: %s\n\n", dll_path, sfc_path);
@@ -165,7 +186,7 @@ int main(int argc, char **argv) {
         .cart_window_size  = MGAPI_CART_WINDOW_BYTES,
         .audio_sample_rate = MGAPI_AUDIO_SAMPLE_RATE_HZ,
         .audio_frames_max  = 4096,
-        .tcp_listen_port   = 0,
+        .tcp_listen_port   = tcp_port,
         .pad_count         = 2,
         .rom_select        = 0,   /* smoke ROM */
         .shell_elf_path    = NULL,
@@ -602,10 +623,30 @@ int main(int argc, char **argv) {
         else { printf("  FAIL  ready==0 after end\n"); g_fails++; }
     }
 
+    printf("\n%s: %d pass / %d fail\n",
+           g_fails == 0 ? "RESULT" : "RESULT", g_passes, g_fails);
+
+    /* --tcp <port> mode: stay alive forever stepping the runtime so
+     * a PuTTY raw-mode client can shell in and 'run' a demo ELF.
+     * One mgapi_step per ~16.6 ms keeps the scheduler advancing at
+     * roughly NTSC vblank cadence; the audio ring stays drained by
+     * the test loop above. Press Ctrl-C to kill. */
+    if (tcp_port != 0) {
+        printf("\nlistening on TCP %u — PuTTY raw-connect to drive the shell\n",
+               (unsigned)tcp_port);
+        printf("Ctrl-C to exit. /td0/demos/{palette,letterbox,sprite}.elf available.\n");
+        const uint64_t step_ns = 16666667ull;   /* ~60 Hz */
+        for (;;) {
+            p_step(step_ns);
+            /* 16 ms sleep keeps host CPU sane. The DLL's TCP listener
+             * runs on its own thread so its progress is independent
+             * of how fast we tick. */
+            Sleep(16);
+        }
+    }
+
     p_shut();
     FreeLibrary(m);
 
-    printf("\n%s: %d pass / %d fail\n",
-           g_fails == 0 ? "RESULT" : "RESULT", g_passes, g_fails);
     return g_fails == 0 ? 0 : 1;
 }

@@ -183,11 +183,24 @@ if (-not $NoGuest) {
 
         # Build + bake the guest test/demo ELFs. l2_test verifies the
         # stage-3c L2 path; menu drives the SELECT DEMO screen from
-        # the copro side (replaces smoke.s's 65816 menu).
+        # the copro side (replaces smoke.s's 65816 menu); the demos/*
+        # ELFs are tiny one-feature samples that exercise the high-
+        # level mg_* API (sprite / palette / force-blank / etc.) — the
+        # vm_init layer drops them into /td0/demos/ so a PuTTY shell
+        # can `run /td0/demos/<name>.elf`.
         $guestCommon  = Join-Path $RepoRoot "examples\common\guest"
+        # mg_*.c implementations the demo ELFs link against. --gc-sections
+        # drops anything the demo doesn't actually reference.
+        $mgGuestImpls = @(
+            "mg_bg.c","mg_frame.c","mg_gfx.c","mg_hdma.c","mg_input.c",
+            "mg_mode7.c","mg_panic.c","mg_sprite.c","mg_audio.c","mg_actor.c"
+        ) | ForEach-Object { Join-Path $guestCommon $_ }
         $guestSources = @(
-            @{ src = "tools\guests\l2_test.c"; sym = "l2_test_elf"; out = "l2_test.elf"; gen = "l2_test_elf_data.c" },
-            @{ src = "tools\guests\menu.c";    sym = "menu_elf";    out = "menu.elf";    gen = "menu_elf_data.c" }
+            @{ src = "tools\guests\l2_test.c"; sym = "l2_test_elf"; out = "l2_test.elf"; gen = "l2_test_elf_data.c"; extra = @() },
+            @{ src = "tools\guests\menu.c";    sym = "menu_elf";    out = "menu.elf";    gen = "menu_elf_data.c";    extra = @() },
+            @{ src = "tools\guests\demos\demo_palette.c";   sym = "demo_palette_elf";   out = "demo_palette.elf";   gen = "demo_palette_elf_data.c";   extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_letterbox.c"; sym = "demo_letterbox_elf"; out = "demo_letterbox.elf"; gen = "demo_letterbox_elf_data.c"; extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_sprite.c";    sym = "demo_sprite_elf";    out = "demo_sprite.elf";    gen = "demo_sprite_elf_data.c";    extra = $mgGuestImpls }
         )
         foreach ($g in $guestSources) {
             $srcPath = Join-Path $RepoRoot $g.src
@@ -195,7 +208,8 @@ if (-not $NoGuest) {
             Write-Step "compiling $($g.out) (RV32IMC)..."
             $outElf = Join-Path $BuildDir $g.out
             $gflags = $gcf + @("-I$guestCommon")
-            & $GuestCc @gflags @gldf "-Wl,-T,$guestLd" "-o" $outElf $srcPath
+            $allSrcs = @($srcPath) + $g.extra
+            & $GuestCc @gflags @gldf "-Wl,-T,$guestLd" "-o" $outElf @allSrcs
             if ($LASTEXITCODE -ne 0) { Die "$($g.out) compile failed" }
             $genPath = Join-Path $genDir $g.gen
             & $bin2c $outElf $g.sym $genPath
@@ -207,7 +221,7 @@ if (-not $NoGuest) {
     }
 }
 if (-not $baked) {
-    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`n" |
+    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`n" |
         Set-Content -Path $shellDataC -Encoding ASCII
 }
 $mgapiSrcs += $shellDataC

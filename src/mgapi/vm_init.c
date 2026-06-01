@@ -30,6 +30,23 @@
 extern const unsigned char shell_elf[];
 extern const size_t        shell_elf_len;
 
+/* Bundled demo guest ELFs. Installed into /td0/demos/ at boot so a
+ * PuTTY shell can `run /td0/demos/demo_<name>.elf`. Each is a tiny
+ * one-feature sample (palette cycle, force-blank toggle, walkable
+ * sprite); see tools/guests/demos/. Same zero-length-when-absent
+ * fallback as shell_elf. */
+extern const unsigned char demo_palette_elf  [];
+extern const size_t        demo_palette_elf_len;
+extern const unsigned char demo_letterbox_elf[];
+extern const size_t        demo_letterbox_elf_len;
+extern const unsigned char demo_sprite_elf   [];
+extern const size_t        demo_sprite_elf_len;
+
+/* install_bundled_demos lives below the g_td0_vol definition so the
+ * helper can reach it. The forward declaration here just lets
+ * mgapi_vm_init call it. */
+static void install_bundled_demos(void);
+
 /* Host clock for the scheduler's tick source — provided by
  * src/host/platform_win.c, declared via vm/host_compat.h. */
 extern uint32_t host_platform_monotonic_ms(void *userdata);
@@ -155,6 +172,11 @@ int mgapi_vm_init(void *cart_volume_handle) {
         }
     }
 
+    /* Drop bundled demo ELFs into /td0/demos/ so a PuTTY shell can
+     * `run /td0/demos/<name>.elf` without having to upload anything.
+     * No-ops when the baked images are empty. */
+    install_bundled_demos();
+
     /* 5. Load the embedded shell ELF as the first VM. XIP backings
      *    so we execute from the read-only baked image. data_region_size
      *    matches host.c's default (16 KB). */
@@ -178,6 +200,30 @@ fail_sys:
     vm_system_destroy(&g_sys);
     g_sys_alive = 0;
     return -ENOMEM;
+}
+
+/* Helper: drop one ELF into /td0/demos/<name>. Silently no-ops when
+ * the baked image is empty (no cross compiler at build time). */
+static void install_demo(const char *name,
+                         const unsigned char *bytes, size_t len) {
+    if (len == 0) return;
+    TrashfsFile f;
+    if (trashfs_open(&g_td0_vol, name,
+                     TRASHFS_O_CREAT | TRASHFS_O_TRUNC, &f) != TRASHFS_OK)
+        return;
+    uint32_t written = 0;
+    (void)trashfs_write(&f, bytes, (uint32_t)len, &written, /*now=*/0);
+    (void)trashfs_close(&f);
+}
+
+static void install_bundled_demos(void) {
+    /* Since we just formatted /td0 above, the mkdir always succeeds
+     * on first install — check only matters if this got called
+     * twice (which mgapi_vm_init guards against via EALREADY). */
+    (void)trashfs_mkdir(&g_td0_vol, "/demos", /*now=*/0);
+    install_demo("/demos/palette.elf",   demo_palette_elf,   demo_palette_elf_len);
+    install_demo("/demos/letterbox.elf", demo_letterbox_elf, demo_letterbox_elf_len);
+    install_demo("/demos/sprite.elf",    demo_sprite_elf,    demo_sprite_elf_len);
 }
 
 void mgapi_vm_shutdown(void) {
