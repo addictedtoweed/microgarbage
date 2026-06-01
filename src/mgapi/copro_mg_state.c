@@ -175,6 +175,20 @@ static bool stage_dma(const void *src, uint32_t size,
     return true;
 }
 
+/* Public version of stage_dma for handlers like mg_chr_upload that
+ * need to queue arbitrary DMAs outside the shadow flow. Returns
+ * MG_R_ERR_DMA_* on overflow so the handler can propagate to the
+ * guest's MgResult. */
+int mg_state_queue_dma(const void *src, uint32_t size,
+                       uint8_t bbus, uint8_t dmap, uint16_t prep) {
+    if (s_slot_used >= 8) return -1;  /* MG_ERR_DMA_SLOTS */
+    if (s_payload_used + size > (PAYLOAD_AREA_END - PAYLOAD_AREA_START)) {
+        return -2;                    /* MG_ERR_DMA_BYTES */
+    }
+    if (!stage_dma(src, size, bbus, dmap, prep)) return -1;
+    return 0;
+}
+
 /* Compose the OAM `prep` word: low byte = OAMADDL, high byte =
  * OAMADDH. Index is in 16-bit OAM words (256 internal addresses for
  * 512-byte main + 32 high). For our shadow which lives in linear
@@ -199,6 +213,80 @@ static uint16_t cgram_prep_word(uint16_t lo_bytes) {
     return (uint16_t)cgadd_idx;
 }
 
+/* Compute OBSEL ($2101) from sprite config. Layout:
+ *   bits 5-7: sprite size code (the MgSpriteSizes enum value)
+ *   bits 3-4: name gap NN — secondary CHR offset = (NN+1) * $1000 words
+ *             above primary; we use chr_base1 - chr_base0 to derive
+ *   bits 0-2: name base — primary CHR base / $2000 words
+ */
+static uint8_t compute_obsel(const MgSpriteConfig *cfg) {
+    uint16_t base0 = cfg->chr_base0_word;
+    uint16_t base1 = cfg->chr_base1_word;
+    uint8_t  nb = (uint8_t)((base0 >> 13) & 0x07);   /* / $2000 words */
+    uint8_t  gap = 0;
+    if (base1 > base0) {
+        uint16_t diff = (uint16_t)(base1 - base0);   /* word delta    */
+        /* NN+1 = diff / $1000 words. */
+        unsigned nn_plus_1 = (unsigned)(diff >> 12);
+        if (nn_plus_1 > 0) gap = (uint8_t)((nn_plus_1 - 1) & 0x03);
+    }
+    return (uint8_t)((cfg->sizes_code << 5) | (gap << 3) | nb);
+}
+
+/* Compute BGxSC ($2107-$210A) from a layer's tilemap_word + size_code:
+ *   bits 2-7: tilemap base / $0400 bytes = / $0200 words = word >> 9
+ *   bits 0-1: size_code (MgBgSize) */
+static uint8_t compute_bgxsc(const MgBgLayerState *bg) {
+    return (uint8_t)(((bg->tilemap_word >> 9) << 2) | (bg->size_code & 3));
+}
+
+/* Compute the CHR-page index for BG12NBA / BG34NBA: chr_word >> 11
+ * gives the 4 KB-page index (since 4 KB / 2 bytes-per-word = 2048
+ * words). */
+static uint8_t chr_page(const MgBgLayerState *bg) {
+    return (uint8_t)((bg->chr_word >> 11) & 0x0F);
+}
+
+static void emit_ppu_batch(void) {
+    const MgState *s = &s_state;
+    PpuBatch b = {0};
+
+    b.bgmode  = s->bgmode;
+    b.obsel   = compute_obsel(&s->spr);
+    b.bg1sc   = compute_bgxsc(&s->bg[0]);
+    b.bg2sc   = compute_bgxsc(&s->bg[1]);
+    b.bg3sc   = compute_bgxsc(&s->bg[2]);
+    b.bg4sc   = compute_bgxsc(&s->bg[3]);
+    b.bg12nba = (uint8_t)((chr_page(&s->bg[1]) << 4) | chr_page(&s->bg[0]));
+    b.bg34nba = (uint8_t)((chr_page(&s->bg[3]) << 4) | chr_page(&s->bg[2]));
+
+    /* TM / TS: per-layer main/sub bits + sprites always enabled. */
+    uint8_t tm = 0, ts = 0;
+    for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
+        if (s->bg[i].enabled_main) tm |= (uint8_t)(1u << i);
+        if (s->bg[i].enabled_sub)  ts |= (uint8_t)(1u << i);
+    }
+    tm |= 0x10;   /* bit 4: sprite layer always on */
+    b.tm = tm;
+    b.ts = ts;
+
+    /* MOSAIC stub — handler doesn't track yet. */
+    b.mosaic = 0;
+
+    /* Scrolls. The kernel writes them low-byte then high-byte to the
+     * write-twice PPU register. */
+    b.bg1hofs = (uint16_t)s->bg[0].hofs;
+    b.bg1vofs = (uint16_t)s->bg[0].vofs;
+    b.bg2hofs = (uint16_t)s->bg[1].hofs;
+    b.bg2vofs = (uint16_t)s->bg[1].vofs;
+    b.bg3hofs = (uint16_t)s->bg[2].hofs;
+    b.bg3vofs = (uint16_t)s->bg[2].vofs;
+    b.bg4hofs = (uint16_t)s->bg[3].hofs;
+    b.bg4vofs = (uint16_t)s->bg[3].vofs;
+
+    cart_window_set_ppu_batch(&b);
+}
+
 void mg_state_build_frame(void) {
     /* Reset per-frame bookkeeping. */
     s_payload_used = 0;
@@ -211,6 +299,13 @@ void mg_state_build_frame(void) {
     for (unsigned i = 0; i < 8; i++) {
         cart_window_set_dma_slot(i, &empty_slot);
     }
+
+    /* Always emit the PPU register batch — it's only 32 bytes and the
+     * kernel will read whatever is staged regardless. Static-snapshot
+     * of all the things mg_bg_mode / mg_bg_setup / mg_bg_enable /
+     * mg_bg_scroll / mg_sprite_sizes / mg_sprite_chr_base have
+     * accumulated. */
+    emit_ppu_batch();
 
     /* OAM. */
     if (s_state.oam_dirty_hi > s_state.oam_dirty_lo) {

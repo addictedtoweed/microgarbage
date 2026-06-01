@@ -119,10 +119,77 @@
     ; means "nothing to do this vblank; just RTI and the previous frame
     ; stays on screen."
     lda f:COPRO_FRAME_RDY_L
-    beq @out
+    bne @do_frame
+    jmp @out               ; long jump — short branch range was exceeded
+                           ; when the PPU register batch was added below
+@do_frame:
 
     ; (Real hardware: assert/extend forced blank for the letterbox lines so the
     ;  whole 54-line window is DMA-able -- see the DMA-budget notes. TODO.)
+
+    ; --- apply PPU register batch -------------------------------------
+    ; 32 bytes at COPRO_PPU_BATCH the copro filled this frame: BGMODE,
+    ; OBSEL, BG1-4SC, BG12NBA, BG34NBA, TM, TS, MOSAIC (single bytes),
+    ; then 8 16-bit scrolls. Single-byte regs first, in order.
+    .a8
+    lda f:PB_BGMODE
+    sta BGMODE
+    lda f:PB_OBSEL
+    sta OBSEL
+    lda f:PB_BG1SC
+    sta BG1SC
+    lda f:PB_BG2SC
+    sta BG2SC
+    lda f:PB_BG3SC
+    sta BG3SC
+    lda f:PB_BG4SC
+    sta BG4SC
+    lda f:PB_BG12NBA
+    sta BG12NBA
+    lda f:PB_BG34NBA
+    sta BG34NBA
+    lda f:PB_TM
+    sta TM
+    lda f:PB_TS
+    sta TS
+    lda f:PB_MOSAIC
+    sta MOSAIC
+
+    ; Scrolls — write-twice 16-bit. The PPU latches low byte first,
+    ; then high byte (9-bit value). We read each 16-bit batch entry
+    ; and write its low/high to the matching PPU reg.
+    lda f:PB_SCROLLS + $00
+    sta BG1HOFS
+    lda f:PB_SCROLLS + $01
+    sta BG1HOFS
+    lda f:PB_SCROLLS + $02
+    sta BG1VOFS
+    lda f:PB_SCROLLS + $03
+    sta BG1VOFS
+    lda f:PB_SCROLLS + $04
+    sta BG2HOFS
+    lda f:PB_SCROLLS + $05
+    sta BG2HOFS
+    lda f:PB_SCROLLS + $06
+    sta BG2VOFS
+    lda f:PB_SCROLLS + $07
+    sta BG2VOFS
+    lda f:PB_SCROLLS + $08
+    sta BG3HOFS
+    lda f:PB_SCROLLS + $09
+    sta BG3HOFS
+    lda f:PB_SCROLLS + $0A
+    sta BG3VOFS
+    lda f:PB_SCROLLS + $0B
+    sta BG3VOFS
+    lda f:PB_SCROLLS + $0C
+    sta BG4HOFS
+    lda f:PB_SCROLLS + $0D
+    sta BG4HOFS
+    lda f:PB_SCROLLS + $0E
+    sta BG4VOFS
+    lda f:PB_SCROLLS + $0F
+    sta BG4VOFS
 
     ; --- walk the 8-slot DMA list -------------------------------------
     ; For each slot whose bbus byte is non-zero: program channel 0 from

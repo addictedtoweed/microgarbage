@@ -118,6 +118,16 @@ void mg_state_dirty_bg    (uint8_t layer, uint16_t lo, uint16_t hi);
  * SYS_COPRO_FRAME_COMMIT handler before it sets frame-ready. */
 void mg_state_build_frame(void);
 
+/* Queue an arbitrary DMA into the per-frame slot list. Used by
+ * mg_chr_upload (and any other handler that needs a DMA outside the
+ * shadow flow). Returns:
+ *    0   = success (MG_OK)
+ *   -1   = no free DMA slot (MG_ERR_DMA_SLOTS)
+ *   -2   = no payload-area space (MG_ERR_DMA_BYTES)
+ * Bytes are copied into the cart window's payload area immediately. */
+int  mg_state_queue_dma(const void *src, uint32_t size,
+                        uint8_t bbus, uint8_t dmap, uint16_t prep);
+
 #ifdef __cplusplus
 }
 #endif

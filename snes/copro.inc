@@ -35,6 +35,8 @@ COPRO_BANK      = $C0           ; HiROM full-window bank
 COPRO_DATA      = $0000         ; per-frame PPU payload the SNES DMAs (copro-laid)
 COPRO_FRAME_RDY = $7800         ; [read]  1 byte: 0 = skip this frame, else process the list
 COPRO_DMA_LIST  = $7808         ; [read]  8 slots * 8 bytes = $7808-$7847 (see below)
+COPRO_PPU_BATCH = $7848         ; [read]  32 bytes: PPU register batch the kernel writes
+                                ;         to PPU regs at the top of each vblank (see below)
 COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
 
 ; --- per-frame DMA dispatch ------------------------------------------
@@ -86,6 +88,24 @@ STROBE_BOOTED   = $7E00         ; [read] boot.s -> copro: running from RAM, go r
 COPRO_STATUS_L    = (COPRO_BANK << 16) | COPRO_STATUS
 COPRO_FRAME_RDY_L = (COPRO_BANK << 16) | COPRO_FRAME_RDY
 COPRO_DMA_LIST_L  = (COPRO_BANK << 16) | COPRO_DMA_LIST
+COPRO_PPU_BATCH_L = (COPRO_BANK << 16) | COPRO_PPU_BATCH
+
+; --- PPU register batch layout (32 bytes at COPRO_PPU_BATCH) ----
+; Single-byte regs in the first 16 bytes, write-twice 16-bit scrolls
+; in the last 16. Matches PpuBatch in src/mgapi/cart_window.h — keep
+; both in sync.
+PB_BGMODE       = COPRO_PPU_BATCH + $00
+PB_OBSEL        = COPRO_PPU_BATCH + $01
+PB_BG1SC        = COPRO_PPU_BATCH + $02
+PB_BG2SC        = COPRO_PPU_BATCH + $03
+PB_BG3SC        = COPRO_PPU_BATCH + $04
+PB_BG4SC        = COPRO_PPU_BATCH + $05
+PB_BG12NBA      = COPRO_PPU_BATCH + $06
+PB_BG34NBA      = COPRO_PPU_BATCH + $07
+PB_TM           = COPRO_PPU_BATCH + $08
+PB_TS           = COPRO_PPU_BATCH + $09
+PB_MOSAIC       = COPRO_PPU_BATCH + $0A
+PB_SCROLLS      = COPRO_PPU_BATCH + $10  ; 8 16-bit scrolls follow
 JOYPORT_P0_LO_L = (COPRO_BANK << 16) | JOYPORT_P0_LO
 JOYPORT_P0_HI_L = (COPRO_BANK << 16) | JOYPORT_P0_HI
 JOYPORT_P1_LO_L = (COPRO_BANK << 16) | JOYPORT_P1_LO

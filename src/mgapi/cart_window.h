@@ -42,6 +42,15 @@ extern "C" {
 #define CW_OFF_FRAME_READY  0x7800u
 #define CW_OFF_DMA_LIST     0x7808u   /* 8 slots * 8 bytes = 64 bytes */
 #define CW_OFF_DMA_LIST_END (CW_OFF_DMA_LIST + 8u * 8u)
+
+/* PPU register batch: 32 bytes the SNES kernel writes to PPU regs
+ * every vblank BEFORE walking the DMA list. Lets the host control
+ * BGMODE / OBSEL / per-BG SC + NBA + scroll / TM / TS / MOSAIC
+ * dynamically per frame, replacing the kernel's boot-time hardcoded
+ * Mode-1-BG1 init. Layout: see PpuBatch struct below. */
+#define CW_OFF_PPU_BATCH    0x7848u
+#define CW_PPU_BATCH_BYTES  32u
+
 #define CW_OFF_STROBE_BOOT  0x7E00u
 #define CW_OFF_STATUS       0x7F00u
 
@@ -61,6 +70,32 @@ typedef struct {
     uint16_t size;        /* byte count for the DMA                  */
     uint16_t prep;        /* dest-register prep word                 */
 } CartDmaSlot;
+
+/* PPU register batch — 32 bytes at $7848 the kernel walks at vblank
+ * before the DMA dispatch. Single-byte registers in bytes 0..15;
+ * write-twice 16-bit scroll registers in bytes 16..31. */
+typedef struct {
+    uint8_t  bgmode;      /* $2105 BGMODE                            */
+    uint8_t  obsel;       /* $2101 OBSEL                              */
+    uint8_t  bg1sc;       /* $2107 BG1SC                              */
+    uint8_t  bg2sc;       /* $2108 BG2SC                              */
+    uint8_t  bg3sc;       /* $2109 BG3SC                              */
+    uint8_t  bg4sc;       /* $210A BG4SC                              */
+    uint8_t  bg12nba;     /* $210B BG12NBA                            */
+    uint8_t  bg34nba;     /* $210C BG34NBA                            */
+    uint8_t  tm;          /* $212C main-screen designation            */
+    uint8_t  ts;          /* $212D sub-screen designation             */
+    uint8_t  mosaic;      /* $2106 MOSAIC                             */
+    uint8_t  _reserved[5];
+    /* Scrolls: each is 16-bit value the kernel writes low then high
+     * (the write-twice PPU registers). H first, then V. */
+    uint16_t bg1hofs, bg1vofs;
+    uint16_t bg2hofs, bg2vofs;
+    uint16_t bg3hofs, bg3vofs;
+    uint16_t bg4hofs, bg4vofs;
+} PpuBatch;
+_Static_assert(sizeof(PpuBatch) == CW_PPU_BATCH_BYTES,
+               "PpuBatch must be exactly 32 bytes — keep in sync with copro.inc");
 
 /* ----------------------------------------------------------------
  *  Lifecycle
@@ -97,6 +132,9 @@ uint8_t cart_window_get_frame_ready(void);
  * marks the slot empty (skipped by the kernel walker).
  */
 void cart_window_set_dma_slot(unsigned index, const CartDmaSlot *slot);
+
+/* Stage the PPU register batch the kernel applies at next vblank. */
+void cart_window_set_ppu_batch(const PpuBatch *batch);
 
 /* Latest joypad snapshot. Word format = SNES auto-joypad
  * ($4218/$4219). The cart-bus side serves these as side-effect

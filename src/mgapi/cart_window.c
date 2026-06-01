@@ -81,6 +81,14 @@ void cart_window_set_dma_slot(unsigned index, const CartDmaSlot *slot) {
     put_le16(p + 6, slot->prep);
 }
 
+void cart_window_set_ppu_batch(const PpuBatch *batch) {
+    if (!batch) return;
+    /* The struct layout matches the on-window bytes exactly (single-
+     * byte regs first, then 16-bit scrolls little-endian) so memcpy
+     * is faithful. PpuBatch is _Static_asserted to 32 bytes. */
+    memcpy(g_window + CW_OFF_PPU_BATCH, batch, CW_PPU_BATCH_BYTES);
+}
+
 void cart_window_post_pads(const uint16_t pads[4]) {
     if (!pads) return;
     g_pads[0] = pads[0];

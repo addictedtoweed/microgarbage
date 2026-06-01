@@ -7,8 +7,21 @@
 INIDISP   = $2100      ; b7 force-blank, b0-3 brightness
 OBSEL     = $2101      ; OBJ size/base
 BGMODE    = $2105      ; BG mode + tile-size bits
+MOSAIC    = $2106      ; mosaic enable + size
 BG1SC     = $2107      ; BG1 tilemap base + screen size
+BG2SC     = $2108      ; BG2 tilemap base + screen size
+BG3SC     = $2109      ; BG3 tilemap base + screen size
+BG4SC     = $210A      ; BG4 tilemap base + screen size
 BG12NBA   = $210B      ; BG1/BG2 char base
+BG34NBA   = $210C      ; BG3/BG4 char base
+BG1HOFS   = $210D      ; BG1 horizontal scroll (write-twice)
+BG1VOFS   = $210E      ; BG1 vertical scroll
+BG2HOFS   = $210F      ; BG2 horizontal scroll
+BG2VOFS   = $2110      ; BG2 vertical scroll
+BG3HOFS   = $2111      ; BG3 horizontal scroll
+BG3VOFS   = $2112      ; BG3 vertical scroll
+BG4HOFS   = $2113      ; BG4 horizontal scroll
+BG4VOFS   = $2114      ; BG4 vertical scroll
 VMAIN     = $2115      ; VRAM addr increment mode
 VMADDL    = $2116      ; VRAM word address low
 VMADDH    = $2117      ; VRAM word address high
@@ -20,6 +33,7 @@ OAMDATA   = $2104      ; OAM data write
 CGADD     = $2121      ; CGRAM word address
 CGDATA    = $2122      ; CGRAM data write
 TM        = $212C      ; main-screen layer enable
+TS        = $212D      ; sub-screen layer enable
 
 ; --- CPU / DMA ($42xx, $43xx) ---
 NMITIMEN  = $4200      ; b7 NMI enable, b0 auto-joypad read

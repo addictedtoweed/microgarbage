@@ -409,13 +409,25 @@ static void h_hdma_enable      (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG
 
 static void h_chr_upload(VmCpu *cpu, void *sys_) {
     (void)sys_;
-    /* TODO: stage src bytes into payload + queue a VRAM-write DMA
-     * slot. For first iteration: just accept and return OK so the
-     * game-side MG_OR_PANIC doesn't fire. */
-    (void)cpu->regs[VM_REG_A0];
-    (void)cpu->regs[VM_REG_A1];
-    (void)cpu->regs[VM_REG_A2];
-    cpu->regs[VM_REG_A0] = MG_R_OK;
+    uint16_t vram_word = (uint16_t)cpu->regs[VM_REG_A0];
+    uint32_t srcp      = cpu->regs[VM_REG_A1];
+    uint16_t bytes     = (uint16_t)cpu->regs[VM_REG_A2];
+
+    if (bytes == 0) { cpu->regs[VM_REG_A0] = MG_R_OK; return; }
+
+    /* Pull the bytes out of guest memory; vm_translate_read hands us a
+     * host pointer we can pass directly to the staging path. */
+    const void *src = vm_translate_read(cpu, srcp, bytes);
+    if (!src) { cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID; return; }
+
+    /* Queue a VRAM-write DMA: bbus = $18 (VMDATAL), dmap = $01
+     * (2-byte / 2-reg, the SNES VRAM write pattern), prep = the
+     * destination VRAM word address. The kernel writes VMAIN = $80
+     * (increment after high write) when it sees this bbus. */
+    int rc = mg_state_queue_dma(src, bytes, 0x18, 0x01, vram_word);
+    if (rc == -1) cpu->regs[VM_REG_A0] = MG_R_ERR_DMA_SLOTS;
+    else if (rc == -2) cpu->regs[VM_REG_A0] = MG_R_ERR_DMA_BYTES;
+    else cpu->regs[VM_REG_A0] = MG_R_OK;
 }
 
 static void h_palette_write(VmCpu *cpu, void *sys_) {
