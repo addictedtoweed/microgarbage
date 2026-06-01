@@ -240,6 +240,17 @@ static bool try_accept(void) {
      * the shell reads or writes flows through our socket. */
     vm_host_set_transport_for_vm(g_ctx.shell_vm_id, &g_transport);
 
+    /* Greet the client directly through the new socket. The shell's
+     * own banner + prompt went to host stdout before the bind (the
+     * stub-transport had write=NULL, so output fell through), so
+     * without this PuTTY would show a blank window until the user
+     * presses Enter to coax the shell into re-emitting a prompt.
+     * One short line is enough to confirm to the user that the
+     * session is alive; pressing Enter once gets the real prompt. */
+    static const char greet[] =
+        "mgapi shell -- press Enter for prompt, type 'help' for commands\r\n";
+    (void)send(cfd, greet, (int)(sizeof greet - 1), 0);
+
     fprintf(stderr, "mgapi: [tcp:%u] client connected from %s:%d\n",
             (unsigned)g_ctx.port,
             inet_ntoa(cli.sin_addr), (int)ntohs(cli.sin_port));
