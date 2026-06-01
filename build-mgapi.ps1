@@ -207,7 +207,8 @@ if (-not $NoGuest) {
             @{ src = "tools\guests\demos\demo_palette.c";   sym = "demo_palette_elf";   out = "demo_palette.elf";   gen = "demo_palette_elf_data.c";   extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_letterbox.c"; sym = "demo_letterbox_elf"; out = "demo_letterbox.elf"; gen = "demo_letterbox_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_sprite.c";    sym = "demo_sprite_elf";    out = "demo_sprite.elf";    gen = "demo_sprite_elf_data.c";    extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_mode7.c";     sym = "demo_mode7_elf";     out = "demo_mode7.elf";     gen = "demo_mode7_elf_data.c";     extra = $mgGuestImpls }
+            @{ src = "tools\guests\demos\demo_mode7.c";     sym = "demo_mode7_elf";     out = "demo_mode7.elf";     gen = "demo_mode7_elf_data.c";     extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_mode7_3d.c";  sym = "demo_mode7_3d_elf";  out = "demo_mode7_3d.elf";  gen = "demo_mode7_3d_elf_data.c";  extra = $mgGuestImpls }
         )
         foreach ($g in $guestSources) {
             $srcPath = Join-Path $RepoRoot $g.src
@@ -228,7 +229,7 @@ if (-not $NoGuest) {
     }
 }
 if (-not $baked) {
-    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`n" |
+    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`n" |
         Set-Content -Path $shellDataC -Encoding ASCII
 }
 $mgapiSrcs += $shellDataC

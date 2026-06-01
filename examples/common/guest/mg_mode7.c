@@ -90,8 +90,119 @@ void mg_mode7_camera(const MgMode7Camera *cam, MgMode7Params *out) {
     out->cy = q16_to_m7center_sat(cam->y);
 
     /* Scroll: the camera abstraction folds position into M7X/Y, so
-     * leave the BG1 scroll fields at zero — the runtime adds them on
+     * leave the BG1 scroll fields at zero -- the runtime adds them on
      * top of the matrix output and we don't want them double-counting. */
     out->hofs = 0;
     out->vofs = 0;
+}
+
+/* ============================================================
+ *  Perspective camera ("3D" Mode 7 with horizon)
+ * ============================================================ */
+
+/* Internal: write a write-twice 16-bit little-endian value into
+ * `dst` at offset `off`. The SNES PPU expects low-byte first. */
+static inline void wr16le(uint8_t *dst, uint16_t off, int16_t v) {
+    dst[off + 0] = (uint8_t)((uint16_t)v       & 0xFF);
+    dst[off + 1] = (uint8_t)(((uint16_t)v >> 8) & 0xFF);
+}
+
+uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
+                           uint8_t  *table_m7a,
+                           uint8_t  *table_m7b,
+                           uint8_t  *table_m7c,
+                           uint8_t  *table_m7d,
+                           MgMode7Params *out_static) {
+    /* Yaw matrix is constant per frame -- cache the trig once. */
+    q16_16_t s, c;
+    q16_sincos(cam->base.yaw, &s, &c);
+
+    const uint8_t h = cam->horizon_row;
+    /* "Active" scanlines run from horizon_row .. 223. Lines above
+     * get a (0,0,0,0) matrix that pairs with MG_MODE7_FILL_BLACK
+     * to read as solid backdrop. */
+    const uint16_t active_count = (h < 224u) ? (uint16_t)(224u - h) : 0u;
+    uint16_t off = 0;
+
+    /* ---- "Sky" segment: repeat (0,0) for `h` scanlines.
+     * SNES caps a single repeat group at 127 lines (count byte's
+     * low 7 bits), so we loop if the horizon is past row 127. */
+    {
+        uint16_t lines_left = h;
+        while (lines_left > 0) {
+            uint8_t chunk = (lines_left > 127u) ? 127u : (uint8_t)lines_left;
+            uint8_t count = (uint8_t)(0x80 | chunk);
+            table_m7a[off + 0] = count; table_m7a[off + 1] = 0; table_m7a[off + 2] = 0;
+            table_m7b[off + 0] = count; table_m7b[off + 1] = 0; table_m7b[off + 2] = 0;
+            table_m7c[off + 0] = count; table_m7c[off + 1] = 0; table_m7c[off + 2] = 0;
+            table_m7d[off + 0] = count; table_m7d[off + 1] = 0; table_m7d[off + 2] = 0;
+            off += 3;
+            lines_left -= chunk;
+        }
+    }
+
+    /* ---- Active segment: per-line M7 values for the ground.
+     * Non-repeat groups also cap at 127 lines each. */
+    {
+        uint16_t lines_left = active_count;
+        uint16_t row = h;
+        while (lines_left > 0) {
+            uint8_t group = (lines_left > 127u) ? 127u : (uint8_t)lines_left;
+            uint16_t count_off = off++;
+            table_m7a[count_off] = group;
+            table_m7b[count_off] = group;
+            table_m7c[count_off] = group;
+            table_m7d[count_off] = group;
+            for (uint8_t i = 0; i < group; i++, row++) {
+                /* depth_factor = height / (row - horizon + 1).
+                 * +1 keeps the line just past the horizon from
+                 * blowing up to infinity. Dividing Q16.16 by a
+                 * plain integer stays in Q16.16 -- no q16_div
+                 * needed because the divisor isn't itself
+                 * fixed-point. */
+                int32_t y_off = (int32_t)(row - h) + 1;
+                q16_16_t depth = cam->height / y_off;
+
+                /* Multiply by the camera's base zoom, then by the
+                 * yaw matrix components. Same Q16.16 -> Q8.8
+                 * narrowing as the flat camera. */
+                q16_16_t z = q16_mul(depth, cam->base.zoom);
+                int16_t m_a = q16_to_q8_8_sat(q16_mul(z,  c));
+                int16_t m_b = q16_to_q8_8_sat(q16_mul(z, -s));
+                int16_t m_c = q16_to_q8_8_sat(q16_mul(z,  s));
+                int16_t m_d = q16_to_q8_8_sat(q16_mul(z,  c));
+
+                wr16le(table_m7a, off, m_a);
+                wr16le(table_m7b, off, m_b);
+                wr16le(table_m7c, off, m_c);
+                wr16le(table_m7d, off, m_d);
+                off += 2;
+            }
+            lines_left -= group;
+        }
+    }
+
+    /* ---- Terminator. */
+    table_m7a[off] = 0;
+    table_m7b[off] = 0;
+    table_m7c[off] = 0;
+    table_m7d[off] = 0;
+    off += 1;
+
+    /* Static part: M7X/Y carries world-plane center; M7A..D get
+     * overwritten every scanline by HDMA but we fill them in case
+     * the first vblank's HDMA hasn't fired yet. Use a flat
+     * (identity * zoom) matrix so the first frame doesn't flash
+     * garbage. */
+    q16_16_t z = cam->base.zoom;
+    out_static->a = q16_to_q8_8_sat(q16_mul(z,  c));
+    out_static->b = q16_to_q8_8_sat(q16_mul(z, -s));
+    out_static->c = q16_to_q8_8_sat(q16_mul(z,  s));
+    out_static->d = q16_to_q8_8_sat(q16_mul(z,  c));
+    out_static->cx = q16_to_m7center_sat(cam->base.x);
+    out_static->cy = q16_to_m7center_sat(cam->base.y);
+    out_static->hofs = 0;
+    out_static->vofs = 0;
+
+    return off;
 }

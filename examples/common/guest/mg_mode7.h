@@ -87,6 +87,52 @@ typedef struct {
 
 void mg_mode7_camera(const MgMode7Camera *cam, MgMode7Params *out);
 
+/* -------- Perspective ("3D") camera with horizon --------
+ *
+ * Add a horizon to the flat camera and the scene reads as a tilted
+ * plane receding into the distance -- F-Zero / Mario Kart's
+ * "looking-at-the-horizon" effect. The trick on real hardware is
+ * HDMA on M7A..M7D: every scanline gets its own matrix, and the
+ * matrix's effective scale grows with screen-Y so the ground looks
+ * further away closer to the horizon.
+ *
+ * `horizon_row` is the scanline where the horizon sits. Lines
+ * strictly ABOVE the horizon get a degenerate (0,0,0,0) matrix
+ * which, paired with MG_MODE7_FILL_BLACK in mg_mode7_wrap, draws as
+ * solid backdrop -- the "sky." Lines below get a 1/y perspective
+ * scaled by `height`, so a higher camera shows less ground per
+ * pixel (the world is further away).
+ *
+ * mg_mode7_camera3d builds the four HDMA tables in caller-owned
+ * buffers and returns the bytes used (same for all four). The
+ * caller wires them with mg_hdma_setup/upload_table/enable on four
+ * channels (1..6 are free; 0 is the runtime's DMA list dispatch
+ * and 7 is the INIDISP letterbox).  */
+typedef struct {
+    MgMode7Camera base;        /* x, y, zoom, yaw -- same flat-cam fields  */
+    q16_16_t      height;      /* Q16.16; bigger = camera further from plane */
+    uint8_t       horizon_row; /* 0..223; lines above draw as backdrop      */
+} MgMode7Camera3D;
+
+/* Each HDMA table buffer must be at least this many bytes. The
+ * actual size depends on horizon_row; with horizon at row 96 the
+ * tables are ~262 bytes (3-byte sky-skip segment + 128 active
+ * scanlines @ 2 bytes + count overhead + 1-byte terminator). 320
+ * gives headroom for any reasonable horizon. */
+#define MG_MODE7_3D_TABLE_BYTES 320
+
+/* Build M7A/B/C/D HDMA tables for the camera. Returns the number
+ * of bytes written into each table -- pass that as the `len` to
+ * mg_hdma_upload_table. out_static gets the camera's static fields
+ * (M7X/Y center + zero scroll); pass it to mg_mode7_set. Pure C,
+ * no ecall. */
+uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
+                           uint8_t  *table_m7a,
+                           uint8_t  *table_m7b,
+                           uint8_t  *table_m7c,
+                           uint8_t  *table_m7d,
+                           MgMode7Params *out_static);
+
 #ifdef __cplusplus
 }
 #endif
