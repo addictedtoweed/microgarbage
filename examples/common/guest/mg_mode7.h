@@ -19,6 +19,8 @@
 
 #include <stdint.h>
 
+#include "math/fixed_point.h"   /* q16_16_t — Q16.16 fixed-point */
+
 #include "mg_panic.h"   /* MgResult */
 
 #ifdef __cplusplus
@@ -58,6 +60,32 @@ void mg_mode7_wrap(MgMode7Wrap behavior);
  * are left untouched. Pure C, no ecall. */
 void mg_mode7_scale_rotate(MgMode7Params *out,
                            uint16_t scale_q8, int16_t angle_q15);
+
+/* -------- High-level camera abstraction --------
+ *
+ * MgMode7Camera puts a "fly over a flat plane" camera in front of the
+ * raw MgMode7Params. Position lives in Q16.16 world-plane pixels
+ * (the M7 plane is 1024×1024, so values up to ~1024.0 are useful).
+ * `yaw` rotates the view CCW around the camera (also Q16.16 radians).
+ * `zoom` is Q16.16 screen-to-world scale — 1.0 = 1 screen pixel covers
+ * 1 world pixel, < 1.0 = wider field of view, > 1.0 = magnify.
+ *
+ * Forward direction at yaw=0 is +X. To move "forward N pixels":
+ *
+ *     q16_16_t s, c; q16_sincos(cam.yaw, &s, &c);
+ *     cam.x += q16_mul(N_in_q16, c);
+ *     cam.y += q16_mul(N_in_q16, s);
+ *
+ * mg_mode7_camera narrows the q16.16 components to the PPU's native
+ * 8.8 matrix slots and 13-bit signed center coords. Pure C, no ecall;
+ * stage the result with mg_mode7_set().  */
+typedef struct {
+    q16_16_t x, y;       /* world-plane position (Q16.16 pixels) */
+    q16_16_t zoom;       /* Q16.16; Q16_ONE = 1:1 screen-to-world */
+    q16_16_t yaw;        /* Q16.16 radians; wraps freely         */
+} MgMode7Camera;
+
+void mg_mode7_camera(const MgMode7Camera *cam, MgMode7Params *out);
 
 #ifdef __cplusplus
 }

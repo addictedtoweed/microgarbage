@@ -1,10 +1,18 @@
 /* ============================================================
- *  mg_mode7.c — guest-side Mode 7 ecall stubs + helper.
+ *  mg_mode7.c — guest-side Mode 7 ecall stubs + helpers.
  *  See mg_mode7.h for the contract.
+ *
+ *  Trig path is the shared CORDIC library (math/trig_q16.h), not a
+ *  private LUT — the same source rebuilds on the M7 as a thin wrapper
+ *  around the H745's hardware CORDIC peripheral, so a guest that
+ *  compiles on Windows runs the same matrix math on real silicon.
+ *
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 #include "mg_mode7.h"
 #include "vm_runtime.h"
+
+#include "math/trig_q16.h"
 
 void mg_mode7_set(const MgMode7Params *p) {
     (void)_vm_sys1(SYS_MG_MODE7_SET, (uint32_t)p);
@@ -14,68 +22,76 @@ void mg_mode7_wrap(MgMode7Wrap behavior) {
     (void)_vm_sys1(SYS_MG_MODE7_WRAP, (uint32_t)behavior);
 }
 
-/* Sine in Q15 (32767 = 1.0) for angles in 8.8 quadrants. 17 entries
- * cover 0..π/2 in steps of (π/2)/16 ≈ 5.625°. We linear-interp
- * between adjacent entries and use symmetry to extend to a full
- * circle. Total ROM cost: 17 × 2 = 34 bytes. */
-static const int16_t s_sin_q15_quarter[17] = {
-        0,  3212,  6393,  9512, 12539, 15446, 18204, 20787,
-    23170, 25329, 27245, 28898, 30273, 31356, 32137, 32609, 32767,
-};
+/* ---- internal helpers --------------------------------------- */
 
-/* sin(angle_q15) where angle_q15 is the angle scaled so 32768 = 2π. */
-static int32_t mg_sin_q15(int16_t angle_q15) {
-    /* Wrap into 0..65535 then split into quadrant + position. */
-    uint16_t a = (uint16_t)angle_q15;
-    unsigned quadrant = (a >> 14) & 3;   /* 0..3 over the circle      */
-    unsigned pos      = a & 0x3FFF;      /* 0..16383 inside a quadrant */
-
-    /* Map pos to an index into the 17-entry quarter table (which
-     * covers idx 0..16). 16384 / 1024 = 16 — so each idx step is
-     * 1024 of position. */
-    unsigned idx = pos >> 10;
-    unsigned frac = pos & 0x3FF;         /* 0..1023 between idx/idx+1 */
-
-    int32_t s0 = s_sin_q15_quarter[idx];
-    int32_t s1 = s_sin_q15_quarter[idx + 1];   /* idx maxes at 15;
-                                                 * the +1 reads idx 16
-                                                 * which holds 32767. */
-    int32_t v  = s0 + ((s1 - s0) * (int32_t)frac >> 10);
-
-    /* Quadrant flip + sign. */
-    switch (quadrant) {
-        case 0: return v;
-        case 1: {  /* mirror: sin(π - x) = sin(x), read backwards */
-            int32_t s0b = s_sin_q15_quarter[16 - idx];
-            int32_t s1b = s_sin_q15_quarter[15 - idx];
-            return s0b + ((s1b - s0b) * (int32_t)frac >> 10);
-        }
-        case 2: return -v;
-        case 3: {
-            int32_t s0b = s_sin_q15_quarter[16 - idx];
-            int32_t s1b = s_sin_q15_quarter[15 - idx];
-            return -(s0b + ((s1b - s0b) * (int32_t)frac >> 10));
-        }
-    }
-    return v;   /* unreachable */
+/* Narrow a q16.16 matrix component to the PPU's 8.8 signed slot
+ * (int16_t). The PPU range is ±127.something; saturate above/below. */
+static int16_t q16_to_q8_8_sat(q16_16_t v) {
+    /* q16.16 -> q8.8 is shift-right by 8. Saturate to int16. */
+    int32_t r = (int32_t)(v >> 8);
+    if (r >  32767) r =  32767;
+    if (r < -32768) r = -32768;
+    return (int16_t)r;
 }
 
-static int32_t mg_cos_q15(int16_t angle_q15) {
-    /* cos = sin(angle + π/2); π/2 = 16384 in this Q15 angle space. */
-    return mg_sin_q15((int16_t)(angle_q15 + 16384));
+/* Narrow a q16.16 plane coordinate to the PPU's 13-bit signed M7X/Y
+ * center field. Range is -4096..4095; saturate. The integer part of
+ * q16.16 is the high 16 bits. */
+static int16_t q16_to_m7center_sat(q16_16_t v) {
+    int32_t r = (int32_t)(v >> 16);   /* integer part */
+    if (r >  4095) r =  4095;
+    if (r < -4096) r = -4096;
+    return (int16_t)r;
 }
+
+/* ---- public helpers ----------------------------------------- */
 
 void mg_mode7_scale_rotate(MgMode7Params *out,
                            uint16_t scale_q8, int16_t angle_q15) {
-    int32_t s = mg_sin_q15(angle_q15);   /* Q15 */
-    int32_t c = mg_cos_q15(angle_q15);   /* Q15 */
+    /* angle_q15 has 32768 = 2π; convert to q16.16 radians.
+     * Q16_TWO_PI / 32768 = scale factor — do the multiply in 64-bit
+     * to dodge intermediate overflow at the max angle. */
+    q16_16_t radians =
+        (q16_16_t)(((int64_t)angle_q15 * (int64_t)Q16_TWO_PI) >> 15);
 
-    /* matrix component = scale * trig, output as 8.8 fixed-point.
-     * scale is 8.8, trig is Q15. Product / 32768 keeps the result
-     * in 8.8 (since 256 * 32768 / 32768 = 256 = 1.0 8.8). */
-    out->a = (int16_t)((int32_t)scale_q8 *  c / 32768);
-    out->b = (int16_t)((int32_t)scale_q8 * -s / 32768);
-    out->c = (int16_t)((int32_t)scale_q8 *  s / 32768);
-    out->d = (int16_t)((int32_t)scale_q8 *  c / 32768);
+    q16_16_t s, c;
+    q16_sincos(radians, &s, &c);
+
+    /* scale (Q8.8) * trig (Q16.16) -> Q8.8 of the matrix slot.
+     * scale_q8 << 16 promotes to Q16.16; q16_mul then yields Q16.16;
+     * q16_to_q8_8_sat shifts right by 8 to land in Q8.8. */
+    q16_16_t scale_q16 = (q16_16_t)((int32_t)scale_q8 << 8);
+    out->a = q16_to_q8_8_sat(q16_mul(scale_q16,  c));
+    out->b = q16_to_q8_8_sat(q16_mul(scale_q16, -s));
+    out->c = q16_to_q8_8_sat(q16_mul(scale_q16,  s));
+    out->d = q16_to_q8_8_sat(q16_mul(scale_q16,  c));
     /* cx/cy/hofs/vofs are left untouched — caller sets those. */
+}
+
+void mg_mode7_camera(const MgMode7Camera *cam, MgMode7Params *out) {
+    q16_16_t s, c;
+    q16_sincos(cam->yaw, &s, &c);
+
+    /* The four matrix slots: zoom * R(yaw), expressed as Q16.16 then
+     * narrowed to Q8.8 for the PPU. The negation on B carries the
+     * CCW rotation convention that mat2_q16_rotation uses, so a
+     * guest that already builds a mat2_q16 by hand will see matching
+     * signs. */
+    q16_16_t z = cam->zoom;
+    out->a = q16_to_q8_8_sat(q16_mul(z,  c));
+    out->b = q16_to_q8_8_sat(q16_mul(z, -s));
+    out->c = q16_to_q8_8_sat(q16_mul(z,  s));
+    out->d = q16_to_q8_8_sat(q16_mul(z,  c));
+
+    /* Center: the screen-center pixel maps directly to (cam.x, cam.y)
+     * on the world plane, so M7X/Y carry the camera position
+     * (truncated to the PPU's 13-bit signed field). */
+    out->cx = q16_to_m7center_sat(cam->x);
+    out->cy = q16_to_m7center_sat(cam->y);
+
+    /* Scroll: the camera abstraction folds position into M7X/Y, so
+     * leave the BG1 scroll fields at zero — the runtime adds them on
+     * top of the matrix output and we don't want them double-counting. */
+    out->hofs = 0;
+    out->vofs = 0;
 }

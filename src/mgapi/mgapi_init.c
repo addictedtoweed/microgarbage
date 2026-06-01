@@ -372,6 +372,8 @@ extern const unsigned char demo_letterbox_elf[];
 extern const size_t        demo_letterbox_elf_len;
 extern const unsigned char demo_sprite_elf   [];
 extern const size_t        demo_sprite_elf_len;
+extern const unsigned char demo_mode7_elf    [];
+extern const size_t        demo_mode7_elf_len;
 
 /* Dev: confirm the bundled demo is installed in /td0/demos/<name>.elf
  * and return its size in bytes. Returns -ENOENT if the file isn't
@@ -429,6 +431,7 @@ MGAPI_API int mgapi_dev_spawn_demo_for_steps(const char *name, uint32_t steps) {
     if      (strcmp(name, "palette")   == 0) { bytes = demo_palette_elf;   len = demo_palette_elf_len; }
     else if (strcmp(name, "letterbox") == 0) { bytes = demo_letterbox_elf; len = demo_letterbox_elf_len; }
     else if (strcmp(name, "sprite")    == 0) { bytes = demo_sprite_elf;    len = demo_sprite_elf_len; }
+    else if (strcmp(name, "mode7")     == 0) { bytes = demo_mode7_elf;     len = demo_mode7_elf_len; }
     else return -ENOENT;
     if (len == 0) return -ENOENT;
     return mgapi_dev_spawn_elf_for_steps(bytes, (uint32_t)len, steps);

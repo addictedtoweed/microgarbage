@@ -42,6 +42,8 @@ extern const unsigned char demo_letterbox_elf[];
 extern const size_t        demo_letterbox_elf_len;
 extern const unsigned char demo_sprite_elf   [];
 extern const size_t        demo_sprite_elf_len;
+extern const unsigned char demo_mode7_elf    [];
+extern const size_t        demo_mode7_elf_len;
 
 /* install_bundled_demos lives below the g_td0_vol definition so the
  * helper can reach it. The forward declaration here just lets
@@ -225,6 +227,7 @@ static void install_bundled_demos(void) {
     install_demo("/demos/palette.elf",   demo_palette_elf,   demo_palette_elf_len);
     install_demo("/demos/letterbox.elf", demo_letterbox_elf, demo_letterbox_elf_len);
     install_demo("/demos/sprite.elf",    demo_sprite_elf,    demo_sprite_elf_len);
+    install_demo("/demos/mode7.elf",     demo_mode7_elf,     demo_mode7_elf_len);
 }
 
 void mgapi_vm_shutdown(void) {
