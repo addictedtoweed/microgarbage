@@ -491,11 +491,38 @@ static void h_pack_chr(VmCpu *cpu, void *s) {
 
 /* Frame-state multiplexed ecall. Op-codes must match the constants
  * in examples/common/guest/mg_frame.c. */
-#define MG_FS_GET_SLOTS  0
-#define MG_FS_GET_BYTES  1
-#define MG_FS_GET_TOP    2
-#define MG_FS_GET_BOT    3
-#define MG_FS_SET_BLANK  4
+#define MG_FS_GET_SLOTS    0
+#define MG_FS_GET_BYTES    1
+#define MG_FS_GET_TOP      2
+#define MG_FS_GET_BOT      3
+#define MG_FS_SET_BLANK    4
+#define MG_FS_PANIC_READ   5   /* (op, guest_buf, cap) -> bytes written  */
+#define MG_FS_PANIC_CTX    6   /* (op, guest_ctx_ptr) -> 0 if no panic   */
+
+/* -------- Persistent panic state (host-side) --------
+ *
+ * h_panic saves the message + a crash context into static storage
+ * that survives the VM halting. A future error.elf reads it via
+ * MG_FS_PANIC_READ / MG_FS_PANIC_CTX. Until error.elf is built and
+ * the runtime auto-loads it on panic, the customer still sees the
+ * stderr message (kept for dev visibility) and a frozen frame on
+ * the SNES. */
+
+#define MG_PANIC_MSG_CAP   240
+
+typedef struct {
+    uint32_t vm_id;             /* the panicking VM                       */
+    uint32_t pc;                /* panic site PC                          */
+    uint32_t a0_a6[7];          /* a0..a6 at panic time                   */
+    uint32_t msg_len;            /* bytes in msg[] (no NUL)                */
+    uint8_t  reserved[4];
+} MgPanicCtx;
+_Static_assert(sizeof(MgPanicCtx) == 44,
+               "MgPanicCtx layout — keep in sync with the guest reader");
+
+static bool        s_panic_active = false;
+static MgPanicCtx  s_panic_ctx;
+static char        s_panic_msg[MG_PANIC_MSG_CAP];
 
 static void h_frame_state(VmCpu *cpu, void *sys_) {
     (void)sys_;
@@ -527,23 +554,124 @@ static void h_frame_state(VmCpu *cpu, void *sys_) {
             cpu->regs[VM_REG_A0] = MG_R_OK;
             return;
         }
+        case MG_FS_PANIC_READ: {
+            /* Args: a1 = guest buffer ptr, a2 = capacity in bytes.
+             * Copies the saved message (no trailing NUL) and returns
+             * the byte count. Returns 0 if no panic is pending. */
+            if (!s_panic_active) {
+                cpu->regs[VM_REG_A0] = 0;
+                return;
+            }
+            uint32_t bufp = cpu->regs[VM_REG_A1];
+            uint32_t cap  = cpu->regs[VM_REG_A2];
+            uint32_t n    = s_panic_ctx.msg_len;
+            if (n > cap) n = cap;
+            if (n > 0 && !guest_write(cpu, bufp, s_panic_msg, n)) {
+                cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+                return;
+            }
+            cpu->regs[VM_REG_A0] = n;
+            return;
+        }
+        case MG_FS_PANIC_CTX: {
+            /* Args: a1 = guest MgPanicCtx*. Returns 0 if no panic, or
+             * MG_R_OK on success. Useful for error.elf to show vm_id /
+             * PC / register dump alongside the message. */
+            if (!s_panic_active) {
+                cpu->regs[VM_REG_A0] = 0;
+                return;
+            }
+            uint32_t ctxp = cpu->regs[VM_REG_A1];
+            if (!guest_write(cpu, ctxp, &s_panic_ctx, sizeof(s_panic_ctx))) {
+                cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+                return;
+            }
+            cpu->regs[VM_REG_A0] = MG_R_OK;
+            return;
+        }
         default:
             cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
             return;
     }
 }
 
+/* Test/host helpers: a future "auto-load error.elf" step will check
+ * s_panic_active and consume the buffer. For now exposed so
+ * mgapi_host_test or other diagnostics can read the saved state
+ * without going through the guest ecall path. */
+bool mgapi_panic_active(void) { return s_panic_active; }
+
+const char *mgapi_panic_msg(uint32_t *out_len) {
+    if (out_len) *out_len = s_panic_active ? s_panic_ctx.msg_len : 0;
+    return s_panic_active ? s_panic_msg : NULL;
+}
+
+void mgapi_panic_clear(void) {
+    s_panic_active = false;
+    /* Leave the buffers in place — clearing is just a flag flip so a
+     * read after clear shows "no panic" but the bytes are still there
+     * for diagnostics. */
+}
+
+/* Find the end of a NUL-terminated guest string starting at guest_va,
+ * capped at `max`. Returns the length (excluding NUL). On the host
+ * side we have the full mapped guest memory via vm_translate_read,
+ * so this is a linear scan. */
+static uint32_t guest_strlen(VmCpu *cpu, uint32_t guest_va, uint32_t max) {
+    const char *p = (const char *)vm_translate_read(cpu, guest_va, 1);
+    if (!p) return 0;
+    /* Scan one byte at a time so a translation boundary doesn't trip
+     * us up — vm_translate_read with size=1 always returns a valid
+     * pointer to that byte. */
+    uint32_t n = 0;
+    while (n < max) {
+        const char *q = (const char *)vm_translate_read(cpu, guest_va + n, 1);
+        if (!q || *q == 0) break;
+        n++;
+    }
+    return n;
+}
+
 static void h_panic(VmCpu *cpu, void *sys_) {
     (void)sys_;
-    /* TODO: real panic flow — save context to persistent slot,
-     * trigger SNES reset, reboot into error.elf. For first iteration:
-     * print the message to host stderr and halt the calling VM. */
     uint32_t msgp = cpu->regs[VM_REG_A0];
-    char buf[256] = {0};
-    if (guest_read(cpu, msgp, buf, sizeof(buf) - 1)) {
-        fprintf(stderr, "mg_panic: %s\n", buf);
-        fflush(stderr);
+
+    /* Capture the message length first, then copy. The message is
+     * what the customer wants to see most; the context fields below
+     * are for debugging. */
+    uint32_t mlen = guest_strlen(cpu, msgp, MG_PANIC_MSG_CAP);
+    if (mlen > 0) {
+        (void)guest_read(cpu, msgp, s_panic_msg, mlen);
     }
+    /* Defensive: if the read failed mid-way, mlen still reflects the
+     * intended length; pad anything past mlen with NUL for the
+     * stderr print below to terminate cleanly. */
+    if (mlen < MG_PANIC_MSG_CAP) {
+        s_panic_msg[mlen] = '\0';
+    }
+
+    /* Build the crash context. PC is the address of the ecall
+     * instruction; a0..a6 are the caller's argument and scratch regs
+     * as they entered the syscall. */
+    s_panic_ctx.vm_id    = cpu->vm_id;
+    s_panic_ctx.pc       = cpu->pc;
+    s_panic_ctx.a0_a6[0] = cpu->regs[VM_REG_A0];
+    s_panic_ctx.a0_a6[1] = cpu->regs[VM_REG_A1];
+    s_panic_ctx.a0_a6[2] = cpu->regs[VM_REG_A2];
+    s_panic_ctx.a0_a6[3] = cpu->regs[VM_REG_A3];
+    s_panic_ctx.a0_a6[4] = cpu->regs[VM_REG_A4];
+    s_panic_ctx.a0_a6[5] = cpu->regs[VM_REG_A5];
+    s_panic_ctx.a0_a6[6] = cpu->regs[VM_REG_A6];
+    s_panic_ctx.msg_len  = mlen;
+
+    s_panic_active = true;
+
+    /* Dev-visible note: stderr stays as a debugging aid until
+     * error.elf is built and the runtime loads it on panic. */
+    fprintf(stderr, "mg_panic [vm %u pc=%08x]: %s\n",
+            (unsigned)cpu->vm_id, (unsigned)cpu->pc, s_panic_msg);
+    fflush(stderr);
+
     cpu->halted = true;
 }
 
