@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 /* The embedded shell ELF, baked in by bin2c at build time
@@ -241,6 +242,13 @@ bool mgapi_vm_step(void) {
     return r == VM_SCHED_RAN;
 }
 
+/* Exposed for dev probes (mgapi_dev_td0_demo_size in mgapi_init.c) that
+ * need to read files out of /td0/ to confirm install_bundled_demos
+ * actually populated the volume. */
+TrashfsVolume *mgapi_vm_td0_volume(void) {
+    return g_sys_alive ? &g_td0_vol : NULL;
+}
+
 uint16_t mgapi_vm_shell_id(void) {
     return g_shell_loaded ? g_shell_vm_id : (uint16_t)0xFFFFu;
 }
@@ -297,10 +305,16 @@ int mgapi_dev_spawn_elf_for_steps(const void *elf, uint32_t elf_size,
     if (!g_sys_alive) return -EAGAIN;
     if (!elf || elf_size == 0) return -EINVAL;
 
+    /* Match the shell's spawn_and_wait config: COPY_RAM + 64KB data
+     * region. This way a demo that fails when the shell runs it also
+     * fails in this probe — keeping the dev path honest against the
+     * real shell path. */
+    uint32_t spawn_data_bytes = (uint32_t)g_sys.config.spawn_data_kb * 1024u;
+    if (spawn_data_bytes == 0) spawn_data_bytes = 64 * 1024;
     VmLoadVmResult lr = vm_system_load_vm(&g_sys, elf, elf_size,
-                                          16 * 1024,
-                                          VM_BACKING_XIP,
-                                          VM_BACKING_XIP);
+                                          spawn_data_bytes,
+                                          VM_BACKING_COPY_RAM,
+                                          VM_BACKING_COPY_RAM);
     if (lr.code != VM_SYS_OK) return -EIO;
     uint16_t vm_id = (uint16_t)lr.assigned_vm_id;
 

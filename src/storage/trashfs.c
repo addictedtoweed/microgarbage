@@ -513,6 +513,26 @@ static uint32_t map_lbn(TrashfsVolume *vol, const uint8_t *inode, uint32_t lbn) 
     return TRASHFS_BLOCK_NONE;
 }
 
+/* If `off` lands in a position where a TRASHFS_DIRENT_SIZE-byte slot
+ * would straddle a block boundary, advance to the next block so the
+ * slot sits cleanly within one block. Returns the (possibly bumped)
+ * offset.
+ *
+ * Why this exists: TRASHFS_BLOCK_SIZE isn't necessarily a multiple
+ * of TRASHFS_DIRENT_SIZE (default 128 / 48 = 2.66 dirents per block).
+ * Writing a dirent across a block boundary would corrupt the next
+ * file's data — bytes that look like "dirent padding" land inside a
+ * data block. The directory's logical size includes the skipped
+ * tail-gap bytes, so the dir is sparse in the gaps (which is fine —
+ * every iterator below skips them via this same helper). */
+static inline uint32_t dirent_align(uint32_t off) {
+    uint32_t pos = off % TRASHFS_BLOCK_SIZE;
+    if (pos + TRASHFS_DIRENT_SIZE > TRASHFS_BLOCK_SIZE) {
+        off += TRASHFS_BLOCK_SIZE - pos;
+    }
+    return off;
+}
+
 /* Scan the root directory for an entry named (name,len). On match,
  * returns true and fills *out_inode / *out_type. */
 /* Find an entry by name within directory inode `dir_ino`. */
@@ -522,22 +542,25 @@ static bool dir_find_in(TrashfsVolume *vol, uint32_t dir_ino,
     const uint8_t *dn = inode_ptr(vol, dir_ino);
     uint32_t dsize = rd32(dn + 4u);
 
-    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
-         off += TRASHFS_DIRENT_SIZE) {
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize; ) {
+        off = dirent_align(off);
+        if (off + TRASHFS_DIRENT_SIZE > dsize) break;
         uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
         uint32_t blk = map_lbn(vol, dn, lbn);
-        if (blk == TRASHFS_BLOCK_NONE) continue;   /* hole — skip */
+        if (blk == TRASHFS_BLOCK_NONE) { off += TRASHFS_DIRENT_SIZE; continue; }
         const uint8_t *e = block_ptr(vol->region, blk)
                          + (off % TRASHFS_BLOCK_SIZE);
         uint32_t einode = rd32(e + 0);
-        if (einode == 0u) continue;                /* empty/deleted slot */
-        uint8_t  etype = e[4];
-        uint8_t  elen  = e[5];
-        if (elen == len && memcmp(e + 6, name, len) == 0) {
-            if (out_inode) *out_inode = einode;
-            if (out_type)  *out_type  = etype;
-            return true;
+        if (einode != 0u) {
+            uint8_t  etype = e[4];
+            uint8_t  elen  = e[5];
+            if (elen == len && memcmp(e + 6, name, len) == 0) {
+                if (out_inode) *out_inode = einode;
+                if (out_type)  *out_type  = etype;
+                return true;
+            }
         }
+        off += TRASHFS_DIRENT_SIZE;
     }
     return false;
 }
@@ -546,14 +569,17 @@ static bool dir_find_in(TrashfsVolume *vol, uint32_t dir_ino,
 static bool dir_is_empty(TrashfsVolume *vol, uint32_t dir_ino) {
     const uint8_t *dn = inode_ptr(vol, dir_ino);
     uint32_t dsize = rd32(dn + 4u);
-    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
-         off += TRASHFS_DIRENT_SIZE) {
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize; ) {
+        off = dirent_align(off);
+        if (off + TRASHFS_DIRENT_SIZE > dsize) break;
         uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
         uint32_t blk = map_lbn(vol, dn, lbn);
-        if (blk == TRASHFS_BLOCK_NONE) continue;
-        const uint8_t *e = block_ptr(vol->region, blk)
-                         + (off % TRASHFS_BLOCK_SIZE);
-        if (rd32(e + 0) != 0u) return false;       /* a live entry */
+        if (blk != TRASHFS_BLOCK_NONE) {
+            const uint8_t *e = block_ptr(vol->region, blk)
+                             + (off % TRASHFS_BLOCK_SIZE);
+            if (rd32(e + 0) != 0u) return false;   /* a live entry */
+        }
+        off += TRASHFS_DIRENT_SIZE;
     }
     return true;
 }
@@ -567,20 +593,21 @@ static bool dir_clear_entry_in(TrashfsVolume *vol, uint32_t dir_ino,
                                uint32_t *out_inode, uint8_t *out_type) {
     uint8_t *dn = inode_ptr(vol, dir_ino);
     uint32_t dsize = rd32(dn + 4u);
-    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
-         off += TRASHFS_DIRENT_SIZE) {
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize; ) {
+        off = dirent_align(off);
+        if (off + TRASHFS_DIRENT_SIZE > dsize) break;
         uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
         uint32_t blk = map_lbn(vol, dn, lbn);
-        if (blk == TRASHFS_BLOCK_NONE) continue;
+        if (blk == TRASHFS_BLOCK_NONE) { off += TRASHFS_DIRENT_SIZE; continue; }
         uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
         uint32_t einode = rd32(e + 0);
-        if (einode == 0u) continue;
-        if (e[5] == len && memcmp(e + 6, name, len) == 0) {
+        if (einode != 0u && e[5] == len && memcmp(e + 6, name, len) == 0) {
             if (out_inode) *out_inode = einode;
             if (out_type)  *out_type  = e[4];
             memset(e, 0, TRASHFS_DIRENT_SIZE);     /* inode=0 -> free slot */
             return true;
         }
+        off += TRASHFS_DIRENT_SIZE;
     }
     return false;
 }
@@ -788,6 +815,9 @@ TrashfsResult trashfs_readdir(TrashfsDir *d, TrashfsDirent_Out *ent,
     const uint8_t *dirnode = inode_ptr(d->vol, d->inode);
 
     while (d->pos + TRASHFS_DIRENT_SIZE <= d->size) {
+        /* Skip block-tail gaps (see dirent_align). */
+        d->pos = dirent_align(d->pos);
+        if (d->pos + TRASHFS_DIRENT_SIZE > d->size) break;
         uint32_t off = d->pos;
         d->pos += TRASHFS_DIRENT_SIZE;
 
@@ -944,24 +974,28 @@ static uint8_t *dir_alloc_dirent_in(TrashfsVolume *vol, uint32_t dir_ino,
     *grew = false;
 
     /* Reuse a freed slot first. */
-    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize;
-         off += TRASHFS_DIRENT_SIZE) {
+    for (uint32_t off = 0; off + TRASHFS_DIRENT_SIZE <= dsize; ) {
+        off = dirent_align(off);
+        if (off + TRASHFS_DIRENT_SIZE > dsize) break;
         uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
         uint32_t blk = map_lbn(vol, dn, lbn);
-        if (blk == TRASHFS_BLOCK_NONE) continue;
-        uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
-        if (rd32(e + 0) == 0u) return e;   /* free slot */
+        if (blk != TRASHFS_BLOCK_NONE) {
+            uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
+            if (rd32(e + 0) == 0u) return e;   /* free slot */
+        }
+        off += TRASHFS_DIRENT_SIZE;
     }
 
     /* Append a new slot at the end, allocating a block if needed.
-     * Re-fetch the inode pointer after bmap_alloc — it doesn't move the
-     * region, but keep the read fresh for the size update below. */
-    uint32_t off = dsize;
+     * If dsize ends in a tail-gap (no room for one more dirent in the
+     * last block), advance to the next block start; the gap bytes are
+     * logically part of the dir's size but never read. */
+    uint32_t off = dirent_align(dsize);
     uint32_t lbn = off / TRASHFS_BLOCK_SIZE;
     uint32_t blk = bmap_alloc(vol, dn, lbn);
     if (blk == TRASHFS_BLOCK_NONE) return NULL;
     uint8_t *e = block_ptr(vol->region, blk) + (off % TRASHFS_BLOCK_SIZE);
-    wr32(dn + 4u, dsize + TRASHFS_DIRENT_SIZE);
+    wr32(dn + 4u, off + TRASHFS_DIRENT_SIZE);
     *grew = true;
     return e;
 }

@@ -64,6 +64,9 @@ typedef int      (*pf_dev_l2_stats)(uint64_t *);
 typedef void     (*pf_dev_vm_stats)(uint32_t *);
 typedef int      (*pf_dev_run_l2_test)(void);
 typedef int      (*pf_dev_stage_menu)(void);
+typedef int      (*pf_dev_spawn_demo)(const char *, uint32_t);
+typedef int      (*pf_dev_td0_size)(const char *);
+typedef int      (*pf_dev_demo_via_trashfs)(const char *);
 typedef void     (*pf_reset_begin)(void);
 typedef int      (*pf_reset_ready)(void);
 typedef void     (*pf_reset_end)(void);
@@ -75,6 +78,24 @@ typedef void     (*pf_reset_end)(void);
 
 static int g_fails = 0;
 static int g_passes = 0;
+
+/* Ctrl-C flag set by the console handler. The --tcp loop below polls
+ * this each tick so the user can break out of the forever-loop without
+ * task-killing the process (which would leave the TCP port bound for
+ * a few seconds in TIME_WAIT). Volatile so the loop sees the write. */
+static volatile LONG g_ctrlc_seen = 0;
+
+static BOOL WINAPI ctrlc_handler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+        type == CTRL_CLOSE_EVENT) {
+        InterlockedExchange(&g_ctrlc_seen, 1);
+        /* Returning TRUE tells Windows we handled it; otherwise the
+         * default handler would call ExitProcess immediately and skip
+         * our shutdown. */
+        return TRUE;
+    }
+    return FALSE;
+}
 
 static void check_eq_u8(const char *what, uint8_t got, uint8_t want) {
     if (got == want) {
@@ -167,6 +188,10 @@ int main(int argc, char **argv) {
     pf_dev_vm_stats   p_vm   = (pf_dev_vm_stats)  GetProcAddress(m, "mgapi_dev_vm_stats");
     pf_dev_run_l2_test p_l2t = (pf_dev_run_l2_test)GetProcAddress(m, "mgapi_dev_run_l2_test");
     pf_dev_stage_menu  p_men = (pf_dev_stage_menu) GetProcAddress(m, "mgapi_dev_stage_menu_one_frame");
+    pf_dev_spawn_demo  p_dem = (pf_dev_spawn_demo) GetProcAddress(m, "mgapi_dev_spawn_demo_for_steps");
+    pf_dev_td0_size    p_td0 = (pf_dev_td0_size)   GetProcAddress(m, "mgapi_dev_td0_demo_size");
+    pf_dev_demo_via_trashfs p_dtf = (pf_dev_demo_via_trashfs)
+                                    GetProcAddress(m, "mgapi_dev_spawn_demo_via_trashfs");
     pf_reset_begin     p_rsb = (pf_reset_begin)    GetProcAddress(m, "mgapi_cart_reset_begin");
     pf_reset_ready     p_rsr = (pf_reset_ready)    GetProcAddress(m, "mgapi_cart_reset_ready");
     pf_reset_end       p_rse = (pf_reset_end)      GetProcAddress(m, "mgapi_cart_reset_end");
@@ -582,6 +607,56 @@ int main(int argc, char **argv) {
     /* Cart-reset marshalling: begin captures a timer; ready returns
      * false until hold_ms has elapsed, then flips to true. Window
      * vectors stay valid throughout (re-staged from the ROM). */
+    /* Spawn each bundled demo for a small number of scheduler steps
+     * and report the return code. This goes through the same loader
+     * path the shell's `run` command uses (vm_system_load_vm), so
+     * a load failure here = a load failure when the user types
+     * `run /td0/demos/<name>.elf`. The "steps" count is enough for
+     * the demo to reach its first mg_wait_frame; we don't need to
+     * see frames committed, just confirm load + first PC steps work. */
+    printf("\n--- bundled demos: install check (/td0/demos/) ---\n");
+    if (p_td0) {
+        static const char *DEMOS[] = { "palette", "letterbox", "sprite" };
+        for (int i = 0; i < (int)(sizeof DEMOS / sizeof DEMOS[0]); i++) {
+            int sz = p_td0(DEMOS[i]);
+            printf("  /td0/demos/%s.elf  size = %d\n", DEMOS[i], sz);
+            if (sz > 0) g_passes++;
+            else { printf("  FAIL  not installed\n"); g_fails++; }
+        }
+    } else {
+        printf("  (skipped: mgapi_dev_td0_demo_size not exported)\n");
+    }
+
+    printf("\n--- bundled demos (load + step probe) ---\n");
+    if (p_dem) {
+        static const char *DEMOS[] = { "palette", "letterbox", "sprite" };
+        for (int i = 0; i < (int)(sizeof DEMOS / sizeof DEMOS[0]); i++) {
+            int rc = p_dem(DEMOS[i], 5000);
+            printf("  spawn '%-9s' for_steps rc = %d\n", DEMOS[i], rc);
+            if (rc == 0) g_passes++;
+            else if (rc == -ENOENT) {
+                printf("  (skipped: %s.elf not embedded)\n", DEMOS[i]);
+            } else {
+                printf("  FAIL  spawn rc != 0\n"); g_fails++;
+            }
+        }
+    } else {
+        printf("  (skipped: mgapi_dev_spawn_demo_for_steps not exported)\n");
+    }
+
+    printf("\n--- bundled demos (slurp from /td0/ + spawn) ---\n");
+    if (p_dtf) {
+        static const char *DEMOS[] = { "palette", "letterbox", "sprite" };
+        for (int i = 0; i < (int)(sizeof DEMOS / sizeof DEMOS[0]); i++) {
+            int rc = p_dtf(DEMOS[i]);
+            printf("  trashfs+spawn '%-9s' rc = %d\n", DEMOS[i], rc);
+            if (rc == 0) g_passes++;
+            else { printf("  FAIL  trashfs+spawn rc != 0\n"); g_fails++; }
+        }
+    } else {
+        printf("  (skipped: mgapi_dev_spawn_demo_via_trashfs not exported)\n");
+    }
+
     printf("\n--- cart reset: timer-based hold ---\n");
     {
         /* Dirty the window first so we can prove reset re-stages it. */
@@ -635,14 +710,18 @@ int main(int argc, char **argv) {
         printf("\nlistening on TCP %u — PuTTY raw-connect to drive the shell\n",
                (unsigned)tcp_port);
         printf("Ctrl-C to exit. /td0/demos/{palette,letterbox,sprite}.elf available.\n");
+        fflush(stdout);
+        SetConsoleCtrlHandler(ctrlc_handler, TRUE);
         const uint64_t step_ns = 16666667ull;   /* ~60 Hz */
-        for (;;) {
+        while (!g_ctrlc_seen) {
             p_step(step_ns);
             /* 16 ms sleep keeps host CPU sane. The DLL's TCP listener
              * runs on its own thread so its progress is independent
              * of how fast we tick. */
             Sleep(16);
         }
+        printf("\nCtrl-C — shutting down...\n");
+        fflush(stdout);
     }
 
     p_shut();

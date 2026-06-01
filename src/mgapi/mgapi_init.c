@@ -20,8 +20,12 @@
 #include "vm_init.h"
 #include "tcp_listen.h"
 
+#include "storage/trashfs.h"
+
 #include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Pull `errno.h` codes into negative-return form. mingw and MSVC
@@ -354,6 +358,80 @@ MGAPI_API int mgapi_dev_run_l2_test(void) {
     if (l2_test_elf_len == 0) return -ENOENT;
     return mgapi_dev_spawn_elf_and_wait(l2_test_elf,
                                         (uint32_t)l2_test_elf_len);
+}
+
+/* Dev: spawn one of the bundled demo ELFs by name and run it for a
+ * fixed number of steps, then halt + unload. Used by the host test
+ * to verify the demos actually load + execute through the same
+ * loader path the shell uses — distinguishing "load failure" from
+ * "shell path-resolve failure." Returns the spawn entry code (0 on
+ * load OK, negative on load failure) so the test can report it. */
+extern const unsigned char demo_palette_elf  [];
+extern const size_t        demo_palette_elf_len;
+extern const unsigned char demo_letterbox_elf[];
+extern const size_t        demo_letterbox_elf_len;
+extern const unsigned char demo_sprite_elf   [];
+extern const size_t        demo_sprite_elf_len;
+
+/* Dev: confirm the bundled demo is installed in /td0/demos/<name>.elf
+ * and return its size in bytes. Returns -ENOENT if the file isn't
+ * there. Used by the host test to distinguish "demos baked in but
+ * not installed to /td0/" from "demos missing entirely." */
+MGAPI_API int mgapi_dev_td0_demo_size(const char *name) {
+    extern TrashfsVolume *mgapi_vm_td0_volume(void);
+    TrashfsVolume *vol = mgapi_vm_td0_volume();
+    if (!vol || !name) return -EINVAL;
+    char path[64];
+    snprintf(path, sizeof path, "/demos/%s.elf", name);
+    TrashfsFile f;
+    if (trashfs_open(vol, path, 0 /*RDONLY*/, &f) != TRASHFS_OK)
+        return -ENOENT;
+    int sz = (int)f.size;
+    trashfs_close(&f);
+    return sz;
+}
+
+/* Dev: slurp /td0/demos/<name>.elf via trashfs, then spawn-and-wait
+ * with the resulting bytes. Mirrors slurp_file + spawn in
+ * vm_host_fs_spawn.c — exposes whether the file's bytes load OK as
+ * a separate dev step (so we can tell a trashfs_read truncation
+ * apart from a path-resolve bug apart from a loader bug). Returns
+ *   >  0   load OK + finished N steps (n bytes slurped)
+ *   == 0   load OK
+ *   < 0    error (-errno: ENOENT, EIO, EINVAL, ENOMEM) */
+MGAPI_API int mgapi_dev_spawn_demo_via_trashfs(const char *name) {
+    extern TrashfsVolume *mgapi_vm_td0_volume(void);
+    TrashfsVolume *vol = mgapi_vm_td0_volume();
+    if (!vol || !name) return -EINVAL;
+    char path[64];
+    snprintf(path, sizeof path, "/demos/%s.elf", name);
+    TrashfsFile f;
+    if (trashfs_open(vol, path, 0, &f) != TRASHFS_OK) return -ENOENT;
+    size_t sz = f.size;
+    uint8_t *buf = (uint8_t *)malloc(sz ? sz : 1);
+    if (!buf) { trashfs_close(&f); return -ENOMEM; }
+    uint32_t got = 0;
+    TrashfsResult tr = trashfs_read(&f, buf, (uint32_t)sz, &got);
+    trashfs_close(&f);
+    if (tr != TRASHFS_OK || got != sz) {
+        free(buf);
+        return -EIO;
+    }
+    int rc = mgapi_dev_spawn_elf_for_steps(buf, (uint32_t)sz, 5000);
+    free(buf);
+    return rc;
+}
+
+MGAPI_API int mgapi_dev_spawn_demo_for_steps(const char *name, uint32_t steps) {
+    const unsigned char *bytes = NULL;
+    size_t                len  = 0;
+    if (!name) return -EINVAL;
+    if      (strcmp(name, "palette")   == 0) { bytes = demo_palette_elf;   len = demo_palette_elf_len; }
+    else if (strcmp(name, "letterbox") == 0) { bytes = demo_letterbox_elf; len = demo_letterbox_elf_len; }
+    else if (strcmp(name, "sprite")    == 0) { bytes = demo_sprite_elf;    len = demo_sprite_elf_len; }
+    else return -ENOENT;
+    if (len == 0) return -ENOENT;
+    return mgapi_dev_spawn_elf_for_steps(bytes, (uint32_t)len, steps);
 }
 
 /* Dev: spawn menu.elf, run it for enough scheduler steps to stage

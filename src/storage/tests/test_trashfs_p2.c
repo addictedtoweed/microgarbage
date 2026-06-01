@@ -84,6 +84,16 @@ static void root_add_entry(uint8_t *region, Geo *g, const char *name,
     uint8_t *root = blk(region, g->inode_start); /* inode 0 */
     uint32_t dsize = r32(root+4);
     uint32_t off = dsize;       /* append at end */
+
+    /* Match the on-disk semantics in src/storage/trashfs.c: refuse to
+     * write a 48-byte dirent across a block boundary by jumping to the
+     * next block start. The directory's logical size includes the
+     * skipped tail-gap bytes; all iterators in trashfs.c handle the
+     * gap symmetrically. */
+    uint32_t pos_in_block = off % BS;
+    if (pos_in_block + 48u > BS) {
+        off += BS - pos_in_block;
+    }
     uint32_t lbn = off / BS;
 
     /* Find or allocate the dir block for this lbn. For the test we
@@ -100,7 +110,7 @@ static void root_add_entry(uint8_t *region, Geo *g, const char *name,
     e[5] = len;
     memcpy(e+6, name, len);
     /* pad bytes already zero from format's memset (fresh volume) */
-    w32(root+4, dsize + 48u);   /* grow dir size */
+    w32(root+4, off + 48u);   /* grow dir size to new logical end */
 }
 
 /* Plant a regular file: name, contents (len bytes). Allocates an
