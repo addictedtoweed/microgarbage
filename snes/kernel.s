@@ -210,6 +210,144 @@
     lda f:PB_SCROLLS + $0F
     sta BG4VOFS
 
+    ; --- HDMA channels 1..6 setup -------------------------------------
+    ; Channel 0 is reserved for the kernel's DMA-list dispatch below.
+    ; Channel 7 stays as INIDISP letterbox (set up at boot).
+    ; For each channel C in 1..6: if the copro-staged enabled byte at
+    ; COPRO_HDMA_CONFIG + C*8 is non-zero, program DMAP_C / BBAD_C /
+    ; A1T_C / A1B_C and OR (1 << C) into the HDMAEN accumulator.
+    ; Then write HDMAEN once with channel-7 bit pre-set.
+    .a8
+    sep #$10
+    .i8
+    ldy #$80                              ; channel 7 (INIDISP) always on
+
+    ; Channel 1
+    lda f:COPRO_HDMA_CONFIG + 1*COPRO_HDMA_CONFIG_STRIDE + 0
+    beq @hskip_1
+    lda f:COPRO_HDMA_CONFIG + 1*COPRO_HDMA_CONFIG_STRIDE + 2
+    sta HDMA_CH_BASE + 1*$10 + 0
+    lda f:COPRO_HDMA_CONFIG + 1*COPRO_HDMA_CONFIG_STRIDE + 1
+    sta HDMA_CH_BASE + 1*$10 + 1
+    rep #$20
+    .a16
+    lda f:COPRO_HDMA_CONFIG + 1*COPRO_HDMA_CONFIG_STRIDE + 4
+    sta HDMA_CH_BASE + 1*$10 + 2
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta HDMA_CH_BASE + 1*$10 + 4
+    tya
+    ora #$02
+    tay
+@hskip_1:
+
+    ; Channel 2
+    lda f:COPRO_HDMA_CONFIG + 2*COPRO_HDMA_CONFIG_STRIDE + 0
+    beq @hskip_2
+    lda f:COPRO_HDMA_CONFIG + 2*COPRO_HDMA_CONFIG_STRIDE + 2
+    sta HDMA_CH_BASE + 2*$10 + 0
+    lda f:COPRO_HDMA_CONFIG + 2*COPRO_HDMA_CONFIG_STRIDE + 1
+    sta HDMA_CH_BASE + 2*$10 + 1
+    rep #$20
+    .a16
+    lda f:COPRO_HDMA_CONFIG + 2*COPRO_HDMA_CONFIG_STRIDE + 4
+    sta HDMA_CH_BASE + 2*$10 + 2
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta HDMA_CH_BASE + 2*$10 + 4
+    tya
+    ora #$04
+    tay
+@hskip_2:
+
+    ; Channel 3
+    lda f:COPRO_HDMA_CONFIG + 3*COPRO_HDMA_CONFIG_STRIDE + 0
+    beq @hskip_3
+    lda f:COPRO_HDMA_CONFIG + 3*COPRO_HDMA_CONFIG_STRIDE + 2
+    sta HDMA_CH_BASE + 3*$10 + 0
+    lda f:COPRO_HDMA_CONFIG + 3*COPRO_HDMA_CONFIG_STRIDE + 1
+    sta HDMA_CH_BASE + 3*$10 + 1
+    rep #$20
+    .a16
+    lda f:COPRO_HDMA_CONFIG + 3*COPRO_HDMA_CONFIG_STRIDE + 4
+    sta HDMA_CH_BASE + 3*$10 + 2
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta HDMA_CH_BASE + 3*$10 + 4
+    tya
+    ora #$08
+    tay
+@hskip_3:
+
+    ; Channel 4
+    lda f:COPRO_HDMA_CONFIG + 4*COPRO_HDMA_CONFIG_STRIDE + 0
+    beq @hskip_4
+    lda f:COPRO_HDMA_CONFIG + 4*COPRO_HDMA_CONFIG_STRIDE + 2
+    sta HDMA_CH_BASE + 4*$10 + 0
+    lda f:COPRO_HDMA_CONFIG + 4*COPRO_HDMA_CONFIG_STRIDE + 1
+    sta HDMA_CH_BASE + 4*$10 + 1
+    rep #$20
+    .a16
+    lda f:COPRO_HDMA_CONFIG + 4*COPRO_HDMA_CONFIG_STRIDE + 4
+    sta HDMA_CH_BASE + 4*$10 + 2
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta HDMA_CH_BASE + 4*$10 + 4
+    tya
+    ora #$10
+    tay
+@hskip_4:
+
+    ; Channel 5
+    lda f:COPRO_HDMA_CONFIG + 5*COPRO_HDMA_CONFIG_STRIDE + 0
+    beq @hskip_5
+    lda f:COPRO_HDMA_CONFIG + 5*COPRO_HDMA_CONFIG_STRIDE + 2
+    sta HDMA_CH_BASE + 5*$10 + 0
+    lda f:COPRO_HDMA_CONFIG + 5*COPRO_HDMA_CONFIG_STRIDE + 1
+    sta HDMA_CH_BASE + 5*$10 + 1
+    rep #$20
+    .a16
+    lda f:COPRO_HDMA_CONFIG + 5*COPRO_HDMA_CONFIG_STRIDE + 4
+    sta HDMA_CH_BASE + 5*$10 + 2
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta HDMA_CH_BASE + 5*$10 + 4
+    tya
+    ora #$20
+    tay
+@hskip_5:
+
+    ; Channel 6
+    lda f:COPRO_HDMA_CONFIG + 6*COPRO_HDMA_CONFIG_STRIDE + 0
+    beq @hskip_6
+    lda f:COPRO_HDMA_CONFIG + 6*COPRO_HDMA_CONFIG_STRIDE + 2
+    sta HDMA_CH_BASE + 6*$10 + 0
+    lda f:COPRO_HDMA_CONFIG + 6*COPRO_HDMA_CONFIG_STRIDE + 1
+    sta HDMA_CH_BASE + 6*$10 + 1
+    rep #$20
+    .a16
+    lda f:COPRO_HDMA_CONFIG + 6*COPRO_HDMA_CONFIG_STRIDE + 4
+    sta HDMA_CH_BASE + 6*$10 + 2
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta HDMA_CH_BASE + 6*$10 + 4
+    tya
+    ora #$40
+    tay
+@hskip_6:
+
+    tya
+    sta HDMAEN                            ; channels enabled this frame
+
+    rep #$10                              ; restore 16-bit X for DMA walk
+    .i16
+
     ; --- walk the 8-slot DMA list -------------------------------------
     ; For each slot whose bbus byte is non-zero: program channel 0 from
     ; the slot, write the prep value to the corresponding PPU dest

@@ -104,6 +104,30 @@ void mg_state_reset(void) {
 
     s_state.force_blank_top    = 0;
     s_state.force_blank_bottom = 0;
+
+    for (unsigned i = 0; i < 7; i++) {
+        s_state.hdma[i].enabled   = false;
+        s_state.hdma[i].bbad      = 0;
+        s_state.hdma[i].dmap      = 0;
+        s_state.hdma[i].table_off = 0;
+    }
+}
+
+/* HDMA tables bump-allocator. Lives in CW_OFF_HDMA_TABLES..
+ * CW_OFF_HDMA_TABLES+CW_HDMA_TABLES_BYTES, separate from the payload
+ * area (which gets reset every frame; HDMA tables stay across frames
+ * unless re-uploaded). Reset by mg_state_reset only. */
+static uint16_t s_hdma_tables_used;
+
+uint16_t mg_state_stage_hdma_table(const void *src, uint16_t len) {
+    if (len == 0 || !src) return 0;
+    if ((uint32_t)s_hdma_tables_used + len > CW_HDMA_TABLES_BYTES) {
+        return UINT16_MAX;
+    }
+    uint16_t off = (uint16_t)(CW_OFF_HDMA_TABLES + s_hdma_tables_used);
+    cart_window_load_blob(off, src, len);
+    s_hdma_tables_used = (uint16_t)(s_hdma_tables_used + len);
+    return off;
 }
 
 MgState *mg_state(void) {
@@ -375,6 +399,25 @@ void mg_state_build_frame(void) {
 
     /* And the INIDISP HDMA table for the force-blank window. */
     emit_inidisp_table();
+
+    /* HDMA control table for channels 0..6. The kernel walks this 56-
+     * byte area at vblank, configures DMAP/BBAD/A1T/A1B for each
+     * enabled channel, and computes HDMAEN. Channel 7 is reserved for
+     * the INIDISP letterbox above; the kernel ORs its bit in. */
+    {
+        uint8_t cfg[CW_HDMA_CONFIG_BYTES] = {0};
+        for (unsigned c = 0; c < 7; c++) {
+            uint8_t *p = cfg + c * CW_HDMA_CFG_BYTES_EACH;
+            p[0] = s_state.hdma[c].enabled ? 1 : 0;
+            p[1] = s_state.hdma[c].bbad;
+            p[2] = s_state.hdma[c].dmap;
+            /* p[3] reserved */
+            p[4] = (uint8_t)(s_state.hdma[c].table_off & 0xFF);
+            p[5] = (uint8_t)(s_state.hdma[c].table_off >> 8);
+            /* p[6..7] reserved */
+        }
+        cart_window_load_blob(CW_OFF_HDMA_CONFIG, cfg, sizeof(cfg));
+    }
 
     /* OAM. */
     if (s_state.oam_dirty_hi > s_state.oam_dirty_lo) {

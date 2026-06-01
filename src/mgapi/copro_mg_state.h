@@ -92,6 +92,17 @@ typedef struct {
      * frame. Default 0,0 = no forced blank, baseline budget. */
     uint8_t  force_blank_top;
     uint8_t  force_blank_bottom;
+
+    /* HDMA channel config — channels 0..6 (channel 7 is reserved for
+     * INIDISP). The runtime publishes this to the cart window's
+     * HDMA control table every frame so the kernel can set up the
+     * SNES HDMA registers correctly. */
+    struct {
+        bool     enabled;
+        uint8_t  bbad;          /* $21xx low byte                     */
+        uint8_t  dmap;          /* SNES DMAP byte (transfer mode)     */
+        uint16_t table_off;     /* offset within cart window           */
+    } hdma[7];
 } MgState;
 
 /* -------- Lifecycle -------- */
@@ -138,6 +149,17 @@ int  mg_state_queue_dma(const void *src, uint32_t size,
  * accumulated since the previous commit). Cheap, never blocks. */
 uint8_t  mg_state_slots_remaining (void);
 uint16_t mg_state_bytes_remaining (void);
+
+/* HDMA table staging — copies `len` bytes from `src` into the cart
+ * window's HDMA tables area at a bump-allocated offset, returning
+ * that offset on success (caller saves it into hdma[channel].table_
+ * off). Returns UINT16_MAX if the area is full.
+ *
+ * Tables persist across frames in the cart window — no per-frame
+ * wipe — but the bump pointer resets only when the runtime explicitly
+ * does. mg_hdma_upload_table is a per-call append; the game is
+ * responsible for not exceeding CW_HDMA_TABLES_BYTES. */
+uint16_t mg_state_stage_hdma_table(const void *src, uint16_t len);
 
 #ifdef __cplusplus
 }

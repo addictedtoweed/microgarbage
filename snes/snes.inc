@@ -53,6 +53,10 @@ A1T7L     = $4372      ; HDMA table address low
 A1T7H     = $4373      ; HDMA table address high
 A1B7      = $4374      ; HDMA table bank
 
+; HDMA channels 0..6 base — each channel's regs are at $43X0..$43XF.
+; Stride is $10 per channel (X = channel index).
+HDMA_CH_BASE = $4300   ; channel 0 base; channel C is at HDMA_CH_BASE + C*$10
+
 ; DMA channel 0 registers
 DMAP0     = $4300      ; transfer pattern + direction
 BBAD0     = $4301      ; B-bus address ($21xx low byte)

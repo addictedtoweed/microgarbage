@@ -41,6 +41,9 @@ COPRO_INIDISP_HDMA = $7868      ; [read]  16 bytes: HDMA mode-0 table the kernel
                                 ;         channel 7 for, INIDISP toggle for letterbox
                                 ;         force-blank. Format: [0x80|N][value] segments
                                 ;         then 0x00 terminator.
+COPRO_HDMA_CONFIG  = $7878      ; [read]  7 channels x 8 bytes = 56 bytes. Per slot:
+                                ;         +0 enabled, +1 bbad, +2 dmap, +4..5 table_off
+COPRO_HDMA_TABLES  = $7900      ; [read]  1280 bytes: where game-staged HDMA tables live
 COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
 
 ; --- per-frame DMA dispatch ------------------------------------------
@@ -117,6 +120,9 @@ PB_SCROLLS      = COPRO_PPU_BATCH + $10  ; 8 16-bit scrolls follow
 ; mode-0 repeat segments. The runtime rebuilds the table each
 ; frame from mg_force_blank values.
 COPRO_HDMA_INIDISP_CHANNEL = 7
+
+COPRO_HDMA_CONFIG_L   = (COPRO_BANK << 16) | COPRO_HDMA_CONFIG
+COPRO_HDMA_CONFIG_STRIDE = 8
 JOYPORT_P0_LO_L = (COPRO_BANK << 16) | JOYPORT_P0_LO
 JOYPORT_P0_HI_L = (COPRO_BANK << 16) | JOYPORT_P0_HI
 JOYPORT_P1_LO_L = (COPRO_BANK << 16) | JOYPORT_P1_LO

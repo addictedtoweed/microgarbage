@@ -59,6 +59,30 @@ extern "C" {
 #define CW_OFF_INIDISP_HDMA 0x7868u
 #define CW_INIDISP_HDMA_BYTES 16u
 
+/* HDMA channel control table — 7 channels x 8 bytes each. Channel 7
+ * is reserved for INIDISP letterbox (see CW_OFF_INIDISP_HDMA); this
+ * area covers channels 0..6. Layout per slot:
+ *   +0  enabled  (0/1)
+ *   +1  bbad     ($21xx destination low byte)
+ *   +2  dmap     (SNES DMAP byte: bits 0..2 transfer mode, etc.)
+ *   +3  reserved
+ *   +4-5 a1t_off (table offset within COPRO_BANK)
+ *   +6-7 reserved
+ * The runtime fills this area every frame the channel config or
+ * enabled state changes; kernel walks it at vblank, sets DMAP/BBAD/
+ * A1T/A1B for each enabled channel, and computes HDMAEN. */
+#define CW_OFF_HDMA_CONFIG    0x7878u
+#define CW_HDMA_CHANNELS       7u
+#define CW_HDMA_CFG_BYTES_EACH 8u
+#define CW_HDMA_CONFIG_BYTES   (CW_HDMA_CHANNELS * CW_HDMA_CFG_BYTES_EACH)
+
+/* HDMA tables area — game stages per-scanline tables for channels
+ * 0..6 here via mg_hdma_upload_table. The runtime bump-allocates
+ * within this 1280-byte slab each frame the same way it does with
+ * payload-area DMA staging. */
+#define CW_OFF_HDMA_TABLES    0x7900u
+#define CW_HDMA_TABLES_BYTES  0x500u   /* 1280 bytes — generous */
+
 #define CW_OFF_STROBE_BOOT  0x7E00u
 #define CW_OFF_STATUS       0x7F00u
 

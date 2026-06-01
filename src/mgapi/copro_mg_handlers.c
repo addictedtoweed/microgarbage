@@ -402,9 +402,82 @@ static void h_bg_main_priority(VmCpu *cpu, void *sys_) {
 
 static void h_mode7_set        (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
 static void h_mode7_wrap       (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
-static void h_hdma_setup       (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
-static void h_hdma_upload      (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
-static void h_hdma_enable      (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
+
+/* MgHdmaCfg mirror — matches examples/common/guest/mg_hdma.h. */
+typedef struct {
+    uint8_t  channel;
+    uint8_t  dest;        /* MgHdmaDest, == $21xx low byte we want */
+    uint8_t  xfer;        /* MgHdmaXfer 0..3                       */
+    uint8_t  indirect;    /* bool                                  */
+} MgHdmaCfgHost;
+
+/* Map MgHdmaXfer (0..3) onto SNES DMAP transfer-mode bits 0..2:
+ *   MG_HDMA_XFER_1B_1R = 0  → 000 (1 byte)
+ *   MG_HDMA_XFER_2B_1R = 1  → 010 (2 bytes, same reg)
+ *   MG_HDMA_XFER_2B_2R = 2  → 001 (2 bytes, 2 regs)
+ *   MG_HDMA_XFER_4B_2R = 3  → 011 (4 bytes, 2 regs ×2)
+ * Plus the indirect bit (bit 6 of DMAP). Direction stays 0 (CPU->PPU). */
+static uint8_t hdma_dmap(uint8_t xfer, bool indirect) {
+    static const uint8_t tab[4] = { 0, 2, 1, 3 };
+    uint8_t d = tab[xfer & 3];
+    if (indirect) d |= 0x40;
+    return d;
+}
+
+static void h_hdma_setup(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint32_t cfgp = cpu->regs[VM_REG_A0];
+    MgHdmaCfgHost cfg;
+    if (!guest_read(cpu, cfgp, &cfg, sizeof(cfg))) {
+        cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+        return;
+    }
+    /* Channel 0 reserved for the kernel's DMA-list dispatch; channel
+     * 7 reserved for INIDISP letterbox. Games use 1..6. */
+    if (cfg.channel == 0 || cfg.channel >= 7) {
+        cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+        return;
+    }
+    mg_state()->hdma[cfg.channel].bbad = cfg.dest;
+    mg_state()->hdma[cfg.channel].dmap = hdma_dmap(cfg.xfer, cfg.indirect != 0);
+    /* table_off stays whatever upload set it to; enabled stays as-is. */
+    cpu->regs[VM_REG_A0] = MG_R_OK;
+}
+
+static void h_hdma_upload(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint8_t  channel = (uint8_t)cpu->regs[VM_REG_A0];
+    uint32_t tablep  = cpu->regs[VM_REG_A1];
+    uint16_t len     = (uint16_t)cpu->regs[VM_REG_A2];
+    if (channel == 0 || channel >= 7) {
+        cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+        return;
+    }
+    if (len == 0) { cpu->regs[VM_REG_A0] = MG_R_OK; return; }
+
+    const void *src = vm_translate_read(cpu, tablep, len);
+    if (!src) { cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID; return; }
+
+    uint16_t off = mg_state_stage_hdma_table(src, len);
+    if (off == UINT16_MAX) {
+        cpu->regs[VM_REG_A0] = MG_R_ERR_DMA_BYTES;
+        return;
+    }
+    mg_state()->hdma[channel].table_off = off;
+    cpu->regs[VM_REG_A0] = MG_R_OK;
+}
+
+static void h_hdma_enable(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint8_t channel = (uint8_t)cpu->regs[VM_REG_A0];
+    bool    on      = (cpu->regs[VM_REG_A1] != 0);
+    if (channel == 0 || channel >= 7) {
+        cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+        return;
+    }
+    mg_state()->hdma[channel].enabled = on;
+    cpu->regs[VM_REG_A0] = MG_R_OK;
+}
 
 /* GFX + panic ----------------------------------------------------- */
 
