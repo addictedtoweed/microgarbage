@@ -44,6 +44,14 @@ HVBJOY    = $4212      ; b7 vblank, b0 auto-joypad busy
 JOY1L     = $4218      ; auto-joypad pad 1 low  (unused when auto-read is off)
 JOY1H     = $4219      ; auto-joypad pad 1 high (unused when auto-read is off)
 MDMAEN    = $420B      ; general-DMA enable (1 bit per channel)
+HDMAEN    = $420C      ; HDMA enable (1 bit per channel)
+
+; HDMA channel 7 registers — kernel reserves for INIDISP letterbox
+DMAP7     = $4370      ; transfer pattern + direction
+BBAD7     = $4371      ; B-bus address (low byte of $21xx target)
+A1T7L     = $4372      ; HDMA table address low
+A1T7H     = $4373      ; HDMA table address high
+A1B7      = $4374      ; HDMA table bank
 
 ; DMA channel 0 registers
 DMAP0     = $4300      ; transfer pattern + direction

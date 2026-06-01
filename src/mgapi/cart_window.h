@@ -51,6 +51,14 @@ extern "C" {
 #define CW_OFF_PPU_BATCH    0x7848u
 #define CW_PPU_BATCH_BYTES  32u
 
+/* INIDISP HDMA table: SNES kernel reserves HDMA channel 7 at boot
+ * pointing at this area. Format is mode-0 repeat segments — each is
+ * a [0x80 | line_count][value] pair, terminator 0x00. The runtime
+ * rebuilds the table every frame from force_blank_top/bottom. 16
+ * bytes is plenty for ≤3 segments + terminator. */
+#define CW_OFF_INIDISP_HDMA 0x7868u
+#define CW_INIDISP_HDMA_BYTES 16u
+
 #define CW_OFF_STROBE_BOOT  0x7E00u
 #define CW_OFF_STATUS       0x7F00u
 

@@ -44,6 +44,25 @@
     lda #COPRO_BANK
     sta A1B0
 
+    ; --- HDMA channel 7: INIDISP letterbox toggle ----------------------
+    ; The copro stages a small mode-0 table at COPRO_INIDISP_HDMA each
+    ; frame from mg_force_blank values. Channel 7 reads it and writes
+    ; INIDISP per-scanline so the top / bottom force-blanked rows go
+    ; black while the visible middle stays at $0F. Setup is once at
+    ; boot; HDMAEN bit 7 stays set so it fires every frame.
+    stz DMAP7               ; mode 0: 1 byte to 1 reg, fixed inc
+    stz BBAD7               ; INIDISP low byte = $00 ($2100)
+    rep #$20
+    .a16
+    lda #COPRO_INIDISP_HDMA
+    sta A1T7L
+    sep #$20
+    .a8
+    lda #COPRO_BANK
+    sta A1B7
+    lda #$80                ; bit 7: enable HDMA channel 7
+    sta HDMAEN
+
     lda #$0F
     sta INIDISP             ; screen on, full brightness
     lda #$80

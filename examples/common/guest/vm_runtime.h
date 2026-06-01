@@ -155,6 +155,7 @@
 #define SYS_MG_PALETTE_SNAP_RESTORE 1217
 #define SYS_MG_PACK_CHR             1218
 #define SYS_MG_PANIC                1219
+#define SYS_MG_FRAME_STATE          1220
 
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.

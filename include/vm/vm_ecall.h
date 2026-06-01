@@ -385,6 +385,17 @@
 #define SYS_MG_PACK_CHR           1218  /* (*dst, *src_linear, tiles, bpp) */
 #define SYS_MG_PANIC              1219  /* (*msg_cstr) → noreturn          */
 
+/* Frame-state introspection + force-blank (1220). One multiplexed
+ * ecall to keep the SYS_MG_* range tight; op-code in a0:
+ *
+ *   op 0  get slots_remaining   → uint8  (0..8)
+ *   op 1  get bytes_remaining   → uint16 (0..~6479)
+ *   op 2  get force_blank_top   → uint8
+ *   op 3  get force_blank_bot   → uint8
+ *   op 4  set force_blank       (a1 = top, a2 = bottom) → 0
+ */
+#define SYS_MG_FRAME_STATE        1220
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

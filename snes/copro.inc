@@ -37,6 +37,10 @@ COPRO_FRAME_RDY = $7800         ; [read]  1 byte: 0 = skip this frame, else proc
 COPRO_DMA_LIST  = $7808         ; [read]  8 slots * 8 bytes = $7808-$7847 (see below)
 COPRO_PPU_BATCH = $7848         ; [read]  32 bytes: PPU register batch the kernel writes
                                 ;         to PPU regs at the top of each vblank (see below)
+COPRO_INIDISP_HDMA = $7868      ; [read]  16 bytes: HDMA mode-0 table the kernel reserves
+                                ;         channel 7 for, INIDISP toggle for letterbox
+                                ;         force-blank. Format: [0x80|N][value] segments
+                                ;         then 0x00 terminator.
 COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
 
 ; --- per-frame DMA dispatch ------------------------------------------
@@ -106,6 +110,13 @@ PB_TM           = COPRO_PPU_BATCH + $08
 PB_TS           = COPRO_PPU_BATCH + $09
 PB_MOSAIC       = COPRO_PPU_BATCH + $0A
 PB_SCROLLS      = COPRO_PPU_BATCH + $10  ; 8 16-bit scrolls follow
+
+; --- INIDISP HDMA channel reservation --------------------------
+; The kernel sets up HDMA channel 7 at boot to read from
+; COPRO_INIDISP_HDMA, writing INIDISP every scanline per the
+; mode-0 repeat segments. The runtime rebuilds the table each
+; frame from mg_force_blank values.
+COPRO_HDMA_INIDISP_CHANNEL = 7
 JOYPORT_P0_LO_L = (COPRO_BANK << 16) | JOYPORT_P0_LO
 JOYPORT_P0_HI_L = (COPRO_BANK << 16) | JOYPORT_P0_HI
 JOYPORT_P1_LO_L = (COPRO_BANK << 16) | JOYPORT_P1_LO

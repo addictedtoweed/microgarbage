@@ -87,6 +87,11 @@ typedef struct {
 
     /* Mode / global PPU state. */
     uint8_t  bgmode;              /* 0..7                              */
+
+    /* Force-blank window. Each scanline yields ~117 more DMA bytes per
+     * frame. Default 0,0 = no forced blank, baseline budget. */
+    uint8_t  force_blank_top;
+    uint8_t  force_blank_bottom;
 } MgState;
 
 /* -------- Lifecycle -------- */
@@ -127,6 +132,12 @@ void mg_state_build_frame(void);
  * Bytes are copied into the cart window's payload area immediately. */
 int  mg_state_queue_dma(const void *src, uint32_t size,
                         uint8_t bbus, uint8_t dmap, uint16_t prep);
+
+/* Budget introspection — both reflect bookkeeping AS OF the most
+ * recent SYS_COPRO_FRAME_COMMIT (the slot count + payload bytes
+ * accumulated since the previous commit). Cheap, never blocks. */
+uint8_t  mg_state_slots_remaining (void);
+uint16_t mg_state_bytes_remaining (void);
 
 #ifdef __cplusplus
 }

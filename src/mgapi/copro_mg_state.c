@@ -47,6 +47,13 @@ static MgState s_state;
 static uint32_t s_payload_used;
 static unsigned s_slot_used;
 
+/* How many slots mg_state's shadow walker populated last frame. The
+ * build_frame walker clears EXACTLY this many slots at the start of
+ * the next walk before re-populating — slots beyond this index stay
+ * untouched so a guest that uses the legacy SYS_COPRO_STAGE_DMA_SLOT
+ * for higher-index slots keeps its entries across frames. */
+static unsigned s_prev_mg_slots;
+
 /* ----------------------------------------------------------------
  *  Lifecycle
  * ---------------------------------------------------------------- */
@@ -94,6 +101,9 @@ void mg_state_reset(void) {
     s_state.spr.chr_base1_word = 0;
 
     s_state.bgmode = 0;
+
+    s_state.force_blank_top    = 0;
+    s_state.force_blank_bottom = 0;
 }
 
 MgState *mg_state(void) {
@@ -179,6 +189,25 @@ static bool stage_dma(const void *src, uint32_t size,
  * need to queue arbitrary DMAs outside the shadow flow. Returns
  * MG_R_ERR_DMA_* on overflow so the handler can propagate to the
  * guest's MgResult. */
+uint8_t mg_state_slots_remaining(void) {
+    return (uint8_t)(8u - s_slot_used);
+}
+
+/* Vblank byte budget (NTSC, joypad auto-read off): ~6479 baseline +
+ * ~117 per force-blanked scanline. We round down to keep callers safe
+ * even when the runtime's measurement of actual vblank length varies
+ * by a few cycles. */
+#define MG_BYTE_BUDGET_BASE   6479u
+#define MG_BYTES_PER_FBLANK   117u
+
+uint16_t mg_state_bytes_remaining(void) {
+    uint32_t cap = MG_BYTE_BUDGET_BASE
+                 + (uint32_t)s_state.force_blank_top    * MG_BYTES_PER_FBLANK
+                 + (uint32_t)s_state.force_blank_bottom * MG_BYTES_PER_FBLANK;
+    if (s_payload_used >= cap) return 0;
+    return (uint16_t)(cap - s_payload_used);
+}
+
 int mg_state_queue_dma(const void *src, uint32_t size,
                        uint8_t bbus, uint8_t dmap, uint16_t prep) {
     if (s_slot_used >= 8) return -1;  /* MG_ERR_DMA_SLOTS */
@@ -287,16 +316,53 @@ static void emit_ppu_batch(void) {
     cart_window_set_ppu_batch(&b);
 }
 
+/* Build the INIDISP HDMA table for the current force_blank_top /
+ * bottom values, write it into the cart window at CW_OFF_INIDISP_HDMA.
+ * The kernel-reserved HDMA channel 7 reads from there each scanline.
+ *
+ * Mode-0 repeat segment format: [0x80 | line_count][value]
+ * Terminator: 0x00
+ * line_count is bits 0-6 of the count byte; 1..127 valid (0 means
+ * "128 lines" with special handling we avoid by splitting). */
+static void emit_inidisp_table(void) {
+    uint8_t buf[CW_INIDISP_HDMA_BYTES] = {0};
+    uint8_t *p = buf;
+    uint8_t  t = s_state.force_blank_top;
+    uint8_t  b = s_state.force_blank_bottom;
+
+    int visible = 224 - (int)t - (int)b;
+    if (visible < 0) visible = 0;
+
+    if (t) {
+        *p++ = (uint8_t)(0x80u | t);   /* repeat for t lines */
+        *p++ = 0x80;                   /* INIDISP = force-blank */
+    }
+    while (visible > 0) {
+        int n = visible > 127 ? 127 : visible;
+        *p++ = (uint8_t)(0x80u | (uint8_t)n);
+        *p++ = 0x0F;                   /* INIDISP = visible, full brightness */
+        visible -= n;
+    }
+    if (b) {
+        *p++ = (uint8_t)(0x80u | b);
+        *p++ = 0x80;
+    }
+    *p++ = 0x00;                       /* terminator */
+
+    cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf,
+                          (uint32_t)(p - buf));
+}
+
 void mg_state_build_frame(void) {
     /* Reset per-frame bookkeeping. */
     s_payload_used = 0;
     s_slot_used    = 0;
 
-    /* Clear any prior slots so a frame with no DMAs publishes a
-     * cleanly-empty slot list. cart_window_set_dma_slot with bbus=0
-     * means "empty slot" per the kernel-visible contract. */
+    /* Clear ONLY the slot indices mg_* used last frame. Slots beyond
+     * that are left alone so guests that mix SYS_COPRO_STAGE_DMA_SLOT
+     * with the mg_* API keep their explicit entries across frames. */
     static const CartDmaSlot empty_slot = {0};
-    for (unsigned i = 0; i < 8; i++) {
+    for (unsigned i = 0; i < s_prev_mg_slots && i < 8; i++) {
         cart_window_set_dma_slot(i, &empty_slot);
     }
 
@@ -306,6 +372,9 @@ void mg_state_build_frame(void) {
      * mg_bg_scroll / mg_sprite_sizes / mg_sprite_chr_base have
      * accumulated. */
     emit_ppu_batch();
+
+    /* And the INIDISP HDMA table for the force-blank window. */
+    emit_inidisp_table();
 
     /* OAM. */
     if (s_state.oam_dirty_hi > s_state.oam_dirty_lo) {
@@ -350,4 +419,8 @@ void mg_state_build_frame(void) {
                         (uint16_t)(bg->tilemap_word + (lo >> 1)));
         bg->dirty_lo = bg->dirty_hi = 0;
     }
+
+    /* Remember how many slots we used so the next frame's clear can
+     * be precise instead of stomping the whole list. */
+    s_prev_mg_slots = s_slot_used;
 }

@@ -62,6 +62,7 @@
 #define SYS_MG_PALETTE_SNAP_RESTORE 1217
 #define SYS_MG_PACK_CHR            1218
 #define SYS_MG_PANIC               1219
+#define SYS_MG_FRAME_STATE         1220
 
 /* MgResult values mirrored from mg_panic.h. */
 #define MG_R_OK             0
@@ -488,6 +489,50 @@ static void h_pack_chr(VmCpu *cpu, void *s) {
     cpu->regs[VM_REG_A0] = MG_R_OK;
 }
 
+/* Frame-state multiplexed ecall. Op-codes must match the constants
+ * in examples/common/guest/mg_frame.c. */
+#define MG_FS_GET_SLOTS  0
+#define MG_FS_GET_BYTES  1
+#define MG_FS_GET_TOP    2
+#define MG_FS_GET_BOT    3
+#define MG_FS_SET_BLANK  4
+
+static void h_frame_state(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint32_t op = cpu->regs[VM_REG_A0];
+    switch (op) {
+        case MG_FS_GET_SLOTS:
+            cpu->regs[VM_REG_A0] = mg_state_slots_remaining();
+            return;
+        case MG_FS_GET_BYTES:
+            cpu->regs[VM_REG_A0] = mg_state_bytes_remaining();
+            return;
+        case MG_FS_GET_TOP:
+            cpu->regs[VM_REG_A0] = mg_state()->force_blank_top;
+            return;
+        case MG_FS_GET_BOT:
+            cpu->regs[VM_REG_A0] = mg_state()->force_blank_bottom;
+            return;
+        case MG_FS_SET_BLANK: {
+            uint8_t top = (uint8_t)cpu->regs[VM_REG_A1];
+            uint8_t bot = (uint8_t)cpu->regs[VM_REG_A2];
+            /* Cap to keep at least 16 visible lines — protects games
+             * from accidentally requesting a fully-blanked screen. */
+            if (top + bot > 208) {
+                cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+                return;
+            }
+            mg_state()->force_blank_top    = top;
+            mg_state()->force_blank_bottom = bot;
+            cpu->regs[VM_REG_A0] = MG_R_OK;
+            return;
+        }
+        default:
+            cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+            return;
+    }
+}
+
 static void h_panic(VmCpu *cpu, void *sys_) {
     (void)sys_;
     /* TODO: real panic flow — save context to persistent slot,
@@ -541,6 +586,7 @@ static const struct mg_handler_entry s_handlers[] = {
     { SYS_MG_PALETTE_SNAP_RESTORE, h_palette_snap_restore },
     { SYS_MG_PACK_CHR,             h_pack_chr           },
     { SYS_MG_PANIC,                h_panic              },
+    { SYS_MG_FRAME_STATE,          h_frame_state        },
 };
 
 #define MG_HANDLER_COUNT ((unsigned)(sizeof(s_handlers) / sizeof(s_handlers[0])))
