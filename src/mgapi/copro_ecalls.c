@@ -14,6 +14,7 @@
 #include "copro_ecalls.h"
 
 #include "cart_window.h"
+#include "copro_mg_state.h"
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
 #include "vm/vm_system.h"
@@ -90,6 +91,14 @@ static void h_stage_dma_slot(VmCpu *cpu, void *system) {
 static void h_frame_commit(VmCpu *cpu, void *system) {
     (void)system;
     uint8_t byte = (uint8_t)(cpu->regs[VM_REG_A0] & 0xFFu);
+
+    /* Walk the mg_* shadow state, stage dirty regions into the cart
+     * window's payload area, queue DMA slots — this is where SYS_MG_*
+     * accumulated state gets turned into the per-frame DMA descriptor
+     * list the SNES kernel consumes. Runs before the frame-ready byte
+     * goes high so the kernel sees a consistent snapshot. */
+    mg_state_build_frame();
+
     cart_window_set_frame_ready(byte);
     cpu->regs[VM_REG_A0] = 0;
 }

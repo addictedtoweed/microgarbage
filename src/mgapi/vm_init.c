@@ -16,6 +16,9 @@
 #include "copro_ecalls.h"
 #include "l2_ecalls.h"
 
+#include "copro_mg_handlers.h"
+#include "copro_mg_state.h"
+
 #include <errno.h>
 #include <stddef.h>
 #include <string.h>
@@ -123,6 +126,14 @@ int mgapi_vm_init(void *cart_volume_handle) {
 
     /* Stage 3b: SYS_COPRO_* ecalls so guests can drive the cart window. */
     if (!mgapi_install_copro_ecalls(&g_sys)) goto fail_sys;
+
+    /* Stage 3b': SYS_MG_* game-API ecalls (1190..1219). The shadow
+     * PPU state lives in copro_mg_state; handlers in
+     * copro_mg_handlers update it on each ecall, and the
+     * SYS_COPRO_FRAME_COMMIT handler walks the shadow at commit to
+     * build the DMA descriptor list the SNES kernel consumes. */
+    mg_state_init();
+    if (!mg_handlers_install(&g_sys)) goto fail_sys;
 
     /* Stage 3c: SYS_L2_* ecalls. Handlers convert host pointers <->
      * guest VAs against the same L2 backing the VM core's translation

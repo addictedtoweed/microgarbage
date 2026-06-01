@@ -136,6 +136,12 @@ $mgapiSrcs += (Join-Path $MgapiSrcDir "vm_init.c")
 $mgapiSrcs += (Join-Path $MgapiSrcDir "copro_ecalls.c")
 $mgapiSrcs += (Join-Path $MgapiSrcDir "l2_ecalls.c")
 
+# Stage 3b': SYS_MG_* game-API handlers + shadow PPU state. The
+# guest-facing mg_* library at examples/common/guest/mg_*.{h,c}
+# calls these.
+$mgapiSrcs += (Join-Path $MgapiSrcDir "copro_mg_state.c")
+$mgapiSrcs += (Join-Path $MgapiSrcDir "copro_mg_handlers.c")
+
 # Stage 4: TCP listener for PuTTY shell sessions.
 $mgapiSrcs += (Join-Path $MgapiSrcDir "tcp_listen.c")
 
