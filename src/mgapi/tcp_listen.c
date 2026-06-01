@@ -263,28 +263,44 @@ static bool try_accept(void) {
  * ---------------------------------------------------------------- */
 
 /* Pre-bound stub transport. Bound to the shell BEFORE any PuTTY
- * client connects, so the shell's sys_read returns 0 ("no data, try
- * later") instead of falling through to host stdio's read() -- which
- * blocks the entire process on Windows when stdin is a winpty pty
- * (the case in MSYS / Git-Bash / mintty). Blocked process means the
- * cooperative VM scheduler stalls, which means mgapi_tcp_listen_poll
- * never runs accept() and the user's PuTTY connection sits in the
- * OS's listen queue forever.
+ * client connects so the shell's sys_read / sys_write don't fall
+ * through to host stdio.
  *
- * The stub leaves write/flush NULL so handle_write / handle_fflush
- * fall through to host stdout -- pre-connect banner output ends up
- * in the bsnes/host terminal where the embedder can still see it.
- * When try_accept fires for a real PuTTY connection,
- * vm_host_set_transport_for_vm replaces this stub with the real
- * TCP transport. */
+ * Two distinct stalls this prevents:
+ *
+ *   1. POSIX read() on the host's stdin -- blocks the entire process
+ *      on Windows when stdin is a winpty pty (MSYS / Git-Bash /
+ *      mintty). The stub's read_nonblock returns 0 ("no data, try
+ *      later") so the shell sleep+retries.
+ *
+ *   2. fwrite() to host stdout when the host is a Windows GUI-
+ *      subsystem .exe (bsnes-plus). LoadLibrary'd mgapi.dll inherits
+ *      bsnes's stdout handle which, for a GUI app, is often closed
+ *      or pointed at NUL -- and fwrite to it can either block or
+ *      silently fail in a way that breaks subsequent reads. The
+ *      stub's write returns "wrote everything" without actually
+ *      touching anything, so the shell's pre-connect banner and
+ *      prompt are silently dropped instead of stalling on the
+ *      broken handle.
+ *
+ *   Pre-connect output is no real loss in either case -- the
+ *   accept-time greeting (sent later through the real socket)
+ *   tells the user the session is up. After accept,
+ *   vm_host_set_transport_for_vm replaces this stub with the real
+ *   TCP transport and everything flows through PuTTY. */
 static int stub_t_read(VmHostTransport *t, void *buf, unsigned cap) {
     (void)t; (void)buf; (void)cap;
-    return 0;   /* always "no data" -- shell sleeps + retries */
+    return 0;   /* "no data" -- shell sleeps + retries */
 }
+static int stub_t_write(VmHostTransport *t, const void *buf, unsigned n) {
+    (void)t; (void)buf;
+    return (int)n;   /* pretend the bytes went somewhere */
+}
+static int stub_t_flush(VmHostTransport *t) { (void)t; return 0; }
 static VmHostTransport g_stub_transport = {
     .read_nonblock = stub_t_read,
-    .write         = NULL,
-    .flush         = NULL,
+    .write         = stub_t_write,
+    .flush         = stub_t_flush,
     .set_raw       = NULL,
     .close         = NULL,
     .is_terminal   = true,
