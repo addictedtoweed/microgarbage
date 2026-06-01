@@ -79,22 +79,64 @@ typedef void     (*pf_reset_end)(void);
 static int g_fails = 0;
 static int g_passes = 0;
 
-/* Ctrl-C flag set by the console handler. The --tcp loop below polls
- * this each tick so the user can break out of the forever-loop without
- * task-killing the process (which would leave the TCP port bound for
- * a few seconds in TIME_WAIT). Volatile so the loop sees the write. */
+/* Ctrl-C flag set by either of the two break-signal paths below.
+ * The --tcp loop polls this each tick so the user can break out of
+ * the forever-loop without task-killing the process (which would
+ * leave the TCP port in TIME_WAIT for a few seconds). Volatile so
+ * the loop reliably sees the write. */
 static volatile LONG g_ctrlc_seen = 0;
 
+/* Native-Win32 console handler. Fires when the process owns a real
+ * console (cmd.exe, PowerShell, Windows Terminal) and the user
+ * presses Ctrl-C / Ctrl-Break or closes the window. */
 static BOOL WINAPI ctrlc_handler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
         type == CTRL_CLOSE_EVENT) {
         InterlockedExchange(&g_ctrlc_seen, 1);
-        /* Returning TRUE tells Windows we handled it; otherwise the
-         * default handler would call ExitProcess immediately and skip
-         * our shutdown. */
+        /* Returning TRUE tells Windows we handled it; the default
+         * handler would otherwise call ExitProcess immediately and
+         * skip our shutdown. */
         return TRUE;
     }
     return FALSE;
+}
+
+/* POSIX-shaped signal handler. Fires when the process is launched
+ * from an MSYS / Cygwin / Git-Bash shell behind a winpty pseudo-
+ * terminal — those environments deliver Ctrl-C as SIGINT, not as a
+ * console-control event, so the Win32 handler above never sees it. */
+#include <signal.h>
+static void sigint_handler(int sig) {
+    (void)sig;
+    InterlockedExchange(&g_ctrlc_seen, 1);
+    /* Re-arm — the CRT resets to SIG_DFL after delivering once. */
+    signal(SIGINT, sigint_handler);
+}
+
+/* Stdin watcher thread — the last-resort Ctrl-C path. MSYS/Git-Bash
+ * + mintty often deliver Ctrl-C as raw byte 0x03 (ETX) in stdin
+ * rather than as a console-control event or SIGINT. The thread does
+ * blocking 1-byte reads and flips g_ctrlc_seen on 0x03, 'q' / 'Q',
+ * or EOF (terminal closed). This intentionally consumes stdin
+ * bytes — in --tcp mode all VM I/O routes through the TCP
+ * transport, so stealing host stdin is harmless. */
+static DWORD WINAPI stdin_watcher(LPVOID arg) {
+    (void)arg;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    for (;;) {
+        char c;
+        DWORD n = 0;
+        if (!ReadFile(h, &c, 1, &n, NULL) || n == 0) {
+            /* EOF or pipe closed — treat as quit. */
+            InterlockedExchange(&g_ctrlc_seen, 1);
+            return 0;
+        }
+        if (c == 0x03 || c == 'q' || c == 'Q') {
+            InterlockedExchange(&g_ctrlc_seen, 1);
+            return 0;
+        }
+    }
 }
 
 static void check_eq_u8(const char *what, uint8_t got, uint8_t want) {
@@ -712,6 +754,16 @@ int main(int argc, char **argv) {
         printf("Ctrl-C to exit. /td0/demos/{palette,letterbox,sprite}.elf available.\n");
         fflush(stdout);
         SetConsoleCtrlHandler(ctrlc_handler, TRUE);
+        signal(SIGINT,  sigint_handler);
+        signal(SIGTERM, sigint_handler);
+        /* Last-resort stdin watcher — fires on Ctrl-C byte (0x03) or
+         * 'q' from MSYS/Git-Bash terminals where the other two paths
+         * don't reach us. Detached; the process exits when the loop
+         * sees g_ctrlc_seen, so we don't bother joining. */
+        HANDLE wt = CreateThread(NULL, 0, stdin_watcher, NULL, 0, NULL);
+        if (wt) CloseHandle(wt);
+        printf("(also: press q + Enter to quit)\n");
+        fflush(stdout);
         const uint64_t step_ns = 16666667ull;   /* ~60 Hz */
         while (!g_ctrlc_seen) {
             p_step(step_ns);
