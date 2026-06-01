@@ -72,14 +72,21 @@ fi
 step "ROM: $ROM"
 
 # ---- 3. Locate bsnes ---------------------------------------
+# Probe the given dir itself AND the standard from-source layout
+# (<bsnes-plus-checkout>/bsnes/out/) so pointing at a checkout root
+# works -- the source build drops the .exe in bsnes/out/.
 find_bsnes() {
     local dir="$1"
     [[ -z "$dir" ]] && return 1
-    for exe in bsnes.exe bsnes-plus.exe; do
-        if [[ -f "$dir/$exe" ]]; then
-            echo "$dir/$exe"
-            return 0
-        fi
+    for sub in "" "bsnes/out"; do
+        local d
+        if [[ -n "$sub" ]]; then d="$dir/$sub"; else d="$dir"; fi
+        for exe in bsnes.exe bsnes-plus.exe; do
+            if [[ -f "$d/$exe" ]]; then
+                echo "$d/$exe"
+                return 0
+            fi
+        done
     done
     return 1
 }
@@ -88,11 +95,13 @@ BSNES_EXE=""
 BSNES_HOME=""
 
 if [[ -n "$BSNES_DIR" ]]; then
-    BSNES_EXE="$(find_bsnes "$BSNES_DIR")" || die "no bsnes(-plus).exe in $BSNES_DIR"
-    BSNES_HOME="$BSNES_DIR"
+    BSNES_EXE="$(find_bsnes "$BSNES_DIR")" || die "no bsnes(-plus).exe in $BSNES_DIR (also checked bsnes/out)"
 elif [[ -n "${BSNES_HOME:-}" ]]; then
-    BSNES_EXE="$(find_bsnes "$BSNES_HOME")" || die "BSNES_HOME=$BSNES_HOME has no bsnes(-plus).exe"
+    BSNES_EXE="$(find_bsnes "$BSNES_HOME")" || die "BSNES_HOME=$BSNES_HOME has no bsnes(-plus).exe (also checked bsnes/out)"
 else
+    # <repo>/../bsnes-plus matches the "bsnes-plus cloned next to
+    # microgarbage" layout -- John's setup, probably anyone else's
+    # working from the same Source/ directory.
     candidates=(
         "$REPO_ROOT/bsnes-plus"
         "$(dirname "$REPO_ROOT")/bsnes-plus"
@@ -101,18 +110,23 @@ else
     )
     for d in "${candidates[@]}"; do
         if found="$(find_bsnes "$d")"; then
-            BSNES_EXE="$found"; BSNES_HOME="$d"; break
+            BSNES_EXE="$found"; break
         fi
     done
     if [[ -z "$BSNES_EXE" ]]; then
         # Last resort: anything on PATH.
         for exe in bsnes.exe bsnes-plus.exe bsnes bsnes-plus; do
             if onpath="$(command -v "$exe" 2>/dev/null)"; then
-                BSNES_EXE="$onpath"; BSNES_HOME="$(dirname "$onpath")"; break
+                BSNES_EXE="$onpath"; break
             fi
         done
     fi
 fi
+
+# Working dir is where the .exe lives -- bsnes-plus from-source builds
+# load cheats / save-states / config relative to the exe, which is in
+# bsnes/out, NOT the checkout root.
+[[ -n "$BSNES_EXE" ]] && BSNES_HOME="$(dirname "$BSNES_EXE")"
 
 if [[ -z "$BSNES_EXE" ]]; then
     cat >&2 <<EOF
@@ -130,6 +144,26 @@ step "bsnes: $BSNES_EXE"
 # Convert paths to Windows form for the .exe. cygpath does the
 # right thing whether MSYS surfaces them as /c/... or C:\...
 ROM_W="$(cygpath -w "$ROM")"
+
+# Prepend Windows-form Qt-bin to PATH so a from-source bsnes-plus built
+# against MSYS2's Qt5 can find Qt5Widgets.dll, libpng, etc. Without
+# this the detached child process's DLL search misses the MSYS-style
+# PATH entries and bsnes dies with
+# "cannot open shared object file: Qt5Widgets.dll".
+#
+# We probe a few common locations for the actual DLL rather than
+# blindly trusting /mingw64/bin -- under Git Bash /mingw64 resolves
+# to the Git-shipped runtime which doesn't include Qt5, and the user
+# really wants MSYS2's. First hit wins.
+QT_BIN=""
+for d in /mingw64/bin /c/msys64/mingw64/bin /c/msys64/clang64/bin; do
+    if [[ -f "$d/Qt5Widgets.dll" ]]; then QT_BIN="$d"; break; fi
+done
+if [[ -n "$QT_BIN" ]]; then
+    PATH="$(cygpath -w "$QT_BIN");$PATH"
+    step "Qt5 bin: $QT_BIN"
+fi
+
 step "launching..."
 (
     cd "$BSNES_HOME"

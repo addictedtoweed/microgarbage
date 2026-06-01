@@ -61,11 +61,18 @@ if (-not (Test-Path $Rom)) {
 Write-Step "ROM: $Rom"
 
 # ---- 2. Locate bsnes ---------------------------------------
+# Probe the given directory itself AND the standard from-source layout
+# (<bsnes-plus-checkout>/bsnes/out/) so pointing at a checkout root
+# Just Works -- the source build drops the .exe in bsnes/out/.
 function Find-Bsnes($dir) {
     if (-not $dir) { return $null }
-    foreach ($exe in @("bsnes.exe", "bsnes-plus.exe")) {
-        $p = Join-Path $dir $exe
-        if (Test-Path $p) { return $p }
+    $subdirs = @("", "bsnes\out")
+    foreach ($sub in $subdirs) {
+        $d = if ($sub) { Join-Path $dir $sub } else { $dir }
+        foreach ($exe in @("bsnes.exe", "bsnes-plus.exe")) {
+            $p = Join-Path $d $exe
+            if (Test-Path $p) { return $p }
+        }
     }
     return $null
 }
@@ -75,16 +82,17 @@ $BsnesHome = $null
 
 if ($BsnesDir) {
     $BsnesExe = Find-Bsnes $BsnesDir
-    if (-not $BsnesExe) { Die "no bsnes(-plus).exe in $BsnesDir" }
-    $BsnesHome = $BsnesDir
+    if (-not $BsnesExe) { Die "no bsnes(-plus).exe in $BsnesDir (also checked bsnes\out)" }
 }
 elseif ($env:BSNES_HOME) {
     $BsnesExe = Find-Bsnes $env:BSNES_HOME
-    if (-not $BsnesExe) { Die "BSNES_HOME=$($env:BSNES_HOME) has no bsnes(-plus).exe" }
-    $BsnesHome = $env:BSNES_HOME
+    if (-not $BsnesExe) { Die "BSNES_HOME=$($env:BSNES_HOME) has no bsnes(-plus).exe (also checked bsnes\out)" }
 }
 else {
-    # Common locations checked in order.
+    # Common locations checked in order. <repo>\..\bsnes-plus matches
+    # the layout where bsnes-plus is cloned next to microgarbage --
+    # which is John's setup and probably anyone else's working from
+    # the same Source/ directory.
     $candidates = @(
         (Join-Path $RepoRoot "bsnes-plus"),
         (Join-Path (Split-Path -Parent $RepoRoot) "bsnes-plus"),
@@ -93,15 +101,20 @@ else {
     )
     foreach ($d in $candidates) {
         $p = Find-Bsnes $d
-        if ($p) { $BsnesExe = $p; $BsnesHome = $d; break }
+        if ($p) { $BsnesExe = $p; break }
     }
     # Last resort: anything on PATH.
     if (-not $BsnesExe) {
         $onPath = Get-Command "bsnes.exe","bsnes-plus.exe" -ErrorAction SilentlyContinue |
                   Select-Object -First 1
-        if ($onPath) { $BsnesExe = $onPath.Source; $BsnesHome = Split-Path -Parent $onPath.Source }
+        if ($onPath) { $BsnesExe = $onPath.Source }
     }
 }
+
+# Working directory is wherever the .exe actually lives -- bsnes-plus
+# from-source builds load cheats / save-states / config relative to
+# the exe, which is in bsnes\out, NOT the checkout root.
+if ($BsnesExe) { $BsnesHome = Split-Path -Parent $BsnesExe }
 
 if (-not $BsnesExe) {
     Write-Host "" -ForegroundColor Red
@@ -114,6 +127,23 @@ if (-not $BsnesExe) {
 Write-Step "bsnes: $BsnesExe"
 
 # ---- 3. Launch ---------------------------------------------
+# Probe for an MSYS2 Qt5 install and prepend its bin to PATH if found.
+# A from-source bsnes-plus built against MSYS2 Qt links Qt5Widgets.dll
+# dynamically; without the path the .exe fails to launch with
+# "Qt5Widgets.dll: cannot open shared object file." A prebuilt nightly
+# that bundles its DLLs alongside the .exe doesn't need this -- the
+# extra PATH entry is harmless if Qt isn't installed.
+$qtCandidates = @(
+    "C:\msys64\mingw64\bin",
+    "C:\msys64\clang64\bin",
+    "$env:MSYS2_HOME\mingw64\bin"
+) | Where-Object { $_ -and (Test-Path (Join-Path $_ "Qt5Widgets.dll")) }
+if ($qtCandidates) {
+    $qtBin = $qtCandidates[0]
+    $env:PATH = "$qtBin;$env:PATH"
+    Write-Step "Qt5 bin: $qtBin"
+}
+
 # Use Start-Process so bsnes's working dir is its own install (it
 # looks for cheats / save-states / config there). The ROM path stays
 # absolute so the cwd swap is invisible to the load.
