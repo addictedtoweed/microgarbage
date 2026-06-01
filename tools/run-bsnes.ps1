@@ -131,8 +131,17 @@ if ($BsnesHome) {
                         (Get-Item $dstDll).LastWriteTime
         }
         if ($needCopy) {
-            Copy-Item -Force $srcDll $dstDll
-            Write-Step "refreshed $dstDll"
+            try {
+                Copy-Item -Force $srcDll $dstDll -ErrorAction Stop
+                Write-Step "refreshed $dstDll"
+            } catch {
+                # Copy fails when a running bsnes still holds the DLL
+                # (Windows file locking). Loud failure prevents the
+                # user from relaunching against yesterday's DLL.
+                Die "cannot refresh $dstDll -- another bsnes instance still has it loaded? close it and re-run."
+            }
+        } else {
+            Write-Step "mgapi.dll already current"
         }
     }
 }

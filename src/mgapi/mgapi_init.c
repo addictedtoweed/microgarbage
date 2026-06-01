@@ -250,7 +250,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.2 (+ cart reset marshalling)";
+    return "mgapi 1.3 (+ stub-transport, accept greeting, HDMA reset)";
 }
 
 /* ----------------------------------------------------------------

@@ -137,8 +137,16 @@ SRC_DLL="$REPO_ROOT/build/mgapi/mgapi.dll"
 DST_DLL="$BSNES_HOME/mgapi.dll"
 if [[ -f "$SRC_DLL" ]]; then
     if [[ ! -f "$DST_DLL" || "$SRC_DLL" -nt "$DST_DLL" ]]; then
-        cp "$SRC_DLL" "$DST_DLL"
+        # cp will fail if bsnes is still running with the DLL loaded
+        # (Windows holds an exclusive handle). Surface that loudly --
+        # otherwise the user relaunches against yesterday's DLL and the
+        # symptoms look identical to a real bug.
+        if ! cp "$SRC_DLL" "$DST_DLL" 2>/dev/null; then
+            die "cannot refresh $DST_DLL -- another bsnes instance still has it loaded? close it and re-run."
+        fi
         step "refreshed $DST_DLL"
+    else
+        step "mgapi.dll already current"
     fi
 fi
 
