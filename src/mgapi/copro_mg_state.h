@@ -103,6 +103,12 @@ typedef struct {
         uint8_t  dmap;          /* SNES DMAP byte (transfer mode)     */
         uint16_t table_off;     /* offset within cart window           */
     } hdma[7];
+
+    /* Mode 7 matrix + center + wrap mode. Identity defaults so a
+     * call to mg_bg_mode(MG_BG_MODE_7) without explicit set is sane. */
+    int16_t  m7a, m7b, m7c, m7d;   /* 8.8 fixed-point matrix            */
+    int16_t  m7cx, m7cy;           /* 13-bit signed center              */
+    uint8_t  m7sel;                /* wrap / fill / flip                */
 } MgState;
 
 /* -------- Lifecycle -------- */

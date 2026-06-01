@@ -43,6 +43,7 @@ COPRO_INIDISP_HDMA = $7868      ; [read]  16 bytes: HDMA mode-0 table the kernel
                                 ;         then 0x00 terminator.
 COPRO_HDMA_CONFIG  = $7878      ; [read]  7 channels x 8 bytes = 56 bytes. Per slot:
                                 ;         +0 enabled, +1 bbad, +2 dmap, +4..5 table_off
+COPRO_MODE7_BATCH  = $78B0      ; [read]  16 bytes: M7SEL + M7A/B/C/D + M7X/Y
 COPRO_HDMA_TABLES  = $7900      ; [read]  1280 bytes: where game-staged HDMA tables live
 COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
 
@@ -113,6 +114,15 @@ PB_TM           = COPRO_PPU_BATCH + $08
 PB_TS           = COPRO_PPU_BATCH + $09
 PB_MOSAIC       = COPRO_PPU_BATCH + $0A
 PB_SCROLLS      = COPRO_PPU_BATCH + $10  ; 8 16-bit scrolls follow
+
+; --- Mode 7 batch offsets --------------------------------------
+M7B_SEL         = COPRO_MODE7_BATCH + $00
+M7B_A_LO        = COPRO_MODE7_BATCH + $02
+M7B_B_LO        = COPRO_MODE7_BATCH + $04
+M7B_C_LO        = COPRO_MODE7_BATCH + $06
+M7B_D_LO        = COPRO_MODE7_BATCH + $08
+M7B_X_LO        = COPRO_MODE7_BATCH + $0A
+M7B_Y_LO        = COPRO_MODE7_BATCH + $0C
 
 ; --- INIDISP HDMA channel reservation --------------------------
 ; The kernel sets up HDMA channel 7 at boot to read from

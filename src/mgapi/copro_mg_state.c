@@ -111,6 +111,15 @@ void mg_state_reset(void) {
         s_state.hdma[i].dmap      = 0;
         s_state.hdma[i].table_off = 0;
     }
+
+    /* Mode 7 identity matrix + zero center + wrap behavior. */
+    s_state.m7a   = 256;   /* 1.0 in 8.8 */
+    s_state.m7b   = 0;
+    s_state.m7c   = 0;
+    s_state.m7d   = 256;
+    s_state.m7cx  = 0;
+    s_state.m7cy  = 0;
+    s_state.m7sel = 0;
 }
 
 /* HDMA tables bump-allocator. Lives in CW_OFF_HDMA_TABLES..
@@ -399,6 +408,20 @@ void mg_state_build_frame(void) {
 
     /* And the INIDISP HDMA table for the force-blank window. */
     emit_inidisp_table();
+
+    /* Mode 7 batch — always emitted; the kernel always writes the M7
+     * regs but their effect only shows when bgmode == 7. Cheap. */
+    {
+        Mode7Batch m7 = {0};
+        m7.m7sel = s_state.m7sel;
+        m7.m7a   = s_state.m7a;
+        m7.m7b   = s_state.m7b;
+        m7.m7c   = s_state.m7c;
+        m7.m7d   = s_state.m7d;
+        m7.m7x   = s_state.m7cx;
+        m7.m7y   = s_state.m7cy;
+        cart_window_set_mode7_batch(&m7);
+    }
 
     /* HDMA control table for channels 0..6. The kernel walks this 56-
      * byte area at vblank, configures DMAP/BBAD/A1T/A1B for each

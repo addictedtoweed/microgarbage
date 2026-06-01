@@ -89,6 +89,11 @@ void cart_window_set_ppu_batch(const PpuBatch *batch) {
     memcpy(g_window + CW_OFF_PPU_BATCH, batch, CW_PPU_BATCH_BYTES);
 }
 
+void cart_window_set_mode7_batch(const Mode7Batch *batch) {
+    if (!batch) return;
+    memcpy(g_window + CW_OFF_MODE7_BATCH, batch, CW_MODE7_BATCH_BYTES);
+}
+
 void cart_window_post_pads(const uint16_t pads[4]) {
     if (!pads) return;
     g_pads[0] = pads[0];

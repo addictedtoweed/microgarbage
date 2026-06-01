@@ -76,6 +76,24 @@ extern "C" {
 #define CW_HDMA_CFG_BYTES_EACH 8u
 #define CW_HDMA_CONFIG_BYTES   (CW_HDMA_CHANNELS * CW_HDMA_CFG_BYTES_EACH)
 
+/* Mode 7 register batch — 16 bytes the kernel writes to the M7*
+ * registers each vblank when emit_mode7_batch has staged values
+ * here. Layout:
+ *   +0    M7SEL              ($211A — wrap/fill mode)
+ *   +1    _reserved
+ *   +2-3  M7A 16-bit value   ($211B, write-twice byte regs)
+ *   +4-5  M7B                ($211C)
+ *   +6-7  M7C                ($211D)
+ *   +8-9  M7D                ($211E)
+ *   +10-11 M7X               ($211F)
+ *   +12-13 M7Y               ($2120)
+ *   +14-15 _reserved
+ *
+ * Mode 7 scroll reuses BG1HOFS / BG1VOFS in the PPU batch — no
+ * separate fields here. */
+#define CW_OFF_MODE7_BATCH    0x78B0u
+#define CW_MODE7_BATCH_BYTES  16u
+
 /* HDMA tables area — game stages per-scanline tables for channels
  * 0..6 here via mg_hdma_upload_table. The runtime bump-allocates
  * within this 1280-byte slab each frame the same way it does with
@@ -129,6 +147,18 @@ typedef struct {
 _Static_assert(sizeof(PpuBatch) == CW_PPU_BATCH_BYTES,
                "PpuBatch must be exactly 32 bytes — keep in sync with copro.inc");
 
+/* Mode 7 batch struct — see CW_OFF_MODE7_BATCH for layout. */
+typedef struct {
+    uint8_t  m7sel;          /* $211A: bit 7 horizontal flip, bit 6
+                              * vertical flip, bits 1-0 wrap/fill    */
+    uint8_t  _pad0;
+    int16_t  m7a, m7b, m7c, m7d;
+    int16_t  m7x, m7y;
+    uint8_t  _pad1[2];
+} Mode7Batch;
+_Static_assert(sizeof(Mode7Batch) == CW_MODE7_BATCH_BYTES,
+               "Mode7Batch must be exactly 16 bytes — keep in sync with copro.inc");
+
 /* ----------------------------------------------------------------
  *  Lifecycle
  * ---------------------------------------------------------------- */
@@ -167,6 +197,10 @@ void cart_window_set_dma_slot(unsigned index, const CartDmaSlot *slot);
 
 /* Stage the PPU register batch the kernel applies at next vblank. */
 void cart_window_set_ppu_batch(const PpuBatch *batch);
+
+/* Stage the Mode 7 batch (M7SEL + matrix + center) the kernel
+ * applies after the PPU register batch each vblank. */
+void cart_window_set_mode7_batch(const Mode7Batch *batch);
 
 /* Latest joypad snapshot. Word format = SNES auto-joypad
  * ($4218/$4219). The cart-bus side serves these as side-effect

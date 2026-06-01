@@ -35,6 +35,15 @@ CGDATA    = $2122      ; CGRAM data write
 TM        = $212C      ; main-screen layer enable
 TS        = $212D      ; sub-screen layer enable
 
+; --- Mode 7 PPU registers (write-twice 8-bit each) ---
+M7SEL     = $211A      ; wrap / fill / flip
+M7A       = $211B      ; matrix a (16-bit, low then high)
+M7B       = $211C      ; matrix b
+M7C       = $211D      ; matrix c
+M7D       = $211E      ; matrix d
+M7X       = $211F      ; center x (13-bit signed)
+M7Y       = $2120      ; center y
+
 ; --- CPU / DMA ($42xx, $43xx) ---
 NMITIMEN  = $4200      ; b7 NMI enable, b0 auto-joypad read
 JOYSER0   = $4016      ; manual joypad serial port 1 (write latch / read bits)

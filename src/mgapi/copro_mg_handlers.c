@@ -400,8 +400,41 @@ static void h_bg_main_priority(VmCpu *cpu, void *sys_) {
 
 /* Mode 7 + HDMA --------------------------------------------------- */
 
-static void h_mode7_set        (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
-static void h_mode7_wrap       (VmCpu *cpu, void *s) { (void)s; cpu->regs[VM_REG_A0] = MG_R_OK; }
+/* MgMode7Params mirror — matches examples/common/guest/mg_mode7.h. */
+typedef struct {
+    int16_t a, b, c, d;
+    int16_t cx, cy;
+    int16_t hofs, vofs;
+} MgMode7ParamsHost;
+
+static void h_mode7_set(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint32_t pp = cpu->regs[VM_REG_A0];
+    MgMode7ParamsHost p;
+    if (!guest_read(cpu, pp, &p, sizeof(p))) {
+        cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+        return;
+    }
+    MgState *st = mg_state();
+    st->m7a  = p.a;
+    st->m7b  = p.b;
+    st->m7c  = p.c;
+    st->m7d  = p.d;
+    st->m7cx = p.cx;
+    st->m7cy = p.cy;
+    /* Mode 7 scroll routes through the BG1 scroll path — write into
+     * layer 0's hofs/vofs so the existing PPU batch picks them up. */
+    st->bg[0].hofs = p.hofs;
+    st->bg[0].vofs = p.vofs;
+    cpu->regs[VM_REG_A0] = MG_R_OK;
+}
+
+static void h_mode7_wrap(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    /* MgMode7Wrap (0..3) maps directly onto the two M7SEL low bits. */
+    mg_state()->m7sel = (uint8_t)(cpu->regs[VM_REG_A0] & 0x03);
+    cpu->regs[VM_REG_A0] = MG_R_OK;
+}
 
 /* MgHdmaCfg mirror — matches examples/common/guest/mg_hdma.h. */
 typedef struct {

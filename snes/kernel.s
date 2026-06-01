@@ -210,6 +210,44 @@
     lda f:PB_SCROLLS + $0F
     sta BG4VOFS
 
+    ; --- Mode 7 batch ------------------------------------------------
+    ; Written every frame regardless of BGMODE; harmless when bgmode != 7
+    ; and avoids a conditional branch. M7A-D + M7X/Y are write-twice
+    ; 8-bit registers — the PPU latches low byte, then high byte gives
+    ; the 16-bit value.
+    lda f:M7B_SEL
+    sta M7SEL
+
+    lda f:M7B_A_LO + 0
+    sta M7A
+    lda f:M7B_A_LO + 1
+    sta M7A
+
+    lda f:M7B_B_LO + 0
+    sta M7B
+    lda f:M7B_B_LO + 1
+    sta M7B
+
+    lda f:M7B_C_LO + 0
+    sta M7C
+    lda f:M7B_C_LO + 1
+    sta M7C
+
+    lda f:M7B_D_LO + 0
+    sta M7D
+    lda f:M7B_D_LO + 1
+    sta M7D
+
+    lda f:M7B_X_LO + 0
+    sta M7X
+    lda f:M7B_X_LO + 1
+    sta M7X
+
+    lda f:M7B_Y_LO + 0
+    sta M7Y
+    lda f:M7B_Y_LO + 1
+    sta M7Y
+
     ; --- HDMA channels 1..6 setup -------------------------------------
     ; Channel 0 is reserved for the kernel's DMA-list dispatch below.
     ; Channel 7 stays as INIDISP letterbox (set up at boot).
