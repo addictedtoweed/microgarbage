@@ -114,6 +114,27 @@ typedef struct {
     int stdin_fd_override;
     int stdout_fd_override;
     int stderr_fd_override;
+
+    /* When true, register the SYS_READ/WRITE/FFLUSH handlers but
+     * leave g_in_file / g_out_file / g_err_file at NULL. The handlers
+     * still work for VMs that have a per-VM transport bound -- they
+     * check the transport first -- but VMs with no transport see
+     * -EBADF from reads/writes and exit cleanly on their first
+     * stdio call.
+     *
+     * Use this when the embedder routes all guest I/O through a
+     * transport (TCP, UART, etc.) and the host's actual stdin/stdout
+     * are invalid (e.g., a Windows GUI-subsystem .exe LoadLibrary'ing
+     * the runtime: stdin/stdout are typically broken handles whose
+     * read()/fwrite() block or fail silently). Skipping the file
+     * fallback prevents the runtime from falling through to those
+     * handles when a transport isn't bound yet.
+     *
+     * Setting this is equivalent to setting stdin_src / stdout_dest /
+     * stderr_dest all to a hypothetical "NULL FILE*" -- but the
+     * config struct can't express that today (NULL means "use the
+     * process default"), so this flag is the explicit opt-out. */
+    bool no_default_files;
 } VmHostStdioConfig;
 
 /* ============================================================

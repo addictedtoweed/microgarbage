@@ -805,10 +805,24 @@ bool vm_host_install_stdio_ex(VmSystem *sys,
     }
 
     /* Commit streams to module state after registrations succeed
-     * so that a failed install leaves the module state unchanged. */
-    g_in_file  = in;
-    g_out_file = out;
-    g_err_file = err;
+     * so that a failed install leaves the module state unchanged.
+     *
+     * no_default_files leaves the FILE* slots NULL. handle_read /
+     * handle_write check a per-VM transport before looking at
+     * g_in_file / g_out_file, so a VM bound to a TCP transport (or
+     * the stub from tcp_listen.c) routes through that transport just
+     * fine. A VM with no transport bound, in this mode, gets
+     * -EBADF from its first stdio call -- the embedder explicitly
+     * opted out of host stdin/stdout because they aren't valid. */
+    if (cfg && cfg->no_default_files) {
+        g_in_file  = NULL;
+        g_out_file = NULL;
+        g_err_file = NULL;
+    } else {
+        g_in_file  = in;
+        g_out_file = out;
+        g_err_file = err;
+    }
     g_in_fd    = override_in;
     g_out_fd   = override_out;
     g_err_fd   = override_err;

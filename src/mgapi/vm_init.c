@@ -128,22 +128,35 @@ int mgapi_vm_init(void *cart_volume_handle) {
     if (!vm_system_init(&g_sys, &cfg)) return -ENOMEM;
     g_sys_alive = 1;
 
-    /* 3. Install bridges. Stdio installation accepts a NULL config
-     *    to mean "default behavior" (raw-mode off, no per-VM
-     *    override). For stage 3a there's no TCP transport bound;
-     *    stage 4 will hook PuTTY in via vm_host_set_transport_for_vm.
+    /* 3. Install bridges.
+     *
+     *    Stdio handler registration is unconditional -- the SYS_READ /
+     *    WRITE / FFLUSH handlers MUST be present so guests can do
+     *    I/O through whichever transport is bound (TCP from
+     *    tcp_listen.c, future UART on the M7, etc.). What the
+     *    `disable_default_stdio` config flag actually wants is the
+     *    second-order effect: don't fall through to the host's
+     *    stdin/stdout when no transport is bound. We thread that
+     *    through as VmHostStdioConfig.no_default_files so the
+     *    handlers stay live but g_in_file/g_out_file stay NULL.
+     *
+     *    Background: a Windows GUI-subsystem .exe (bsnes-plus)
+     *    LoadLibrary'ing mgapi.dll inherits stdin/stdout handles
+     *    that are typically broken -- fwrite either blocks or fails
+     *    silently in a way that wedges subsequent reads. Falling
+     *    through to those handles would make the shell unrecoverable
+     *    in that embedding, even though every guest I/O call would
+     *    route correctly through TCP once a client connected. The
+     *    no_default_files path is the explicit opt-out.
      *
      *    The fs install is what makes /td0/, /cart/, and /host/
      *    visible to guests AND enables SYS_SPAWN_AND_WAIT (the
      *    shell's `run <path>` command). */
-    if (!g_disable_default_stdio) {
+    {
         VmHostStdioConfig sio = {0};
+        sio.no_default_files = g_disable_default_stdio ? true : false;
         if (!vm_host_install_stdio_ex(&g_sys, &sio)) goto fail_sys;
     }
-    /* When disable_default_stdio is set the shell's sys_read returns
-     * EOF immediately (no transport bound), so the shell exits
-     * cleanly on its first read. TCP transport binding (stage 4)
-     * still works because it's per-VM, not the default. */
     if (!vm_host_install_fs(&g_sys)) goto fail_sys;
 
     /* Stage 3b: SYS_COPRO_* ecalls so guests can drive the cart window. */
