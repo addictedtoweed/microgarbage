@@ -128,6 +128,20 @@ fi
 # bsnes/out, NOT the checkout root.
 [[ -n "$BSNES_EXE" ]] && BSNES_HOME="$(dirname "$BSNES_EXE")"
 
+# Refresh mgapi.dll into bsnes-out if the build copy is newer. The
+# bsnes-plus cart class LoadLibrary's mgapi.dll from alongside
+# bsnes.exe; without this step, every rebuild needs a manual copy or
+# bsnes runs against yesterday's DLL and the symptoms look bizarre
+# (PuTTY silent, no shell, mgapi banner from the wrong version).
+SRC_DLL="$REPO_ROOT/build/mgapi/mgapi.dll"
+DST_DLL="$BSNES_HOME/mgapi.dll"
+if [[ -f "$SRC_DLL" ]]; then
+    if [[ ! -f "$DST_DLL" || "$SRC_DLL" -nt "$DST_DLL" ]]; then
+        cp "$SRC_DLL" "$DST_DLL"
+        step "refreshed $DST_DLL"
+    fi
+fi
+
 if [[ -z "$BSNES_EXE" ]]; then
     cat >&2 <<EOF
 

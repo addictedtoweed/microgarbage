@@ -116,6 +116,27 @@ else {
 # the exe, which is in bsnes\out, NOT the checkout root.
 if ($BsnesExe) { $BsnesHome = Split-Path -Parent $BsnesExe }
 
+# Refresh mgapi.dll into bsnes-out if the build copy is newer. The
+# bsnes-plus cart class LoadLibrary's mgapi.dll from alongside
+# bsnes.exe; without this step, every rebuild needs a manual copy or
+# bsnes runs against the previous build's DLL and the symptoms look
+# bizarre (PuTTY silent, no shell, mgapi banner from the wrong version).
+if ($BsnesHome) {
+    $srcDll = Join-Path $RepoRoot "build\mgapi\mgapi.dll"
+    $dstDll = Join-Path $BsnesHome "mgapi.dll"
+    if (Test-Path $srcDll) {
+        $needCopy = -not (Test-Path $dstDll)
+        if (-not $needCopy) {
+            $needCopy = (Get-Item $srcDll).LastWriteTime -gt
+                        (Get-Item $dstDll).LastWriteTime
+        }
+        if ($needCopy) {
+            Copy-Item -Force $srcDll $dstDll
+            Write-Step "refreshed $dstDll"
+        }
+    }
+}
+
 if (-not $BsnesExe) {
     Write-Host "" -ForegroundColor Red
     Write-Host "run-bsnes: couldn't find bsnes(-plus).exe." -ForegroundColor Red

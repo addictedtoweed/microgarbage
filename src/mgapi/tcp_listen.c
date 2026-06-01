@@ -251,6 +251,35 @@ static bool try_accept(void) {
  *  Public API
  * ---------------------------------------------------------------- */
 
+/* Pre-bound stub transport. Bound to the shell BEFORE any PuTTY
+ * client connects, so the shell's sys_read returns 0 ("no data, try
+ * later") instead of falling through to host stdio's read() -- which
+ * blocks the entire process on Windows when stdin is a winpty pty
+ * (the case in MSYS / Git-Bash / mintty). Blocked process means the
+ * cooperative VM scheduler stalls, which means mgapi_tcp_listen_poll
+ * never runs accept() and the user's PuTTY connection sits in the
+ * OS's listen queue forever.
+ *
+ * The stub leaves write/flush NULL so handle_write / handle_fflush
+ * fall through to host stdout -- pre-connect banner output ends up
+ * in the bsnes/host terminal where the embedder can still see it.
+ * When try_accept fires for a real PuTTY connection,
+ * vm_host_set_transport_for_vm replaces this stub with the real
+ * TCP transport. */
+static int stub_t_read(VmHostTransport *t, void *buf, unsigned cap) {
+    (void)t; (void)buf; (void)cap;
+    return 0;   /* always "no data" -- shell sleeps + retries */
+}
+static VmHostTransport g_stub_transport = {
+    .read_nonblock = stub_t_read,
+    .write         = NULL,
+    .flush         = NULL,
+    .set_raw       = NULL,
+    .close         = NULL,
+    .is_terminal   = true,
+    .ctx           = NULL,
+};
+
 int mgapi_tcp_listen_init(uint16_t port, uint16_t shell_vm_id) {
     if (g_initialized) return 0;
 
@@ -267,6 +296,12 @@ int mgapi_tcp_listen_init(uint16_t port, uint16_t shell_vm_id) {
     g_transport.close         = tcp_t_close;
     g_transport.is_terminal   = true;
     g_transport.ctx           = &g_ctx;
+
+    /* Bind the stub so the shell's first sys_read doesn't fall
+     * through to a blocking host-stdin read. Replaced by g_transport
+     * on the first PuTTY accept; if PuTTY later disconnects,
+     * tcp_t_read goes idle (returns 0) which behaves identically. */
+    vm_host_set_transport_for_vm(shell_vm_id, &g_stub_transport);
 
     g_initialized = 1;
     fprintf(stderr, "mgapi: listening on TCP :%u for shell vm %u\n",

@@ -390,6 +390,26 @@ void mg_state_build_frame(void) {
     /* Reset per-frame bookkeeping. */
     s_payload_used = 0;
     s_slot_used    = 0;
+    /* HDMA-tables pool is also reset per-frame. The contract on the
+     * comment above ("HDMA tables stay across frames unless re-
+     * uploaded") meant that the BYTES at a given offset persist, but
+     * without resetting the bump pointer the pool fills up after
+     * three frames and dynamic HDMA (per-frame matrix re-upload, the
+     * Mode 7 perspective case) panics with MG_R_ERR_DMA_BYTES.
+     *
+     * Resetting per-frame means the next round of upload calls start
+     * from offset 0 and overwrite the previous frame's bytes -- which
+     * is exactly what dynamic-HDMA games want. Static HDMA still
+     * works the same way: the game just re-uploads the identical
+     * table every frame; cheap, since the bytes flow through the
+     * cart-window payload only (no SNES-side DMA per upload).
+     *
+     * The kernel's HDMA-config descriptors carry table_off per
+     * channel and stay stable until mg_hdma_setup is called again,
+     * so consistent per-channel offset (which mg_hdma_upload_table
+     * gives you naturally for consistent call order) keeps each
+     * channel pointing at its own slice across frames. */
+    s_hdma_tables_used = 0;
 
     /* Clear ONLY the slot indices mg_* used last frame. Slots beyond
      * that are left alone so guests that mix SYS_COPRO_STAGE_DMA_SLOT
