@@ -302,6 +302,18 @@ static void mgapi_diag_periodic(uint64_t elapsed_ns) {
                 "  slot[%d]: bbus=$%02X dmap=$%02X src=$%04X size=%u prep=$%04X\n",
                 s, bbus, dmap, src, sz, prep);
     }
+    /* INIDISP HDMA table at $7868. Expected for fullscreen (no
+     * force-blank) with our emit_inidisp_table generator:
+     *     FF 0F E1 0F 00 ...      (5 bytes: 127 lines + 97 lines)
+     * If the data byte after a count byte is $80, force-blank is
+     * being written per scanline -> screen blanks. If the table
+     * looks truncated (00 too early) HDMA stops and INIDISP keeps
+     * whatever value it had before, which boot.s set to $0F. */
+    fprintf(stderr, "  inidisp_tbl: ");
+    for (int i = 0; i < 16; i++) {
+        fprintf(stderr, "%02X ", mgapi_cart_read(0xC07868 + i));
+    }
+    fprintf(stderr, "\n");
     fflush(stderr);
 }
 
