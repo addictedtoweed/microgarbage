@@ -544,10 +544,13 @@ void mg_state_build_frame(void) {
             s_bg_emit_logged[i] = true;
             fprintf(stderr,
                     "mgapi: FIRST BG%u tilemap emit -- lo=%u hi=%u "
-                    "tilemap_word=$%04X (size=%u bytes)\n",
+                    "tilemap_word=$%04X size=%u "
+                    "[before stage: slot=%u payload_off=%u]\n",
                     i + 1, (unsigned)bg->dirty_lo, (unsigned)bg->dirty_hi,
                     (unsigned)bg->tilemap_word,
-                    (unsigned)(bg->dirty_hi - bg->dirty_lo));
+                    (unsigned)(bg->dirty_hi - bg->dirty_lo),
+                    (unsigned)s_slot_used,
+                    (unsigned)s_payload_used);
             fflush(stderr);
         }
         uint16_t lo = bg->dirty_lo;
