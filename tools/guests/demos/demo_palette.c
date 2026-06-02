@@ -60,13 +60,16 @@ static void rainbow(uint8_t phase, uint8_t *r, uint8_t *g, uint8_t *b) {
 }
 
 void _start(void) {
-    /* Mode 1; BG1 tilemap at VRAM word $0000, CHR at $0800. */
+    /* Mode 1; BG1 tilemap at VRAM word $0000, CHR at $1000.
+     * BG1 CHR base is set via BG12NBA low nibble x $1000 -- only
+     * $0000/$1000/$2000/.../$7000 are representable. $1000 is the
+     * first $1000-aligned address past the 32x32 tilemap. */
     mg_bg_mode(MG_BG_MODE_1);
-    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x0800);
+    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x1000);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
 
-    /* Upload our one solid-color tile to VRAM word $0800. */
-    MG_OR_PANIC(mg_chr_upload(0x0800, SOLID_CHR, sizeof SOLID_CHR));
+    /* Upload our one solid-color tile to VRAM word $1000. */
+    MG_OR_PANIC(mg_chr_upload(0x1000, SOLID_CHR, sizeof SOLID_CHR));
 
     /* Fill the 32×32 tilemap with tile 0 (the one we just uploaded).
      * mg_bg_blit takes a contiguous cells array and wraps row-major

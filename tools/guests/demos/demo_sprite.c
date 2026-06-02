@@ -49,7 +49,7 @@ void _start(void) {
      * We still enable BG1 with an empty tilemap so the PPU's main
      * screen isn't completely dead (some emulators get unhappy). */
     mg_bg_mode(MG_BG_MODE_1);
-    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x0800);
+    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x1000);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
 
     /* OBSEL: pick 8×8 / 16×16 size pair; CHR bases at VRAM word

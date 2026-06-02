@@ -41,10 +41,10 @@ static const uint8_t PRESETS[3][2] = {
 
 void _start(void) {
     mg_bg_mode(MG_BG_MODE_1);
-    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x0800);
+    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x1000);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
 
-    MG_OR_PANIC(mg_chr_upload(0x0800, SOLID_CHR, sizeof SOLID_CHR));
+    MG_OR_PANIC(mg_chr_upload(0x1000, SOLID_CHR, sizeof SOLID_CHR));
 
     static MgBgTile tmap[32 * 32];
     for (int i = 0; i < 32 * 32; i++) tmap[i].word = 0;
