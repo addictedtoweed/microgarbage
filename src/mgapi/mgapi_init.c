@@ -337,7 +337,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.7 (+ cart-bus diag heartbeat)";
+    return "mgapi 1.8 (+ kernel reads cart bank $C0 + safe BRK)";
 }
 
 /* ----------------------------------------------------------------

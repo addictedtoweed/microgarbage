@@ -54,7 +54,7 @@
     stz BBAD7               ; INIDISP low byte = $00 ($2100)
     rep #$20
     .a16
-    lda #COPRO_INIDISP_HDMA
+    lda #.loword(COPRO_INIDISP_HDMA)
     sta A1T7L
     sep #$20
     .a8

@@ -33,19 +33,21 @@
 COPRO_BANK      = $C0           ; HiROM full-window bank
 
 COPRO_DATA      = $0000         ; per-frame PPU payload the SNES DMAs (copro-laid)
-COPRO_FRAME_RDY = $7800         ; [read]  1 byte: 0 = skip this frame, else process the list
-COPRO_DMA_LIST  = $7808         ; [read]  8 slots * 8 bytes = $7808-$7847 (see below)
-COPRO_PPU_BATCH = $7848         ; [read]  32 bytes: PPU register batch the kernel writes
-                                ;         to PPU regs at the top of each vblank (see below)
-COPRO_INIDISP_HDMA = $7868      ; [read]  16 bytes: HDMA mode-0 table the kernel reserves
-                                ;         channel 7 for, INIDISP toggle for letterbox
-                                ;         force-blank. Format: [0x80|N][value] segments
-                                ;         then 0x00 terminator.
-COPRO_HDMA_CONFIG  = $7878      ; [read]  7 channels x 8 bytes = 56 bytes. Per slot:
-                                ;         +0 enabled, +1 bbad, +2 dmap, +4..5 table_off
-COPRO_MODE7_BATCH  = $78B0      ; [read]  16 bytes: M7SEL + M7A/B/C/D + M7X/Y
-COPRO_HDMA_TABLES  = $7900      ; [read]  1280 bytes: where game-staged HDMA tables live
-COPRO_STATUS    = $7F00         ; [read]  handshake status byte (copro -> SNES)
+; All of the copro-served addresses below are EXPLICITLY 24-bit
+; (bank $C0 + offset), so any `lda f:<sym>` in kernel.s reads from
+; the cart window. Previously these were 16-bit and ca65 silently
+; zero-extended to bank $00 (open bus) -- which made every PPU
+; register batch + HDMA config + DMA list read in the NMI handler
+; return garbage, and the screen stayed black even with the kernel
+; running and the demo committing frames.
+COPRO_FRAME_RDY = (COPRO_BANK << 16) | $7800
+COPRO_DMA_LIST  = (COPRO_BANK << 16) | $7808
+COPRO_PPU_BATCH = (COPRO_BANK << 16) | $7848
+COPRO_INIDISP_HDMA = (COPRO_BANK << 16) | $7868
+COPRO_HDMA_CONFIG  = (COPRO_BANK << 16) | $7878
+COPRO_MODE7_BATCH  = (COPRO_BANK << 16) | $78B0
+COPRO_HDMA_TABLES  = (COPRO_BANK << 16) | $7900
+COPRO_STATUS    = (COPRO_BANK << 16) | $7F00
 
 ; --- per-frame DMA dispatch ------------------------------------------
 ; The kernel checks COPRO_FRAME_RDY in NMI; 0 means the copro is mid-stage
@@ -102,27 +104,34 @@ COPRO_PPU_BATCH_L = (COPRO_BANK << 16) | COPRO_PPU_BATCH
 ; Single-byte regs in the first 16 bytes, write-twice 16-bit scrolls
 ; in the last 16. Matches PpuBatch in src/mgapi/cart_window.h — keep
 ; both in sync.
-PB_BGMODE       = COPRO_PPU_BATCH + $00
-PB_OBSEL        = COPRO_PPU_BATCH + $01
-PB_BG1SC        = COPRO_PPU_BATCH + $02
-PB_BG2SC        = COPRO_PPU_BATCH + $03
-PB_BG3SC        = COPRO_PPU_BATCH + $04
-PB_BG4SC        = COPRO_PPU_BATCH + $05
-PB_BG12NBA      = COPRO_PPU_BATCH + $06
-PB_BG34NBA      = COPRO_PPU_BATCH + $07
-PB_TM           = COPRO_PPU_BATCH + $08
-PB_TS           = COPRO_PPU_BATCH + $09
-PB_MOSAIC       = COPRO_PPU_BATCH + $0A
-PB_SCROLLS      = COPRO_PPU_BATCH + $10  ; 8 16-bit scrolls follow
+;
+; The PB_* symbols carry the full 24-bit (bank $C0) address so that
+; `lda f:PB_*` from kernel.s reads from $C0:$78xx (the cart window
+; the copro stages) instead of $00:$78xx (open bus in bank zero,
+; which previously returned garbage and made every PPU register
+; write a no-op).
+PB_BGMODE       = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $00)
+PB_OBSEL        = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $01)
+PB_BG1SC        = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $02)
+PB_BG2SC        = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $03)
+PB_BG3SC        = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $04)
+PB_BG4SC        = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $05)
+PB_BG12NBA      = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $06)
+PB_BG34NBA      = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $07)
+PB_TM           = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $08)
+PB_TS           = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $09)
+PB_MOSAIC       = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $0A)
+PB_SCROLLS      = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $10)
 
 ; --- Mode 7 batch offsets --------------------------------------
-M7B_SEL         = COPRO_MODE7_BATCH + $00
-M7B_A_LO        = COPRO_MODE7_BATCH + $02
-M7B_B_LO        = COPRO_MODE7_BATCH + $04
-M7B_C_LO        = COPRO_MODE7_BATCH + $06
-M7B_D_LO        = COPRO_MODE7_BATCH + $08
-M7B_X_LO        = COPRO_MODE7_BATCH + $0A
-M7B_Y_LO        = COPRO_MODE7_BATCH + $0C
+; Same bank-prefix story as PB_*.
+M7B_SEL         = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $00)
+M7B_A_LO        = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $02)
+M7B_B_LO        = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $04)
+M7B_C_LO        = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $06)
+M7B_D_LO        = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $08)
+M7B_X_LO        = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $0A)
+M7B_Y_LO        = (COPRO_BANK << 16) | (COPRO_MODE7_BATCH + $0C)
 
 ; --- INIDISP HDMA channel reservation --------------------------
 ; The kernel sets up HDMA channel 7 at boot to read from

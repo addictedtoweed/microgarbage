@@ -80,6 +80,13 @@ nmi_trampoline:
     jmp (RAMVEC_NMI)
 irq_trampoline:
     jmp (RAMVEC_IRQ)
+; Safety net: a stray BRK (= opcode $00) shouldn't trap the CPU in
+; an infinite "BRK -> BRK vector points to $0000 -> read $00 -> BRK"
+; loop the way it used to. Pointing the BRK vector here gets us a
+; clean RTI back to whatever was executing, so the kernel survives a
+; transient and we can see what's on the PPU.
+brk_trampoline:
+    rti
 
 ; ------------------------------------------------------------------
 ; Minimal SNES header ($FFC0-$FFDF) — lets stock bsnes detect/load this
@@ -103,7 +110,7 @@ irq_trampoline:
 ; ------------------------------------------------------------------
 .segment "VECTORS"
     .word $0000             ; FFE4 COP   (native)
-    .word $0000             ; FFE6 BRK
+    .word brk_trampoline    ; FFE6 BRK -- "just RTI", see TRAMP segment
     .word $0000             ; FFE8 ABORT
     .word nmi_trampoline    ; FFEA NMI
     .word $0000             ; FFEC (reserved)
