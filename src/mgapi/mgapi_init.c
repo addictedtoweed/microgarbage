@@ -63,9 +63,28 @@ int mgapi_init(const MgapiConfig *cfg) {
 
     cart_window_init();
 
+    /* Pick the effective ROM selection. The embedder's cfg.rom_select
+     * is the default, but $MGAPI_ROM_SELECT overrides it -- handy when
+     * the embedder (e.g. the bsnes-plus cart class) was compiled with
+     * one value and the user wants a different one without rebuilding
+     * the host. Accepts "smoke" / "boot" / "none"; anything else is
+     * ignored and we fall through to the embedder's value. */
+    uint8_t rom_select = cfg->rom_select;
+    {
+        const char *env = getenv("MGAPI_ROM_SELECT");
+        if (env) {
+            if      (strcmp(env, "smoke") == 0) rom_select = MGAPI_ROM_SMOKE;
+            else if (strcmp(env, "boot")  == 0) rom_select = MGAPI_ROM_BOOT;
+            else if (strcmp(env, "none")  == 0) rom_select = MGAPI_ROM_NONE;
+            fprintf(stderr, "mgapi: MGAPI_ROM_SELECT=%s -> rom_select=%u\n",
+                    env, (unsigned)rom_select);
+            fflush(stderr);
+        }
+    }
+
     /* Remember the ROM selection so reset_begin can re-stage from the
      * same source on warm reset. Also resolve hold_ms (0 = default). */
-    g_rom_select    = cfg->rom_select;
+    g_rom_select    = rom_select;
     g_reset_hold_ms = cfg->reset.hold_ms ? cfg->reset.hold_ms : 50u;
 
     /* Auto-load the chosen ROM image into the cart window. See
@@ -75,9 +94,9 @@ int mgapi_init(const MgapiConfig *cfg) {
     extern const size_t        smoke_rom_len;
     extern const unsigned char boot_rom[];
     extern const size_t        boot_rom_len;
-    if (cfg->rom_select == MGAPI_ROM_SMOKE && smoke_rom_len > 0) {
+    if (rom_select == MGAPI_ROM_SMOKE && smoke_rom_len > 0) {
         cart_window_load_blob(0, smoke_rom, (uint32_t)smoke_rom_len);
-    } else if (cfg->rom_select == MGAPI_ROM_BOOT && boot_rom_len > 0) {
+    } else if (rom_select == MGAPI_ROM_BOOT && boot_rom_len > 0) {
         cart_window_load_blob(0, boot_rom, (uint32_t)boot_rom_len);
     }
     /* MGAPI_ROM_NONE: leave the window zero — caller will stage. */
@@ -250,7 +269,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.4 (+ stdio handlers always-on, no_default_files flag)";
+    return "mgapi 1.5 (+ $MGAPI_ROM_SELECT env override)";
 }
 
 /* ----------------------------------------------------------------

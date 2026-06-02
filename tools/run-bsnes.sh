@@ -8,10 +8,10 @@
 #  conventions and let CMD-style argv pass through.
 #
 #  Usage:
-#    ./tools/run-bsnes.sh                       # smoke ROM, search
-#    ./tools/run-bsnes.sh --bsnes-dir /c/bsnes  # explicit location
-#    ./tools/run-bsnes.sh --boot                # load snes_boot.bin
-#    ./tools/run-bsnes.sh --rom path/to.sfc     # arbitrary ROM
+#    ./tools/run-bsnes.sh                       # boot kernel (demos via PuTTY)
+#    ./tools/run-bsnes.sh --smoke               # legacy 65816 SELECT DEMO menu
+#    ./tools/run-bsnes.sh --bsnes-dir /c/bsnes  # explicit bsnes-plus location
+#    ./tools/run-bsnes.sh --rom path/to.sfc     # arbitrary ROM file
 #    ./tools/run-bsnes.sh --no-build            # skip snes/build.ps1
 #
 #  Resolution order for bsnes (first match wins):
@@ -35,13 +35,14 @@ step "repo: $REPO_ROOT"
 # ---- 1. Parse args ------------------------------------------
 BSNES_DIR=""
 ROM=""
-BOOT=0
+SMOKE=0
 NO_BUILD=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bsnes-dir) BSNES_DIR="$2"; shift 2 ;;
         --rom)       ROM="$2";       shift 2 ;;
-        --boot)      BOOT=1;         shift   ;;
+        --smoke)     SMOKE=1;        shift   ;;
+        --boot)      SMOKE=0;        shift   ;;  # backward-compat alias for the default
         --no-build)  NO_BUILD=1;     shift   ;;
         -h|--help)
             sed -n '3,18p' "$0"; exit 0 ;;
@@ -49,24 +50,34 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Default mgapi rom_select to "boot" (the runtime kernel that picks up
+# the cart-window staging from running demos). --smoke flips to the
+# self-contained 65816 SELECT DEMO menu for legacy bring-up tests.
+# Both are honored by mgapi.dll via $MGAPI_ROM_SELECT, regardless of
+# whatever cfg.rom_select the bsnes mapper was compiled with.
+if (( SMOKE )); then
+    export MGAPI_ROM_SELECT="smoke"
+else
+    export MGAPI_ROM_SELECT="boot"
+fi
+step "MGAPI_ROM_SELECT=$MGAPI_ROM_SELECT"
+
 # ---- 2. Pick the ROM ----------------------------------------
+# Note: the actual cart-bus content is served by mgapi.dll from its
+# embedded smoke_rom[] or boot_rom[] arrays (driven by MGAPI_ROM_SELECT
+# above), so the file passed here is essentially a trigger for bsnes
+# to invoke the mgapi cart class. snes_smoke.sfc is what bsnes
+# reliably recognizes as a SNES ROM, so we keep using that.
 if [[ -z "$ROM" ]]; then
-    if (( BOOT )); then ROM="$REPO_ROOT/snes/build/snes_boot.bin"
-    else                ROM="$REPO_ROOT/snes/build/snes_smoke.sfc"
-    fi
+    ROM="$REPO_ROOT/snes/build/snes_smoke.sfc"
 fi
 if [[ ! -f "$ROM" ]]; then
     if (( NO_BUILD )); then
         die "ROM not found: $ROM (and --no-build was set)"
     fi
-    step "ROM missing; running snes/build.ps1 to produce it..."
-    if (( BOOT )); then
-        powershell.exe -NoProfile -ExecutionPolicy Bypass \
-            -File "$(cygpath -w "$REPO_ROOT/snes/build.ps1")"
-    else
-        powershell.exe -NoProfile -ExecutionPolicy Bypass \
-            -File "$(cygpath -w "$REPO_ROOT/snes/build.ps1")" -Smoke
-    fi
+    step "ROM missing; running snes/build.ps1 -Smoke to produce it..."
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+        -File "$(cygpath -w "$REPO_ROOT/snes/build.ps1")" -Smoke
     [[ -f "$ROM" ]] || die "snes/build.ps1 ran but $ROM still missing"
 fi
 step "ROM: $ROM"

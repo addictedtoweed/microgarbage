@@ -1,17 +1,17 @@
 # ============================================================
 #  run-bsnes.ps1 -- start bsnes-plus on a microgarbage SNES ROM.
 #
-#  Defaults to snes_smoke.sfc -- the self-contained 65816 menu that
-#  boots in any SNES emulator. -Boot flag points at snes_boot.bin
-#  instead (only useful once the mgapi.dll cart mapper is wired
-#  into the bsnes-plus build -- until then the boot blob is just
-#  the cart-window image and won't run on its own).
+#  Defaults to the runtime-kernel ROM (boot.s + kernel.s) -- the SNES
+#  side that picks up cart-window staging from demos launched via the
+#  PuTTY shell on TCP :2323. -Smoke selects the self-contained 65816
+#  SELECT DEMO menu instead (legacy bring-up; cart-window staging
+#  ignored).
 #
 #  Usage:
-#    .\tools\run-bsnes.ps1                       # smoke ROM, search PATH
+#    .\tools\run-bsnes.ps1                       # boot kernel (demos via PuTTY)
+#    .\tools\run-bsnes.ps1 -Smoke                # legacy 65816 SELECT DEMO menu
 #    .\tools\run-bsnes.ps1 -BsnesDir C:\bsnes    # explicit bsnes location
-#    .\tools\run-bsnes.ps1 -Boot                 # load snes_boot.bin
-#    .\tools\run-bsnes.ps1 -Rom path\to\rom.sfc  # arbitrary ROM
+#    .\tools\run-bsnes.ps1 -Rom path\to\rom.sfc  # arbitrary ROM file
 #    .\tools\run-bsnes.ps1 -NoBuild              # skip the snes\build.ps1 step
 #
 #  Resolution order for bsnes:
@@ -29,9 +29,18 @@
 param(
     [string]$BsnesDir,
     [string]$Rom,
-    [switch]$Boot,
+    [switch]$Smoke,
+    [switch]$Boot,    # backward-compat alias for the (now default) boot flow
     [switch]$NoBuild
 )
+
+# Default mgapi rom_select to "boot" (the runtime kernel that picks up
+# cart-window staging from PuTTY-launched demos). -Smoke flips to the
+# self-contained 65816 SELECT DEMO menu for legacy bring-up tests.
+# Either way, mgapi.dll honors $env:MGAPI_ROM_SELECT regardless of
+# whatever cfg.rom_select the bsnes mapper was compiled with.
+if ($Smoke) { $env:MGAPI_ROM_SELECT = "smoke" }
+else        { $env:MGAPI_ROM_SELECT = "boot"  }
 
 $ErrorActionPreference = "Stop"
 
@@ -42,19 +51,24 @@ function Die($msg) { Write-Host "run-bsnes: ERROR -- $msg" -ForegroundColor Red;
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Write-Step "repo: $RepoRoot"
 
-# ---- 1. Pick the ROM ----------------------------------------
+Write-Step "MGAPI_ROM_SELECT=$($env:MGAPI_ROM_SELECT)"
+
+# ---- 1. Pick the ROM file ------------------------------------
+# The cart-bus content is served by mgapi.dll from its embedded
+# smoke_rom[] or boot_rom[] arrays (driven by MGAPI_ROM_SELECT above),
+# so the file passed here is mostly a trigger for bsnes to invoke
+# the mgapi cart class. snes_smoke.sfc is what bsnes reliably
+# recognizes as a SNES ROM, so we keep using that.
 if (-not $Rom) {
-    $romName = if ($Boot) { "snes_boot.bin" } else { "snes_smoke.sfc" }
-    $Rom = Join-Path $RepoRoot "snes\build\$romName"
+    $Rom = Join-Path $RepoRoot "snes\build\snes_smoke.sfc"
 }
 if (-not (Test-Path $Rom)) {
     if ($NoBuild) {
         Die "ROM not found: $Rom  (and -NoBuild was set)"
     }
-    Write-Step "ROM missing; running snes\build.ps1 to produce it..."
+    Write-Step "ROM missing; running snes\build.ps1 -Smoke to produce it..."
     $snesBuild = Join-Path $RepoRoot "snes\build.ps1"
-    if ($Boot) { & $snesBuild }
-    else       { & $snesBuild -Smoke }
+    & $snesBuild -Smoke
     if ($LASTEXITCODE -ne 0) { Die "snes\build.ps1 failed" }
     if (-not (Test-Path $Rom)) { Die "snes\build.ps1 ran but $Rom still missing" }
 }
