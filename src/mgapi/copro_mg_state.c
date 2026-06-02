@@ -42,10 +42,16 @@
 /* The singleton state. */
 static MgState s_state;
 
-/* Frame-time bump pointer + DMA slot count. Reset at the start of
- * mg_state_build_frame. */
+/* Bump pointer + DMA slot count for the cart-window payload + DMA
+ * list. The "checkpoint" pair is what build_frame resets to instead
+ * of zero -- mg_chr_upload (and any other "persistent" stage that
+ * uploads bytes once and expects them to survive across frames)
+ * advances the checkpoint so its bytes + slot don't get overwritten
+ * by the shadow-state emissions on the next commit. */
 static uint32_t s_payload_used;
 static unsigned s_slot_used;
+static uint32_t s_payload_checkpoint;   /* persistent direct staging end */
+static unsigned s_slot_checkpoint;      /* persistent direct slot count  */
 
 /* How many slots mg_state's shadow walker populated last frame. The
  * build_frame walker clears EXACTLY this many slots at the start of
@@ -120,6 +126,14 @@ void mg_state_reset(void) {
     s_state.m7cx  = 0;
     s_state.m7cy  = 0;
     s_state.m7sel = 0;
+
+    /* Persistent-staging checkpoint -- starts at zero so the first
+     * mg_chr_upload (or similar) allocates from payload offset 0.
+     * Each direct stage advances it; build_frame rewinds to here
+     * instead of zero so persistent uploads survive. Reset on VM
+     * unload / new game spawn so the next demo starts clean. */
+    s_payload_checkpoint = 0;
+    s_slot_checkpoint    = 0;
 }
 
 /* HDMA tables bump-allocator. Lives in CW_OFF_HDMA_TABLES..
@@ -248,6 +262,12 @@ int mg_state_queue_dma(const void *src, uint32_t size,
         return -2;                    /* MG_ERR_DMA_BYTES */
     }
     if (!stage_dma(src, size, bbus, dmap, prep)) return -1;
+    /* Advance the persistent checkpoint -- this is a "direct" upload
+     * (mg_chr_upload, etc.) that the guest expects to survive across
+     * frames. build_frame's reset rewinds to here instead of zero so
+     * the bytes + slot stay intact. */
+    s_payload_checkpoint = s_payload_used;
+    s_slot_checkpoint    = s_slot_used;
     return 0;
 }
 
@@ -387,9 +407,22 @@ static void emit_inidisp_table(void) {
 }
 
 void mg_state_build_frame(void) {
-    /* Reset per-frame bookkeeping. */
-    s_payload_used = 0;
-    s_slot_used    = 0;
+    /* Reset per-frame bookkeeping. We rewind to the persistent
+     * checkpoint (set by mg_chr_upload and other direct-stage paths),
+     * not to zero, so any persistent uploads from before this commit
+     * survive the rebuild. Shadow emissions below allocate from the
+     * checkpoint onward, leaving the persistent bytes + slot 0..N-1
+     * untouched.
+     *
+     * Without this rewind to checkpoint, a demo that calls
+     * mg_chr_upload once at startup loses its CHR bytes on the very
+     * next mg_frame_commit -- the CGRAM / tilemap shadow walker
+     * overwrites payload offset 0 (CHR's bytes) and slot 0 (CHR's
+     * descriptor). The kernel then DMAs garbage into VRAM and BG1
+     * renders empty tiles -- the bug behind John's "still blank"
+     * screen even when dma=1 in the diag heartbeat. */
+    s_payload_used = s_payload_checkpoint;
+    s_slot_used    = s_slot_checkpoint;
     /* HDMA-tables pool is also reset per-frame. The contract on the
      * comment above ("HDMA tables stay across frames unless re-
      * uploaded") meant that the BYTES at a given offset persist, but
@@ -411,11 +444,17 @@ void mg_state_build_frame(void) {
      * channel pointing at its own slice across frames. */
     s_hdma_tables_used = 0;
 
-    /* Clear ONLY the slot indices mg_* used last frame. Slots beyond
-     * that are left alone so guests that mix SYS_COPRO_STAGE_DMA_SLOT
-     * with the mg_* API keep their explicit entries across frames. */
+    /* Clear ONLY the slot indices the shadow walker populated last
+     * frame (s_prev_mg_slots), and only those AT OR AFTER the
+     * persistent checkpoint. Slots at indices 0..checkpoint-1 are
+     * persistent uploads (mg_chr_upload, etc.) and must survive.
+     * Slots beyond the shadow region are left alone so guests that
+     * mix SYS_COPRO_STAGE_DMA_SLOT with the mg_* API keep their
+     * explicit entries across frames. */
     static const CartDmaSlot empty_slot = {0};
-    for (unsigned i = 0; i < s_prev_mg_slots && i < 8; i++) {
+    for (unsigned i = s_slot_checkpoint;
+         i < s_prev_mg_slots && i < 8;
+         i++) {
         cart_window_set_dma_slot(i, &empty_slot);
     }
 
