@@ -220,6 +220,69 @@ void mgapi_post_joypads(const uint16_t pads[4]) {
 }
 
 /* ----------------------------------------------------------------
+ *  Diagnostic: cart-bus access tracking
+ *
+ *  When the SNES side stays solid black despite a guest staging
+ *  frames, the question is always "is the SNES actually running our
+ *  kernel?" Easiest way to tell: instrument cart_window_read so we
+ *  can see what offsets the SNES is fetching. mgapi_diag_periodic
+ *  (called from mgapi_step) prints a one-line summary roughly every
+ *  second.
+ *
+ *  Lifecycle markers we surface immediately:
+ *    BOOT_STROBE    boot.s reached its end, jumped to kernel.s
+ *    FIRST $7800    kernel's NMI handler ran for the first time
+ *    FIRST DMA-LIST kernel reached its DMA dispatch (proves NMI is
+ *                   not just looping at the gate)
+ * ---------------------------------------------------------------- */
+
+static uint32_t g_diag_cart_reads;
+static uint16_t g_diag_last_off;
+static bool     g_diag_boot_strobed;
+static bool     g_diag_nmi_seen;
+static bool     g_diag_dma_seen;
+static uint64_t g_diag_last_print_ns;
+static uint64_t g_diag_clock_ns;
+
+void mgapi_diag_note_cart_read(uint16_t off, uint32_t full) {
+    (void)full;
+    g_diag_cart_reads++;
+    g_diag_last_off = off;
+    if (off == 0x7E00 /* STROBE_BOOTED */ && !g_diag_boot_strobed) {
+        g_diag_boot_strobed = true;
+        fprintf(stderr, "mgapi: BOOT_STROBED -- boot.s reached kernel jump\n");
+        fflush(stderr);
+    }
+    if (off == 0x7800 /* FRAME_READY */ && !g_diag_nmi_seen) {
+        g_diag_nmi_seen = true;
+        fprintf(stderr, "mgapi: FIRST $7800 read -- kernel NMI fired\n");
+        fflush(stderr);
+    }
+    if (off >= 0x7808 && off < 0x7848 && !g_diag_dma_seen) {
+        g_diag_dma_seen = true;
+        fprintf(stderr,
+                "mgapi: FIRST DMA-LIST read at $%04X -- kernel walking slots\n",
+                (unsigned)off);
+        fflush(stderr);
+    }
+}
+
+static void mgapi_diag_periodic(uint64_t elapsed_ns) {
+    g_diag_clock_ns += elapsed_ns;
+    /* One-line status per ~1 second of wall-clock so the user can see
+     * if the SNES is actually executing without spamming the log. */
+    if (g_diag_clock_ns - g_diag_last_print_ns < 1000000000ull) return;
+    g_diag_last_print_ns = g_diag_clock_ns;
+    fprintf(stderr,
+            "mgapi diag: cart_reads=%u last_off=$%04X boot=%d nmi=%d dma=%d\n",
+            g_diag_cart_reads, (unsigned)g_diag_last_off,
+            g_diag_boot_strobed ? 1 : 0,
+            g_diag_nmi_seen     ? 1 : 0,
+            g_diag_dma_seen     ? 1 : 0);
+    fflush(stderr);
+}
+
+/* ----------------------------------------------------------------
  *  Per-frame tick + audio pull (stubbed for stage 1)
  * ---------------------------------------------------------------- */
 
@@ -246,6 +309,11 @@ void mgapi_step(uint64_t elapsed_ns) {
     }
     mgapi_audio_pump(frames);
 
+    /* Diagnostic heartbeat -- one stderr line per second showing cart
+     * bus activity so we can tell "kernel is running" apart from
+     * "kernel never started." */
+    mgapi_diag_periodic(elapsed_ns ? elapsed_ns : 16666667ull);
+
     /* Stage 4: poll the TCP listener for new client connections.
      * Cheap when no listener is configured (early-out inside). */
     mgapi_tcp_listen_poll();
@@ -269,7 +337,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.6 (+ Ctrl-C-kills-spawn)";
+    return "mgapi 1.7 (+ cart-bus diag heartbeat)";
 }
 
 /* ----------------------------------------------------------------

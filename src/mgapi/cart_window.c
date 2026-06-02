@@ -117,6 +117,13 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
      * (runtime) — same bytes, just different address forms. */
     uint16_t off = (uint16_t)(snes_addr_24 & 0xFFFFu);
 
+    /* Diagnostic counters: surface what the SNES is actually doing
+     * on the cart bus so we can tell "kernel not running" apart from
+     * "kernel running but data wrong." Stderr-printed once per
+     * transition by mgapi_diag_periodic() (called from mgapi_step). */
+    extern void mgapi_diag_note_cart_read(uint16_t off, uint32_t full);
+    mgapi_diag_note_cart_read(off, snes_addr_24);
+
     /* Status byte. */
     if (off == CW_OFF_STATUS) return g_status;
 
