@@ -21,6 +21,7 @@
 
 #include "cart_window.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* The payload area in the cart window (offset 0 .. CW_OFF_JOY_BASE).
@@ -535,9 +536,20 @@ void mg_state_build_frame(void) {
     /* BG tilemaps. Each layer's tilemap_word is the VRAM word
      * address; we DMA at VMAIN auto-increment + VMADDR = tilemap_word
      * + (dirty_lo / 2). The 2-byte-2-reg DMAP writes tile words. */
+    static bool s_bg_emit_logged[MG_BG_LAYERS] = {false};
     for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
         MgBgLayerState *bg = &s_state.bg[i];
         if (bg->dirty_hi <= bg->dirty_lo) continue;
+        if (!s_bg_emit_logged[i]) {
+            s_bg_emit_logged[i] = true;
+            fprintf(stderr,
+                    "mgapi: FIRST BG%u tilemap emit -- lo=%u hi=%u "
+                    "tilemap_word=$%04X (size=%u bytes)\n",
+                    i + 1, (unsigned)bg->dirty_lo, (unsigned)bg->dirty_hi,
+                    (unsigned)bg->tilemap_word,
+                    (unsigned)(bg->dirty_hi - bg->dirty_lo));
+            fflush(stderr);
+        }
         uint16_t lo = bg->dirty_lo;
         uint16_t hi = bg->dirty_hi;
         const uint8_t *src = bg->shadow + lo;
