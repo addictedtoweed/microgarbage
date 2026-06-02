@@ -290,7 +290,7 @@ static void mgapi_diag_periodic(uint64_t elapsed_ns) {
             mgapi_cart_read(0xC07848), mgapi_cart_read(0xC07849),
             mgapi_cart_read(0xC0784A), mgapi_cart_read(0xC0784E),
             mgapi_cart_read(0xC07850), mgapi_cart_read(0xC07851));
-    for (int s = 0; s < 4; s++) {
+    for (int s = 0; s < 8; s++) {
         uint32_t base = 0xC07808 + s * 8;
         uint8_t bbus = mgapi_cart_read(base + 0);
         uint8_t dmap = mgapi_cart_read(base + 1);
