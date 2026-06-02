@@ -24,6 +24,17 @@
 static uint8_t  g_window[CART_WINDOW_BYTES];
 static uint8_t  g_status;            /* served at $7F00      */
 static uint8_t  g_frame_ready;       /* served at $7800      */
+
+/* Frame-flow counters. g_frame_staged ticks every time we set
+ * g_frame_ready to non-zero (= the guest committed a frame).
+ * g_frame_consumed ticks every time the SNES reads from the
+ * last joypad mailbox port ($7700) -- that's the kernel's
+ * end-of-frame ack in its @loop sequence. A guest in
+ * h_frame_commit can compare the two to see whether the prior
+ * frame has been picked up yet, and skip the rebuild if the
+ * kernel is still walking the previous one. */
+static uint32_t g_frame_staged;
+static uint32_t g_frame_consumed;
 static uint16_t g_pads[4];           /* served via mailbox   */
 static unsigned g_last_pad_port;     /* last polled, 0..7    */
 static uint32_t g_reset_count;       /* bumped on reset_begin */
@@ -68,8 +79,14 @@ void cart_window_load_blob(uint32_t offset, const void *src, uint32_t len) {
     memcpy(g_window + offset, src, len);
 }
 
-void cart_window_set_frame_ready(uint8_t byte) { g_frame_ready = byte; }
+void cart_window_set_frame_ready(uint8_t byte) {
+    g_frame_ready = byte;
+    if (byte != 0) g_frame_staged++;
+}
 uint8_t cart_window_get_frame_ready(void)      { return g_frame_ready; }
+
+uint32_t cart_window_frame_staged(void)  { return g_frame_staged; }
+uint32_t cart_window_frame_consumed(void){ return g_frame_consumed; }
 
 void cart_window_set_dma_slot(unsigned index, const CartDmaSlot *slot) {
     if (index >= 8 || !slot) return;
@@ -148,6 +165,12 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
     if (off >= CW_OFF_JOY_BASE && off < CW_OFF_JOY_END) {
         unsigned port = (unsigned)(off - CW_OFF_JOY_BASE) >> CW_JOY_PAGE_SHIFT;
         g_last_pad_port = port;
+        /* Port 7 = the LAST joypad mailbox read in the kernel's
+         * @loop sequence (pad 3 high byte). Bumping g_frame_consumed
+         * here means we know the SNES has finished walking the
+         * staged DMA list and ack'd the previous frame -- a guest
+         * blocked in h_frame_commit can now stage a fresh one. */
+        if (port == 7) g_frame_consumed++;
         return 0;
     }
 

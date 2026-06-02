@@ -360,7 +360,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.10 (+ ppu-batch + DMA-slot dump in diag)";
+    return "mgapi 1.11 (+ frame_commit waits for SNES ack)";
 }
 
 /* ----------------------------------------------------------------

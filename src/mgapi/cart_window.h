@@ -190,6 +190,15 @@ void cart_window_load_blob(uint32_t offset, const void *src, uint32_t len);
 void cart_window_set_frame_ready(uint8_t byte);
 uint8_t cart_window_get_frame_ready(void);
 
+/* Frame-flow counters. _staged ticks per set_frame_ready(!=0).
+ * _consumed ticks per SNES read of $7700 (joypad mailbox last byte,
+ * end of the kernel's per-frame poll). h_frame_commit compares
+ * the two to skip rebuilds while the kernel is still walking the
+ * previous frame, so a tight guest loop can't overwrite a staged
+ * frame before the SNES has finished consuming it. */
+uint32_t cart_window_frame_staged(void);
+uint32_t cart_window_frame_consumed(void);
+
 /* Stage one DMA list slot. Slot indices 0..7. Writing all zeros
  * marks the slot empty (skipped by the kernel walker).
  */

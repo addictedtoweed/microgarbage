@@ -92,6 +92,24 @@ static void h_frame_commit(VmCpu *cpu, void *system) {
     (void)system;
     uint8_t byte = (uint8_t)(cpu->regs[VM_REG_A0] & 0xFFu);
 
+    /* If the SNES kernel hasn't yet ack'd the previous staged frame
+     * (joypad mailbox port 7 read), don't touch anything -- the
+     * previous frame's DMA list is still in flight in cart_window
+     * and a rebuild would clear dirty marks + reset payload bytes
+     * the kernel is mid-walking. Tight guest loops (mg_frame_commit
+     * + mg_wait_frame, which returns immediately today) call this
+     * thousands of times per real SNES frame; we want at most ONE
+     * effective commit per kernel @loop iteration so each staged
+     * frame survives long enough to reach the PPU.
+     *
+     * "byte=0" is the explicit cancel path; still honor it so a
+     * guest can pull a frame back if it decides to. */
+    if (byte != 0 &&
+        cart_window_frame_staged() > cart_window_frame_consumed()) {
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+
     /* Walk the mg_* shadow state, stage dirty regions into the cart
      * window's payload area, queue DMA slots — this is where SYS_MG_*
      * accumulated state gets turned into the per-frame DMA descriptor
