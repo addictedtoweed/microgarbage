@@ -10,6 +10,8 @@
 #include "vm_init.h"
 
 #include "vm/vm_system.h"
+#include "vm/vm_core.h"
+#include "vm/vm_sched.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_fs.h"
 #include "storage/trashfs.h"
@@ -266,6 +268,33 @@ bool mgapi_vm_step(void) {
  * actually populated the volume. */
 TrashfsVolume *mgapi_vm_td0_volume(void) {
     return g_sys_alive ? &g_td0_vol : NULL;
+}
+
+/* Exposed so tcp_listen can route a Ctrl-C byte from PuTTY into a
+ * halt of the currently spawned demo. Walks the VM table looking for
+ * a parent in BLOCK_ON_CHILD, halts its child cleanly so the next
+ * reap delivers an exit code and the shell resumes its prompt.
+ * Returns the killed child's vm_id, or UINT16_MAX if no spawn was
+ * running. */
+uint16_t mgapi_vm_kill_running_spawn(void) {
+    if (!g_sys_alive) return (uint16_t)UINT16_MAX;
+    for (uint16_t pid = 0; pid < VM_SCHED_MAX_VMS; pid++) {
+        VmCpu *p = g_sys.vms[pid];
+        if (!p) continue;
+        if (p->block_reason != BLOCK_ON_CHILD) continue;
+        uint16_t cid = p->block_child_vm;
+        if (cid >= VM_SCHED_MAX_VMS) continue;
+        VmCpu *c = g_sys.vms[cid];
+        if (!c || c->halted) continue;
+        /* Halt the child cleanly. trap_cause = TRAP_HALT signals the
+         * reap path that this isn't a crash; exit code 130 follows
+         * the Unix convention for SIGINT-killed processes (128 + 2). */
+        c->halted     = true;
+        c->trap_cause = TRAP_HALT;
+        c->regs[VM_REG_A0] = 130u;
+        return cid;
+    }
+    return (uint16_t)UINT16_MAX;
 }
 
 uint16_t mgapi_vm_shell_id(void) {

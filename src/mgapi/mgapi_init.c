@@ -269,7 +269,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.5 (+ $MGAPI_ROM_SELECT env override)";
+    return "mgapi 1.6 (+ Ctrl-C-kills-spawn)";
 }
 
 /* ----------------------------------------------------------------

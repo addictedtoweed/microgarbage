@@ -351,9 +351,70 @@ void mgapi_tcp_listen_shutdown(void) {
     /* Leave WSAStartup'd — cheap and the embedder may re-init us. */
 }
 
+/* Forward decl from vm_init.c -- halts a running spawned VM if any
+ * parent is parked on it, so the next reap delivers exit 130 to the
+ * shell. Returns the killed child's vm_id, or UINT16_MAX if no
+ * spawn is in flight. */
+extern uint16_t mgapi_vm_kill_running_spawn(void);
+
+/* While the shell is blocked in sys_spawn_and_wait on a running
+ * demo, the demo doesn't read stdin -- so any bytes the user types
+ * in PuTTY pile up in the OS socket buffer. We MSG_PEEK that buffer
+ * each poll; if a Ctrl-C byte (0x03) is sitting there, halt the
+ * running spawn (the reap delivers exit 130 to the shell, the shell
+ * resumes its prompt) and consume bytes up to and including the
+ * 0x03 so they don't show up on the next command line. The byte
+ * stays out of the shell's transport read stream because we drain
+ * it here.
+ *
+ * No-op when no client is connected or no spawn is in flight. */
+static void check_for_ctrlc_kill(void) {
+    if (g_ctx.client_fd == TCP_SOCK_INVALID) return;
+    unsigned char peek[32];
+    int r = recv(g_ctx.client_fd, (char *)peek, sizeof(peek),
+                 MSG_PEEK);
+    if (r <= 0) {
+        /* WOULDBLOCK / no data / orderly-close -- ignore here;
+         * tcp_t_read handles the disconnect case when the shell's
+         * read fires next. */
+        return;
+    }
+    int idx = -1;
+    for (int i = 0; i < r; i++) {
+        if (peek[i] == 0x03) { idx = i; break; }
+    }
+    if (idx < 0) return;
+
+    uint16_t killed = mgapi_vm_kill_running_spawn();
+    if (killed == (uint16_t)UINT16_MAX) {
+        /* No spawn running -- leave the byte alone so the shell sees
+         * it via its normal read path (Ctrl-C at the prompt is a
+         * line-clear, handled in readline_raw). */
+        return;
+    }
+
+    /* Drain bytes up to and including the 0x03 so the next shell
+     * read starts clean. */
+    char drain[32];
+    int to_drain = idx + 1;
+    while (to_drain > 0) {
+        int got = recv(g_ctx.client_fd, drain,
+                       to_drain < (int)sizeof(drain) ? to_drain
+                                                    : (int)sizeof(drain),
+                       0);
+        if (got <= 0) break;
+        to_drain -= got;
+    }
+
+    fprintf(stderr, "mgapi: Ctrl-C -- killed spawn vm %u\n",
+            (unsigned)killed);
+    fflush(stderr);
+}
+
 void mgapi_tcp_listen_poll(void) {
     if (!g_initialized) return;
     (void)try_accept();
+    check_for_ctrlc_kill();
 }
 
 bool mgapi_tcp_listen_client_connected(void) {
