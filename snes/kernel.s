@@ -397,10 +397,14 @@
     ldx #0
 @slot:
     cpx #(8 * 8)            ; processed all 8 slots? -> done
-    beq @done
+    bne :+
+    jmp @done
+:
 
     lda f:COPRO_DMA_LIST_L+0,x    ; bbus (0 => empty slot, skip)
-    beq @next
+    bne :+
+    jmp @next
+:
     sta BBAD0
     lda f:COPRO_DMA_LIST_L+1,x    ; dmap
     sta DMAP0
@@ -418,13 +422,17 @@
     ; no prep written -- the copro is trusted to put a valid byte here.
     lda BBAD0
     cmp #<CGDATA            ; $22 -> CGADD (low byte only; CGRAM is word-addressed but the reg is 8-bit)
-    bne @check_v
+    beq :+
+    jmp @check_v
+:
     lda f:COPRO_DMA_LIST_L+6,x
     sta CGADD
-    bra @fire
+    jmp @fire
 @check_v:
     cmp #<VMDATAL           ; $18 -> set VMAIN word-step, write VMADDL/H
-    bne @check_o
+    beq :+
+    jmp @check_o
+:
     lda #$80
     sta VMAIN
     rep #$20
@@ -433,10 +441,12 @@
     sta VMADDL
     sep #$20
     .a8
-    bra @fire
+    jmp @fire
 @check_o:
     cmp #<OAMDATA           ; $04 -> write OAMADDL/H
-    bne @fire
+    beq :+
+    jmp @fire
+:
     rep #$20
     .a16
     lda f:COPRO_DMA_LIST_L+6,x
@@ -453,7 +463,7 @@
     .repeat 8
     inx
     .endrepeat
-    bra @slot
+    jmp @slot
 
 @done:
 @out:
