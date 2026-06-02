@@ -279,6 +279,29 @@ static void mgapi_diag_periodic(uint64_t elapsed_ns) {
             g_diag_boot_strobed ? 1 : 0,
             g_diag_nmi_seen     ? 1 : 0,
             g_diag_dma_seen     ? 1 : 0);
+    /* Dump what the SNES sees in the staging area: PPU batch first
+     * 12 bytes (BGMODE..MOSAIC), then DMA slots 0..2. That tells us
+     * whether the host is staging plausible PPU register values and
+     * DMA descriptors -- if a slot's bbus is $00 or its src points
+     * outside payload, the kernel will skip or read garbage. */
+    extern uint8_t mgapi_cart_read(uint32_t addr);
+    fprintf(stderr,
+            "  ppu_batch: bgmode=%02X obsel=%02X bg1sc=%02X bg12nba=%02X tm=%02X ts=%02X\n",
+            mgapi_cart_read(0xC07848), mgapi_cart_read(0xC07849),
+            mgapi_cart_read(0xC0784A), mgapi_cart_read(0xC0784E),
+            mgapi_cart_read(0xC07850), mgapi_cart_read(0xC07851));
+    for (int s = 0; s < 4; s++) {
+        uint32_t base = 0xC07808 + s * 8;
+        uint8_t bbus = mgapi_cart_read(base + 0);
+        uint8_t dmap = mgapi_cart_read(base + 1);
+        uint16_t src = mgapi_cart_read(base + 2) | (mgapi_cart_read(base + 3) << 8);
+        uint16_t sz  = mgapi_cart_read(base + 4) | (mgapi_cart_read(base + 5) << 8);
+        uint16_t prep= mgapi_cart_read(base + 6) | (mgapi_cart_read(base + 7) << 8);
+        if (bbus == 0 && sz == 0) continue;
+        fprintf(stderr,
+                "  slot[%d]: bbus=$%02X dmap=$%02X src=$%04X size=%u prep=$%04X\n",
+                s, bbus, dmap, src, sz, prep);
+    }
     fflush(stderr);
 }
 
@@ -337,7 +360,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.9 (+ persistent CHR slot survives commit)";
+    return "mgapi 1.10 (+ ppu-batch + DMA-slot dump in diag)";
 }
 
 /* ----------------------------------------------------------------
