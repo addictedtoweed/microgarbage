@@ -322,11 +322,20 @@ static uint8_t compute_bgxsc(const MgBgLayerState *bg) {
     return (uint8_t)(((bg->tilemap_word >> 9) << 2) | (bg->size_code & 3));
 }
 
-/* Compute the CHR-page index for BG12NBA / BG34NBA: chr_word >> 11
- * gives the 4 KB-page index (since 4 KB / 2 bytes-per-word = 2048
- * words). */
+/* Compute the CHR-page index for BG12NBA / BG34NBA.
+ *
+ * The PPU encodes the BG CHR base as low-nibble * $1000 in VRAM word
+ * coordinates: $0000 / $1000 / $2000 / ... / $7000. chr_word stores
+ * the base in VRAM words (same units), so the conversion is
+ *
+ *     page_index = chr_word / $1000 = chr_word >> 12
+ *
+ * Earlier the shift was 11 (= divide by $0800), which doubled the
+ * encoded page for every chr_word -- a guest asking for $1000 got
+ * page 2 (= $2000) in BG12NBA. BG1 looked at $2000, the actual
+ * upload at VRAM $1000 went unused, screen rendered backdrop. */
 static uint8_t chr_page(const MgBgLayerState *bg) {
-    return (uint8_t)((bg->chr_word >> 11) & 0x0F);
+    return (uint8_t)((bg->chr_word >> 12) & 0x0F);
 }
 
 static void emit_ppu_batch(void) {
