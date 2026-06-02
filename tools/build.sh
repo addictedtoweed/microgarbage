@@ -64,14 +64,19 @@ else
 fi
 
 # ---- 3. TMP fix --------------------------------------------
-# MSYS hands child processes a TMP that's the Unix-style /tmp. When
-# powershell.exe launches and calls Windows tools that don't grok
-# MSYS paths (ca65, ld65), they choke on the spaces in
-# "/c/Users/IP Freely/...". Convert to the 8.3 short form so the
-# build chain doesn't see spaces anywhere.
-TMP_LONG="$(cmd.exe /c 'echo %TEMP%' 2>/dev/null | tr -d '\r' || true)"
-if [[ -n "$TMP_LONG" ]]; then
-    TMP_SHORT="$(cygpath -s -w "$TMP_LONG" 2>/dev/null || echo "$TMP_LONG")"
+# Set TMP / TEMP to the 8.3 short form of the user's Windows temp
+# directory so the build chain doesn't trip over spaces in the path.
+# Some of the windows tools spawned downstream choke on
+# "C:\Users\IP Freely\AppData\Local\Temp" but are happy with
+# "C:\Users\IPFREE~1\AppData\Local\Temp".
+#
+# Earlier versions of this script shelled out to `cmd.exe /c "echo
+# %TEMP%"` to discover the long path, but that hangs in some MSYS
+# configurations (the pipe back to bash doesn't close). $USERPROFILE
+# is set directly by MSYS and round-trips through cygpath cleanly.
+if [[ -n "${USERPROFILE:-}" ]]; then
+    TMP_LONG="$USERPROFILE\\AppData\\Local\\Temp"
+    TMP_SHORT="$(cygpath -s -w "$(cygpath -u "$TMP_LONG")" 2>/dev/null || echo "$TMP_LONG")"
     export TMP="$TMP_SHORT"
     export TEMP="$TMP_SHORT"
 fi
