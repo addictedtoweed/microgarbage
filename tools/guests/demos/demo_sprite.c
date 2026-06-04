@@ -45,6 +45,15 @@ static void init_spr_chr(void) {
 void _start(void) {
     init_spr_chr();
 
+    /* Wipe leftover shadow state + BG tilemap data from any prior demo.
+     * v1.28's partial mg_ppu_clean_slate dirties all BG shadows so the
+     * next commit zeroes the active layer's tilemap area, clearing the
+     * stale tile references that previously caused 8x8 colored blocks
+     * at the top of the screen after running mode7.elf or mode7_3d.elf.
+     * Full VRAM clear (including CHR data) is still a known limitation
+     * (see session notes task #6). */
+    mg_ppu_clean_slate();
+
     /* Background: black so the sprite is the only thing on screen.
      * We still enable BG1 with an empty tilemap so the PPU's main
      * screen isn't completely dead (some emulators get unhappy). */

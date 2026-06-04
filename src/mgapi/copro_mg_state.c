@@ -694,6 +694,14 @@ void mg_state_build_frame(void) {
     for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
         MgBgLayerState *bg = &s_state.bg[i];
         if (bg->dirty_hi <= bg->dirty_lo) continue;
+        /* Skip disabled layers — h_ppu_clean_slate dirties all four
+         * BG shadows so any enabled one gets its tilemap area zeroed
+         * on the next commit, but we don't want to waste payload + a
+         * slot DMAing to a tilemap_word the demo will never read.
+         * Without this, 4 layers × 2KB = 8KB exceeds the per-vblank
+         * DMA budget. The dirty bits stay set until the layer is
+         * enabled (no-op until then). */
+        if (!bg->enabled_main && !bg->enabled_sub) continue;
         if (!s_bg_emit_logged[i]) {
             s_bg_emit_logged[i] = true;
             fprintf(stderr,
