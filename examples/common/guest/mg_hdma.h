@@ -63,11 +63,21 @@ typedef enum {
     MG_HDMA_XFER_4B_2R = 3,   /* 4 bytes to two regs x2                 */
 } MgHdmaXfer;
 
+/* IMPORTANT: keep this struct exactly 4 packed bytes — the host
+ * h_hdma_setup does a fixed sizeof(MgHdmaCfgHost)=4 read into a
+ * uint8_t-fielded mirror struct. RISC-V GCC sizes enums as int (4
+ * bytes), so if dest/xfer were typed as MgHdmaDest/MgHdmaXfer the
+ * guest struct would grow to 16 bytes with 3 padding bytes after
+ * channel — the host would then read {channel, 0, 0, 0} and set
+ * BBAD=$00 (= INIDISP) and DMAP=$00 (mode 0) instead of the M7
+ * destination + mode-2 the demo asked for. Visible symptom was
+ * mode7_3d.elf rendering solid black because channel 1 HDMA was
+ * silently writing INIDISP=$00 (brightness 0) every scanline. */
 typedef struct {
-    uint8_t     channel;      /* 0..7 — shares bank with general DMA   */
-    MgHdmaDest  dest;
-    MgHdmaXfer  xfer;
-    bool        indirect;     /* true = table holds pointers (rare)    */
+    uint8_t  channel;         /* 0..7 — shares bank with general DMA   */
+    uint8_t  dest;            /* MgHdmaDest value, narrowed to byte    */
+    uint8_t  xfer;            /* MgHdmaXfer value, narrowed to byte    */
+    uint8_t  indirect;        /* nonzero = table holds pointers (rare) */
 } MgHdmaCfg;
 
 /* Configure a channel. Idempotent across frames until reconfigured

@@ -29,7 +29,8 @@
  * entry. ~28 KB is plenty for the OAM (~544 B) + CGRAM (~512 B) +
  * any incidental CHR/tilemap uploads accumulated across the frame. */
 #define PAYLOAD_AREA_START  0x0000u
-#define PAYLOAD_AREA_END    CW_OFF_JOY_BASE   /* 0x7000 */
+#define PAYLOAD_AREA_END    CW_OFF_HDMA_TABLES   /* 0x6000 — payload ends
+                                                  * where HDMA tables begin */
 
 /* SNES PPU B-bus addresses we emit. */
 #define BBUS_OAMDATA   0x04   /* $2104 — write index then bytes        */

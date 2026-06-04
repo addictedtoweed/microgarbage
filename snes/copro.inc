@@ -48,10 +48,14 @@ COPRO_INIDISP_HDMA = (COPRO_BANK << 16) | $7868
 ; table (one INIDISP value per scanline). bsnes-plus's HDMA emulation
 ; doesn't honor the repeat-mode bit, so we encode every line explicitly;
 ; the table doesn't fit in the old 16-byte slot. Shifts HDMA_CONFIG /
-; MODE7_BATCH / HDMA_TABLES down by $F0 ($100 - $10) accordingly.
+; MODE7_BATCH down by $F0 ($100 - $10) accordingly.
 COPRO_HDMA_CONFIG  = (COPRO_BANK << 16) | $7968
 COPRO_MODE7_BATCH  = (COPRO_BANK << 16) | $79A0
-COPRO_HDMA_TABLES  = (COPRO_BANK << 16) | $7A00
+; HDMA tables relocated to $6000 (carved from the back of the payload area)
+; with size bumped from 1280 to 4096 bytes so mode7_3d's hybrid-encoded
+; M7A-D tables (~1800 bytes for 4 channels) fit. Payload area shrinks to
+; $0000-$5FFF (24KB, still ample for typical demo per-frame DMA staging).
+COPRO_HDMA_TABLES  = (COPRO_BANK << 16) | $6000
 ; Moved from $7F00 to share the gap with STROBE_BOOTED (see below).
 COPRO_STATUS    = (COPRO_BANK << 16) | $79B1
 

@@ -114,12 +114,13 @@ typedef struct {
     uint8_t       horizon_row; /* 0..223; lines above draw as backdrop      */
 } MgMode7Camera3D;
 
-/* Each HDMA table buffer must be at least this many bytes. The
- * actual size depends on horizon_row; with horizon at row 96 the
- * tables are ~262 bytes (3-byte sky-skip segment + 128 active
- * scanlines @ 2 bytes + count overhead + 1-byte terminator). 320
- * gives headroom for any reasonable horizon. */
-#define MG_MODE7_3D_TABLE_BYTES 320
+/* Each HDMA table buffer must be at least this many bytes under the
+ * bsnes-plus hybrid HDMA encoding (count = $80|N + N×2 data bytes per
+ * chunk). Worst-case for any horizon: full 224 scanlines split into
+ * two chunks (127 + 97) = 1 + 254 + 1 + 194 = 450 bytes for the
+ * non-sky case, or sky+active each ≤ 127 lines (255 + 195 = 450).
+ * Plus 1 terminator byte = 451 bytes max. 512 gives margin. */
+#define MG_MODE7_3D_TABLE_BYTES 512
 
 /* Build M7A/B/C/D HDMA tables for the camera. Returns the number
  * of bytes written into each table -- pass that as the `len` to

@@ -124,35 +124,55 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
     const uint16_t active_count = (h < 224u) ? (uint16_t)(224u - h) : 0u;
     uint16_t off = 0;
 
-    /* ---- "Sky" segment: repeat (0,0) for `h` scanlines.
-     * SNES caps a single repeat group at 127 lines (count byte's
-     * low 7 bits), so we loop if the horizon is past row 127. */
+    /* ---- "Sky" segment: write (0,0) for `h` scanlines using the
+     * hybrid encoding that works on bsnes-plus: count = $80 | N
+     * followed by N×2 data bytes (one 16-bit M7 value per scanline).
+     *
+     * bsnes-plus's HDMA always advances the source per scanline,
+     * regardless of the count byte's repeat-mode bit (see the
+     * INIDISP letterbox fix in copro_mg_state.c). For count = $80|N,
+     * line_counter starts at $80+N, decrements through $80+N..$81,
+     * then hits $80 at the end of scanline N-1 -- triggering refetch
+     * because (line_counter & 0x7F) == 0. So exactly N transfers
+     * fire (one per scanline) and the next chunk takes over.
+     *
+     * Cap at 127 lines per chunk; for h > 127 we split. */
     {
         uint16_t lines_left = h;
         while (lines_left > 0) {
             uint8_t chunk = (lines_left > 127u) ? 127u : (uint8_t)lines_left;
-            uint8_t count = (uint8_t)(0x80 | chunk);
-            table_m7a[off + 0] = count; table_m7a[off + 1] = 0; table_m7a[off + 2] = 0;
-            table_m7b[off + 0] = count; table_m7b[off + 1] = 0; table_m7b[off + 2] = 0;
-            table_m7c[off + 0] = count; table_m7c[off + 1] = 0; table_m7c[off + 2] = 0;
-            table_m7d[off + 0] = count; table_m7d[off + 1] = 0; table_m7d[off + 2] = 0;
-            off += 3;
+            uint8_t count = (uint8_t)(0x80u | chunk);
+            table_m7a[off] = count;
+            table_m7b[off] = count;
+            table_m7c[off] = count;
+            table_m7d[off] = count;
+            off++;
+            for (uint8_t i = 0; i < chunk; i++) {
+                wr16le(table_m7a, off, 0);
+                wr16le(table_m7b, off, 0);
+                wr16le(table_m7c, off, 0);
+                wr16le(table_m7d, off, 0);
+                off += 2;
+            }
             lines_left -= chunk;
         }
     }
 
     /* ---- Active segment: per-line M7 values for the ground.
-     * Non-repeat groups also cap at 127 lines each. */
+     * Same $80|N hybrid encoding as the sky chunk so bsnes-plus
+     * fires exactly one transfer per scanline. Cap at 127 lines per
+     * chunk. */
     {
         uint16_t lines_left = active_count;
         uint16_t row = h;
         while (lines_left > 0) {
             uint8_t group = (lines_left > 127u) ? 127u : (uint8_t)lines_left;
+            uint8_t count = (uint8_t)(0x80u | group);
             uint16_t count_off = off++;
-            table_m7a[count_off] = group;
-            table_m7b[count_off] = group;
-            table_m7c[count_off] = group;
-            table_m7d[count_off] = group;
+            table_m7a[count_off] = count;
+            table_m7b[count_off] = count;
+            table_m7c[count_off] = count;
+            table_m7d[count_off] = count;
             for (uint8_t i = 0; i < group; i++, row++) {
                 /* depth_factor = height / (row - horizon + 1).
                  * +1 keeps the line just past the horizon from

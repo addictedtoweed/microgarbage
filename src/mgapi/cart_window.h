@@ -109,10 +109,18 @@ extern "C" {
 
 /* HDMA tables area — game stages per-scanline tables for channels
  * 0..6 here via mg_hdma_upload_table. The runtime bump-allocates
- * within this 1280-byte slab each frame the same way it does with
- * payload-area DMA staging. */
-#define CW_OFF_HDMA_TABLES    0x7A00u
-#define CW_HDMA_TABLES_BYTES  0x500u   /* 1280 bytes — generous */
+ * within this 4096-byte slab each frame the same way it does with
+ * payload-area DMA staging.
+ *
+ * Sized at 4KB (up from 1280) to accommodate mode7_3d's four M7A-D
+ * tables under bsnes-plus's hybrid-encoding scheme (~450 bytes per
+ * table × 4 = ~1800 bytes), with headroom for more channels or
+ * smaller granularities. Tucked into the back of the previous
+ * payload area at $6000-$6FFF; payload now ends at $6000 (24KB
+ * instead of 28KB), still comfortably more than any demo's per-
+ * frame DMA payload needs. */
+#define CW_OFF_HDMA_TABLES    0x6000u
+#define CW_HDMA_TABLES_BYTES  0x1000u  /* 4096 bytes — fits mode7_3d */
 
 /* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
  * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap
