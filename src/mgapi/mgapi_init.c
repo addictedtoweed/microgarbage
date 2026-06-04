@@ -372,7 +372,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.38 (mode7_3d works: fixed MgHdmaCfg struct padding ABI bug)";
+    return "mgapi 1.42 (joypads via mapper-side input.poll; cart_window ack-only)";
 }
 
 /* ----------------------------------------------------------------

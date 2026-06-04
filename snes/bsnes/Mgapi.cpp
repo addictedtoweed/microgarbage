@@ -135,6 +135,28 @@ unsigned Mgapi::size() const {
 
 void Mgapi::Enter() { mgapi.enter(); }
 
+// Pack one port's worth of joypad button bits into the SNES auto-
+// joypad word ($4218) shape: bit 15 = B, ..., bit 4 = R, bits 3..0
+// = controller-type signature (0 for standard pad). Uses the public
+// Input::port_read API — same path the SNES kernel hits via $4016
+// reads, but driven from the C++ mapper side. The caller MUST run
+// SNES::input.poll() first (resets the per-port counter and refreshes
+// the Qt-side mapper cache); then 16 calls to port_read return the
+// 12 button bits + 4 signature bits in standard SNES order.
+//
+// Note: system.interface->input_poll(...) would let us query each
+// button directly without the bit-bang dance, but System::interface
+// is private and Mgapi isn't a friend of System. port_read is public
+// and reaches the same Qt mapper via input.cpp's port_read switch
+// case for Device::Joypad. Functionally equivalent.
+static uint16_t mgapi_pack_joypad_port(bool port_index) {
+  uint16_t w = 0;
+  for(unsigned i = 0; i < 16; i++) {
+    w = (uint16_t)((w << 1) | (SNES::input.port_read(port_index) & 1u));
+  }
+  return w;
+}
+
 void Mgapi::enter() {
   while(true) {
     scheduler.synchronize();
@@ -148,8 +170,20 @@ void Mgapi::enter() {
 
       // Advance mgapi's runtime once per 60 Hz frame's worth of
       // audio samples (735 ≈ 44100 / 60). Drives the VM scheduler,
-      // audio service render, TCP listener poll, etc.
+      // audio service render, TCP listener poll, etc. Joypad post
+      // happens here too so its cadence matches mgapi_step()'s.
       if(samples_until_step == 0) {
+        // Refresh the Qt-side input cache + reset port counters
+        // before reading individual buttons.
+        SNES::input.poll();
+        uint16_t pads[4] = {0, 0, 0, 0};
+        pads[0] = mgapi_pack_joypad_port(false);   // port 1
+        pads[1] = mgapi_pack_joypad_port(true);    // port 2
+        // Pads 2/3 stay zero (multitap not wired through this path
+        // yet; we'd need to use Device::Multitap + per-controller
+        // deviceindex 1..3 and pull through input.port_read's
+        // multitap branch instead of the Joypad branch).
+        p_post_joypads(pads);
         p_step(16666666ull);
         samples_until_step = 735;
       } else {

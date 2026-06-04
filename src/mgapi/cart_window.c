@@ -157,11 +157,19 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
 
     /* Joypad mailbox: 8 page-aligned 256-byte ports at
      * $7000, $7100, ..., $7700. Each read latches "this port was
-     * polled" (pad index + lo/hi byte derived from the high byte
-     * of the address). The returned data byte is don't-care; the
-     * SNES kernel reads through f:JOYPORT_Pn_xx_L,X with X being
-     * the actual pad byte, so the access itself carries the data
-     * to us — we don't need to return it. */
+     * polled" (port = pad index + lo/hi byte derived from the high
+     * byte of the address). The returned data byte is don't-care.
+     *
+     * Pad DATA comes through the mgapi_post_joypads host hook — for
+     * bsnes-plus the cart-class Mgapi adapter polls bsnes-plus's
+     * input.poll + system.interface->input_poll each frame and posts
+     * the packed pad word; for real-hardware hosts the kernel's
+     * bit-banged $4016/$4017 reads would carry pad bytes via the
+     * address low byte, but bsnes-plus's $4016 handler doesn't
+     * deliver mapped-keyboard state through our cart class (it
+     * returns open-bus garbage that converges to $FFFF after a few
+     * frames), so we don't try to derive pad data from the mailbox
+     * address — we just record the port so port 7 can ack the frame. */
     if (off >= CW_OFF_JOY_BASE && off < CW_OFF_JOY_END) {
         unsigned port = (unsigned)(off - CW_OFF_JOY_BASE) >> CW_JOY_PAGE_SHIFT;
         g_last_pad_port = port;
