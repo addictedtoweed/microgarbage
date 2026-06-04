@@ -52,12 +52,25 @@ extern "C" {
 #define CW_PPU_BATCH_BYTES  32u
 
 /* INIDISP HDMA table: SNES kernel reserves HDMA channel 7 at boot
- * pointing at this area. Format is mode-0 repeat segments — each is
- * a [0x80 | line_count][value] pair, terminator 0x00. The runtime
- * rebuilds the table every frame from force_blank_top/bottom. 16
- * bytes is plenty for ≤3 segments + terminator. */
+ * pointing at this area. Format is mode-0 DIRECT segments — each
+ * chunk is [line_count][value_byte_0][value_byte_1]...[value_byte_N-1]
+ * with one value per scanline (line_count < 128). Terminator is 0x00.
+ *
+ * Why direct mode instead of repeat (which would fit comfortably in
+ * 16 bytes): bsnes-plus's HDMA emulation always reads a fresh source
+ * byte per scanline regardless of the repeat-mode bit, treating the
+ * count byte's bit 7 (REPEAT) as having no effect on source-address
+ * progression. A real-hardware repeat table renders wrong on bsnes-
+ * plus — the channel reads garbage off the END of the table starting
+ * at scanline 1 of each chunk. Direct mode encodes one value per
+ * scanline explicitly, so the same table works on real hardware and
+ * bsnes-plus identically.
+ *
+ * Size: 256 bytes covers any full 224-scanline configuration. A worst
+ * case is 2 chunks of 127 + 97 + per-line data = 226 bytes + terminator
+ * + top/bottom letterbox count bytes = ~230 bytes. */
 #define CW_OFF_INIDISP_HDMA 0x7868u
-#define CW_INIDISP_HDMA_BYTES 16u
+#define CW_INIDISP_HDMA_BYTES 256u
 
 /* HDMA channel control table — 7 channels x 8 bytes each. Channel 7
  * is reserved for INIDISP letterbox (see CW_OFF_INIDISP_HDMA); this
@@ -71,7 +84,7 @@ extern "C" {
  * The runtime fills this area every frame the channel config or
  * enabled state changes; kernel walks it at vblank, sets DMAP/BBAD/
  * A1T/A1B for each enabled channel, and computes HDMAEN. */
-#define CW_OFF_HDMA_CONFIG    0x7878u
+#define CW_OFF_HDMA_CONFIG    0x7968u
 #define CW_HDMA_CHANNELS       7u
 #define CW_HDMA_CFG_BYTES_EACH 8u
 #define CW_HDMA_CONFIG_BYTES   (CW_HDMA_CHANNELS * CW_HDMA_CFG_BYTES_EACH)
@@ -91,18 +104,25 @@ extern "C" {
  *
  * Mode 7 scroll reuses BG1HOFS / BG1VOFS in the PPU batch — no
  * separate fields here. */
-#define CW_OFF_MODE7_BATCH    0x78B0u
+#define CW_OFF_MODE7_BATCH    0x79A0u
 #define CW_MODE7_BATCH_BYTES  16u
 
 /* HDMA tables area — game stages per-scanline tables for channels
  * 0..6 here via mg_hdma_upload_table. The runtime bump-allocates
  * within this 1280-byte slab each frame the same way it does with
  * payload-area DMA staging. */
-#define CW_OFF_HDMA_TABLES    0x7900u
+#define CW_OFF_HDMA_TABLES    0x7A00u
 #define CW_HDMA_TABLES_BYTES  0x500u   /* 1280 bytes — generous */
 
-#define CW_OFF_STROBE_BOOT  0x7E00u
-#define CW_OFF_STATUS       0x7F00u
+/* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
+ * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap
+ * between Mode 7 batch ($79A0..$79AF) and HDMA tables ($7A00..). A
+ * sufficiently large HDMA upload would otherwise have HDMA reads
+ * trigger the strobe-boot state machine (or read status bits as table
+ * data). Single-byte each so still 14 bytes of gap left for future
+ * additions. */
+#define CW_OFF_STROBE_BOOT  0x79B0u
+#define CW_OFF_STATUS       0x79B1u
 
 #define CW_OFF_JOY_BASE     0x7000u
 #define CW_OFF_JOY_END      0x7800u   /* exclusive; covers P0..P3 LO/HI */

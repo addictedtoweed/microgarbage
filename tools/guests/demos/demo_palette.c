@@ -60,43 +60,25 @@ static void rainbow(uint8_t phase, uint8_t *r, uint8_t *g, uint8_t *b) {
 }
 
 void _start(void) {
-    /* Mode 1; BG1 tilemap at VRAM word $0000, CHR at $1000.
-     * BG1 CHR base is set via BG12NBA low nibble x $1000 -- only
-     * $0000/$1000/$2000/.../$7000 are representable. $1000 is the
-     * first $1000-aligned address past the 32x32 tilemap. */
+    /* Minimal backdrop-only demo (simplified from the original rainbow
+     * version during the v1.x debugging arc). BG2 is enabled with no
+     * CHR upload and no tilemap blit, so BG2 reads zeros from VRAM and
+     * renders fully transparent; the screen shows backdrop CGRAM[0]
+     * everywhere. CGRAM[0] is re-set every frame so the dirty range
+     * stays non-zero (a defensive habit from the v1.17 race-fix era;
+     * post-v1.17 the once-at-setup write is sufficient too). */
     mg_bg_mode(MG_BG_MODE_1);
-    mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x1000);
-    mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
+    mg_bg_setup(MG_BG_LAYER_2, 0x0400, MG_BG_SIZE_32x32, 0x2000);
+    mg_bg_enable(MG_BG_LAYER_2, /*main=*/true, /*sub=*/false);
 
-    /* Upload our one solid-color tile to VRAM word $1000. */
-    MG_OR_PANIC(mg_chr_upload(0x1000, SOLID_CHR, sizeof SOLID_CHR));
+    mg_palette_set_rgb(0, 255, 0, 0);   /* backdrop = bright red */
 
-    /* Fill the 32×32 tilemap with tile 0 (the one we just uploaded).
-     * mg_bg_blit takes a contiguous cells array and wraps row-major
-     * past the right edge; one call fills the whole layer. */
-    static MgBgTile tilemap_buf[32 * 32];
-    MgBgTile cell = { .word = 0 };   /* tile=0, palette=0, flags=0 */
-    for (int i = 0; i < 32 * 32; i++) tilemap_buf[i] = cell;
-    mg_bg_blit(MG_BG_LAYER_1, 0, 0, tilemap_buf, 32 * 32);
-
-    /* Backdrop (color 0) = black. Color 1 starts red. */
-    mg_palette_set_rgb(0, 0, 0, 0);
-    mg_palette_set_rgb(1, 255, 0, 0);
-
-    uint8_t phase = 0;
-    uint8_t step  = 1;   /* phase delta per frame, 1..6 */
     for (;;) {
-        MgPads pads = mg_pads();
-        if (mg_pad_pressed(pads.p0, MG_BTN_START)) sys_exit(0);
-        if (mg_pad_pressed(pads.p0, MG_BTN_LEFT)  && step > 1) step--;
-        if (mg_pad_pressed(pads.p0, MG_BTN_RIGHT) && step < 6) step++;
-
-        phase = (uint8_t)(phase + step);
-        uint8_t r, g, b;
-        rainbow(phase, &r, &g, &b);
-        mg_palette_set_rgb(1, r, g, b);
-
+        mg_palette_set_rgb(0, 255, 0, 0);
         mg_frame_commit();
         mg_wait_frame();
     }
+    (void)SOLID_CHR;
+    (void)rainbow;
+    (void)sys_exit;
 }

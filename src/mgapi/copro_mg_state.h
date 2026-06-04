@@ -93,6 +93,13 @@ typedef struct {
     uint8_t  force_blank_top;
     uint8_t  force_blank_bottom;
 
+    /* Set by h_ppu_clean_slate; the next build_frame stages a VRAM-clear
+     * DMA slot (fixed-source 64KB fill) and clears the flag. Without
+     * this latch the clean-slate's direct slot allocation gets clobbered
+     * by build_frame's s_slot_used = s_slot_checkpoint reset, so the
+     * VRAM clear never fires and PPU state leaks between demos. */
+    bool     pending_vram_clear;
+
     /* HDMA channel config — channels 0..6 (channel 7 is reserved for
      * INIDISP). The runtime publishes this to the cart window's
      * HDMA control table every frame so the kernel can set up the
@@ -166,6 +173,21 @@ uint16_t mg_state_bytes_remaining (void);
  * does. mg_hdma_upload_table is a per-call append; the game is
  * responsible for not exceeding CW_HDMA_TABLES_BYTES. */
 uint16_t mg_state_stage_hdma_table(const void *src, uint16_t len);
+
+/* Drop the per-frame HDMA-table bump pointer back to 0. Used by
+ * h_frame_commit's early-return path so a tight commit-cancelled loop
+ * doesn't accumulate uploads across iterations and overflow the pool.
+ * See implementation comment for the safety argument. */
+void mg_state_drop_hdma_tables(void);
+
+/* Stage a full-VRAM-clear DMA slot using the SNES fixed-source trick:
+ * a 2-byte zero source + DMA with DAS=0 (= 65536 byte transfers) +
+ * DMAP bit 4 set (fixed source, no increment) → fills all 32K VRAM
+ * words with $0000 in a single DMA from the same 2-byte payload.
+ * Used by mg_ppu_clean_slate to wipe leftover tilemap/CHR from a
+ * previous demo's run. Returns false if no free slot or payload
+ * space is available. */
+bool mg_state_stage_vram_clear(void);
 
 #ifdef __cplusplus
 }

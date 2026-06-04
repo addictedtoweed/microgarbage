@@ -20,6 +20,10 @@ MgResult mg_chr_upload(uint16_t vram_word, const void *src, uint16_t bytes) {
                                        vram_word, (uint32_t)src, bytes);
 }
 
+void mg_ppu_clean_slate(void) {
+    (void)_vm_sys0(SYS_MG_PPU_CLEAN_SLATE);
+}
+
 void mg_palette_set(uint8_t idx, uint16_t bgr555) {
     /* Single-color write as a load of length 1. The host knows how
      * to write one entry; saves us a dedicated ecall slot. */

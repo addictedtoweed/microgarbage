@@ -53,8 +53,13 @@ void _start(void) {
     mg_palette_set_rgb(0, 0,    0,    0  );   /* backdrop = black  */
     mg_palette_set_rgb(1, 64,   128,  255);   /* visible plane = sky blue */
 
-    uint8_t preset = 0;
-    mg_force_blank(PRESETS[0][0], PRESETS[0][1]);
+    /* Start at preset 1 (8/8 demo-TV letterbox) so the v1.20 INIDISP
+     * direct-mode HDMA is visibly verified on launch without needing
+     * keyboard input to be wired up in bsnes-plus. The default of
+     * preset 0 (no letterbox) makes the demo look identical to a
+     * solid-blue render whether or not letterbox actually works. */
+    uint8_t preset = 1;
+    mg_force_blank(PRESETS[1][0], PRESETS[1][1]);
 
     for (;;) {
         MgPads pads = mg_pads();

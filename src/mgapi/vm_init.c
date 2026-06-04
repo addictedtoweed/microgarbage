@@ -49,6 +49,15 @@ extern const size_t        demo_mode7_elf_len;
 extern const unsigned char demo_mode7_3d_elf [];
 extern const size_t        demo_mode7_3d_elf_len;
 
+/* Adapter for vm_system unload hook (which passes vm_id + userdata) to
+ * mg_state_reset's parameterless signature. Registered once at init.
+ * See the call site below for the rationale (per-spawn shadow reset). */
+static void mg_state_reset_on_unload(uint16_t vm_id, void *userdata) {
+    (void)vm_id;
+    (void)userdata;
+    mg_state_reset();
+}
+
 /* install_bundled_demos lives below the g_td0_vol definition so the
  * helper can reach it. The forward declaration here just lets
  * mgapi_vm_init call it. */
@@ -171,6 +180,18 @@ int mgapi_vm_init(void *cart_volume_handle) {
      * build the DMA descriptor list the SNES kernel consumes. */
     mg_state_init();
     if (!mg_handlers_install(&g_sys)) goto fail_sys;
+
+    /* Reset mg_state on every VM unload so the next demo starts with
+     * clean shadow state. Without this, BG enables, HDMA channels,
+     * sprite config, M7 wrap, and force-blank settings leak between
+     * demos (only CGRAM/OAM/CHR get re-staged because they're shadow-
+     * backed; the boolean/enum config bits persist). Observed symptoms
+     * before this hook: palette.elf after letterbox.elf doesn't show
+     * its red backdrop because BG1 stays enabled from letterbox; demos
+     * after mode7_3d.elf get mangled video because HDMA channels 1..4
+     * stay enabled with stale table_off pointers. */
+    (void)vm_system_register_unload_hook(&g_sys,
+        &mg_state_reset_on_unload, NULL);
 
     /* Stage 3c: SYS_L2_* ecalls. Handlers convert host pointers <->
      * guest VAs against the same L2 backing the VM core's translation

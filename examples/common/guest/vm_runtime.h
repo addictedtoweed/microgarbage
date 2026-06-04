@@ -156,6 +156,7 @@
 #define SYS_MG_PACK_CHR             1218
 #define SYS_MG_PANIC                1219
 #define SYS_MG_FRAME_STATE          1220
+#define SYS_MG_PPU_CLEAN_SLATE      1221
 
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.

@@ -106,6 +106,15 @@ static void h_frame_commit(VmCpu *cpu, void *system) {
      * guest can pull a frame back if it decides to. */
     if (byte != 0 &&
         cart_window_frame_staged() > cart_window_frame_consumed()) {
+        /* Drop the HDMA-table bump pointer so the next iteration's
+         * mg_hdma_upload_table calls start from offset 0 again — the
+         * pool would otherwise accumulate this iteration's uploads on
+         * top of the previous (un-acked) iteration's, overflowing on
+         * iter N+1 even though each iter's tables fit on their own.
+         * The kernel reads tables via hdma[].table_off which stays
+         * stable across uploads, so overwriting at the same offsets
+         * is safe. */
+        mg_state_drop_hdma_tables();
         cpu->regs[VM_REG_A0] = 0;
         return;
     }

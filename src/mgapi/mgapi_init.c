@@ -248,7 +248,7 @@ void mgapi_diag_note_cart_read(uint16_t off, uint32_t full) {
     (void)full;
     g_diag_cart_reads++;
     g_diag_last_off = off;
-    if (off == 0x7E00 /* STROBE_BOOTED */ && !g_diag_boot_strobed) {
+    if (off == CW_OFF_STROBE_BOOT && !g_diag_boot_strobed) {
         g_diag_boot_strobed = true;
         fprintf(stderr, "mgapi: BOOT_STROBED -- boot.s reached kernel jump\n");
         fflush(stderr);
@@ -372,7 +372,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.11 (+ frame_commit waits for SNES ack)";
+    return "mgapi 1.27 (+ unload hook also clears cart_window slots)";
 }
 
 /* ----------------------------------------------------------------

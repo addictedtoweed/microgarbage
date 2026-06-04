@@ -396,6 +396,14 @@
  */
 #define SYS_MG_FRAME_STATE        1220
 
+/* Opt-in PPU reset (1221). A child VM calls this when it wants to
+ * start from a known-zero PPU state regardless of what the parent left
+ * behind. The next mg_frame_commit's DMA list will include CGRAM/OAM
+ * full-zero writes plus a VRAM-fill slot that wipes all 32K VRAM words
+ * to $0000. Skip the call if you want to inherit parent graphics
+ * (e.g., for sub-window blits or shared-overlay UIs). */
+#define SYS_MG_PPU_CLEAN_SLATE    1221  /* () → 0 */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

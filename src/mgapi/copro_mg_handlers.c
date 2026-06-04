@@ -63,6 +63,7 @@
 #define SYS_MG_PACK_CHR            1218
 #define SYS_MG_PANIC               1219
 #define SYS_MG_FRAME_STATE         1220
+#define SYS_MG_PPU_CLEAN_SLATE     1221
 
 /* MgResult values mirrored from mg_panic.h. */
 #define MG_R_OK             0
@@ -483,16 +484,26 @@ static void h_hdma_upload(VmCpu *cpu, void *sys_) {
     uint32_t tablep  = cpu->regs[VM_REG_A1];
     uint16_t len     = (uint16_t)cpu->regs[VM_REG_A2];
     if (channel == 0 || channel >= 7) {
+        fprintf(stderr, "mgapi h_hdma_upload: bad channel %u (1..6 valid)\n",
+                (unsigned)channel);
         cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
         return;
     }
     if (len == 0) { cpu->regs[VM_REG_A0] = MG_R_OK; return; }
 
     const void *src = vm_translate_read(cpu, tablep, len);
-    if (!src) { cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID; return; }
+    if (!src) {
+        fprintf(stderr, "mgapi h_hdma_upload: vm_translate_read(0x%08x, %u) "
+                        "returned NULL\n", tablep, (unsigned)len);
+        cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID;
+        return;
+    }
 
     uint16_t off = mg_state_stage_hdma_table(src, len);
     if (off == UINT16_MAX) {
+        fprintf(stderr, "mgapi h_hdma_upload: pool overflow ch=%u len=%u "
+                        "(pool cap 1280)\n",
+                (unsigned)channel, (unsigned)len);
         cpu->regs[VM_REG_A0] = MG_R_ERR_DMA_BYTES;
         return;
     }
@@ -781,6 +792,49 @@ static void h_panic(VmCpu *cpu, void *sys_) {
     cpu->halted = true;
 }
 
+/* Voluntary "clean slate" PPU reset. A child VM calls this when it
+ * doesn't want to inherit the parent's PPU state (VRAM tiles, CGRAM
+ * palette, OAM sprites, BG/M7/HDMA config). The host-side unload hook
+ * (vm_init.c) already resets mg_state's shadow when a VM exits, but the
+ * actual PPU memory (VRAM/CGRAM/OAM) persists across VM boundaries
+ * because the host can't touch those without staging a DMA. This call
+ * stages those DMAs:
+ *
+ *   1. Reset all shadow state via mg_state_reset (cgram zero, oam y=240
+ *      hidden, bg disabled, m7 identity, hdma disabled, etc.)
+ *   2. Mark cgram/oam shadow ranges full-dirty so the next commit DMA's
+ *      the zeroed/hidden values into PPU CGRAM/OAM.
+ *   3. Stage a VRAM-clear DMA slot (fixed-source $0000 + 65536-byte
+ *      transfer → fills all 32K VRAM words with $0000).
+ *
+ * Result: after the NEXT mg_frame_commit, PPU VRAM/CGRAM/OAM are all
+ * zero, BG layers disabled, force-blank off. The caller can then start
+ * uploading its own tiles/palette/sprites from a known-clean state.
+ *
+ * Cost: 1 DMA slot + 2 bytes of payload (the zero source). The actual
+ * 64KB VRAM DMA happens entirely in vblank — 32K word writes at 8
+ * master cycles each = 1024us, which fits in the ~2.4ms NTSC vblank
+ * with margin. OAM (544 bytes) and CGRAM (512 bytes) DMAs also fit. */
+static void h_ppu_clean_slate(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    MgState *st = mg_state();
+
+    /* Reset shadows + config. mg_state_reset publishes oam_dirty=full
+     * so OAM gets re-DMA'd; we mirror that for CGRAM since the reset
+     * leaves CGRAM clean (no dirty marks). */
+    mg_state_reset();
+    st->cgram_dirty_lo = 0;
+    st->cgram_dirty_hi = sizeof(st->cgram_shadow);
+
+    /* Set the pending-VRAM-clear flag; build_frame stages the actual
+     * DMA slot during the next commit's emit phase, when slot indices
+     * are coordinated with CGRAM/OAM/etc. (Staging directly here would
+     * race with build_frame's s_slot_used reset and get clobbered.) */
+    st->pending_vram_clear = true;
+
+    cpu->regs[VM_REG_A0] = MG_R_OK;
+}
+
 /* Install / uninstall --------------------------------------------- */
 
 /* Compact table to keep install + unwind small. */
@@ -821,6 +875,7 @@ static const struct mg_handler_entry s_handlers[] = {
     { SYS_MG_PACK_CHR,             h_pack_chr           },
     { SYS_MG_PANIC,                h_panic              },
     { SYS_MG_FRAME_STATE,          h_frame_state        },
+    { SYS_MG_PPU_CLEAN_SLATE,      h_ppu_clean_slate    },
 };
 
 #define MG_HANDLER_COUNT ((unsigned)(sizeof(s_handlers) / sizeof(s_handlers[0])))

@@ -44,10 +44,16 @@ COPRO_FRAME_RDY = (COPRO_BANK << 16) | $7800
 COPRO_DMA_LIST  = (COPRO_BANK << 16) | $7808
 COPRO_PPU_BATCH = (COPRO_BANK << 16) | $7848
 COPRO_INIDISP_HDMA = (COPRO_BANK << 16) | $7868
-COPRO_HDMA_CONFIG  = (COPRO_BANK << 16) | $7878
-COPRO_MODE7_BATCH  = (COPRO_BANK << 16) | $78B0
-COPRO_HDMA_TABLES  = (COPRO_BANK << 16) | $7900
-COPRO_STATUS    = (COPRO_BANK << 16) | $7F00
+; INIDISP HDMA area expanded from 16 to 256 bytes to hold a direct-mode
+; table (one INIDISP value per scanline). bsnes-plus's HDMA emulation
+; doesn't honor the repeat-mode bit, so we encode every line explicitly;
+; the table doesn't fit in the old 16-byte slot. Shifts HDMA_CONFIG /
+; MODE7_BATCH / HDMA_TABLES down by $F0 ($100 - $10) accordingly.
+COPRO_HDMA_CONFIG  = (COPRO_BANK << 16) | $7968
+COPRO_MODE7_BATCH  = (COPRO_BANK << 16) | $79A0
+COPRO_HDMA_TABLES  = (COPRO_BANK << 16) | $7A00
+; Moved from $7F00 to share the gap with STROBE_BOOTED (see below).
+COPRO_STATUS    = (COPRO_BANK << 16) | $79B1
 
 ; --- per-frame DMA dispatch ------------------------------------------
 ; The kernel checks COPRO_FRAME_RDY in NMI; 0 means the copro is mid-stage
@@ -92,7 +98,8 @@ JOYPORT_P2_LO   = $7400
 JOYPORT_P2_HI   = $7500
 JOYPORT_P3_LO   = $7600
 JOYPORT_P3_HI   = $7700
-STROBE_BOOTED   = $7E00         ; [read] boot.s -> copro: running from RAM, go runtime
+; Moved from $7E00 (now inside HDMA tables pool $7A00-$7EFF after v1.20).
+STROBE_BOOTED   = $79B0         ; [read] boot.s -> copro: running from RAM, go runtime
 
 ; long (24-bit) forms so reads hit COPRO_BANK with DBR left at $00
 COPRO_STATUS_L    = (COPRO_BANK << 16) | COPRO_STATUS

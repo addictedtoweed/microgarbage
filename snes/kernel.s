@@ -61,7 +61,12 @@
     lda #COPRO_BANK
     sta A1B7
     lda #$80                ; bit 7: enable HDMA channel 7
-    sta HDMAEN
+    sta HDMAEN              ; the host's emit_inidisp_table writes $00 at
+                            ; $7868 when no letterbox is configured, so
+                            ; channel 7 terminates immediately each frame
+                            ; without touching INIDISP (the common case).
+                            ; When letterbox IS configured, channel 7
+                            ; drives INIDISP per scanline from the table.
 
     lda #$0F
     sta INIDISP             ; screen on, full brightness
@@ -142,6 +147,15 @@
     jmp @out               ; long jump — short branch range was exceeded
                            ; when the PPU register batch was added below
 @do_frame:
+
+    ; Reaffirm INIDISP visible at every NMI start so the screen survives
+    ; even if HDMA channel 7's source table is malformed or never
+    ; touched this frame. Belt-and-suspenders against the bsnes-plus
+    ; HDMA repeat-mode discrepancy (see emit_inidisp_table in
+    ; copro_mg_state.c). Real-hardware no-op when HDMA writes $0F
+    ; anyway; cheap diagnostic safety on emulators.
+    lda #$0F
+    sta INIDISP
 
     ; (Real hardware: assert/extend forced blank for the letterbox lines so the
     ;  whole 54-line window is DMA-able -- see the DMA-budget notes. TODO.)

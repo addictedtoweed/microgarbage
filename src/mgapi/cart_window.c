@@ -166,11 +166,28 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
         unsigned port = (unsigned)(off - CW_OFF_JOY_BASE) >> CW_JOY_PAGE_SHIFT;
         g_last_pad_port = port;
         /* Port 7 = the LAST joypad mailbox read in the kernel's
-         * @loop sequence (pad 3 high byte). Bumping g_frame_consumed
-         * here means we know the SNES has finished walking the
-         * staged DMA list and ack'd the previous frame -- a guest
-         * blocked in h_frame_commit can now stage a fresh one. */
-        if (port == 7) g_frame_consumed++;
+         * @loop sequence (pad 3 high byte). The kernel reads it on
+         * EVERY main-loop iteration regardless of whether NMI just
+         * processed a staged frame — so blindly bumping consumed
+         * every time would let it race far ahead of staged during
+         * the shell's idle period (no demo running). When the first
+         * demo finally commits, `staged > consumed` is already
+         * FALSE (consumed >> 1), so the very next iter's commit
+         * wouldn't early-return and would clear the just-staged
+         * slot BEFORE NMI 1 dispatched it. Result: frame 1's CGRAM
+         * DMA never lands in PPU; the screen is blank for demos
+         * that only re-dirty CGRAM once at setup (the visible
+         * symptom in mode7.elf).
+         *
+         * Fix: only bump consumed when frame_ready was 1 at the
+         * time of this port-7 read — i.e., NMI just walked a real
+         * staged frame. Also clear frame_ready to 0 so subsequent
+         * port-7 reads (from idle NMI loop iterations after demo
+         * exit, or before next commit) don't keep bumping. */
+        if (port == 7 && g_frame_ready != 0) {
+            g_frame_consumed++;
+            g_frame_ready = 0;
+        }
         return 0;
     }
 

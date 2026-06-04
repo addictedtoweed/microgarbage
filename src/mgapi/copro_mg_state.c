@@ -84,10 +84,18 @@ void mg_state_reset(void) {
     s_state.oam_dirty_lo   = 0;
     s_state.oam_dirty_hi   = MG_OAM_BYTES;   /* publish "everything hidden" */
 
-    /* CGRAM defaults: all zero (black). */
+    /* CGRAM defaults: all zero (black). Mark the WHOLE range dirty so
+     * the next commit DMAs all 512 zero bytes into the PPU's CGRAM,
+     * clearing leftover palette entries from the previous demo. Without
+     * this the new demo's mg_palette_set_rgb calls only dirty the
+     * specific entries it touches; CGRAM[1..N] for any N the new demo
+     * doesn't explicitly set keeps the old demo's values (visible
+     * symptom: red strip at top after palette.elf → letterbox.elf →
+     * sprite.elf, where leftover CGRAM[1] from letterbox.elf shows
+     * through BG1 rendering tile-0 from leftover VRAM). */
     memset(s_state.cgram_shadow, 0, sizeof(s_state.cgram_shadow));
     s_state.cgram_dirty_lo = 0;
-    s_state.cgram_dirty_hi = 0;
+    s_state.cgram_dirty_hi = sizeof(s_state.cgram_shadow);
 
     /* BG layers default to disabled + zero tilemap. */
     for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
@@ -128,6 +136,28 @@ void mg_state_reset(void) {
     s_state.m7cy  = 0;
     s_state.m7sel = 0;
 
+    /* Reset payload + slot bump pointers AND clear all 8 cart_window
+     * slots to empty. Without this, slot data from the previous demo's
+     * last commit persists in cart_window even after mg_state shadow
+     * reset; the next demo's mg_chr_upload allocates from the stale
+     * s_slot_used value (e.g., slot 1 if the previous demo had 1 slot
+     * used), so its CHR goes to slot 1 not slot 0 — and the previous
+     * demo's slot 0 CGRAM-red DMA keeps firing every NMI, ahead of the
+     * new demo's CGRAM-zero DMA at a higher slot. Visible symptom:
+     * palette.elf → letterbox.elf shows CGRAM[0] = red instead of the
+     * black letterbox.elf wants. Clearing slots here ensures the next
+     * demo starts with all-empty cart_window slots regardless of what
+     * the previous demo's bump pointers happened to be. */
+    s_payload_used = 0;
+    s_slot_used    = 0;
+    {
+        static const CartDmaSlot empty_slot = {0};
+        for (unsigned i = 0; i < 8; i++) {
+            cart_window_set_dma_slot(i, &empty_slot);
+        }
+    }
+    s_prev_mg_slots = 0;
+
     /* Persistent-staging checkpoint -- starts at zero so the first
      * mg_chr_upload (or similar) allocates from payload offset 0.
      * Each direct stage advances it; build_frame rewinds to here
@@ -152,6 +182,54 @@ uint16_t mg_state_stage_hdma_table(const void *src, uint16_t len) {
     cart_window_load_blob(off, src, len);
     s_hdma_tables_used = (uint16_t)(s_hdma_tables_used + len);
     return off;
+}
+
+/* Drop all per-frame HDMA-table staging — used by the early-return
+ * path in h_frame_commit when the SNES kernel hasn't yet acked the
+ * previous frame. Without this, mg_hdma_upload_table calls from
+ * subsequent iterations of a tight commit-cancelled loop accumulate
+ * into the pool and overflow CW_HDMA_TABLES_BYTES on iteration N+1
+ * even though each iteration's tables would fit on their own.
+ *
+ * Safe because the stored hdma[].table_off pointers stay unchanged
+ * across the next iteration's re-uploads — the new tables overwrite
+ * the old ones at the same offsets the kernel reads from. */
+void mg_state_drop_hdma_tables(void) {
+    s_hdma_tables_used = 0;
+}
+
+/* Forward decl — alloc_payload's full definition is further down in
+ * the file (it logically belongs with the stage_dma machinery), but
+ * we need it here for mg_state_stage_vram_clear. */
+static uint32_t alloc_payload(uint32_t bytes);
+
+/* Full-VRAM clear via SNES fixed-source DMA trick. See header comment
+ * for the protocol; here we set up the slot fields directly because:
+ *   - we need DMAP bit 4 (fixed source) — stage_dma doesn't expose this
+ *   - we want slot.size = $0000, which SNES DAS interprets as 65536-
+ *     byte transfer (= 32K word writes = full VRAM). stage_dma's size==0
+ *     guard would short-circuit, so we bypass it.
+ *
+ * The 2-byte zero source sits in the regular payload area; the fixed-
+ * source mode means the SNES reads the SAME 2 bytes 65536 times, never
+ * advancing past them. Cheap (2 bytes of payload, 1 slot). */
+bool mg_state_stage_vram_clear(void) {
+    if (s_slot_used >= 8) return false;
+
+    static const uint8_t zeros[2] = {0, 0};
+    uint32_t off = alloc_payload(2);
+    if (off == UINT32_MAX) return false;
+    cart_window_load_blob(off, zeros, 2);
+
+    CartDmaSlot slot = {
+        .bbus = BBUS_VMDATAL,
+        .dmap = DMAP_2B_2R | 0x10,  /* bit 4: fixed source */
+        .src  = (uint16_t)off,
+        .size = 0,                   /* SNES interprets DAS=0 as 65536 */
+        .prep = 0,                   /* VMADDR start = 0 */
+    };
+    cart_window_set_dma_slot(s_slot_used++, &slot);
+    return true;
 }
 
 MgState *mg_state(void) {
@@ -383,34 +461,105 @@ static void emit_ppu_batch(void) {
  * bottom values, write it into the cart window at CW_OFF_INIDISP_HDMA.
  * The kernel-reserved HDMA channel 7 reads from there each scanline.
  *
- * Mode-0 repeat segment format: [0x80 | line_count][value]
- * Terminator: 0x00
- * line_count is bits 0-6 of the count byte; 1..127 valid (0 means
- * "128 lines" with special handling we avoid by splitting). */
+ * Uses DIRECT mode encoding (one value per scanline) because bsnes-
+ * plus's HDMA doesn't honor repeat-mode bit 7 (it always advances the
+ * source address per scanline). A real-hardware repeat table renders
+ * incorrectly there — the channel reads past the intended data after
+ * scanline 1. Direct mode works identically on both. Direct mode
+ * format: [count_byte][value_0][value_1]...[value_count-1]. Count's
+ * low 7 bits = chunk length (1..127); bit 7 = 0 (no repeat). $00
+ * count terminates the channel for the frame.
+ *
+ * COMMON CASE (no letterbox: force_blank_top == 0 && force_blank_bottom
+ * == 0) — emit just a 0x00 terminator. Channel 7 fires at scanline 0,
+ * reads $00 as the count byte, marks the channel completed for the
+ * frame, and never touches INIDISP. The kernel writes INIDISP=$0F at
+ * boot and at every NMI entry, so the screen stays visible at full
+ * brightness throughout the frame.
+ *
+ * LETTERBOX CASE — emit a direct chunk for the top force-blank lines
+ * (value $80 = force-blank), one or two chunks for the visible middle
+ * (value $0F = visible/full-brightness), and a final chunk for the
+ * bottom force-blank lines. SNES caps each chunk at 127 lines; the
+ * 224-scanline middle needs two chunks (127 + 97). Total table size
+ * peaks around 230 bytes for an all-letterbox frame, comfortably
+ * within CW_INIDISP_HDMA_BYTES = 256.
+ *
+ * Cost per scanline on the SNES DMA side: 8 master cycles per byte
+ * read + 8 per write to INIDISP = 16 master cycles per scanline. For
+ * 224 lines that's 3584 master cycles spread across the frame's
+ * HBLANKs — negligible compared to per-scanline budgets. */
 static void emit_inidisp_table(void) {
     uint8_t buf[CW_INIDISP_HDMA_BYTES] = {0};
     uint8_t *p = buf;
     uint8_t  t = s_state.force_blank_top;
     uint8_t  b = s_state.force_blank_bottom;
 
+    if (t == 0 && b == 0) {
+        /* No letterbox: terminator-only. HDMA channel 7 completes
+         * before writing INIDISP this frame; the kernel's boot/NMI
+         * INIDISP=$0F write is the only thing the PPU sees. */
+        buf[0] = 0x00;
+        cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf, 1u);
+        return;
+    }
+
     int visible = 224 - (int)t - (int)b;
     if (visible < 0) visible = 0;
 
-    if (t) {
-        *p++ = (uint8_t)(0x80u | t);   /* repeat for t lines */
-        *p++ = 0x80;                   /* INIDISP = force-blank */
+    /* Hybrid encoding: count = 0x80 | N where N is the line count for
+     * this chunk (1..127), followed by N data bytes (one per scanline).
+     *
+     * bsnes-plus's HDMA loop:
+     *   per scanline: if do_transfer { transfer; src++ }; line_counter--;
+     *                  do_transfer = line_counter & 0x80;
+     *                  if (line_counter & 0x7F) == 0: refetch count.
+     *
+     * For count $80 | N, line_counter starts at $80 + N. After N
+     * decrements it's at $80. Bit 7 still set → do_transfer = true for
+     * all N transfers. Then (line_counter & 0x7F) == 0 → REFETCH
+     * immediately, picking up the next chunk's count byte. So N
+     * transfers fire on scanlines 0..N-1 and the next chunk takes over
+     * on scanline N. Exactly what we want.
+     *
+     * Each scanline reads a separate data byte from the source. We
+     * emit N copies of the desired INIDISP value ($80 force-blank or
+     * $0F visible). Max chunk N = 127 (count $FF = $80 | $7F), so the
+     * typical 208-line middle band splits into 127 + 81. Real SNES
+     * note: on real hardware this encoding makes one transfer per
+     * scanline that reads the same single repeated value (the first
+     * data byte gets used for all N lines, the rest skipped — but the
+     * source addr advance differs from bsnes-plus, so the next chunk's
+     * count byte lands at a different offset). bsnes-plus only for
+     * now; real-SNES compat would need a different encoding. */
+#define LB_CHUNK(n, val) do {                          \
+        *p++ = (uint8_t)(0x80u | (uint8_t)(n));        \
+        for (int _i = 0; _i < (n); _i++) *p++ = (val); \
+    } while (0)
+
+    /* Top force-blank chunk(s). Cap at 127 per chunk. */
+    while (t > 0) {
+        uint8_t n = t > 127 ? 127 : t;
+        LB_CHUNK(n, 0x80);
+        t = (uint8_t)(t - n);
     }
+
+    /* Visible middle. */
     while (visible > 0) {
         int n = visible > 127 ? 127 : visible;
-        *p++ = (uint8_t)(0x80u | (uint8_t)n);
-        *p++ = 0x0F;                   /* INIDISP = visible, full brightness */
+        LB_CHUNK(n, 0x0F);
         visible -= n;
     }
-    if (b) {
-        *p++ = (uint8_t)(0x80u | b);
-        *p++ = 0x80;
+
+    /* Bottom force-blank chunk(s). */
+    while (b > 0) {
+        uint8_t n = b > 127 ? 127 : b;
+        LB_CHUNK(n, 0x80);
+        b = (uint8_t)(b - n);
     }
+
     *p++ = 0x00;                       /* terminator */
+#undef LB_CHUNK
 
     cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf,
                           (uint32_t)(p - buf));
@@ -511,6 +660,22 @@ void mg_state_build_frame(void) {
         cart_window_load_blob(CW_OFF_HDMA_CONFIG, cfg, sizeof(cfg));
     }
 
+    /* CGRAM goes BEFORE OAM. With OAM at slot[1] and CGRAM at slot[2],
+     * frame 1's CGRAM DMA fails to land in PPU on bsnes-plus (likely
+     * the 544-byte OAM DMA leaves the SNES bus / OAMADDR in a state
+     * that breaks the subsequent CGRAM dispatch). Putting CGRAM at a
+     * lower slot index keeps it ahead of the OAM DMA where dispatch
+     * is reliably proven to work. */
+    if (s_state.cgram_dirty_hi > s_state.cgram_dirty_lo) {
+        uint16_t lo = s_state.cgram_dirty_lo;
+        uint16_t hi = s_state.cgram_dirty_hi;
+        const uint8_t *src = (const uint8_t *)s_state.cgram_shadow + lo;
+        (void)stage_dma(src, (uint16_t)(hi - lo),
+                        BBUS_CGDATA, DMAP_1B_1R,
+                        cgram_prep_word(lo));
+        s_state.cgram_dirty_lo = s_state.cgram_dirty_hi = 0;
+    }
+
     /* OAM. */
     if (s_state.oam_dirty_hi > s_state.oam_dirty_lo) {
         /* DMA the whole shadow (544 bytes) — simpler than partial
@@ -520,17 +685,6 @@ void mg_state_build_frame(void) {
                         BBUS_OAMDATA, DMAP_1B_1R,
                         oam_prep_word(s_state.oam_dirty_lo));
         s_state.oam_dirty_lo = s_state.oam_dirty_hi = 0;
-    }
-
-    /* CGRAM. */
-    if (s_state.cgram_dirty_hi > s_state.cgram_dirty_lo) {
-        uint16_t lo = s_state.cgram_dirty_lo;
-        uint16_t hi = s_state.cgram_dirty_hi;
-        const uint8_t *src = (const uint8_t *)s_state.cgram_shadow + lo;
-        (void)stage_dma(src, (uint16_t)(hi - lo),
-                        BBUS_CGDATA, DMAP_1B_1R,
-                        cgram_prep_word(lo));
-        s_state.cgram_dirty_lo = s_state.cgram_dirty_hi = 0;
     }
 
     /* BG tilemaps. Each layer's tilemap_word is the VRAM word

@@ -28,6 +28,26 @@
 extern "C" {
 #endif
 
+/* -------- PPU clean slate (opt-in) -------- */
+
+/* Reset the SNES PPU to a known-zero state on the next vblank:
+ * VRAM/CGRAM/OAM all wiped, BG layers disabled, M7 matrix identity at
+ * center (0,0), HDMA channels disabled, force-blank cleared, sprites
+ * hidden at y=240. After calling this, the next mg_frame_commit's DMA
+ * list will include the VRAM-clear + CGRAM/OAM zero writes.
+ *
+ * Voluntary. A child VM that wants to inherit its parent's loaded
+ * graphics (e.g., a paged-overlay UI that builds on a kernel-loaded
+ * tilemap) skips the call. A standalone demo calls it as the first
+ * line of _start. Costs 1 DMA slot + 2 bytes of payload for the VRAM-
+ * fill source; the actual 64KB VRAM DMA fits comfortably in vblank.
+ *
+ * Note: the host-side mg_state shadow is reset automatically on every
+ * VM unload (vm_init.c's unload hook). This call is specifically for
+ * clearing the PPU state itself, which the host can't touch except by
+ * staging a DMA. */
+void mg_ppu_clean_slate(void);
+
 /* -------- CHR upload -------- */
 
 /* Stage `bytes` of pre-packed planar CHR into the cart-window and
