@@ -114,25 +114,58 @@ typedef struct {
     uint8_t       horizon_row; /* 0..223; lines above draw as backdrop      */
 } MgMode7Camera3D;
 
-/* Each HDMA table buffer must be at least this many bytes under the
- * bsnes-plus hybrid HDMA encoding (count = $80|N + N×2 data bytes per
- * chunk). Worst-case for any horizon: full 224 scanlines split into
- * two chunks (127 + 97) = 1 + 254 + 1 + 194 = 450 bytes for the
- * non-sky case, or sky+active each ≤ 127 lines (255 + 195 = 450).
- * Plus 1 terminator byte = 451 bytes max. 512 gives margin. */
-#define MG_MODE7_3D_TABLE_BYTES 512
+/* Per-table size budget. The M7A..D tables and the M7SEL table are
+ * mode-0/mode-2 (1 or 2 bytes per scanline) so 512 bytes is more
+ * than enough. The combined HOFS+VOFS table is mode-3 (4 bytes per
+ * scanline) so its worst case is 224*4 + chunk counts + terminator
+ * ≈ 900 bytes — declare it separately as 1024. */
+#define MG_MODE7_3D_TABLE_BYTES    512
+#define MG_MODE7_3D_HV_TABLE_BYTES 1024
 
-/* Build M7A/B/C/D HDMA tables for the camera. Returns the number
- * of bytes written into each table -- pass that as the `len` to
- * mg_hdma_upload_table. out_static gets the camera's static fields
- * (M7X/Y center + zero scroll); pass it to mg_mode7_set. Pure C,
- * no ecall. */
-uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
-                           uint8_t  *table_m7a,
-                           uint8_t  *table_m7b,
-                           uint8_t  *table_m7c,
-                           uint8_t  *table_m7d,
-                           MgMode7Params *out_static);
+/* Build 6 HDMA tables for the camera (M7A/B/C/D + BG1HOFS + BG1VOFS).
+ * Returns the number of bytes written into each table — pass that as
+ * `len` to mg_hdma_upload_table. out_static gets the camera's static
+ * fields (M7X/Y set to 0; scroll zeroed since HOFS/VOFS now come
+ * from HDMA); pass it to mg_mode7_set. Pure C, no ecall.
+ *
+ * The per-scanline HOFS/VOFS values are computed so that camera
+ * translation produces uniform plane-coord shifts across all rows
+ * (no skew). Specifically:
+ *
+ *     HOFS_at_row = (cos·cam.x + sin·cam.y) / z_at_row
+ *     VOFS_at_row = (-sin·cam.x + cos·cam.y) / z_at_row
+ *
+ * which, fed into the SNES Mode-7 formula plane_x = A·(X' + HOFS) +
+ * B·(Y' + VOFS), exactly cancels the per-row z multiplier. The
+ * effect: moving the camera 1 unit forward slides every scanline's
+ * sampled plane region by 1 unit too, like F-Zero. With the prior
+ * (HOFS = constant) approach the same move produced shifts of z
+ * units per scanline -- visible as a strong "shear" toward the
+ * horizon. */
+/* Returned struct gives the byte count for each table type. The 4
+ * M7A..D tables share the same size (mode-2: 2 bytes/scanline); the
+ * combined HOFS+VOFS table is mode-3 (4 bytes/scanline) and is
+ * larger. Callers upload each table with its respective count. */
+typedef struct {
+    uint16_t bytes_m7;    /* size of each M7A..D table */
+    uint16_t bytes_hv;    /* size of the HOFS+VOFS combined table */
+} MgMode7TableSizes;
+
+MgMode7TableSizes mg_mode7_camera3d(const MgMode7Camera3D *cam,
+                                    uint8_t  *table_m7a,
+                                    uint8_t  *table_m7b,
+                                    uint8_t  *table_m7c,
+                                    uint8_t  *table_m7d,
+                                    uint8_t  *table_hv,
+                                    MgMode7Params *out_static);
+
+/* Build a static M7SEL HDMA table that switches "screen over" mode
+ * per scanline so the sky band uses MG_MODE7_FILL_BLACK (out-of-plane
+ * → backdrop = a solid sky color) and the active band uses MG_MODE7_
+ * WRAP (plane coords wrap mod 1024 → no FILL_BLACK wedges from per-
+ * scanline-varying matrices). Call once at demo startup; the table
+ * doesn't depend on the camera. Returns bytes written. */
+uint16_t mg_mode7_build_m7sel_table(uint8_t *table, uint8_t horizon_row);
 
 #ifdef __cplusplus
 }

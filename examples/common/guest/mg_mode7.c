@@ -107,20 +107,29 @@ static inline void wr16le(uint8_t *dst, uint16_t off, int16_t v) {
     dst[off + 1] = (uint8_t)(((uint16_t)v >> 8) & 0xFF);
 }
 
-uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
-                           uint8_t  *table_m7a,
-                           uint8_t  *table_m7b,
-                           uint8_t  *table_m7c,
-                           uint8_t  *table_m7d,
-                           MgMode7Params *out_static) {
+MgMode7TableSizes mg_mode7_camera3d(const MgMode7Camera3D *cam,
+                                    uint8_t  *table_m7a,
+                                    uint8_t  *table_m7b,
+                                    uint8_t  *table_m7c,
+                                    uint8_t  *table_m7d,
+                                    uint8_t  *table_hv,
+                                    MgMode7Params *out_static) {
+    /* The HV table is a separate offset cursor since it advances at
+     * 4 bytes/scanline while M7A..D advance at 2 bytes/scanline. */
+    uint16_t hv_off = 0;
     /* Yaw matrix is constant per frame -- cache the trig once. */
     q16_16_t s, c;
     q16_sincos(cam->base.yaw, &s, &c);
 
+    /* Translation numerators (depth-independent part of HOFS/VOFS).
+     * Per-scanline HOFS = num_h / z_at_row, VOFS = num_v / z_at_row. */
+    q16_16_t num_h = q16_mul(c, cam->base.x) + q16_mul(s, cam->base.y);
+    q16_16_t num_v = q16_mul(-s, cam->base.x) + q16_mul(c, cam->base.y);
+
     const uint8_t h = cam->horizon_row;
     /* "Active" scanlines run from horizon_row .. 223. Lines above
-     * get a (0,0,0,0) matrix that pairs with MG_MODE7_FILL_BLACK
-     * to read as solid backdrop. */
+     * get a saturated diagonal matrix + 0 scroll that pairs with
+     * MG_MODE7_FILL_BLACK to read as solid backdrop. */
     const uint16_t active_count = (h < 224u) ? (uint16_t)(224u - h) : 0u;
     uint16_t off = 0;
 
@@ -154,12 +163,24 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
             table_m7c[off] = count;
             table_m7d[off] = count;
             off++;
+            table_hv[hv_off++] = count;
             for (uint8_t i = 0; i < chunk; i++) {
                 wr16le(table_m7a, off, (int16_t)0x7FFF);
                 wr16le(table_m7b, off, 0);
                 wr16le(table_m7c, off, 0);
                 wr16le(table_m7d, off, (int16_t)0x7FFF);
                 off += 2;
+                /* HV table mode-3 4 bytes/scanline:
+                 *   bytes 0,1 -> BG1HOFS (write-twice, low then high)
+                 *   bytes 2,3 -> BG1VOFS (write-twice)
+                 * For sky scanlines the M7=$7FFF saturation pushes
+                 * plane coords out of range so HOFS/VOFS are don't-
+                 * care -- write zeros. */
+                table_hv[hv_off + 0] = 0;
+                table_hv[hv_off + 1] = 0;
+                table_hv[hv_off + 2] = 0;
+                table_hv[hv_off + 3] = 0;
+                hv_off += 4;
             }
             lines_left -= chunk;
         }
@@ -180,6 +201,7 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
             table_m7b[count_off] = count;
             table_m7c[count_off] = count;
             table_m7d[count_off] = count;
+            table_hv[hv_off++] = count;
             for (uint8_t i = 0; i < group; i++, row++) {
                 /* depth_factor = height / (row - horizon + 1).
                  * +1 keeps the line just past the horizon from
@@ -199,11 +221,45 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
                 int16_t m_c = q16_to_q8_8_sat(q16_mul(z,  s));
                 int16_t m_d = q16_to_q8_8_sat(q16_mul(z,  c));
 
+                /* Per-scanline HOFS/VOFS that cancel the row's z
+                 * multiplier when the SNES PPU computes
+                 * plane_x = A·(X' + HOFS) + B·(Y' + VOFS). Dividing
+                 * a Q16.16 numerator by a Q16.16 z gives a Q0
+                 * integer, which is exactly what M7HOFS/M7VOFS
+                 * want (signed 13-bit, saturated).
+                 *
+                 * The -128 / -224 anchor terms put screen pixel
+                 * (SX=128, SY=224) at the camera position: screen
+                 * center horizontally maps to cam.x (so left/right
+                 * is symmetric), and SY=224 (just past the bottom
+                 * of the visible 224-line frame) maps to cam.y --
+                 * meaning every visible row (SY in horizon..223)
+                 * shows plane_y < cam.y, i.e., AHEAD of the camera
+                 * in the looking direction. Without the -224 anchor
+                 * (e.g., with -112 = screen middle), the lower half
+                 * of the screen would map to plane_y > cam.y =
+                 * BEHIND the camera, which doesn't match how a
+                 * horizontal-look camera sees a flat ground. */
+                int32_t hofs = (z != 0) ? (int32_t)(num_h / z) : 0;
+                int32_t vofs = (z != 0) ? (int32_t)(num_v / z) : 0;
+                hofs -= 128;
+                vofs -= 224;
+                if (hofs >  4095) hofs =  4095;
+                if (hofs < -4096) hofs = -4096;
+                if (vofs >  4095) vofs =  4095;
+                if (vofs < -4096) vofs = -4096;
+
                 wr16le(table_m7a, off, m_a);
                 wr16le(table_m7b, off, m_b);
                 wr16le(table_m7c, off, m_c);
                 wr16le(table_m7d, off, m_d);
                 off += 2;
+                /* HV table mode-3: HOFS_lo, HOFS_hi, VOFS_lo, VOFS_hi. */
+                table_hv[hv_off + 0] = (uint8_t)((uint16_t)hofs       & 0xFFu);
+                table_hv[hv_off + 1] = (uint8_t)(((uint16_t)hofs >> 8) & 0xFFu);
+                table_hv[hv_off + 2] = (uint8_t)((uint16_t)vofs       & 0xFFu);
+                table_hv[hv_off + 3] = (uint8_t)(((uint16_t)vofs >> 8) & 0xFFu);
+                hv_off += 4;
             }
             lines_left -= group;
         }
@@ -215,21 +271,68 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
     table_m7c[off] = 0;
     table_m7d[off] = 0;
     off += 1;
+    table_hv[hv_off++] = 0;
 
-    /* Static part: M7X/Y carries world-plane center; M7A..D get
-     * overwritten every scanline by HDMA but we fill them in case
-     * the first vblank's HDMA hasn't fired yet. Use a flat
-     * (identity * zoom) matrix so the first frame doesn't flash
-     * garbage. */
+    /* Static part. M7X/M7Y are 0 -- the per-scanline HOFS/VOFS
+     * carries the camera offset via the formula
+     * plane_x = A·(X' + HOFS) + B·(Y' + VOFS) (with X' = SX - M7X,
+     * but M7X = 0 collapses that to just SX). Static M7A/D are an
+     * identity-scale placeholder in case the first vblank's HDMA
+     * hasn't fired yet; HDMA overwrites them at scanline 0+. */
     q16_16_t z = cam->base.zoom;
     out_static->a = q16_to_q8_8_sat(q16_mul(z,  c));
     out_static->b = q16_to_q8_8_sat(q16_mul(z, -s));
     out_static->c = q16_to_q8_8_sat(q16_mul(z,  s));
     out_static->d = q16_to_q8_8_sat(q16_mul(z,  c));
-    out_static->cx = q16_to_m7center_sat(cam->base.x);
-    out_static->cy = q16_to_m7center_sat(cam->base.y);
+    out_static->cx = 0;
+    out_static->cy = 0;
     out_static->hofs = 0;
     out_static->vofs = 0;
 
+    MgMode7TableSizes sizes;
+    sizes.bytes_m7 = off;
+    sizes.bytes_hv = hv_off;
+    return sizes;
+}
+
+/* ---- Static M7SEL HDMA table builder ---------------------------- */
+
+uint16_t mg_mode7_build_m7sel_table(uint8_t *table, uint8_t horizon_row) {
+    /* Sky band: M7SEL bits 6..7 = 10 (= FILL_BLACK / transparent ->
+     * backdrop). With the matrix saturated to $7FFF for sky lines,
+     * plane coords always go out of range and the backdrop color
+     * shows.
+     *
+     * Active band: M7SEL bits 6..7 = 00 (= WRAP). Plane coords wrap
+     * mod 1024 so the camera can move anywhere and a tile is always
+     * sampled -- no FILL_BLACK wedges from per-scanline matrix
+     * scaling pushing some scanlines out of range while keeping
+     * others in. */
+    uint16_t off = 0;
+    /* Sky chunks. */
+    {
+        uint16_t left = horizon_row;
+        while (left > 0) {
+            uint8_t n = (left > 127u) ? 127u : (uint8_t)left;
+            table[off++] = (uint8_t)(0x80u | n);
+            for (uint8_t i = 0; i < n; i++) {
+                table[off++] = 0x80u;
+            }
+            left -= n;
+        }
+    }
+    /* Active chunks. */
+    {
+        uint16_t left = (uint16_t)(224u - horizon_row);
+        while (left > 0) {
+            uint8_t n = (left > 127u) ? 127u : (uint8_t)left;
+            table[off++] = (uint8_t)(0x80u | n);
+            for (uint8_t i = 0; i < n; i++) {
+                table[off++] = 0x00u;
+            }
+            left -= n;
+        }
+    }
+    table[off++] = 0x00u;   /* terminator */
     return off;
 }

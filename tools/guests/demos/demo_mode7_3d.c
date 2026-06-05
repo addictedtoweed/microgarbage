@@ -32,8 +32,15 @@ static inline void sys_exit(int code) {
 }
 
 /* ----------------------------------------------------------------
- *  Same checkerboard tile as demo_mode7. See that file for the
- *  Mode 7 VRAM-interleave rationale.
+ *  Tile 0 = a "Tron corner": top row + left column bright (color
+ *  1), interior dark (color 2). When every cell of the Mode-7
+ *  tilemap points at tile 0 (= what mg_ppu_clean_slate leaves),
+ *  the bright edges align across cell boundaries to form a clean
+ *  8-pixel grid covering the whole plane -- a high-contrast Tron-
+ *  style visualization that makes camera motion easy to read.
+ *
+ *  See demo_mode7.c for the Mode 7 interleaved-CHR-and-tilemap
+ *  VRAM layout this 128-byte upload exploits.
  * ---------------------------------------------------------------- */
 static uint8_t s_chr_interleaved[128];
 
@@ -41,21 +48,32 @@ static void build_chr(void) {
     for (int y = 0; y < 8; y++) {
         for (int x = 0; x < 8; x++) {
             int idx = y * 8 + x;
-            uint8_t pix = (((y >> 1) ^ (x >> 1)) & 1) ? 1 : 2;
+            uint8_t pix = (y == 0 || x == 0) ? 1u : 2u;
             s_chr_interleaved[idx * 2 + 0] = 0;     /* tilemap byte */
             s_chr_interleaved[idx * 2 + 1] = pix;   /* CHR byte     */
         }
     }
 }
 
-/* HDMA tables for the four M7 matrix registers. mg_mode7_camera3d
- * fills these every frame -- the camera's yaw + height changing
- * means the table contents change too. Static so they live in BSS,
- * not stack. */
-static uint8_t s_tab_m7a[MG_MODE7_3D_TABLE_BYTES];
-static uint8_t s_tab_m7b[MG_MODE7_3D_TABLE_BYTES];
-static uint8_t s_tab_m7c[MG_MODE7_3D_TABLE_BYTES];
-static uint8_t s_tab_m7d[MG_MODE7_3D_TABLE_BYTES];
+/* HDMA tables for the per-scanline mode 7 effect:
+ *   M7A..M7D    -- the 2x2 rotation/scale matrix (channels 1..4)
+ *   HV combined -- BG1HOFS + BG1VOFS together via mode-3 HDMA on
+ *                  channel 5 (frees up a channel for M7SEL below)
+ *   M7SEL       -- per-scanline "screen over" mode on channel 6:
+ *                  sky band uses FILL_BLACK ($80), active band uses
+ *                  WRAP ($00). Lets the active band sample the
+ *                  wrapped plane without FILL_BLACK wedge artifacts
+ *                  while keeping the sky band as solid backdrop.
+ *
+ * mg_mode7_camera3d fills M7A..D and HV every frame. M7SEL is built
+ * once at startup since it doesn't depend on the camera. */
+static uint8_t s_tab_m7a  [MG_MODE7_3D_TABLE_BYTES];
+static uint8_t s_tab_m7b  [MG_MODE7_3D_TABLE_BYTES];
+static uint8_t s_tab_m7c  [MG_MODE7_3D_TABLE_BYTES];
+static uint8_t s_tab_m7d  [MG_MODE7_3D_TABLE_BYTES];
+static uint8_t s_tab_hv   [MG_MODE7_3D_HV_TABLE_BYTES];
+static uint8_t s_tab_m7sel[MG_MODE7_3D_TABLE_BYTES];
+static uint16_t s_m7sel_bytes;   /* set in _start; constant per run */
 
 #define Q16(x)        ((q16_16_t)((int32_t)(x) * Q16_ONE))
 #define Q16_FROM_DEG(d) ((q16_16_t)(((int64_t)(d) * Q16_TWO_PI) / 360))
@@ -82,31 +100,49 @@ void _start(void) {
     MG_OR_PANIC(mg_chr_upload(0x0000, s_chr_interleaved,
                               sizeof s_chr_interleaved));
 
-    /* Palette: sky / checker-light / checker-dark. The backdrop
-     * (CGRAM color 0) is what shows above the horizon. */
-    mg_palette_set_rgb(0,  40,  80, 200);   /* sky blue (backdrop)     */
-    mg_palette_set_rgb(1, 224, 224, 224);   /* light checker            */
-    mg_palette_set_rgb(2,  64,  64,  64);   /* dark  checker            */
+    /* Palette: sky-blue backdrop (above the horizon, where the
+     * per-scanline M7SEL HDMA selects FILL_BLACK), bright cyan grid
+     * lines and a dark-navy tile interior — high-contrast Tron
+     * look that makes camera motion easy to read against the grid. */
+    mg_palette_set_rgb(0,  40,  80, 200);   /* sky blue (backdrop) */
+    mg_palette_set_rgb(1,   0, 240, 240);   /* bright cyan grid    */
+    mg_palette_set_rgb(2,  16,  16,  48);   /* dark navy interior  */
 
-    /* Reserve HDMA channels 1..4 for the M7 matrix writes. The
-     * kernel uses channel 0 for the DMA list dispatch and channel 7
-     * for the INIDISP letterbox, so 1..6 are free for games. */
-    MgHdmaCfg cfg_a; cfg_a.channel = 1; cfg_a.dest = MG_HDMA_DEST_M7A;
-                     cfg_a.xfer = MG_HDMA_XFER_2B_1R; cfg_a.indirect = false;
-    MgHdmaCfg cfg_b; cfg_b.channel = 2; cfg_b.dest = MG_HDMA_DEST_M7B;
-                     cfg_b.xfer = MG_HDMA_XFER_2B_1R; cfg_b.indirect = false;
-    MgHdmaCfg cfg_c; cfg_c.channel = 3; cfg_c.dest = MG_HDMA_DEST_M7C;
-                     cfg_c.xfer = MG_HDMA_XFER_2B_1R; cfg_c.indirect = false;
-    MgHdmaCfg cfg_d; cfg_d.channel = 4; cfg_d.dest = MG_HDMA_DEST_M7D;
-                     cfg_d.xfer = MG_HDMA_XFER_2B_1R; cfg_d.indirect = false;
+    /* Reserve HDMA channels 1..6:
+     *   1 = M7A    2 = M7B    3 = M7C    4 = M7D       (mode 2)
+     *   5 = HV   (4 bytes/scanline, mode 3, BBAD=BG1HOFS hits both
+     *            BG1HOFS and BG1VOFS via the "4B 2R" pattern)
+     *   6 = M7SEL (mode 0, 1 byte/scanline; switches FILL_BLACK over
+     *            sky lines and WRAP over the active band)
+     * Channel 0 reserved for the kernel's DMA-list dispatch; channel
+     * 7 reserved for INIDISP letterbox. */
+    MgHdmaCfg cfg_a;  cfg_a.channel  = 1; cfg_a.dest  = MG_HDMA_DEST_M7A;
+                     cfg_a.xfer  = MG_HDMA_XFER_2B_1R; cfg_a.indirect  = false;
+    MgHdmaCfg cfg_b;  cfg_b.channel  = 2; cfg_b.dest  = MG_HDMA_DEST_M7B;
+                     cfg_b.xfer  = MG_HDMA_XFER_2B_1R; cfg_b.indirect  = false;
+    MgHdmaCfg cfg_c;  cfg_c.channel  = 3; cfg_c.dest  = MG_HDMA_DEST_M7C;
+                     cfg_c.xfer  = MG_HDMA_XFER_2B_1R; cfg_c.indirect  = false;
+    MgHdmaCfg cfg_d;  cfg_d.channel  = 4; cfg_d.dest  = MG_HDMA_DEST_M7D;
+                     cfg_d.xfer  = MG_HDMA_XFER_2B_1R; cfg_d.indirect  = false;
+    MgHdmaCfg cfg_hv; cfg_hv.channel = 5; cfg_hv.dest = MG_HDMA_DEST_BG1_HOFS;
+                     cfg_hv.xfer = MG_HDMA_XFER_4B_2R; cfg_hv.indirect = false;
+    MgHdmaCfg cfg_s;  cfg_s.channel  = 6; cfg_s.dest  = MG_HDMA_DEST_M7SEL;
+                     cfg_s.xfer  = MG_HDMA_XFER_1B_1R; cfg_s.indirect  = false;
     mg_hdma_setup(&cfg_a);
     mg_hdma_setup(&cfg_b);
     mg_hdma_setup(&cfg_c);
     mg_hdma_setup(&cfg_d);
+    mg_hdma_setup(&cfg_hv);
+    mg_hdma_setup(&cfg_s);
     mg_hdma_enable(1, true);
     mg_hdma_enable(2, true);
     mg_hdma_enable(3, true);
     mg_hdma_enable(4, true);
+    mg_hdma_enable(5, true);
+    mg_hdma_enable(6, true);
+
+    /* Build the M7SEL table once -- doesn't depend on the camera. */
+    s_m7sel_bytes = mg_mode7_build_m7sel_table(s_tab_m7sel, 96);
 
     /* Camera starts mid-plane, looking down the -y plane axis, eye-
      * height tuned so the checker tiles a few pixels deep look
@@ -139,25 +175,30 @@ void _start(void) {
         q16_16_t s, c;
         q16_sincos(cam.base.yaw, &s, &c);
 
-        /* Forward / strafe basis aligned with mg_mode7_camera3d's
-         * perspective convention: at yaw=0 the camera looks down the
-         * -y plane axis (top-of-screen = -y direction = "far away
-         * forward"), with +x as the camera's right-hand strafe axis.
+        /* Motion basis. UP = move forward (in the direction the
+         * camera is facing); strafe is +/- right of forward.
          *
-         *   forward = ( sin(yaw), -cos(yaw))
-         *   right   = ( cos(yaw),  sin(yaw))
-         *
-         * Earlier the demo used forward = (cos, sin), which is
-         * 90° off from where the matrix actually points -- pressing
-         * UP scrolled the world sideways instead of into the horizon.
-         */
+         * Convention rebuilt around mg_mode7_camera3d's new HOFS/
+         * VOFS formula: that math puts cam.x at SX=128 (screen
+         * center, horizontally) and cam.y at SY=224 (just past the
+         * bottom edge of the visible 224-line frame). So at yaw=0
+         * the camera is looking toward +y (smaller plane_y means
+         * "ahead" -- wait, actually the inverse: every visible
+         * scanline has plane_y < cam.y, meaning we render plane
+         * regions AHEAD of cam.y. "Forward" therefore = direction
+         * of decreasing plane_y = -y axis). So UP = cam.y -= MOVE
+         * was right -- but the user reports it as reversed, which
+         * makes me suspect the visual flow is what counts and SNES
+         * mode 7 convention has +y as "ahead" for some other
+         * historical reason. Inverting here matches user-reported
+         * feel; the math doesn't care which sign cam.y takes. */
         if (mg_pad_held(pads.p0, MG_BTN_UP)) {
-            cam.base.x += q16_mul(MOVE_STEP,  s);
-            cam.base.y -= q16_mul(MOVE_STEP,  c);
-        }
-        if (mg_pad_held(pads.p0, MG_BTN_DOWN)) {
             cam.base.x -= q16_mul(MOVE_STEP,  s);
             cam.base.y += q16_mul(MOVE_STEP,  c);
+        }
+        if (mg_pad_held(pads.p0, MG_BTN_DOWN)) {
+            cam.base.x += q16_mul(MOVE_STEP,  s);
+            cam.base.y -= q16_mul(MOVE_STEP,  c);
         }
         if (mg_pad_held(pads.p0, MG_BTN_LEFT)) {
             cam.base.x -= q16_mul(MOVE_STEP,  c);
@@ -167,6 +208,19 @@ void _start(void) {
             cam.base.x += q16_mul(MOVE_STEP,  c);
             cam.base.y += q16_mul(MOVE_STEP,  s);
         }
+
+        /* Wrap camera modulo 1024 (= the SNES Mode-7 plane width).
+         * Because the active band uses WRAP via the per-scanline
+         * M7SEL HDMA, plane sampling wraps anyway -- this just keeps
+         * cam.x/cam.y from drifting outside the 13-bit range that
+         * M7HOFS/M7VOFS can encode after the cam/z divide. The user
+         * can fly arbitrarily far in any direction; the world keeps
+         * presenting the same uniform Tron-grid pattern. */
+        const q16_16_t PLANE = Q16(1024);
+        while (cam.base.x >= PLANE) cam.base.x -= PLANE;
+        while (cam.base.x <  0)     cam.base.x += PLANE;
+        while (cam.base.y >= PLANE) cam.base.y -= PLANE;
+        while (cam.base.y <  0)     cam.base.y += PLANE;
 
         if (mg_pad_held(pads.p0, MG_BTN_A)) {
             cam.height += HEIGHT_STEP;
@@ -188,19 +242,26 @@ void _start(void) {
             cam.height = Q16(64); cam.horizon_row = 96;
         }
 
-        /* Build the four HDMA tables + the static matrix part. */
+        /* Build the per-frame HDMA tables + the static matrix part.
+         * M7A..D and HV come back from mg_mode7_camera3d; M7SEL is
+         * static and was built once in _start. */
         MgMode7Params p;
-        uint16_t bytes = mg_mode7_camera3d(&cam,
-                                           s_tab_m7a, s_tab_m7b,
-                                           s_tab_m7c, s_tab_m7d, &p);
+        MgMode7TableSizes sz = mg_mode7_camera3d(&cam,
+                                                 s_tab_m7a, s_tab_m7b,
+                                                 s_tab_m7c, s_tab_m7d,
+                                                 s_tab_hv,  &p);
 
-        /* Upload them. Each call queues one DMA slot + `bytes` of
-         * cart-window payload; four of those use 4/8 slots and
-         * ~1 KB of the ~6.5 KB per-frame byte budget. */
-        MG_OR_PANIC(mg_hdma_upload_table(1, s_tab_m7a, bytes));
-        MG_OR_PANIC(mg_hdma_upload_table(2, s_tab_m7b, bytes));
-        MG_OR_PANIC(mg_hdma_upload_table(3, s_tab_m7c, bytes));
-        MG_OR_PANIC(mg_hdma_upload_table(4, s_tab_m7d, bytes));
+        /* Upload all six tables. Sizes vary by mode:
+         *   M7A..D : sz.bytes_m7  (~452 each)
+         *   HV     : sz.bytes_hv  (~900, mode-3 doubles byte/scanline)
+         *   M7SEL  : s_m7sel_bytes (~228, mode-0 single byte/scanline)
+         * Total cart-window pool usage ~3 KB, under the 4 KB cap. */
+        MG_OR_PANIC(mg_hdma_upload_table(1, s_tab_m7a,   sz.bytes_m7));
+        MG_OR_PANIC(mg_hdma_upload_table(2, s_tab_m7b,   sz.bytes_m7));
+        MG_OR_PANIC(mg_hdma_upload_table(3, s_tab_m7c,   sz.bytes_m7));
+        MG_OR_PANIC(mg_hdma_upload_table(4, s_tab_m7d,   sz.bytes_m7));
+        MG_OR_PANIC(mg_hdma_upload_table(5, s_tab_hv,    sz.bytes_hv));
+        MG_OR_PANIC(mg_hdma_upload_table(6, s_tab_m7sel, s_m7sel_bytes));
 
         mg_mode7_set(&p);
 

@@ -45,6 +45,7 @@ typedef enum {
     MG_HDMA_DEST_BG4_HOFS    = 0x13,
     MG_HDMA_DEST_BG4_VOFS    = 0x14,
     MG_HDMA_DEST_FIXED_COLOR = 0x32,   /* sky-gradient classic       */
+    MG_HDMA_DEST_M7SEL       = 0x1A,
     MG_HDMA_DEST_M7A         = 0x1B,
     MG_HDMA_DEST_M7B         = 0x1C,
     MG_HDMA_DEST_M7C         = 0x1D,
