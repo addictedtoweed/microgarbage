@@ -122,7 +122,8 @@ void _start(void) {
     cam.height    = Q16(64);
     cam.horizon_row = 96;
 
-    const q16_16_t YAW_STEP    = Q16_FROM_DEG(1);
+    /* 1° per frame at 60 Hz = 60°/sec; halve it for finer aim. */
+    const q16_16_t YAW_STEP    = Q16_FROM_DEG(1) / 2;
     const q16_16_t MOVE_STEP   = Q16_ONE;            /* 1.0 unit/frame  */
     const q16_16_t HEIGHT_STEP = Q16_ONE;            /* 1.0 unit/frame  */
     const q16_16_t HEIGHT_MIN  = Q16(8);
