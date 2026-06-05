@@ -62,6 +62,14 @@ static unsigned s_slot_checkpoint;      /* persistent direct slot count  */
  * for higher-index slots keeps its entries across frames. */
 static unsigned s_prev_mg_slots;
 
+/* Clean-slate VRAM-clear arming state. Set by
+ * mg_state_arm_clean_slate_vram_clear (called from h_ppu_clean_slate)
+ * and consumed by mg_state_build_frame the frame after the kernel
+ * acks the staged frame containing the clear. See
+ * mg_state_arm_clean_slate_vram_clear's comment for the full protocol. */
+static uint32_t s_clean_slate_drop_at_consumed;
+static bool     s_clean_slate_pending;
+
 /* ----------------------------------------------------------------
  *  Lifecycle
  * ---------------------------------------------------------------- */
@@ -166,6 +174,13 @@ void mg_state_reset(void) {
      * unload / new game spawn so the next demo starts clean. */
     s_payload_checkpoint = 0;
     s_slot_checkpoint    = 0;
+
+    /* Drop any in-flight clean-slate VRAM-clear arming from a
+     * previous demo. If this reset is being called by h_ppu_clean_slate
+     * itself, the handler will re-arm via mg_state_arm_clean_slate_*
+     * after we return. */
+    s_clean_slate_pending = false;
+    s_clean_slate_drop_at_consumed = 0;
 }
 
 /* HDMA tables bump-allocator. Lives in CW_OFF_HDMA_TABLES..
@@ -230,6 +245,45 @@ bool mg_state_stage_vram_clear(void) {
         .prep = 0,                   /* VMADDR start = 0 */
     };
     cart_window_set_dma_slot(s_slot_used++, &slot);
+    return true;
+}
+
+/* "Arm" a clean-slate VRAM clear: stage the VRAM-fill slot AT slot 0,
+ * promote it to persistent (so it survives build_frame's checkpoint
+ * rewind on the first NMI), and record the frame_consumed value at
+ * which we should drop it. h_ppu_clean_slate calls this immediately
+ * after mg_state_reset; the demo's subsequent mg_chr_upload then
+ * lands at slot 1 instead of slot 0, so the kernel processes the
+ * VRAM clear FIRST (wiping leftover tilemap/CHR from any previous
+ * demo) and THEN the CHR upload (writing the new demo's tile 0).
+ *
+ * The drop happens in mg_state_build_frame after cart_window's
+ * frame_consumed counter advances past s_clean_slate_drop_at_consumed
+ * — i.e., the kernel has finished walking the slot list at least once,
+ * so the 24ms VRAM-clear DMA has run. After dropping, slot 0 is empty
+ * (kernel skips bbus=0) and the persistent CHR upload at slot 1 stays
+ * put. We don't bother reclaiming the 2 bytes of payload the clear's
+ * zero source consumed — they're just sitting there harmlessly.
+ *
+ * One visible cost: the 24ms VRAM clear DMA pauses CPU and exceeds a
+ * single vblank, so the first display frame after clean_slate shows
+ * a brief flash of scrambled VRAM. Acceptable as a one-shot init cost;
+ * a future enhancement could stage an INIDISP=$80 force-blank slot at
+ * slot 0 ahead of the clear (slot 1 would become VRAM clear; slot 2
+ * the CHR upload) to hide the flash, but that uses one more slot.
+ *
+ * Returns true on success, false if slot 0 is somehow already in use
+ * (shouldn't happen — caller is responsible for mg_state_reset first). */
+bool mg_state_arm_clean_slate_vram_clear(void) {
+    if (s_slot_used != 0) return false;   /* expected called right after reset */
+    if (!mg_state_stage_vram_clear()) return false;
+    /* Promote the slot + payload to persistent so build_frame's rewind
+     * leaves them alone on the first commit. */
+    s_payload_checkpoint = s_payload_used;
+    s_slot_checkpoint    = s_slot_used;
+    /* Drop the slot once the kernel has acked the next frame. */
+    s_clean_slate_drop_at_consumed = cart_window_frame_consumed() + 1;
+    s_clean_slate_pending = true;
     return true;
 }
 
@@ -567,6 +621,25 @@ static void emit_inidisp_table(void) {
 }
 
 void mg_state_build_frame(void) {
+    /* Drop the clean-slate VRAM-clear slot once the kernel has acked
+     * the frame that contained it. mg_state_arm_clean_slate_vram_clear
+     * armed s_clean_slate_drop_at_consumed = current_consumed + 1 right
+     * after promoting slot 0 to persistent; once frame_consumed has
+     * caught up, the clear has fired exactly once and we can free the
+     * slot. We leave the 2 bytes of zero payload in place (no point
+     * compacting; future allocations land safely past s_payload_used).
+     *
+     * After dropping, slot 0 is empty (bbus=0 → kernel skips); the
+     * persistent CHR upload that demos stage immediately after
+     * clean_slate sits at slot 1 and is unaffected. */
+    if (s_clean_slate_pending &&
+        cart_window_frame_consumed() >= s_clean_slate_drop_at_consumed) {
+        static const CartDmaSlot empty_slot = {0};
+        cart_window_set_dma_slot(0, &empty_slot);
+        s_clean_slate_pending = false;
+        s_clean_slate_drop_at_consumed = 0;
+    }
+
     /* Reset per-frame bookkeeping. We rewind to the persistent
      * checkpoint (set by mg_chr_upload and other direct-stage paths),
      * not to zero, so any persistent uploads from before this commit

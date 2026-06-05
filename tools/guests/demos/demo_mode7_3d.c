@@ -63,17 +63,18 @@ static uint8_t s_tab_m7d[MG_MODE7_3D_TABLE_BYTES];
 void _start(void) {
     build_chr();
 
-    /* Mode 7 + FILL_BLACK so sky lines (which get a degenerate
-     * (0,0,0,0) matrix from mg_mode7_camera3d) draw as the
-     * backdrop color rather than wrapping garbage from the plane.
-     *
-     * NOTE: don't call mg_ppu_clean_slate here. BG1's tilemap_word
-     * defaults to 0 and clean_slate dirties the BG-shadow, which
-     * would stage a 2KB-of-zeros DMA at VRAM 0 -- right on top of
-     * our just-uploaded Mode-7 interleaved CHR+tilemap. Mode 7's
-     * shared CHR/tilemap layout is incompatible with the per-BG-
-     * layer tilemap-clear pattern that the indexed-tile BG modes
-     * use. We rely on the kernel's boot-time VRAM clear instead. */
+    /* Clean-slate clears all 64KB of VRAM via a fixed-source DMA at
+     * the very first slot, so leftover tilemap/CHR from a previous
+     * demo doesn't show through as the camera strafes into cells
+     * mode7_3d's small (1 tile + 64 cell) CHR upload didn't touch.
+     * The clear fires once on the first NMI; build_frame drops the
+     * slot afterward so it doesn't re-fire every frame. */
+    mg_ppu_clean_slate();
+
+    /* Mode 7 + FILL_BLACK so sky lines (which get a $7FFF-saturated
+     * matrix from mg_mode7_camera3d) draw as the backdrop color via
+     * the out-of-plane FILL_BLACK rule rather than sampling whatever
+     * cell sits under the camera. */
     mg_bg_mode(MG_BG_MODE_7);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
     mg_mode7_wrap(MG_MODE7_FILL_BLACK);

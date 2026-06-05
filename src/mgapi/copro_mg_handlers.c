@@ -848,33 +848,27 @@ static void h_ppu_clean_slate(VmCpu *cpu, void *sys_) {
     st->cgram_dirty_lo = 0;
     st->cgram_dirty_hi = sizeof(st->cgram_shadow);
 
-    /* Set the pending-VRAM-clear flag; build_frame stages the actual
-     * DMA slot during the next commit's emit phase, when slot indices
-     * are coordinated with CGRAM/OAM/etc. (Staging directly here would
-     * race with build_frame's s_slot_used reset and get clobbered.)
-     *
-     * KNOWN BUG: the VRAM-clear path is not yet honored by build_frame
-     * (see task #6 in the session notes). Until it is, the partial
-     * mitigation below covers the most common visible leak — stale
-     * tilemap entries from a previous demo. */
+    /* Arm a full 64KB VRAM-clear DMA at slot 0 and promote it to
+     * persistent so the subsequent mg_chr_upload lands at slot 1 (=
+     * fires AFTER the VRAM clear). build_frame drops the slot once
+     * the kernel has acked the frame that contained it. See
+     * mg_state_arm_clean_slate_vram_clear's comment for the full
+     * protocol. The legacy `pending_vram_clear` flag stays for older
+     * code paths that may inspect it but it's no longer the source
+     * of truth. */
+    (void)mg_state_arm_clean_slate_vram_clear();
     st->pending_vram_clear = true;
 
-    /* Dirty all 4 BG shadow tilemaps so emit_bg_tilemap stages a
-     * 2KB-of-zeros DMA into whatever tilemap_word the demo's
-     * mg_bg_setup ends up at. emit_bg_tilemap's enabled-layer check
-     * (added alongside this) ensures only ACTIVE layers actually emit,
-     * so the typical 1-2 enabled layer demos hit a 2-4KB DMA that
-     * fits in vblank. This clears the leak where a prior demo's
-     * tilemap data (e.g., mode7.elf's CHR/tilemap-interleaved write at
-     * VRAM $0000) shows through a new demo's BG that reads from the
-     * same VRAM range. Tile-0 CHR persistence is NOT addressed by
-     * this — demos that don't upload their own CHR can still see
-     * leftover pixel data, but the visible-block-at-top class of
-     * symptom is the most common and is fixed by tilemap clear. */
-    for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
-        st->bg[i].dirty_lo = 0;
-        st->bg[i].dirty_hi = (uint16_t)sizeof(st->bg[i].shadow);
-    }
+    /* Do NOT dirty the BG shadows. The earlier (v1.28) implementation
+     * dirtied all 4 BG tilemap shadows so emit_bg_tilemap would stage
+     * 2KB of zeros at each enabled layer's tilemap_word. That worked
+     * fine for indexed-tile BG modes (1-3), but breaks Mode 7: BG1's
+     * tilemap_word defaults to 0 in Mode 7, and the interleaved
+     * CHR+tilemap layout means the 2KB clear at VRAM word 0 ALSO
+     * zeroes tile 0's CHR (which the demo's mg_chr_upload just
+     * wrote!). With the full 64KB VRAM clear now firing at slot 0
+     * before the CHR upload at slot 1, the per-layer tilemap clear
+     * is redundant AND destructive for Mode 7 -- skip it. */
 
     cpu->regs[VM_REG_A0] = MG_R_OK;
 }

@@ -189,6 +189,14 @@ void mg_state_drop_hdma_tables(void);
  * space is available. */
 bool mg_state_stage_vram_clear(void);
 
+/* Stage the VRAM-clear slot AT slot 0, promote it to persistent, and
+ * arm the build_frame self-drop after the kernel acks the next frame.
+ * Caller must invoke this right after mg_state_reset and BEFORE any
+ * mg_chr_upload / mg_palette_write so the CHR upload lands at slot 1
+ * (after the VRAM clear) instead of overlapping it. Returns false on
+ * unexpected non-empty slot 0; otherwise true. */
+bool mg_state_arm_clean_slate_vram_clear(void);
+
 #ifdef __cplusplus
 }
 #endif
