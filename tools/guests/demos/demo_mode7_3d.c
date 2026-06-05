@@ -108,8 +108,12 @@ void _start(void) {
     mg_hdma_enable(3, true);
     mg_hdma_enable(4, true);
 
-    /* Camera starts mid-plane, facing +X, eye-height tuned so the
-     * checker tiles a few pixels deep look reasonable. */
+    /* Camera starts mid-plane, looking down the -y plane axis, eye-
+     * height tuned so the checker tiles a few pixels deep look
+     * reasonable. Step magnitudes are slow enough to feel
+     * controllable -- with MOVE_STEP=1 you get 60 plane units/sec
+     * forward at 60 fps, ~7 sec to traverse the full 1024-wide
+     * plane. YAW_STEP=1° / frame = 60°/sec held. */
     MgMode7Camera3D cam;
     cam.base.x    = Q16(512);
     cam.base.y    = Q16(512);
@@ -118,11 +122,11 @@ void _start(void) {
     cam.height    = Q16(64);
     cam.horizon_row = 96;
 
-    const q16_16_t YAW_STEP    = Q16_FROM_DEG(5);
-    const q16_16_t MOVE_STEP   = Q16(2);
-    const q16_16_t HEIGHT_STEP = Q16(4);
+    const q16_16_t YAW_STEP    = Q16_FROM_DEG(1);
+    const q16_16_t MOVE_STEP   = Q16_ONE;            /* 1.0 unit/frame  */
+    const q16_16_t HEIGHT_STEP = Q16_ONE;            /* 1.0 unit/frame  */
     const q16_16_t HEIGHT_MIN  = Q16(8);
-    const q16_16_t HEIGHT_MAX  = Q16(512);
+    const q16_16_t HEIGHT_MAX  = Q16(192);
 
     for (;;) {
         MgPads pads = mg_pads();
@@ -172,7 +176,12 @@ void _start(void) {
             if (cam.height < HEIGHT_MIN) cam.height = HEIGHT_MIN;
         }
 
-        if (mg_pad_pressed(pads.p0, MG_BTN_SELECT)) {
+        /* SELECT button doubles as a yaw control fallback in case the
+         * L/R shoulders aren't mapped in the emulator's input config:
+         * SELECT alone yaws LEFT, SELECT+START yaws RIGHT, plain
+         * SELECT-press (no other buttons held) resets the camera. */
+        if (mg_pad_pressed(pads.p0, MG_BTN_SELECT) &&
+            !mg_pad_held(pads.p0, MG_BTN_START)) {
             cam.base.x = Q16(512); cam.base.y = Q16(512);
             cam.base.zoom = Q16_ONE; cam.base.yaw = 0;
             cam.height = Q16(64); cam.horizon_row = 96;

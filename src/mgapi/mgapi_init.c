@@ -372,7 +372,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.47 (clean_slate skips BG-shadow dirty; was destroying mode7 CHR)";
+    return "mgapi 1.48 (mode7_3d motion speeds slowed for control)";
 }
 
 /* ----------------------------------------------------------------
