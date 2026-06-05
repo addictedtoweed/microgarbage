@@ -372,7 +372,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.42 (joypads via mapper-side input.poll; cart_window ack-only)";
+    return "mgapi 1.45 (mode7_3d sky-band uses $7FFF M7A,D to force backdrop fill)";
 }
 
 /* ----------------------------------------------------------------

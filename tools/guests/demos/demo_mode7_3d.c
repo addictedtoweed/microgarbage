@@ -133,21 +133,33 @@ void _start(void) {
         q16_16_t s, c;
         q16_sincos(cam.base.yaw, &s, &c);
 
+        /* Forward / strafe basis aligned with mg_mode7_camera3d's
+         * perspective convention: at yaw=0 the camera looks down the
+         * -y plane axis (top-of-screen = -y direction = "far away
+         * forward"), with +x as the camera's right-hand strafe axis.
+         *
+         *   forward = ( sin(yaw), -cos(yaw))
+         *   right   = ( cos(yaw),  sin(yaw))
+         *
+         * Earlier the demo used forward = (cos, sin), which is
+         * 90° off from where the matrix actually points -- pressing
+         * UP scrolled the world sideways instead of into the horizon.
+         */
         if (mg_pad_held(pads.p0, MG_BTN_UP)) {
-            cam.base.x += q16_mul(MOVE_STEP, c);
-            cam.base.y += q16_mul(MOVE_STEP, s);
+            cam.base.x += q16_mul(MOVE_STEP,  s);
+            cam.base.y -= q16_mul(MOVE_STEP,  c);
         }
         if (mg_pad_held(pads.p0, MG_BTN_DOWN)) {
-            cam.base.x -= q16_mul(MOVE_STEP, c);
-            cam.base.y -= q16_mul(MOVE_STEP, s);
+            cam.base.x -= q16_mul(MOVE_STEP,  s);
+            cam.base.y += q16_mul(MOVE_STEP,  c);
         }
         if (mg_pad_held(pads.p0, MG_BTN_LEFT)) {
-            cam.base.x += q16_mul(MOVE_STEP, s);
-            cam.base.y -= q16_mul(MOVE_STEP, c);
+            cam.base.x -= q16_mul(MOVE_STEP,  c);
+            cam.base.y -= q16_mul(MOVE_STEP,  s);
         }
         if (mg_pad_held(pads.p0, MG_BTN_RIGHT)) {
-            cam.base.x -= q16_mul(MOVE_STEP, s);
-            cam.base.y += q16_mul(MOVE_STEP, c);
+            cam.base.x += q16_mul(MOVE_STEP,  c);
+            cam.base.y += q16_mul(MOVE_STEP,  s);
         }
 
         if (mg_pad_held(pads.p0, MG_BTN_A)) {

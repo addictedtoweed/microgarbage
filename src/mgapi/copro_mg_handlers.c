@@ -432,8 +432,30 @@ static void h_mode7_set(VmCpu *cpu, void *sys_) {
 
 static void h_mode7_wrap(VmCpu *cpu, void *sys_) {
     (void)sys_;
-    /* MgMode7Wrap (0..3) maps directly onto the two M7SEL low bits. */
-    mg_state()->m7sel = (uint8_t)(cpu->regs[VM_REG_A0] & 0x03);
+    /* Map MgMode7Wrap → SNES M7SEL bits 6..7 ("screen over"):
+     *   WRAP       (0) → 00 (wrap)
+     *   CLAMP      (1) → 00 (same; SNES has no separate clamp mode)
+     *   FILL_TILE0 (2) → 11 (outside = tile 0 only)
+     *   FILL_BLACK (3) → 10 (outside = transparent → backdrop color)
+     *
+     * The enum-to-bits mapping isn't a straight shift: enum values
+     * 2 and 3 swap their high bit relative to the SNES encoding,
+     * because our enum names FILL_BLACK after the visual intent
+     * ("show backdrop color, which is typically configured to black
+     * for a letterboxed look") rather than the SNES "transparent"
+     * semantics. Earlier this handler wrote the raw enum value into
+     * bits 0..1 (which are H/V flip!), leaving screen-over at 00
+     * (wrap) — the sky band in mode7_3d wrapped the plane and
+     * appeared to scroll as the camera moved instead of staying at
+     * the backdrop color. */
+    uint8_t guest = (uint8_t)(cpu->regs[VM_REG_A0] & 0x03);
+    static const uint8_t snes_screen_over[4] = {
+        0x00,   /* WRAP       -> 00 */
+        0x00,   /* CLAMP      -> 00 */
+        0xC0,   /* FILL_TILE0 -> 11 (bits 6..7 = 11) */
+        0x80,   /* FILL_BLACK -> 10 (bits 6..7 = 10) */
+    };
+    mg_state()->m7sel = snes_screen_over[guest];
     cpu->regs[VM_REG_A0] = MG_R_OK;
 }
 

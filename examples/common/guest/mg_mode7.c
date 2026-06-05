@@ -124,18 +124,25 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
     const uint16_t active_count = (h < 224u) ? (uint16_t)(224u - h) : 0u;
     uint16_t off = 0;
 
-    /* ---- "Sky" segment: write (0,0) for `h` scanlines using the
-     * hybrid encoding that works on bsnes-plus: count = $80 | N
-     * followed by N×2 data bytes (one 16-bit M7 value per scanline).
+    /* ---- "Sky" segment: write a maxed-out diagonal scale matrix
+     * ($7FFF = +127.996 in Q8.8) for `h` scanlines. The intent is to
+     * push every sky-pixel's plane coordinate far outside the 1024×
+     * 1024 plane bounds so MG_MODE7_FILL_BLACK actually fires and
+     * the pixel reads as the backdrop color.
      *
-     * bsnes-plus's HDMA always advances the source per scanline,
-     * regardless of the count byte's repeat-mode bit (see the
-     * INIDISP letterbox fix in copro_mg_state.c). For count = $80|N,
-     * line_counter starts at $80+N, decrements through $80+N..$81,
-     * then hits $80 at the end of scanline N-1 -- triggering refetch
-     * because (line_counter & 0x7F) == 0. So exactly N transfers
-     * fire (one per scanline) and the next chunk takes over.
+     * Why not (0,0,0,0)? That collapses every screen pixel to the
+     * single plane coord (M7X, M7Y) = (cam.x, cam.y), which IS in
+     * plane range — FILL_BLACK doesn't trigger and the PPU samples
+     * whatever tile happens to be at the camera's world position
+     * (visible as a black/garbage band in early mode7_3d builds).
      *
+     * Why $7FFF? Largest positive Q8.8 → multiplied by (sx - M7X)
+     * up to 384 yields ~49000, well past the 1024 wrap boundary
+     * for any screen pixel.
+     *
+     * Hybrid encoding: count = $80|N + N×2 data bytes per chunk;
+     * bsnes-plus advances source per scanline regardless of the
+     * repeat-mode bit (see INIDISP letterbox in copro_mg_state.c).
      * Cap at 127 lines per chunk; for h > 127 we split. */
     {
         uint16_t lines_left = h;
@@ -148,10 +155,10 @@ uint16_t mg_mode7_camera3d(const MgMode7Camera3D *cam,
             table_m7d[off] = count;
             off++;
             for (uint8_t i = 0; i < chunk; i++) {
-                wr16le(table_m7a, off, 0);
+                wr16le(table_m7a, off, (int16_t)0x7FFF);
                 wr16le(table_m7b, off, 0);
                 wr16le(table_m7c, off, 0);
-                wr16le(table_m7d, off, 0);
+                wr16le(table_m7d, off, (int16_t)0x7FFF);
                 off += 2;
             }
             lines_left -= chunk;
