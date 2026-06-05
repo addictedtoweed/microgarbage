@@ -372,7 +372,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.49 (mode7_3d yaw halved to 30deg/sec for finer aim)";
+    return "mgapi 1.51 (OBJ off when all sprites offscreen; hides phantom blocks)";
 }
 
 /* ----------------------------------------------------------------

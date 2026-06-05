@@ -70,6 +70,16 @@ static unsigned s_prev_mg_slots;
 static uint32_t s_clean_slate_drop_at_consumed;
 static bool     s_clean_slate_pending;
 
+/* CGRAM re-upload counter, decremented by mg_state_build_frame. While
+ * positive, build_frame forces cgram_dirty=full so the CGRAM DMA is
+ * re-staged even if the guest hasn't touched the palette. Needed
+ * because the 24ms VRAM-clear DMA at slot 0 on the clean_slate frame
+ * appears to leave the SNES bus in a state that makes the slot-2
+ * CGRAM DMA on the same frame land short (CGRAM[0] stays at boot 0);
+ * re-staging on the next 2-3 frames (when slot 0 has been dropped and
+ * CGRAM moves earlier in the slot list) recovers cleanly. */
+static unsigned s_cgram_reupload_frames;
+
 /* ----------------------------------------------------------------
  *  Lifecycle
  * ---------------------------------------------------------------- */
@@ -181,6 +191,7 @@ void mg_state_reset(void) {
      * after we return. */
     s_clean_slate_pending = false;
     s_clean_slate_drop_at_consumed = 0;
+    s_cgram_reupload_frames = 0;
 }
 
 /* HDMA tables bump-allocator. Lives in CW_OFF_HDMA_TABLES..
@@ -284,6 +295,11 @@ bool mg_state_arm_clean_slate_vram_clear(void) {
     /* Drop the slot once the kernel has acked the next frame. */
     s_clean_slate_drop_at_consumed = cart_window_frame_consumed() + 1;
     s_clean_slate_pending = true;
+    /* Force CGRAM re-upload for the next 3 frames (= the clean_slate
+     * frame + the two right after) so the palette lands even if the
+     * long VRAM-clear DMA disrupts the slot-2 CGRAM dispatch on the
+     * first frame. */
+    s_cgram_reupload_frames = 3;
     return true;
 }
 
@@ -485,13 +501,27 @@ static void emit_ppu_batch(void) {
     b.bg12nba = (uint8_t)((chr_page(&s->bg[1]) << 4) | chr_page(&s->bg[0]));
     b.bg34nba = (uint8_t)((chr_page(&s->bg[3]) << 4) | chr_page(&s->bg[2]));
 
-    /* TM / TS: per-layer main/sub bits + sprites always enabled. */
+    /* TM / TS: per-layer main/sub bits + sprites only when at least
+     * one sprite is actually placed onscreen. mg_state_reset parks
+     * all 128 sprites at Y=240 (offscreen); any guest mg_sprite_set
+     * (or similar) call that moves one to Y<240 flips OBJ on for
+     * that frame. Demos that never touch sprites (mode7, mode7_3d)
+     * get OBJ off, so a stray uninit byte in OAM or a sprite-CHR
+     * read picking up garbage from another demo's VRAM doesn't
+     * render a phantom block on the main screen. */
     uint8_t tm = 0, ts = 0;
     for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
         if (s->bg[i].enabled_main) tm |= (uint8_t)(1u << i);
         if (s->bg[i].enabled_sub)  ts |= (uint8_t)(1u << i);
     }
-    tm |= 0x10;   /* bit 4: sprite layer always on */
+    bool any_sprite_onscreen = false;
+    for (unsigned i = 0; i < 128; i++) {
+        if (s->oam_shadow[i * 4 + 1] < 224) {
+            any_sprite_onscreen = true;
+            break;
+        }
+    }
+    if (any_sprite_onscreen) tm |= 0x10;
     b.tm = tm;
     b.ts = ts;
 
@@ -638,6 +668,16 @@ void mg_state_build_frame(void) {
         cart_window_set_dma_slot(0, &empty_slot);
         s_clean_slate_pending = false;
         s_clean_slate_drop_at_consumed = 0;
+    }
+
+    /* Force a full CGRAM re-upload while the post-clean-slate counter
+     * is positive. The shadow has whatever palette the guest set up;
+     * widening dirty to [0, 512) just makes the CGRAM emission below
+     * pick up the whole shadow regardless of what the guest touched. */
+    if (s_cgram_reupload_frames > 0) {
+        s_state.cgram_dirty_lo = 0;
+        s_state.cgram_dirty_hi = sizeof(s_state.cgram_shadow);
+        s_cgram_reupload_frames--;
     }
 
     /* Reset per-frame bookkeeping. We rewind to the persistent
