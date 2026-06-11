@@ -90,6 +90,25 @@ enum {
      * it's serialized against the mixer pump (no locking the pool/arbiter
      * out from under the audio callback). */
     REQ_AUDIO_SWEEP_VM     = 0x010D,
+    /* PCM streaming voice — guest pushes raw int16 stereo frames into
+     * a mixer channel one chunk at a time.
+     *
+     * OPEN: a0 = sample_rate, a1 = channels (1=mono→L=R, 2=stereo),
+     *       a2 = owner_vm. Returns a voice handle. The voice is alive
+     *       until CLOSE (or VM teardown via SWEEP_VM).
+     *
+     * FEED: a0 = voice, a1 = frame_count to feed. PCM bytes are
+     *       already in the shared staging buffer (the caller copies
+     *       int16 stereo frames there before posting). The service
+     *       pushes them into the voice's mixer channel ring.
+     *       Returns frames actually fed (may be less than requested
+     *       if the channel ring is full). Caller retries with the
+     *       remainder.
+     *
+     * CLOSE: a0 = voice. Stops + frees the voice/track. */
+    REQ_AUDIO_PCM_STREAM_OPEN  = 0x010E,
+    REQ_AUDIO_PCM_STREAM_FEED  = 0x010F,
+    REQ_AUDIO_PCM_STREAM_CLOSE = 0x0110,
 
     /* file (0x02xx) — reserved for the M4-owns-SD proxy */
     REQ_FILE_OPEN   = 0x0200,

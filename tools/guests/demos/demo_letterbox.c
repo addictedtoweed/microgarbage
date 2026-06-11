@@ -1,15 +1,17 @@
 /* ============================================================
- *  demo_letterbox.c — toggle force-blank letterboxing on START.
+ *  demo_letterbox.c — cycle letterbox heights on START.
  *
  *  Three letterbox heights are cycled by pressing START:
  *      (0, 0)   no letterbox — full 224 visible
  *      (8, 8)   "demo TV" — 208 visible
  *      (16, 16) "movie" — 192 visible
  *
- *  Demonstrates: mg_force_blank + the runtime's INIDISP HDMA-channel-7
- *  table rebuild. The visible region snaps to the new height on the
- *  next frame. BG content is a solid blue plane so the contrast
- *  between visible-vs-blanked bands is unmistakable.
+ *  v2.29 Phase 3b: uses mg_kernel_layout (unified HIRQ-ISR-driven
+ *  letterbox) instead of the legacy mg_force_blank path. The visible
+ *  region's INIDISP transitions happen in the kernel's
+ *  default_hirq_handler at scanlines top_lb and (224 - bottom_lb).
+ *  BG content is a solid blue plane so the contrast between
+ *  visible-vs-blanked bands is unmistakable.
  *
  *  Public domain (CC0). No warranty.
  * ============================================================ */
@@ -40,6 +42,10 @@ static const uint8_t PRESETS[3][2] = {
 };
 
 void _start(void) {
+    /* v2.24: clean_slate so leftover VRAM / CGRAM from the previous demo
+     * doesn't bleed through (especially after audio_mixer / sprite). */
+    mg_ppu_clean_slate();
+
     mg_bg_mode(MG_BG_MODE_1);
     mg_bg_setup(MG_BG_LAYER_1, 0x0000, MG_BG_SIZE_32x32, 0x1000);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
@@ -59,14 +65,14 @@ void _start(void) {
      * preset 0 (no letterbox) makes the demo look identical to a
      * solid-blue render whether or not letterbox actually works. */
     uint8_t preset = 1;
-    mg_force_blank(PRESETS[1][0], PRESETS[1][1]);
+    mg_kernel_layout(PRESETS[1][0], PRESETS[1][1]);
 
     for (;;) {
         MgPads pads = mg_pads();
         if (mg_pad_pressed(pads.p0, MG_BTN_SELECT)) sys_exit(0);
         if (mg_pad_pressed(pads.p0, MG_BTN_START)) {
             preset = (uint8_t)((preset + 1u) % 3u);
-            mg_force_blank(PRESETS[preset][0], PRESETS[preset][1]);
+            mg_kernel_layout(PRESETS[preset][0], PRESETS[preset][1]);
         }
 
         mg_frame_commit();

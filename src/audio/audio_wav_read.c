@@ -91,6 +91,81 @@ uint32_t wav_to_mono_pcm16(const WavInfo *info, int16_t *dst,
     return n;
 }
 
+/* Like wav_to_mono_pcm16 but resamples the result to dst_rate Hz with
+ * linear interpolation. Useful when the loader knows the target rate
+ * (e.g. the audio service's mixer rate) and wants every SFX in the
+ * pool to be at that rate so the per-channel mixer step stays 1.0 —
+ * sidesteps the need for per-sample source-rate tracking inside the
+ * mixer. Returns frames written at dst_rate. */
+uint32_t wav_to_mono_pcm16_resample(const WavInfo *info, int16_t *dst,
+                                    uint32_t max_dst_frames,
+                                    uint32_t dst_rate) {
+    if (!info || !dst || !info->data || dst_rate == 0) return 0;
+    uint32_t src_rate = info->sample_rate ? info->sample_rate : dst_rate;
+    if (src_rate == dst_rate) {
+        return wav_to_mono_pcm16(info, dst, max_dst_frames);
+    }
+    uint32_t ch  = info->channels;
+    uint32_t bps = info->bits / 8u;
+    uint32_t fb  = ch * bps;
+    if (fb == 0) return 0;
+    uint32_t src_frames = info->data_bytes / fb;
+    if (src_frames < 2) return 0;
+
+    /* Linear interpolation in q32.32. step = src_rate / dst_rate per
+     * output frame; phase wraps the integer part into an input-frame
+     * advance, the fractional part lerps between src[i] and src[i+1]. */
+    uint64_t step = ((uint64_t)src_rate << 32) / (uint64_t)dst_rate;
+
+    /* Cap output by both the dst-buffer and by what the source can
+     * actually produce (one src frame yields ~dst_rate/src_rate dst
+     * frames). The exact bound is (src_frames-1) * dst_rate / src_rate,
+     * computed in 64-bit to avoid overflow on long SFX. */
+    uint64_t producible = ((uint64_t)(src_frames - 1u) * (uint64_t)dst_rate)
+                            / (uint64_t)src_rate;
+    if (producible > (uint64_t)max_dst_frames) producible = max_dst_frames;
+    uint32_t n_out = (uint32_t)producible;
+
+    const uint8_t *d = info->data;
+    const uint32_t bits = info->bits;
+
+    /* Read + downmix one source frame to mono int16. Static-inline so
+     * GCC's -Wpedantic doesn't complain about GNU statement-expressions
+     * (a previous macro attempt tripped that warning). */
+    #define READ_SRC_FRAME(idx_var, out_var) do {                           \
+        int32_t _acc = 0;                                                   \
+        for (uint32_t _c = 0; _c < ch; _c++) {                              \
+            const uint8_t *_s = d + (size_t)(idx_var) * fb + (size_t)_c * bps; \
+            int32_t _v = (bits == 16)                                       \
+                ? (int32_t)(int16_t)rd_u16le(_s)                            \
+                : ((int32_t)_s[0] - 128) * 256;                             \
+            _acc += _v;                                                     \
+        }                                                                   \
+        (out_var) = (int32_t)(_acc / (int32_t)ch);                          \
+    } while (0)
+
+    uint64_t phase = 0;
+    for (uint32_t i = 0; i < n_out; i++) {
+        uint32_t idx  = (uint32_t)(phase >> 32);
+        uint32_t frac = (uint32_t)phase;
+        int32_t  a = 0, b = 0;
+        if (idx + 1 >= src_frames) {
+            /* Edge — clamp to last source sample. */
+            READ_SRC_FRAME(src_frames - 1u, a);
+            dst[i] = (int16_t)a;
+        } else {
+            READ_SRC_FRAME(idx, a);
+            READ_SRC_FRAME(idx + 1u, b);
+            int64_t lerp = (int64_t)a
+                         + (((int64_t)(b - a) * (int64_t)frac) >> 32);
+            dst[i] = (int16_t)lerp;
+        }
+        phase += step;
+    }
+    #undef READ_SRC_FRAME
+    return n_out;
+}
+
 uint32_t wav_to_stereo_pcm16(const WavInfo *info, int16_t *dst,
                              uint32_t max_frames) {
     if (!info || !dst || !info->data) return 0;

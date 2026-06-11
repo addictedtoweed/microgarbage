@@ -246,16 +246,26 @@ static void handle_load_wav(VmCpu *cpu, void *system) {
     WavInfo info;
     if (wav_parse(filebuf, rd, &info) != WAV_OK) { free(filebuf); return; }
 
-    /* Downmix straight into the staging buffer (mono int16), under the
-     * audio lock so a concurrent VM can't clobber it before the load. */
+    /* v2.00: stage SFX at their NATIVE sample rate; the mixer
+     * interpolates per-channel at play time (the design intent from
+     * docs/audio-architecture.md — "per-channel source rate + linear
+     * /cubic interpolation"). This preserves pool-space (no 2×
+     * upsample-and-store) and avoids a second resample pass before
+     * the mixer's own resampler. The rate is communicated to the
+     * audio service via the REQ_AUDIO_LOAD_STAGED a2 arg and stored
+     * on the pool object; svc_sink_start reads it back and configures
+     * the mixer channel before playback. */
     uint32_t max_frames = (uint32_t)(g_staging_cap / sizeof(int16_t));
     audio_lock();
     uint32_t frames = wav_to_mono_pcm16(&info, (int16_t *)g_staging, max_frames);
     free(filebuf);
     if (frames == 0) { audio_unlock(); return; }
     uint32_t status = 0, handle = 0;
+    /* a2 carries the source sample rate so the mixer can interpolate
+     * at play time. 0 would mean "assume mixer rate" (legacy callers). */
     bool ok = audio_call_locked(REQ_AUDIO_LOAD_STAGED, frames * sizeof(int16_t),
-                                cpu->vm_id, 0, 0, &status, &handle);
+                                cpu->vm_id, info.sample_rate, 0,
+                                &status, &handle);
     audio_unlock();
     cpu->regs[VM_REG_A0] = (ok && status == 0) ? handle : 0;
 }
@@ -295,6 +305,66 @@ static void handle_stream_wav(VmCpu *cpu, void *system) {
                                 cpu->vm_id, 0, 0, &status, &voice);
     audio_unlock();
     cpu->regs[VM_REG_A0] = (ok && status == 0) ? voice : 0;
+}
+
+/* ---- SYS_AUDIO_PCM_STREAM_OPEN (rate, channels) -> voice or 0 ----
+ * Opens a guest-fed streaming voice for raw int16 stereo audio. v2.02
+ * accepts channels=2 only (caller duplicates mono → L=R before feeding).
+ * The mixer's per-channel source-rate interpolator handles any rate
+ * mismatch with the mixer output rate. Used by demo_fmv for the
+ * per-FMV-frame audio chunk path. */
+static void handle_pcm_stream_open(VmCpu *cpu, void *system) {
+    (void)system;
+    uint32_t rate     = cpu->regs[VM_REG_A0];
+    uint32_t channels = cpu->regs[VM_REG_A1];
+    uint32_t status = 0, voice = 0;
+    if (!audio_call(REQ_AUDIO_PCM_STREAM_OPEN, rate, channels, cpu->vm_id,
+                    0, &status, &voice)) {
+        cpu->regs[VM_REG_A0] = 0; return;
+    }
+    cpu->regs[VM_REG_A0] = (status == 0) ? voice : 0;
+}
+
+/* ---- SYS_AUDIO_PCM_STREAM_FEED (voice, frames_buf, frame_count)
+ *      -> frames_fed (0..frame_count) ----
+ *
+ * Copies guest's int16 stereo PCM into the shared staging buffer, then
+ * asks the service to push it into the voice's mixer channel ring.
+ * Returns the actual frame count fed; the caller retries for the
+ * remainder if it's less than requested (channel ring was full). */
+static void handle_pcm_stream_feed(VmCpu *cpu, void *system) {
+    (void)system;
+    uint32_t voice       = cpu->regs[VM_REG_A0];
+    uint32_t frames_buf  = cpu->regs[VM_REG_A1];
+    uint32_t frame_count = cpu->regs[VM_REG_A2];
+    cpu->regs[VM_REG_A0] = 0;
+
+    if (!g_staging || frame_count == 0) return;
+    /* int16 stereo = 4 bytes/frame */
+    uint64_t bytes = (uint64_t)frame_count * 4u;
+    if (bytes == 0 || bytes > g_staging_cap) return;
+
+    const void *src = vm_translate_read(cpu, frames_buf, (uint32_t)bytes);
+    if (!src) return;
+
+    audio_lock();
+    memcpy(g_staging, src, (size_t)bytes);
+    uint32_t status = 0, fed = 0;
+    bool ok = audio_call_locked(REQ_AUDIO_PCM_STREAM_FEED,
+                                voice, frame_count, 0, 0, &status, &fed);
+    audio_unlock();
+    cpu->regs[VM_REG_A0] = (ok && status == 0) ? fed : 0;
+}
+
+/* ---- SYS_AUDIO_PCM_STREAM_CLOSE (voice) -> 0 or -errno ---- */
+static void handle_pcm_stream_close(VmCpu *cpu, void *system) {
+    (void)system;
+    uint32_t voice = cpu->regs[VM_REG_A0];
+    uint32_t status = 0, h = 0;
+    if (!audio_call(REQ_AUDIO_PCM_STREAM_CLOSE, voice, 0, 0, 0, &status, &h)) {
+        cpu->regs[VM_REG_A0] = (uint32_t)(-VM_EIO); return;
+    }
+    cpu->regs[VM_REG_A0] = (status == 0) ? 0u : (uint32_t)(-VM_EINVAL);
 }
 
 static void handle_fft_enable(VmCpu *cpu, void *system) {
@@ -354,6 +424,12 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
                            handle_load_wav)) goto f9;
     if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_STREAM_WAV,
                            handle_stream_wav)) goto f10;
+    if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_PCM_STREAM_OPEN,
+                           handle_pcm_stream_open)) goto f11;
+    if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_PCM_STREAM_FEED,
+                           handle_pcm_stream_feed)) goto f12;
+    if (!vm_ecall_register(sys->ecall_router, SYS_AUDIO_PCM_STREAM_CLOSE,
+                           handle_pcm_stream_close)) goto f13;
 
     /* Reclaim a guest's audio resources (+ its FFT hold) when it exits
      * or crashes, before its vm_id can be reused. Best-effort: a full
@@ -362,6 +438,9 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg) {
     vm_system_register_unload_hook(sys, audio_unload_hook, NULL);
     return true;
 
+f13: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_PCM_STREAM_CLOSE);
+f12: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_PCM_STREAM_FEED);
+f11: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_PCM_STREAM_OPEN);
 f10: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_LOAD_WAV);
 f9: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_FFT_ENABLE);
 f8: vm_ecall_unregister(sys->ecall_router, SYS_AUDIO_GET_LEVELS);

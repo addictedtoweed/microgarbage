@@ -166,10 +166,41 @@ AudioPoolResult audio_pool_alloc(AudioPool *p, uint32_t size,
     o->refcount   = 1;
     o->generation = p->generations[slot];
     o->owner_vm   = owner_vm;
+    o->sample_rate = 0;   /* default: assume mixer rate (no resample) */
     o->in_use     = true;
 
     *out_handle = pack_handle(slot, o->generation);
     return AUDIO_POOL_OK;
+}
+
+AudioPoolResult audio_pool_alloc_with_rate(AudioPool *p, uint32_t size,
+                                            uint16_t owner_vm,
+                                            uint32_t sample_rate,
+                                            AudioObjHandle *out_handle) {
+    AudioPoolResult r = audio_pool_alloc(p, size, owner_vm, out_handle);
+    if (r != AUDIO_POOL_OK) return r;
+    /* Stash the rate on the freshly-allocated slot. Handle is
+     * (gen << 16) | (slot + 1), per pack_handle above. */
+    uint32_t slot;
+    uint16_t gen;
+    if (unpack_handle(*out_handle, &slot, &gen)
+        && slot < AUDIO_POOL_MAX_OBJECTS
+        && p->objects[slot].in_use) {
+        p->objects[slot].sample_rate = sample_rate;
+    }
+    return AUDIO_POOL_OK;
+}
+
+uint32_t audio_pool_object_sample_rate(const AudioPool *p, AudioObjHandle h) {
+    if (!p) return 0;
+    uint32_t slot;
+    uint16_t gen;
+    if (!unpack_handle(h, &slot, &gen)) return 0;
+    if (slot >= AUDIO_POOL_MAX_OBJECTS) return 0;
+    const AudioObject *o = &p->objects[slot];
+    if (!o->in_use) return 0;
+    if (gen != o->generation) return 0;
+    return o->sample_rate;
 }
 
 static void free_object(AudioPool *p, uint32_t slot) {

@@ -346,6 +346,16 @@ void mixer_destroy(AudioMixer *m);
 void mixer_set_volume(AudioMixer *m, size_t channel, q15_t volume);
 void mixer_set_pan(AudioMixer *m, size_t channel, q15_t pan);
 void mixer_mute(AudioMixer *m, size_t channel, bool muted);
+
+/* Update a channel's source sample rate. Recomputes the q32.32 step
+ * and arms linear/cubic interpolation (per docs/audio-architecture.md
+ * "per-channel source rate + linear/cubic interpolation"). Pass 0 to
+ * disable resampling — the channel will treat each source frame as
+ * one output frame, the legacy default. Resets interpolation taps so
+ * the change takes effect cleanly on the next mixer_render. Typically
+ * called before mixer_channel_reset + feeding a new sample. */
+void mixer_set_source_rate(AudioMixer *m, size_t channel, uint32_t source_rate);
+
 void mixer_channel_start(AudioMixer *m, size_t channel);
 void mixer_channel_stop(AudioMixer *m, size_t channel);
 void mixer_channel_reset(AudioMixer *m, size_t channel);
@@ -365,6 +375,13 @@ void mixer_channel_reset(AudioMixer *m, size_t channel);
 
 size_t mixer_write_channel(AudioMixer *m, size_t channel,
                             const void *samples, size_t count);
+
+/* Free frames in this channel's source ring (capacity - count). Lets
+ * a caller (e.g. SYS_AUDIO_PCM_STREAM_FEED's handler) check before
+ * writing so it can implement back-pressure — feed only what fits,
+ * report the count actually fed, and let the guest retry the rest.
+ * Returns 0 if `channel` is out of range or the channel has no ring. */
+size_t mixer_channel_free_frames(const AudioMixer *m, size_t channel);
 
 /* ============================================================
  *  Render

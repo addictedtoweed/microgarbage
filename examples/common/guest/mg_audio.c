@@ -42,6 +42,25 @@ MgVoice mg_stream_play(const char *path, uint32_t flags) {
                                       (uint32_t)path, flags);
 }
 
+MgVoice mg_audio_pcm_stream_open(uint32_t sample_rate_hz) {
+    /* channels = 2 (stereo) is the only supported value in v2.02. */
+    return (MgVoice)(int32_t)_vm_sys2(SYS_AUDIO_PCM_STREAM_OPEN,
+                                       sample_rate_hz, 2u);
+}
+
+uint32_t mg_audio_pcm_stream_feed(MgVoice voice,
+                                   const int16_t *interleaved_stereo,
+                                   uint32_t frame_count) {
+    return (uint32_t)_vm_sys3(SYS_AUDIO_PCM_STREAM_FEED,
+                              (uint32_t)voice,
+                              (uint32_t)interleaved_stereo,
+                              frame_count);
+}
+
+void mg_audio_pcm_stream_close(MgVoice voice) {
+    (void)_vm_sys1(SYS_AUDIO_PCM_STREAM_CLOSE, (uint32_t)voice);
+}
+
 void mg_audio_stop(MgVoice voice) {
     (void)_vm_sys1(SYS_AUDIO_STOP, (uint32_t)voice);
 }

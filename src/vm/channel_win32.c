@@ -34,7 +34,7 @@
 
 #include "vm/service_channel.h"
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
+#if defined(_WIN32)
 
 #include <windows.h>
 #include <stdlib.h>
@@ -123,4 +123,4 @@ bool channel_thread_transport_make(ChannelTransport *out) {
     return true;
 }
 
-#endif /* _WIN32 && !__CYGWIN__ */
+#endif /* _WIN32 */

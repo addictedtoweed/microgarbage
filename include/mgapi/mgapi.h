@@ -86,7 +86,22 @@ typedef struct MgapiConfig {
     /* Cart window size; must equal MGAPI_CART_WINDOW_BYTES. */
     uint32_t  cart_window_size;
 
-    /* Sample rate; must equal MGAPI_AUDIO_SAMPLE_RATE_HZ. */
+    /* Sample rate the mgapi mixer AND host audio sink will run at.
+     *
+     *   0           — auto-detect. On Windows this queries WASAPI's
+     *                 default render endpoint mix-format rate (what
+     *                 Audio Engine actually plays the device at).
+     *                 Recommended for emulator-style hosts where the
+     *                 OS owns audio configuration. MCU builds MUST
+     *                 NOT pass 0 (there is no device to ask).
+     *   non-zero    — taken as-is. MCU firmware passes the I2S clock
+     *                 rate it wired up (typically MGAPI_AUDIO_SAMPLE_
+     *                 RATE_HZ = 44100 for PCM5100-class DACs);
+     *                 lower-power MCUs can configure 32000 or 22050
+     *                 to trade audio bandwidth for CPU headroom.
+     *
+     * The mixer's stream-resampling path handles source WAVs at any
+     * rate, so source assets don't need to match. */
     uint32_t  audio_sample_rate;
 
     /* Upper bound on the chunk size the mapper will request from

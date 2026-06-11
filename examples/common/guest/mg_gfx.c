@@ -20,6 +20,12 @@ MgResult mg_chr_upload(uint16_t vram_word, const void *src, uint16_t bytes) {
                                        vram_word, (uint32_t)src, bytes);
 }
 
+MgResult mg_chr_upload_transient(uint16_t vram_word, const void *src,
+                                  uint16_t bytes) {
+    return (MgResult)(int32_t)_vm_sys3(SYS_MG_CHR_UPLOAD_TRANSIENT,
+                                       vram_word, (uint32_t)src, bytes);
+}
+
 void mg_ppu_clean_slate(void) {
     (void)_vm_sys0(SYS_MG_PPU_CLEAN_SLATE);
 }

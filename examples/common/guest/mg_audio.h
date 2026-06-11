@@ -64,6 +64,29 @@ MgVoice mg_sfx_play       (MgSfx handle, int16_t gain_q15, int16_t pan_q15);
  * handle or MG_VOICE_REJECTED if a stream slot couldn't be reserved. */
 MgVoice mg_stream_play    (const char *path, uint32_t flags);
 
+/* -------- PCM streaming (live-fed) --------
+ *
+ * Open a voice the guest pushes raw int16 STEREO samples into one chunk
+ * at a time. Used for FMV2 playback (the muxed video file holds one
+ * audio chunk per video frame) and other live-PCM sources. The mixer's
+ * per-channel interpolator handles any sample-rate mismatch with the
+ * mixer's output rate.
+ *
+ *   v = mg_audio_pcm_stream_open(44100);   // 0 == REJECTED
+ *   // per chunk:
+ *   uint32_t fed = mg_audio_pcm_stream_feed(v, interleaved_lr, frame_count);
+ *   // fed < frame_count means the channel ring was full; retry the
+ *   // remainder next tick.
+ *   mg_audio_pcm_stream_close(v);
+ *
+ * v2.02: channels=2 (stereo) only. Duplicate mono samples L=R on the
+ * guest before feeding; saves a runtime branch. */
+MgVoice  mg_audio_pcm_stream_open (uint32_t sample_rate_hz);
+uint32_t mg_audio_pcm_stream_feed (MgVoice voice,
+                                    const int16_t *interleaved_stereo,
+                                    uint32_t frame_count);
+void     mg_audio_pcm_stream_close(MgVoice voice);
+
 /* -------- Voice control -------- */
 
 /* Stop and release the voice. After this the handle is dead. */

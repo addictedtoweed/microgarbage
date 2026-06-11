@@ -131,10 +131,13 @@ bool audio_sink_open(AudioSink *sink, const char *backend_name,
         b = &audio_sink_wav;
         g_wav_path = path;
     }
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(_WIN32)
     else if (strcmp(backend_name, "wave") == 0 ||
              strcmp(backend_name, "waveout") == 0) {
         b = &audio_sink_waveout;
+    }
+    else if (strcmp(backend_name, "wasapi") == 0) {
+        b = &audio_sink_wasapi;
     }
 #endif
     if (!b) return false;

@@ -43,7 +43,7 @@ fi
 # ---- host ----
 LINK="-lpthread"
 case "$(uname -s 2>/dev/null)" in
-    *NT*|*MINGW*|*MSYS*|*CYGWIN*) ;;
+    *NT*|*MINGW*|*MSYS*) ;;
     *) LINK="$LINK -lrt" ;;
 esac
 echo "08_rtos_demo: compiling host..."

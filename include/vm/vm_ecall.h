@@ -300,7 +300,16 @@
 #define SYS_AUDIO_FFT_ENABLE   1168  /* (enable) → 0; turn band meters on/off      */
 #define SYS_AUDIO_LOAD_WAV     1169  /* (path) → object handle; host parses a .wav */
 #define SYS_AUDIO_STREAM_WAV   1170  /* (path) → voice; host streams a long .wav   */
-/* 1171..1175 reserved for audio */
+/* PCM streaming voice — guest pushes raw int16 stereo frames into a
+ * mixer channel one chunk at a time. Used by FMV2 playback (per-frame
+ * audio chunk demuxed from the muxed video file and fed straight to
+ * the mixer) and any other live-PCM source (procedural music, network
+ * voice, …). The mixer's per-channel source-rate interpolator handles
+ * any sample-rate mismatch with the mixer output rate. */
+#define SYS_AUDIO_PCM_STREAM_OPEN  1171  /* (rate, channels) → voice or 0           */
+#define SYS_AUDIO_PCM_STREAM_FEED  1172  /* (voice, frames_buf, frame_count) → fed  */
+#define SYS_AUDIO_PCM_STREAM_CLOSE 1173  /* (voice) → 0 or -errno                   */
+/* 1174..1175 reserved for audio */
 
 /* --- Cart coprocessor staging (1180..1199) ---
  *
@@ -403,6 +412,39 @@
  * to $0000. Skip the call if you want to inherit parent graphics
  * (e.g., for sub-window blits or shared-overlay UIs). */
 #define SYS_MG_PPU_CLEAN_SLATE    1221  /* () → 0 */
+
+/* --- Stream arbiter (1223..1226) ---
+ *
+ * Guest registers an already-open vm_host_fs fd as a streaming
+ * source with the host-side round-robin arbiter (see
+ * include/io/stream_arbiter.h). The arbiter reads chunk_bytes at
+ * a time into a per-stream SPSC ring, ahead of the guest's
+ * consumption — so the guest's per-iter consume returns
+ * immediately if the ring has a chunk staged, or returns "empty"
+ * for the guest to poll with sleep_ticks.
+ *
+ * Motivation: matches the music-stream pattern (file→ring→mixer)
+ * for any guest, and on the MCU port becomes the single SD-bus
+ * scheduler that prevents one stream from starving another.
+ */
+#define SYS_STREAM_REGISTER  1223  /* (fd, chunk_bytes, depth) → handle/-errno */
+#define SYS_STREAM_CONSUME   1224  /* (handle, dst, dst_cap) → bytes copied (=chunk_bytes), 0=empty, -1=EOF */
+#define SYS_STREAM_CLOSE     1225  /* (handle) → 0 or -errno */
+#define SYS_STREAM_EOF       1226  /* (handle) → 1 if drained and EOF, else 0 */
+
+/* v2.18: install a per-app custom NMI handler. Guest passes a buffer
+ * of 65816 machine code; host copies into the cart-window NMI region
+ * and bumps a version counter the SNES kernel polls in @loop. The
+ * kernel copies to WRAM at $0E00 and updates RAMVEC_NMI on next poll
+ * (within one frame). Handler bytes are run from WRAM (no cart-bus
+ * read per instruction). See include/mg_nmi.h for the builder API.
+ *   args: (const void *code, uint32_t size)
+ *   ret:  0 on success; -EINVAL if size > 1024 or code is bad. */
+#define SYS_MG_NMI_INSTALL   1227  /* (code, size) → 0 or -errno */
+#define SYS_MG_HIRQ_INSTALL  1228  /* (code, size) → 0 or -errno, v2.26 */
+#define SYS_MG_HIRQ_CONFIGURE 1229 /* (vtime, htime, nmitimen_bits) → 0, v2.26 */
+#define SYS_MG_KERNEL_LAYOUT  1230 /* (top_lb, bottom_lb) → 0, v2.29 Phase 3a */
+#define SYS_MG_SIPHON_CONFIGURE 1231 /* (bytes_per_line, src_off, wram_dst) → 0 */
 
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */

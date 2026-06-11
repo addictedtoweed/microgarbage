@@ -21,7 +21,7 @@
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
+#if defined(_WIN32)
 
 #include "vm/host_platform.h"
 
@@ -124,4 +124,4 @@ void host_platform_request_stop(void) {
     g_stop = 1;
 }
 
-#endif /* _WIN32 && !__CYGWIN__ */
+#endif /* _WIN32 */

@@ -157,6 +157,22 @@ void mg_state_build_frame(void);
 int  mg_state_queue_dma(const void *src, uint32_t size,
                         uint8_t bbus, uint8_t dmap, uint16_t prep);
 
+/* v2.05: sub-frame chaining. Called by cart_window when the kernel
+ * reads the port-7 mailbox (which happens once per main-loop iteration
+ * between NMIs). Returns true if a NEXT sub-frame's slot list was just
+ * loaded into the cart window — caller should KEEP FRAME_RDY = 1 so
+ * the next NMI processes it. Returns false if the queue is empty —
+ * caller bumps frame_consumed and clears FRAME_RDY. */
+bool mg_state_advance_subframe(void);
+
+/* Transient variant — same as mg_state_queue_dma except it does NOT
+ * advance the persistent checkpoint, so the bytes are freed on the
+ * next frame's build_frame rewind. Use for streaming uploads
+ * (FMV per-frame CHR, etc.) where the upload is only valid for this
+ * one frame and would otherwise pile up across frames. */
+int  mg_state_queue_dma_transient(const void *src, uint32_t size,
+                                  uint8_t bbus, uint8_t dmap, uint16_t prep);
+
 /* Budget introspection — both reflect bookkeeping AS OF the most
  * recent SYS_COPRO_FRAME_COMMIT (the slot count + payload bytes
  * accumulated since the previous commit). Cheap, never blocks. */
@@ -179,6 +195,18 @@ uint16_t mg_state_stage_hdma_table(const void *src, uint16_t len);
  * doesn't accumulate uploads across iterations and overflow the pool.
  * See implementation comment for the safety argument. */
 void mg_state_drop_hdma_tables(void);
+
+/* v2.17: drop any queued mg_chr_upload_transient bytes WITHOUT
+ * staging them. Called from the silent-drop path of h_frame_commit
+ * when the previous frame hasn't been ack'd yet. Without this, the
+ * dropped commit's transients pile up in s_pending until the next
+ * successful commit, which then flushes BOTH the dropped iter's and
+ * the new iter's transients — overflowing s_pending_buf (32 KB)
+ * once two FMV-sized iters worth (~54 KB) try to share the queue.
+ * The overflow rejects the new iter's CHR uploads silently, leaving
+ * the dropped iter's CHR paired with the new iter's tilemap →
+ * visible "every other FMV frame is garbage." */
+void mg_state_drop_pending_transients(void);
 
 /* Stage a full-VRAM-clear DMA slot using the SNES fixed-source trick:
  * a 2-byte zero source + DMA with DAS=0 (= 65536 byte transfers) +

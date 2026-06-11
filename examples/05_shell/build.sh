@@ -101,7 +101,6 @@ echo "05_shell: compiling host..."
 HOST_LIBS=()
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) HOST_LIBS+=(-lws2_32) ;;
-    CYGWIN*)      HOST_LIBS+=(-lpthread -lwinmm) ;;  # worker + waveOut (live audio)
     *)            HOST_LIBS+=(-lpthread) ;;          # audio worker thread
 esac
 # The host is almost all cold code (setup, transports, the shell waits
@@ -115,6 +114,7 @@ esac
     "${VM_CORE_SRCS[@]}" \
     "$HOST_PLATFORM_SRC" \
     "$REPO_ROOT/src/vm/vm_host_fs.c" \
+    "$REPO_ROOT/src/vm/vm_host_fs_spawn.c" \
     "$REPO_ROOT/src/storage/trashfs.c" \
     "$REPO_ROOT/src/audio/audio_service.c" \
     "$REPO_ROOT/src/audio/audio_arbiter.c" \
@@ -202,23 +202,12 @@ echo "  Type 'help' once inside the shell for a command list."
 # Optional: build the standalone audio stress harness (POSIX only — it
 # uses the pthread channel transport). Renders the engine under load to
 # a .wav you can listen to: "$BUILD_DIR/audio_stress out.wav 6".
-# On Cygwin it ALSO links the waveOut backend (-lwinmm) so you can get
-# LIVE output: AUDIO_STRESS_OUT=wave "$BUILD_DIR/audio_stress".
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*) : ;;   # native Windows: needs the win32 transport (future)
     *)
         echo "05_shell: building audio_stress harness..."
         STRESS_EXTRA_SRCS=()
         STRESS_EXTRA_LIBS=()
-        case "$(uname -s 2>/dev/null)" in
-            CYGWIN*)
-                # Cygwin has pthreads (channel works) AND can call Win32
-                # waveOut directly — the live-output path that works today.
-                STRESS_EXTRA_SRCS+=("$REPO_ROOT/src/audio/audio_sink_waveout.c")
-                STRESS_EXTRA_LIBS+=(-lwinmm)
-                echo "05_shell:   (Cygwin: linking waveOut for live output)"
-                ;;
-        esac
         "$CC" -std=c11 -O2 -I"$REPO_ROOT/include" \
             -o "$BUILD_DIR/audio_stress" \
             "$EXAMPLE_DIR/audio_stress.c" \

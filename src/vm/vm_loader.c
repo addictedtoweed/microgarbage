@@ -411,6 +411,17 @@ VmLoadResult vm_load(VmCpu *cpu,
     cpu->regions[VM_REGION_SHARED].length   = cfg->shared_size;
     cpu->regions[VM_REGION_SHARED].writable = (cfg->shared_base != NULL);
 
+    /* ===== L2 sub-region (upper half of SHARED, optional) =====
+     *
+     * Backed by the embedder's system-wide PSRAM slice; all VMs see
+     * the same memory here, which is what makes the global L2
+     * allocator's "any-VM-can-dereference" model work. Empty when
+     * the embedder doesn't supply one, in which case the upper half
+     * of SHARED just faults — same as before the split was added. */
+    cpu->l2_shared.base     = (uint8_t *)cfg->l2_shared_base;
+    cpu->l2_shared.length   = cfg->l2_shared_size;
+    cpu->l2_shared.writable = (cfg->l2_shared_base != NULL);
+
     /* ===== Entry point and stack pointer ===== */
 
     cpu->pc = e_entry;

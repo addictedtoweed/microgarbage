@@ -57,6 +57,21 @@ void    mg_force_blank        (uint8_t top, uint8_t bottom);
 uint8_t mg_force_blank_top    (void);
 uint8_t mg_force_blank_bottom (void);
 
+/* v2.29 Phase 3a: unified kernel layout — same effect as mg_force_blank
+ * but routes through the unified HIRQ ISR path. Ranges 0..112 each. */
+void    mg_kernel_layout      (uint8_t top_lb, uint8_t bottom_lb);
+
+/* v2.29 Phase 3a: per-scanline DMA siphon during the visible region.
+ *   bytes_per_line : 0..32 (0 = disabled)
+ *   src_off        : 16-bit cart_window offset where the host stages
+ *                    `bytes_per_line × visible_lines` bytes per frame
+ *   wram_dst       : 24-bit WRAM destination where bytes accumulate
+ *                    (each scanline appends bytes_per_line bytes from
+ *                    src, starting at wram_dst for line 0 and advancing
+ *                    by bytes_per_line per line) */
+void    mg_siphon_configure   (uint8_t bytes_per_line, uint16_t src_off,
+                               uint32_t wram_dst);
+
 #ifdef __cplusplus
 }
 #endif

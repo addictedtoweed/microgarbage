@@ -77,8 +77,9 @@ void audio_sink_close(AudioSink *sink);
 
 /* ---- backends (exposed so tests can use them directly) ---- */
 extern const AudioSinkBackend audio_sink_wav;       /* always available */
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(_WIN32)
 extern const AudioSinkBackend audio_sink_waveout;   /* Windows only     */
+extern const AudioSinkBackend audio_sink_wasapi;    /* Windows only     */
 #endif
 
 /* ============================================================
@@ -124,6 +125,15 @@ WavResult wav_parse(const uint8_t *buf, size_t len, WavInfo *out);
  * playback. Returns frames written. */
 uint32_t wav_to_mono_pcm16(const WavInfo *info, int16_t *dst,
                            uint32_t max_frames);
+
+/* Decode + downmix-to-mono + linear-resample to dst_rate Hz. Used by
+ * loaders that want every SFX in the pool to land at a fixed rate so
+ * the per-channel mixer step can stay at the identity (1.0) — avoids
+ * needing per-sample source-rate tracking inside the mixer/arbiter.
+ * Returns frames written at dst_rate. */
+uint32_t wav_to_mono_pcm16_resample(const WavInfo *info, int16_t *dst,
+                                    uint32_t max_dst_frames,
+                                    uint32_t dst_rate);
 
 /* Convert parsed WAV PCM into INTERLEAVED STEREO PCM16 in `dst`
  * (caller-allocated, room for `max_frames * 2` int16). Stereo is

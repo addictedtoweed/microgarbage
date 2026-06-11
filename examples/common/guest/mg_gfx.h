@@ -56,6 +56,15 @@ void mg_ppu_clean_slate(void);
  * Costs one DMA slot + `bytes` against the byte budget. */
 MgResult mg_chr_upload(uint16_t vram_word, const void *src, uint16_t bytes);
 
+/* Transient variant — like mg_chr_upload but bytes are NOT promoted
+ * into the persistent checkpoint, so they're freed at the start of
+ * the next frame instead of accumulating in the cart-window payload
+ * area forever. Use for streaming sources (FMV per-frame CHR, dynamic
+ * CHR effects); use mg_chr_upload for static content that needs to
+ * survive frames (font tiles, sprite CHR). */
+MgResult mg_chr_upload_transient(uint16_t vram_word, const void *src,
+                                  uint16_t bytes);
+
 /* -------- Palette (shadow CGRAM, free per-color writes) -------- */
 
 /* Single-entry BGR555-word write. */

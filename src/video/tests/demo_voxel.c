@@ -38,7 +38,7 @@
  * aggregator, not libc's, so the trig/floor helpers below are libm-free
  * (and fit the project's no-libm style anyway). */
 
-#define SEED          1337u
+#define SEED          65536u
 #define MAPSZ         256          /* heightfield is MAPSZ x MAPSZ, wraps */
 #define MAPMASK       (MAPSZ - 1)
 #define SNES_NTSC_HZ  60.0988

@@ -59,6 +59,46 @@ COPRO_HDMA_TABLES  = (COPRO_BANK << 16) | $6000
 ; Moved from $7F00 to share the gap with STROBE_BOOTED (see below).
 COPRO_STATUS    = (COPRO_BANK << 16) | $79B1
 
+; v2.18: per-app custom NMI handler region. The host stages 65816 bytes
+; at COPRO_NMI_CODE_L when the guest calls SYS_MG_NMI_INSTALL, and bumps
+; COPRO_NMI_VERSION_L. Kernel @loop polls the version, copies the region
+; into WRAM at K_NMI_CODE_BASE when changed, and updates RAMVEC_NMI.
+COPRO_NMI_CODE_L      = (COPRO_BANK << 16) | $6C00
+COPRO_NMI_CODE_BYTES  = $0400          ; 1 KB
+COPRO_NMI_VERSION_L   = (COPRO_BANK << 16) | $79B2
+
+; v2.26 Phase 2.5: per-app HIRQ handler region. Same shape as the NMI
+; region — guest stages bytes via SYS_MG_HIRQ_INSTALL, kernel polls
+; COPRO_HIRQ_VERSION_L, byte-copies the region into WRAM at
+; K_HIRQ_CODE_BASE, and rewrites RAMVEC_IRQ.
+COPRO_HIRQ_CODE_L     = (COPRO_BANK << 16) | $6800
+COPRO_HIRQ_CODE_BYTES = $0400          ; 1 KB
+COPRO_HIRQ_VERSION_L  = (COPRO_BANK << 16) | $79B3
+
+; v2.26 Phase 2.5b: HIRQ schedule struct (see cart_window.h
+; CW_OFF_HIRQ_SCHED). Kernel reads these 5 bytes each main-loop
+; iteration and programs $4207-$420A + $4200 (NMITIMEN).
+; v2.27.8 moved from $7900 → $79B4 to escape the INIDISP HDMA table
+; region ($7868-$7967) which the host rewrites every frame.
+COPRO_HIRQ_SCHED_L            = (COPRO_BANK << 16) | $79B4
+COPRO_HIRQ_SCHED_HTIMEL_L     = (COPRO_BANK << 16) | $79B4
+COPRO_HIRQ_SCHED_HTIMEH_L     = (COPRO_BANK << 16) | $79B5
+COPRO_HIRQ_SCHED_VTIMEL_L     = (COPRO_BANK << 16) | $79B6
+COPRO_HIRQ_SCHED_VTIMEH_L     = (COPRO_BANK << 16) | $79B7
+COPRO_HIRQ_SCHED_NMITIMEN_L   = (COPRO_BANK << 16) | $79B8
+
+; v2.29 Phase 3a: kernel layout + siphon config — see cart_window.h
+; CW_OFF_KERNEL_LAYOUT / CW_OFF_SIPHON_CONFIG. Read by the NMI handler
+; at vblank to set up the next frame's HIRQ schedule.
+COPRO_LAYOUT_TOP_LB_L         = (COPRO_BANK << 16) | $79B9
+COPRO_LAYOUT_BOT_LB_L         = (COPRO_BANK << 16) | $79BA
+COPRO_SIPHON_BYTES_L          = (COPRO_BANK << 16) | $79BB
+COPRO_SIPHON_SRC_LO_L         = (COPRO_BANK << 16) | $79BC
+COPRO_SIPHON_SRC_HI_L         = (COPRO_BANK << 16) | $79BD
+COPRO_SIPHON_WRAM_LO_L        = (COPRO_BANK << 16) | $79BE
+COPRO_SIPHON_WRAM_MID_L       = (COPRO_BANK << 16) | $79BF
+COPRO_SIPHON_WRAM_HI_L        = (COPRO_BANK << 16) | $79C0
+
 ; --- per-frame DMA dispatch ------------------------------------------
 ; The kernel checks COPRO_FRAME_RDY in NMI; 0 means the copro is mid-stage
 ; (do nothing this vblank, the previous frame stays on screen). When the
@@ -190,3 +230,48 @@ PADS            = $0220         ; 4 pads x 16 bits = 8 bytes (PADS+0..+7); see
                                 ; mirrors auto-joypad register format ($4218):
                                 ;   bit 15..4 = B Y Sel St U D L R A X L R
                                 ;   bit  3..0 = signature (0 for std pad)
+K_NMI_VERSION   = $022A         ; v2.18: cached COPRO_NMI_VERSION (last value
+                                ; we acted on by copying the cart-window NMI
+                                ; region to K_NMI_CODE_BASE). Initialized to
+                                ; $00 by boot.s (WRAM is zeroed).
+K_NMI_CODE_BASE = $0E00         ; v2.18: runnable custom NMI handler lives in
+                                ; this 1 KB WRAM window. Initial RAMVEC_NMI
+                                ; still points at the kernel.s nmi proc; the
+                                ; first SYS_MG_NMI_INSTALL triggers a copy
+                                ; here + RAMVEC_NMI rewrite to this address.
+K_NMI_DEFAULT   = $022C         ; v2.21: cached address of the default kernel
+                                ; NMI proc, saved at kmain init. The @loop
+                                ; version-poll restores RAMVEC_NMI from this
+                                ; on "uninstall" (cart version rolls back to
+                                ; 0, which the host writes on VM unload), so
+                                ; the next demo gets a clean default handler
+                                ; instead of inheriting the previous demo's.
+K_HIRQ_VERSION  = $022E         ; v2.26: cached COPRO_HIRQ_VERSION (last value
+                                ; we acted on). Zeroed at kmain init.
+K_HIRQ_CODE_BASE = $1200        ; v2.26: runnable HIRQ handler lives in this
+                                ; 1 KB WRAM window. Initial RAMVEC_IRQ is
+                                ; 0 (no handler); first SYS_MG_HIRQ_INSTALL
+                                ; triggers a copy here + RAMVEC_IRQ rewrite.
+
+; v2.29 Phase 3a: kernel layout + siphon WRAM cache. The NMI handler
+; reads cart_window once per vblank and caches here; the default HIRQ
+; ISR uses these values without further cart_window reads (cheaper
+; per-fire). All zeros = no letterbox, no siphon.
+K_LAYOUT_TOP_LB     = $0230     ; cached top letterbox line count
+K_LAYOUT_BOT_LB     = $0231     ; cached bottom letterbox line count
+K_LAYOUT_VIS_END    = $0232     ; computed: 224 - bot_lb (first bottom-LB line)
+
+K_SIPHON_BYTES      = $0233     ; cached bytes_per_line (0 = disabled)
+K_SIPHON_SRC_LO     = $0234     ; current source pointer (within bank $C0)
+K_SIPHON_SRC_HI     = $0235
+K_SIPHON_SRC_BASE_LO= $0236     ; reset value (NMI reloads SRC_LO from here)
+K_SIPHON_SRC_BASE_HI= $0237
+K_SIPHON_WRAM_LO    = $0238     ; WMADDR value to set at siphon start
+K_SIPHON_WRAM_MID   = $0239
+K_SIPHON_WRAM_HI    = $023A
+
+K_FRAME_STATE       = $023B     ; per-frame ISR state (see kernel.s default_hirq)
+K_CURRENT_LINE      = $023C     ; cached V counter target (for write-only VTIMEL)
+K_HIRQ_DEFAULT      = $023D     ; cached address of default_hirq_handler so the
+                                ; @loop's HIRQ uninstall path can restore it
+                                ; (2 bytes — same shape as K_NMI_DEFAULT)

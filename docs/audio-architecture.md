@@ -24,8 +24,15 @@ Built and tested (desktop, native-Windows + Cygwin/POSIX):
   file-stream voice that reads incrementally, so a song far larger than
   the pool plays without loading into it. Desktop binds stdio (`/host`)
   + trashfs (`/td0`); an MCU port binds its own SD/flash reader — same
-  source, only the reader differs. (Source-rate≠output-rate resampling is still a
-  TODO — author WAVs at the output rate, 44.1 kHz.)
+  source, only the reader differs. **Source-rate ≠ output-rate is
+  handled by the mixer per the design** (v2.00): SFX are loaded into
+  the pool at their *native* sample rate, `AudioObject::sample_rate`
+  records it, and `audio_service`'s SFX play path calls
+  `mixer_set_source_rate` before feeding the channel. The mixer's
+  per-channel q32.32 step + linear interpolation generates output
+  frames at the mixer's configured rate. Pool space is preserved (no
+  upsample-and-store), and there's one resample pass on playback —
+  the design the doc has called for since day one.
 - **Full-stereo mixer** — every channel is `PCM16_STEREO`. Stereo is
   preserved; mono sources are promoted to L==R (no downmix) in the SFX
   feed, the pool→player adapter (`audio_pool_stream`, promote flag),

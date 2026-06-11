@@ -36,11 +36,15 @@
 #define HOR     70          /* horizon screen row                         */
 #define DEPTH   14000.0f    /* z = DEPTH / (y - HOR)                       */
 #define FOCAL   90.0f       /* screen->plane focal (x-scale = z*256/FOCAL) */
-#define A_MAX   5000        /* beyond this x-scale the channel is sub-pixel: cut to sky */
+#define A_MAX   8000        /* beyond this x-scale the channel is sub-pixel: cut to sky */
 #define VSCALE  0.14f       /* compress depth into the plane V so the far point fits */
 #define SCROLLW 168         /* cam_z wrap (keeps far ty < 1024; multiple of band period) */
 #define SKY_V   4           /* transparent plane row sampled above horizon */
 #define CHAN_U  128         /* plane U of the lava channel (centre)        */
+#define BAND_SPEED  90.0f   /* forward band-scroll rush                    */
+#define SNAKE_SPEED 0.35f   /* how fast the meander evolves (endless)      */
+#define BEND        40.0f   /* meander amplitude (screen px at depth)      */
+#define SPREAD      0.0008f /* how much the bend varies with depth         */
 
 static PpuState P;
 static uint32_t FB[PPU_SCREEN_W * PPU_SCREEN_H];
@@ -71,15 +75,17 @@ static void build_scene(void) {
         unsigned tu = w & 127u, tv = (w >> 7) & 127u;
         unsigned tile;
         if (tv < 2u)                     tile = 0u;   /* far transparent band       */
-        else if (tu >= 13u && tu <= 18u) tile = 2u;   /* WIDER lava channel (centre)*/
-        else if (tu >= 7u  && tu <= 24u) tile = 1u;   /* rock walls flanking it     */
+        else if (tu >= 12u && tu <= 19u) tile = 2u;   /* lava channel (~25% wider)  */
+        else if (tu >= 6u  && tu <= 25u) tile = 1u;   /* rock walls flanking it     */
         else                             tile = 0u;   /* sky beyond the canyon      */
 
         /* char pixel for char-word w: tile w/64, pixel (w%8, (w/8)%8). */
         unsigned ct = w >> 6, py = (w >> 3) & 7u;
+        unsigned band = (py >> 1) & 1u;                      /* period-4 bands: less near-field
+                                                              * strobe than period-2 */
         unsigned idx = (ct == 0u) ? 0u                       /* transparent  */
-                     : (ct == 2u) ? (8u + (py & 1u))         /* lava bands   */
-                     :              (2u + (py & 1u));         /* rock bands   */
+                     : (ct == 2u) ? (8u + band)              /* lava bands   */
+                     :              (2u + band);             /* rock bands   */
         P.vram[w] = (uint16_t)((tile & 0xFFu) | ((idx & 0xFFu) << 8));
     }
 
@@ -93,7 +99,8 @@ static void build_scene(void) {
     P.hdma_count = 3;
 }
 
-static void fill_tables(float cam_z) {
+static void fill_tables(float cam_z, float phase) {
+    float cdnear = DEPTH / (float)(PPU_SCREEN_H - 1 - HOR);   /* depth at the bottom row */
     for (int y = 0; y < PPU_SCREEN_H; y++) {
         if (y <= HOR) {                               /* sky: a=0 -> sample plane (CHAN_U, SKY_V) */
             a_tab[y]    = 0;
@@ -115,17 +122,21 @@ static void fill_tables(float cam_z) {
         a_tab[y]    = (uint16_t)(int16_t)a;
         int ty      = (int)(cam_z + z * VSCALE);      /* compress depth into the plane V */
         vofs_tab[y] = (uint16_t)(int16_t)(ty - y);
-        float cd    = z > 1200.0f ? 1200.0f : z;      /* cap the CURVE distance so the far rows
-                                                       * (where z lurches) share one stable bend */
-        int curve   = (int)(70.0f * fsin((cam_z + cd) * 0.0009f));
-        hofs_tab[y] = (uint16_t)(int16_t)curve;       /* dx = sx + hofs - 128 -> channel snakes */
+        /* Meander: the path centre bends with depth, and the bend evolves
+         * with `phase` (continuous => endless). Referenced to the near row,
+         * so the bottom (where the camera sits) stays centred = camera
+         * follows the path centre, snaking ahead. `cd` capped so far rows
+         * share one stable bend (no horizon lurch). */
+        float cd    = z > 1200.0f ? 1200.0f : z;
+        int   bend  = (int)(BEND * (fsin(phase + cd * SPREAD) - fsin(phase + cdnear * SPREAD)));
+        hofs_tab[y] = (uint16_t)(int16_t)bend;
     }
 }
 
 #ifdef TUNNEL_HEADLESS
 int main(void) {
     build_scene();
-    fill_tables(200.0f);
+    fill_tables(60.0f, 1.0f);
     ppu_render(&P, FB);
     for (int y = 0; y < PPU_SCREEN_H; y += 7) {
         for (int x = 0; x < PPU_SCREEN_W; x += 4) {
@@ -156,9 +167,11 @@ int main(void) {
     double t0 = now_sec(), report = t0;
     unsigned frames = 0;
     while (!present_should_close()) {
-        float cam_z = (float)((now_sec() - t0) * 90.0);
+        float t     = (float)(now_sec() - t0);
+        float cam_z = t * BAND_SPEED;
         while (cam_z >= (float)SCROLLW) cam_z -= (float)SCROLLW;   /* seamless band-scroll loop */
-        fill_tables(cam_z);
+        float phase = t * SNAKE_SPEED;                            /* endless meander */
+        fill_tables(cam_z, phase);
         ppu_render(&P, FB);
         present_frame(FB);
         frames++;

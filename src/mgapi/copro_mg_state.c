@@ -29,8 +29,13 @@
  * entry. ~28 KB is plenty for the OAM (~544 B) + CGRAM (~512 B) +
  * any incidental CHR/tilemap uploads accumulated across the frame. */
 #define PAYLOAD_AREA_START  0x0000u
-#define PAYLOAD_AREA_END    CW_OFF_HDMA_TABLES   /* 0x6000 — payload ends
-                                                  * where HDMA tables begin */
+#define PAYLOAD_AREA_END    CW_OFF_HDMA_TABLES   /* 0x7000 — payload ends
+                                                  * where HDMA tables begin.
+                                                  * v2.18 BISECT: reverted from
+                                                  * CW_OFF_NMI_CODE to isolate
+                                                  * whether mode7_3d's crash and
+                                                  * audio_mixer's flicker were
+                                                  * payload-size regressions. */
 
 /* SNES PPU B-bus addresses we emit. */
 #define BBUS_OAMDATA   0x04   /* $2104 — write index then bytes        */
@@ -62,6 +67,61 @@ static unsigned s_slot_checkpoint;      /* persistent direct slot count  */
  * for higher-index slots keeps its entries across frames. */
 static unsigned s_prev_mg_slots;
 
+/* v2.05: host-side sub-frame chaining.
+ *
+ * For demos like the FMV player that need more per-frame DMA than
+ * fits in one SNES NMI's vblank budget (~9 KB), the runtime splits
+ * the slot list into multiple "sub-frames." The cart window's 64-byte
+ * slot-list area gets rotated between sub-frames per NMI tick (port-7
+ * mailbox read advances to the next sub-frame). The kernel doesn't
+ * know about this — it still walks 8 slots per NMI, just sees a
+ * different slot list each time. frame_consumed bumps only when the
+ * last sub-frame has been processed.
+ *
+ * Slots accumulate in s_staged here (via stage_dma) instead of
+ * writing to cart_window directly. The split + first-sub-frame-write
+ * happens at the end of build_frame; subsequent sub-frame writes
+ * happen in mg_state_advance_subframe (called from cart_window's
+ * port-7 read handler). */
+#define MG_MAX_STAGED_SLOTS   48u   /* 8 slots × up to 6 sub-frames + margin */
+/* MG_MAX_SUBFRAMES bumped from 4 → 8 (v2.11). The 4 cap silently
+ * dropped cgram + bg-tilemap shadow DMAs on the first commit after
+ * mg_ppu_clean_slate when a demo also chunked CHR into 3 slots —
+ * SF0 spent on the 65536-B clean_slate VRAM-clear budget, SF1-3 on
+ * the three CHR chunks, leaving no room for SF4 (cgram + tilemap).
+ * Multi-commit demos hid this via s_cgram_reupload_frames /
+ * s_bg_reupload_frames widening dirty for 3 / 60 follow-ups; single-
+ * commit demos (demo_fmv_still) failed to display anything.
+ * 8 covers 2× the worst-case + headroom; ~80 B extra BSS. */
+#define MG_MAX_SUBFRAMES       8u   /* hard cap */
+/* Per-NMI DMA byte budget. Per the FMV design:
+ *   (vblank_lines + force_blanked_lines) × 1364 cycles / 8 = bytes/NMI
+ *   = (38 + 16) × 1364 / 8 = 9207 with force_blank(8, 8).
+ * Round down a touch so callers' uploads don't bump right against
+ * the wall. Sub-frame packing keeps total bytes ≤ this per group. */
+#define MG_SUBFRAME_BYTE_BUDGET 9200u
+
+typedef struct {
+    uint8_t  bbus;
+    uint8_t  dmap;
+    uint16_t prep;
+    uint16_t src;    /* offset into cart-window payload area */
+    uint16_t size;
+} StagedSlot;
+
+typedef struct {
+    uint8_t     slot_count;
+    StagedSlot  slots[8];
+} SubFrame;
+
+static StagedSlot s_staged[MG_MAX_STAGED_SLOTS];
+static unsigned   s_staged_count;
+static unsigned   s_staged_checkpoint;   /* persistent prefix end */
+
+static SubFrame s_subframes[MG_MAX_SUBFRAMES];
+static unsigned s_subframe_count;
+static unsigned s_subframe_index;
+
 /* Clean-slate VRAM-clear arming state. Set by
  * mg_state_arm_clean_slate_vram_clear (called from h_ppu_clean_slate)
  * and consumed by mg_state_build_frame the frame after the kernel
@@ -69,6 +129,32 @@ static unsigned s_prev_mg_slots;
  * mg_state_arm_clean_slate_vram_clear's comment for the full protocol. */
 static uint32_t s_clean_slate_drop_at_consumed;
 static bool     s_clean_slate_pending;
+
+/* v2.20: clean_slate full-frame force-blank window, gated on
+ * cart_window_frame_consumed(). While consumed has not caught up to
+ * s_clean_slate_force_blank_until_consumed, emit_inidisp_table emits
+ * a 224-line $80 table instead of the normal letterbox shape — the
+ * PPU stays force-blanked for the entire frame (vblank + active
+ * display) so the 64 KB VRAM clear at slot 0 and the demo's initial
+ * CGRAM/CHR/tilemap/OAM all land regardless of the kernel's slot-walk
+ * timing.
+ *
+ * Why consumed-based instead of a build_frame counter: the 64 KB
+ * clear takes ~32 ms (~2 NTSC frames) of CPU-paused DMA. During that
+ * span, NMI is held off and consumed doesn't advance. Host build_frame
+ * keeps being called (~60 Hz) but each call corresponds to a guest
+ * commit, NOT to an actually-processed frame. A naive per-build_frame
+ * decrement raced ahead of the real NMI cycle and lifted force-blank
+ * before VRAM finished updating, producing the "font ghost" artifact.
+ * Gating on consumed advance means the window lasts however long the
+ * SNES actually needs.
+ *
+ * Threshold = 4 consumed advances: covers the clear (1 NMI) + 3
+ * follow-up NMIs for demos that stage CHR over multiple frames
+ * (FMV-style chunked uploads). Visible cost ≈ 67 ms of black between
+ * demos. */
+static uint32_t s_clean_slate_force_blank_until_consumed;
+static bool     s_clean_slate_force_blank_active;
 
 /* CGRAM re-upload counter, decremented by mg_state_build_frame. While
  * positive, build_frame forces cgram_dirty=full so the CGRAM DMA is
@@ -79,6 +165,23 @@ static bool     s_clean_slate_pending;
  * re-staging on the next 2-3 frames (when slot 0 has been dropped and
  * CGRAM moves earlier in the slot list) recovers cleanly. */
 static unsigned s_cgram_reupload_frames;
+
+/* Same idea, for BG tilemaps. Reintroduced in v1.84 after the audio_mixer
+ * "text rows 2/5/12/14/17 missing while rows 7/9 visible" pattern came
+ * back the moment we actually ran the BG1SC-fixed v1.83 DLL through the
+ * real kernel runtime (previous test runs accidentally fell through to
+ * the smoke ROM's 65816 menu and looked correct for the wrong reason).
+ *
+ * The root cause is still timing: clean_slate's 64KB VRAM-clear DMA at
+ * slot 0 takes ~24 ms — about 1.5 NTSC frames — which means the slot-5
+ * BG-tilemap DMA on the first frame fires while the kernel is well past
+ * vblank. v1.76's INIDISP=$80 force-blank wrapper around the slot walk
+ * is supposed to let those writes land regardless of vcounter, but in
+ * practice bsnes-plus only honors part of the range. Three frames of
+ * re-emission cover the recovery window — by frame 2 the persistent
+ * slot 0 has been dropped, vblank is plenty, and the BG-tilemap DMA
+ * lands cleanly. */
+static unsigned s_bg_reupload_frames;
 
 /* ----------------------------------------------------------------
  *  Lifecycle
@@ -185,6 +288,28 @@ void mg_state_reset(void) {
     s_payload_checkpoint = 0;
     s_slot_checkpoint    = 0;
 
+    /* v2.25: the staged-DMA queue (s_staged + s_subframes) carries
+     * persistent slot descriptors across build_frame calls within a
+     * single demo's run. Reset on demo teardown so the next demo's
+     * build_frame doesn't rewind into the previous demo's leftover
+     * descriptors — those would still carry the old bbus/dmap/prep
+     * values but the src offsets would now point at the new demo's
+     * payload bytes, dispatching wrong content to wrong PPU registers.
+     * Visible symptom: demo_audio_mixer's CGRAM[1] came up black on
+     * second run after another demo; demo_sprite showed garbage CHR
+     * tiles after similar transitions.
+     *
+     * s_pending_* (FMV transient queue) and s_hdma_tables_used live
+     * later in the file; they're either reset per-frame by build_frame
+     * (HDMA tables) or only touched by demos that aren't currently
+     * affected (pending transients = FMV). Skip them here to keep this
+     * function ordering correct; revisit if FMV cross-demo runs
+     * regress. */
+    s_staged_count = 0;
+    s_staged_checkpoint = 0;
+    s_subframe_count = 0;
+    s_subframe_index = 0;
+
     /* Drop any in-flight clean-slate VRAM-clear arming from a
      * previous demo. If this reset is being called by h_ppu_clean_slate
      * itself, the handler will re-arm via mg_state_arm_clean_slate_*
@@ -192,6 +317,7 @@ void mg_state_reset(void) {
     s_clean_slate_pending = false;
     s_clean_slate_drop_at_consumed = 0;
     s_cgram_reupload_frames = 0;
+    s_bg_reupload_frames    = 0;
 }
 
 /* HDMA tables bump-allocator. Lives in CW_OFF_HDMA_TABLES..
@@ -292,6 +418,7 @@ bool mg_state_arm_clean_slate_vram_clear(void) {
      * leaves them alone on the first commit. */
     s_payload_checkpoint = s_payload_used;
     s_slot_checkpoint    = s_slot_used;
+    s_staged_checkpoint  = s_staged_count;
     /* Drop the slot once the kernel has acked the next frame. */
     s_clean_slate_drop_at_consumed = cart_window_frame_consumed() + 1;
     s_clean_slate_pending = true;
@@ -300,6 +427,24 @@ bool mg_state_arm_clean_slate_vram_clear(void) {
      * long VRAM-clear DMA disrupts the slot-2 CGRAM dispatch on the
      * first frame. */
     s_cgram_reupload_frames = 3;
+    /* v1.87: bumped from 3 → 60 (= 1 second at 60 Hz). The 3-frame
+     * reupload window in v1.84 didn't actually deliver the BG tilemap;
+     * audio_mixer kept showing the same row-7/row-9-only scatter
+     * pattern across many test runs. Each successful commit re-stages
+     * 2 KB; over 60 commits that's 120 KB of DMA traffic (~ 4% of
+     * vblank budget), which is the cheapest brute-force way to make
+     * sure whatever frame finally lands the full tilemap exists in
+     * the window. We'll back this down once the underlying timing
+     * is fully understood (force-blank semantics across NMI overrun,
+     * mid-active-display NMI, etc.). */
+    s_bg_reupload_frames    = 60;
+
+    /* v2.20: hold the screen at full force-blank until consumed has
+     * advanced by 4 — covers the ~32 ms VRAM clear (1 NMI) plus 3
+     * follow-up NMIs of demo setup. See the comment on
+     * s_clean_slate_force_blank_until_consumed for the why. */
+    s_clean_slate_force_blank_until_consumed = cart_window_frame_consumed() + 4;
+    s_clean_slate_force_blank_active = true;
     return true;
 }
 
@@ -363,7 +508,7 @@ static uint32_t alloc_payload(uint32_t bytes) {
  * slot pointing at them. Returns true on success. */
 static bool stage_dma(const void *src, uint32_t size,
                       uint8_t bbus, uint8_t dmap, uint16_t prep) {
-    if (s_slot_used >= 8) return false;
+    if (s_staged_count >= MG_MAX_STAGED_SLOTS) return false;
     if (size == 0) return true;     /* nothing to do, success */
 
     uint32_t off = alloc_payload(size);
@@ -371,14 +516,112 @@ static bool stage_dma(const void *src, uint32_t size,
 
     cart_window_load_blob(off, src, size);
 
-    CartDmaSlot slot = {
+    s_staged[s_staged_count++] = (StagedSlot){
         .bbus = bbus,
         .dmap = dmap,
+        .prep = prep,
         .src  = (uint16_t)off,
         .size = (uint16_t)size,
-        .prep = prep,
     };
-    cart_window_set_dma_slot(s_slot_used++, &slot);
+    /* Keep s_slot_used as a parallel byte-counter for legacy budget
+     * APIs (mg_state_slots_remaining). One slot of any size counts
+     * once toward the 8-slot soft limit the older API exposes; with
+     * sub-frame chaining the real cap is MG_MAX_STAGED_SLOTS. */
+    s_slot_used++;
+    return true;
+}
+
+/* ---- sub-frame queue management ---- */
+
+/* Stuff the eight cart-window slot entries from one sub-frame, padding
+ * remaining slot indices with empty (bbus=0) so the kernel skips them
+ * cleanly. */
+static void write_subframe_to_cart_window(const SubFrame *sf) {
+    static const CartDmaSlot empty_slot = {0};
+    for (unsigned i = 0; i < 8; i++) {
+        if (i < sf->slot_count) {
+            CartDmaSlot s = {
+                .bbus = sf->slots[i].bbus,
+                .dmap = sf->slots[i].dmap,
+                .src  = sf->slots[i].src,
+                .size = sf->slots[i].size,
+                .prep = sf->slots[i].prep,
+            };
+            cart_window_set_dma_slot(i, &s);
+        } else {
+            cart_window_set_dma_slot(i, &empty_slot);
+        }
+    }
+}
+
+/* Greedy-pack s_staged[] into sub-frames of ≤8 slots and ≤BUDGET bytes
+ * each. Writes the FIRST sub-frame to the cart window's slot list so
+ * the next NMI can process it. Subsequent sub-frames sit in
+ * s_subframes[] waiting for mg_state_advance_subframe. */
+static void flush_subframes(void) {
+    s_subframe_count = 0;
+    s_subframe_index = 0;
+    if (s_staged_count == 0) {
+        /* No work — clear cart-window slots so any leftover from a
+         * previous frame's tail entries doesn't fire. */
+        static const CartDmaSlot empty_slot = {0};
+        for (unsigned i = 0; i < 8; i++) {
+            cart_window_set_dma_slot(i, &empty_slot);
+        }
+        return;
+    }
+
+    SubFrame *cur = &s_subframes[0];
+    cur->slot_count = 0;
+    uint32_t cur_bytes = 0;
+    s_subframe_count = 1;
+
+    for (unsigned i = 0; i < s_staged_count; i++) {
+        const StagedSlot *s = &s_staged[i];
+        /* SNES DMA: size=0 means 65536. clean_slate's VRAM-clear is
+         * the canonical user; count it at its real transfer size for
+         * budget purposes so it lands in its own sub-frame. */
+        uint32_t slot_bytes = (s->size == 0) ? 65536u : s->size;
+        bool need_new_subframe =
+            (cur->slot_count >= 8) ||
+            (cur->slot_count > 0 &&
+             cur_bytes + slot_bytes > MG_SUBFRAME_BYTE_BUDGET);
+        if (need_new_subframe) {
+            if (s_subframe_count >= MG_MAX_SUBFRAMES) {
+                /* Out of sub-frame slots — drop the remaining
+                 * stage entries. Should be rare; bump the cap if it
+                 * fires (stderr to surface for tuning). */
+                fprintf(stderr,
+                    "mgapi: subframe overflow (staged=%u, dropped from %u)\n",
+                    s_staged_count, i);
+                break;
+            }
+            cur = &s_subframes[s_subframe_count++];
+            cur->slot_count = 0;
+            cur_bytes = 0;
+        }
+        cur->slots[cur->slot_count++] = *s;
+        cur_bytes += slot_bytes;
+    }
+
+    write_subframe_to_cart_window(&s_subframes[0]);
+}
+
+/* Advance to the next sub-frame's slot list. Called by cart_window
+ * when the kernel reads port 7 (which it does once per main-loop
+ * iteration, i.e. between NMIs). Returns true if another sub-frame
+ * was loaded into the cart window (caller keeps FRAME_RDY=1), false
+ * if the queue is empty (caller bumps frame_consumed and clears
+ * FRAME_RDY). */
+bool mg_state_advance_subframe(void) {
+    s_subframe_index++;
+    if (s_subframe_index >= s_subframe_count) {
+        /* Logical frame fully delivered. */
+        s_subframe_index = 0;
+        s_subframe_count = 0;
+        return false;
+    }
+    write_subframe_to_cart_window(&s_subframes[s_subframe_index]);
     return true;
 }
 
@@ -418,7 +661,69 @@ int mg_state_queue_dma(const void *src, uint32_t size,
      * the bytes + slot stay intact. */
     s_payload_checkpoint = s_payload_used;
     s_slot_checkpoint    = s_slot_used;
+    s_staged_checkpoint  = s_staged_count;
     return 0;
+}
+
+/* Pending transient queue — copied from the guest now, staged into
+ * the cart window LATER (inside build_frame, AFTER the shadow walker)
+ * so the transient bytes land AFTER the shadow DMAs in payload. If
+ * we stage_dma now, build_frame's payload-pointer rewind would
+ * clobber the bytes when the shadow walker writes from the checkpoint
+ * onward. Bookkeeping is reset every successful flush. */
+#define MG_PENDING_TRANSIENT_BUF_BYTES (32u * 1024u)
+#define MG_PENDING_TRANSIENT_MAX        8u
+typedef struct {
+    uint32_t buf_off;
+    uint16_t size;
+    uint16_t prep;
+    uint8_t  bbus;
+    uint8_t  dmap;
+} PendingTransientDma;
+static uint8_t  s_pending_buf[MG_PENDING_TRANSIENT_BUF_BYTES];
+static PendingTransientDma s_pending[MG_PENDING_TRANSIENT_MAX];
+static uint32_t s_pending_buf_used;
+static uint32_t s_pending_count;
+
+int mg_state_queue_dma_transient(const void *src, uint32_t size,
+                                 uint8_t bbus, uint8_t dmap, uint16_t prep) {
+    if (s_pending_count >= MG_PENDING_TRANSIENT_MAX) return -1;
+    if (s_pending_buf_used + size > MG_PENDING_TRANSIENT_BUF_BYTES) return -2;
+
+    /* Copy the bytes now — the guest's source pointer may be reused
+     * before build_frame fires. */
+    memcpy(s_pending_buf + s_pending_buf_used, src, size);
+    s_pending[s_pending_count] = (PendingTransientDma){
+        .buf_off = s_pending_buf_used,
+        .size    = (uint16_t)size,
+        .prep    = prep,
+        .bbus    = bbus,
+        .dmap    = dmap,
+    };
+    s_pending_count++;
+    s_pending_buf_used += size;
+    return 0;
+}
+
+void mg_state_drop_pending_transients(void) {
+    /* See header comment for the failure mode this prevents
+     * (h_frame_commit silent-drop + accumulated FMV transients =
+     * "every other frame is garbage" symptom). */
+    s_pending_count    = 0;
+    s_pending_buf_used = 0;
+}
+
+/* Stage queued transient DMAs into the cart-window payload. Called
+ * by build_frame after the shadow walker so the transient bytes land
+ * past the shadow region. Resets the queue. */
+static void flush_pending_transients(void) {
+    for (uint32_t i = 0; i < s_pending_count; i++) {
+        const PendingTransientDma *p = &s_pending[i];
+        (void)stage_dma(s_pending_buf + p->buf_off, p->size,
+                         p->bbus, p->dmap, p->prep);
+    }
+    s_pending_count    = 0;
+    s_pending_buf_used = 0;
 }
 
 /* Compose the OAM `prep` word: low byte = OAMADDL, high byte =
@@ -465,11 +770,24 @@ static uint8_t compute_obsel(const MgSpriteConfig *cfg) {
     return (uint8_t)((cfg->sizes_code << 5) | (gap << 3) | nb);
 }
 
-/* Compute BGxSC ($2107-$210A) from a layer's tilemap_word + size_code:
- *   bits 2-7: tilemap base / $0400 bytes = / $0200 words = word >> 9
+/* Compute BGxSC ($2107-$210A) from a layer's tilemap_word + size_code.
+ *
+ * v1.78 fix: BG1SC bits 2-7 hold the tilemap base in 1024-WORD units
+ * (= 2048 BYTE units), not 1024-byte. The original >> 9 derivation
+ * was off by one shift and placed the staged tilemap 2KB below where
+ * the PPU actually fetched it from. Only audio_mixer (which is the
+ * first demo to ever use tilemap_word != 0 outside Mode 7) exposed
+ * this — sprite.elf uses tilemap_word=0 so BG1SC=0 worked by accident,
+ * and Mode 7 has its own non-BG1SC tilemap addressing.
+ *
+ * bsnes-plus mmio_w2107 confirms: screen_addr = (data & 0xfc) << 9,
+ * which encodes ((bits 2-7) * 2048 bytes) = ((bits 2-7) * 1024 words).
+ * So bits 2-7 = tilemap_word / 1024 = tilemap_word >> 10.
+ *
+ *   bits 2-7: tilemap base / 1024 words = word >> 10
  *   bits 0-1: size_code (MgBgSize) */
 static uint8_t compute_bgxsc(const MgBgLayerState *bg) {
-    return (uint8_t)(((bg->tilemap_word >> 9) << 2) | (bg->size_code & 3));
+    return (uint8_t)(((bg->tilemap_word >> 10) << 2) | (bg->size_code & 3));
 }
 
 /* Compute the CHR-page index for BG12NBA / BG34NBA.
@@ -580,12 +898,91 @@ static void emit_inidisp_table(void) {
     uint8_t  t = s_state.force_blank_top;
     uint8_t  b = s_state.force_blank_bottom;
 
+    /* v2.20: clean_slate full-frame force-blank override. Emit a
+     * 224-line all-$80 table (terminator at end) while consumed has
+     * not advanced to the threshold the arm step recorded. Gating on
+     * consumed (not on a build_frame counter) means the window lasts
+     * however long the SNES actually needs to process the clear +
+     * initial setup, regardless of how many host commits the guest's
+     * loop fires in the meantime. */
+    if (s_clean_slate_force_blank_active &&
+        cart_window_frame_consumed() < s_clean_slate_force_blank_until_consumed) {
+        int lines = 224;
+        while (lines > 0) {
+            int n = lines > 127 ? 127 : lines;
+            *p++ = (uint8_t)(0x80u | (uint8_t)n);
+            for (int i = 0; i < n; i++) *p++ = 0x80;
+            lines -= n;
+        }
+        *p++ = 0x00;                  /* terminator */
+        /* v2.23: write the FULL CW_INIDISP_HDMA_BYTES region (not just
+         * (p - buf)) so trailing bytes from a previous frame's larger
+         * table are explicitly zeroed. Stale $80 chunks past the new
+         * terminator caused letterbox-height top-band ghosting in any
+         * demo following demo_letterbox — bsnes-plus's HDMA quirks
+         * meant the terminator wasn't reliably stopping channel 7. */
+        cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf,
+                              CW_INIDISP_HDMA_BYTES);
+        return;
+    }
+    /* Threshold reached — disarm so subsequent emits go through the
+     * normal letterbox path even if force_blank_until_consumed wraps. */
+    s_clean_slate_force_blank_active = false;
+
     if (t == 0 && b == 0) {
         /* No letterbox: terminator-only. HDMA channel 7 completes
          * before writing INIDISP this frame; the kernel's boot/NMI
          * INIDISP=$0F write is the only thing the PPU sees. */
-        buf[0] = 0x00;
-        cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf, 1u);
+        /* buf is already zero-initialized; write the full region so
+         * trailing bytes from a previous frame's larger table can't
+         * confuse channel 7. See the v2.23 comment in the force-blank
+         * branch above for the failure mode this prevents. */
+        cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf,
+                              CW_INIDISP_HDMA_BYTES);
+        return;
+    }
+
+    /* v2.16: TOP-only mode (t > 0, b == 0). HDMA channel 7 writes
+     * $80 for the top T lines, then reads a terminator and goes
+     * idle for the rest of the frame.
+     *
+     * Why: demos with very large per-NMI DMAs (FMV's chr2/chr3 = 9120
+     * B each = ~17 scanlines of overrun past vblank into the next
+     * frame) NEED the kernel-set INIDISP=$80 to stay in effect
+     * throughout the overrun, otherwise the PPU silently drops VRAM
+     * writes once HDMA flips INIDISP back to $0F at scanline 8.
+     *
+     * With TOP-only encoding, HDMA writes $80 for lines 0..T-1
+     * (matching the kernel-set value), then terminates. INIDISP stays
+     * at the last-written value ($80) until the kernel writes $0F at
+     * @done after the DMA loop ends. Effective "force-blank top" is
+     * however many scanlines pass before the kernel's @done — i.e.,
+     * exactly as long as the DMA needs. No HDMA flip mid-DMA, no
+     * dropped VRAM writes.
+     *
+     * Trade-off: there's no HDMA-driven bottom letterbox in this
+     * mode. Demos that need symmetric letterbox should set both T
+     * and B (falls through to the full encoder below). */
+    if (t > 0 && b == 0) {
+#define LB_CHUNK(n, val) do {                          \
+        *p++ = (uint8_t)(0x80u | (uint8_t)(n));        \
+        for (int _i = 0; _i < (n); _i++) *p++ = (val); \
+    } while (0)
+        while (t > 0) {
+            uint8_t n = t > 127 ? 127 : t;
+            LB_CHUNK(n, 0x80);
+            t = (uint8_t)(t - n);
+        }
+        *p++ = 0x00;                  /* terminator — ch7 done for rest of frame */
+#undef LB_CHUNK
+        /* v2.23: write the FULL CW_INIDISP_HDMA_BYTES region (not just
+         * (p - buf)) so trailing bytes from a previous frame's larger
+         * table are explicitly zeroed. Stale $80 chunks past the new
+         * terminator caused letterbox-height top-band ghosting in any
+         * demo following demo_letterbox — bsnes-plus's HDMA quirks
+         * meant the terminator wasn't reliably stopping channel 7. */
+        cart_window_load_blob(CW_OFF_INIDISP_HDMA, buf,
+                              CW_INIDISP_HDMA_BYTES);
         return;
     }
 
@@ -680,6 +1077,32 @@ void mg_state_build_frame(void) {
         s_cgram_reupload_frames--;
     }
 
+    /* Same trick for BG tilemaps — widen each enabled layer's dirty
+     * range to the full 2 KB so the emission below re-DMAs it. Three
+     * frames cover the clean_slate VRAM-clear overrun window (see
+     * s_bg_reupload_frames at top of file). Disabled layers stay
+     * skipped — the emit_bg loop's enabled-check still gates each DMA. */
+    if (s_bg_reupload_frames > 0) {
+        for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
+            MgBgLayerState *bg = &s_state.bg[i];
+            if (!bg->enabled_main && !bg->enabled_sub) continue;
+            bg->dirty_lo = 0;
+            bg->dirty_hi = MG_BG_TILEMAP_BYTES;
+        }
+        s_bg_reupload_frames--;
+        if (s_bg_reupload_frames == 0) {
+            /* One-shot stderr line so we can confirm the reupload window
+             * actually ran to completion. If this never fires, the
+             * counter never started; if it fires and the screen still
+             * scatters, every frame's DMA is failing the same way and
+             * the bug is downstream of staging. */
+            fprintf(stderr,
+                    "mgapi: bg_reupload window closed (60 commits)\n");
+            fflush(stderr);
+        }
+    }
+
+
     /* Reset per-frame bookkeeping. We rewind to the persistent
      * checkpoint (set by mg_chr_upload and other direct-stage paths),
      * not to zero, so any persistent uploads from before this commit
@@ -696,6 +1119,7 @@ void mg_state_build_frame(void) {
      * screen even when dma=1 in the diag heartbeat. */
     s_payload_used = s_payload_checkpoint;
     s_slot_used    = s_slot_checkpoint;
+    s_staged_count = s_staged_checkpoint;
     /* HDMA-tables pool is also reset per-frame. The contract on the
      * comment above ("HDMA tables stay across frames unless re-
      * uploaded") meant that the BYTES at a given offset persist, but
@@ -804,7 +1228,6 @@ void mg_state_build_frame(void) {
     /* BG tilemaps. Each layer's tilemap_word is the VRAM word
      * address; we DMA at VMAIN auto-increment + VMADDR = tilemap_word
      * + (dirty_lo / 2). The 2-byte-2-reg DMAP writes tile words. */
-    static bool s_bg_emit_logged[MG_BG_LAYERS] = {false};
     for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
         MgBgLayerState *bg = &s_state.bg[i];
         if (bg->dirty_hi <= bg->dirty_lo) continue;
@@ -816,19 +1239,6 @@ void mg_state_build_frame(void) {
          * DMA budget. The dirty bits stay set until the layer is
          * enabled (no-op until then). */
         if (!bg->enabled_main && !bg->enabled_sub) continue;
-        if (!s_bg_emit_logged[i]) {
-            s_bg_emit_logged[i] = true;
-            fprintf(stderr,
-                    "mgapi: FIRST BG%u tilemap emit -- lo=%u hi=%u "
-                    "tilemap_word=$%04X size=%u "
-                    "[before stage: slot=%u payload_off=%u]\n",
-                    i + 1, (unsigned)bg->dirty_lo, (unsigned)bg->dirty_hi,
-                    (unsigned)bg->tilemap_word,
-                    (unsigned)(bg->dirty_hi - bg->dirty_lo),
-                    (unsigned)s_slot_used,
-                    (unsigned)s_payload_used);
-            fflush(stderr);
-        }
         uint16_t lo = bg->dirty_lo;
         uint16_t hi = bg->dirty_hi;
         const uint8_t *src = bg->shadow + lo;
@@ -844,6 +1254,19 @@ void mg_state_build_frame(void) {
                         (uint16_t)(bg->tilemap_word + (lo >> 1)));
         bg->dirty_lo = bg->dirty_hi = 0;
     }
+
+    /* Stage any pending transient uploads (mg_chr_upload_transient).
+     * These land AFTER the shadow region in payload, so the shadow
+     * walker's writes to offsets [checkpoint .. shadow_end] don't
+     * collide with them. v2.04. */
+    flush_pending_transients();
+
+    /* v2.05: split s_staged[] into sub-frames and write the first
+     * sub-frame's slots to the cart window. Subsequent sub-frames are
+     * loaded by mg_state_advance_subframe (called from cart_window's
+     * port-7 read handler). Until the queue drains, the host keeps
+     * FRAME_RDY = 1 and the kernel processes one sub-frame per NMI. */
+    flush_subframes();
 
     /* Remember how many slots we used so the next frame's clear can
      * be precise instead of stomping the whole list. */

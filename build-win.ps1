@@ -4,20 +4,12 @@
 
 .DESCRIPTION
     Produces a self-contained native Windows host (build\host.exe for
-    the 05_shell example) using mingw-w64. The resulting binary does
-    NOT depend on the Cygwin DLL and uses the Win32 code paths
-    (WinSock2, SetConsoleMode, etc.) — i.e. the `_WIN32 && !__CYGWIN__`
-    branches in the source.
+    the 05_shell example) using mingw-w64. The resulting binary uses
+    the Win32 code paths (WinSock2, SetConsoleMode, etc.).
 
-    This is the canonical *shippable* build. The Cygwin build.sh
-    remains for fast local iteration and for running the unit-test
-    suites (which are platform-neutral); it produces a Cygwin-linked
-    binary that exercises the POSIX paths instead.
-
-    You can run this from PowerShell directly, OR from a Cygwin shell
-    via:  powershell.exe -ExecutionPolicy Bypass -File build-win.ps1
-    The compiler — not the shell you launch from — decides the target,
-    and mingw-w64 always emits native Windows binaries.
+    This is the canonical Windows build script. Run from PowerShell;
+    you can also invoke from MSYS2 MinGW64 bash via
+    `powershell.exe -ExecutionPolicy Bypass -File build-win.ps1`.
 
 .PARAMETER Clean
     Remove the build output and exit.

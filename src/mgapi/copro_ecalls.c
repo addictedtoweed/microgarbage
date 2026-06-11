@@ -115,6 +115,15 @@ static void h_frame_commit(VmCpu *cpu, void *system) {
          * stable across uploads, so overwriting at the same offsets
          * is safe. */
         mg_state_drop_hdma_tables();
+        /* v2.17: also drop queued mg_chr_upload_transient bytes.
+         * Without this, FMV's iter N's 4 transients (tilemap + 3 CHR
+         * chunks = ~27 KB) sit in s_pending until the next successful
+         * commit; iter N+1's 4 transients pile on top → ~54 KB attempt
+         * → MG_PENDING_TRANSIENT_BUF_BYTES (32 KB) overflows → iter N+1's
+         * CHR uploads silently rejected → next-displayed buffer has
+         * iter N's CHR paired with iter N+1's tilemap = "every other
+         * FMV frame is garbage" symptom. */
+        mg_state_drop_pending_transients();
         cpu->regs[VM_REG_A0] = 0;
         return;
     }
@@ -171,18 +180,31 @@ static void h_reset_count(VmCpu *cpu, void *system) {
 
 /* SYS_COPRO_WAIT_VBLANK() → 0
  *
- * Stage 3b: returns immediately. The full design has the scheduler
- * block this VM on BLOCK_FRAME_CONSUMED until the bsnes mapper reports
- * that the SNES NMI processed the staged frame. That requires both a
- * scheduler-side block reason and a real frame-consumed signal from
- * the mapper, which lands when stage 5's bsnes glue is in place.
+ * v2.30.7 Phase 3b: proper implementation. Block guest until the
+ * SNES kernel has consumed the last frame the guest committed —
+ * specifically, until cart_window's g_frame_consumed counter
+ * catches up to g_frame_staged. The cart_window port-7 read
+ * callback (cart_window_read for offset CW_OFF_JOY_BASE + 7*256,
+ * which the SNES kernel reads once per @loop iteration when a
+ * staged frame has been processed) bumps frame_consumed and calls
+ * vm_sched_wake_frame_consumed, which wakes any VM whose stored
+ * target the consumed counter has reached.
  *
- * Returning immediately is safe: guests that rely on this for pacing
- * just spin-loop today, and the runtime falls back to whatever the
- * VM's existing sleep_until / yield mechanism provides. */
+ * Fast path: if no staged commit is pending (g_frame_staged ==
+ * g_frame_consumed), return immediately. Otherwise block on
+ * BLOCK_FRAME_CONSUMED with block_deadline = g_frame_staged. */
 static void h_wait_vblank(VmCpu *cpu, void *system) {
     (void)system;
-    cpu->regs[VM_REG_A0] = 0;
+    uint32_t staged   = cart_window_frame_staged();
+    uint32_t consumed = cart_window_frame_consumed();
+    if (consumed >= staged) {
+        /* Nothing in flight — return immediately. */
+        cpu->regs[VM_REG_A0] = 0;
+        return;
+    }
+    cpu->block_reason   = BLOCK_FRAME_CONSUMED;
+    cpu->block_deadline = staged;
+    cpu->regs[VM_REG_A0] = 0;   /* set on wake, but be defensive */
 }
 
 /* ----------------------------------------------------------------

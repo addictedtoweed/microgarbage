@@ -1,24 +1,16 @@
 /* ============================================================
- *  platform_posix.c — host_platform.h for Linux and Cygwin
+ *  platform_posix.c — host_platform.h for Linux and macOS.
  *
  *  POSIX implementation of the host platform layer: clock_gettime
  *  for time, nanosleep for sleep, sigaction for the stop hook.
  *
- *  This file is the relocation of code that previously lived inline
- *  in examples/05_shell/host.c. Behavior is intended to be
- *  identical; only the location changed.
- *
- *  Built on: any non-Windows target, AND Cygwin (which is POSIX —
- *  __CYGWIN__ is defined but _WIN32 is not... except Cygwin DOES
- *  define _WIN32 in some header configurations, so the build system
- *  selects this file explicitly rather than relying on #ifdef here).
- *  To keep it self-contained and avoid surprises, the whole file is
- *  guarded so that an accidental compile on native Windows is a
- *  no-op rather than a double-definition.
+ *  The whole file is guarded by !defined(_WIN32) so that an
+ *  accidental compile on native Windows is a no-op rather than a
+ *  double-definition.
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 
-#if !defined(_WIN32) || defined(__CYGWIN__)
+#if !defined(_WIN32)
 
 /* clock_gettime / CLOCK_MONOTONIC need POSIX feature macros on some
  * libcs. Define before any include. */
@@ -110,4 +102,4 @@ void host_platform_request_stop(void) {
     g_stop = 1;
 }
 
-#endif /* !_WIN32 || __CYGWIN__ */
+#endif /* !_WIN32 */

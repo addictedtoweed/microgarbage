@@ -230,6 +230,19 @@ typedef struct {
     void    *shared_base;        /* host pointer to shared memory */
     uint32_t shared_size;        /* size of shared memory in bytes */
 
+    /* --- L2 sub-region (upper half of SHARED, 0xE000_0000+) ---
+     *
+     * Optional system-wide PSRAM (or similar) backing the upper
+     * half of VM_REGION_SHARED. Same instance is passed to every
+     * VM in the system — all VMs see the same backing here, which
+     * is what makes the global L2 allocator's "alloc returns a VA
+     * any VM can dereference" model work.
+     *
+     * NULL/0 leaves the L2 sub-region absent: accesses to
+     * 0xE000_0000+ fault, matching the pre-split behavior. */
+    void    *l2_shared_base;
+    uint32_t l2_shared_size;
+
 } VmLoaderConfig;
 
 /* ============================================================

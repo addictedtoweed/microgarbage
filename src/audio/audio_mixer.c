@@ -573,6 +573,32 @@ void mixer_mute(AudioMixer *m, size_t channel, bool muted) {
     m->channels[channel].muted = muted;
 }
 
+void mixer_set_source_rate(AudioMixer *m, size_t channel, uint32_t source_rate) {
+    if (!m || channel >= m->channel_count) return;
+    MixerChannel *c = &m->channels[channel];
+    /* source_rate == 0 or == output_rate: identity step, no resample.
+     * Otherwise compute the q32.32 step and arm the interpolator.
+     * Reset phase + interpolation taps so the new rate kicks in cleanly
+     * at the next sample fed to the channel — callers typically pair
+     * this with mixer_channel_reset before feeding a new sample. */
+    if (source_rate == 0 || (int)source_rate == m->sample_rate) {
+        c->needs_resample = false;
+        c->base_step      = 0;
+        c->step           = 0;
+    } else {
+        c->needs_resample = true;
+        c->base_step      = compute_step_q32_32((int)source_rate,
+                                                 m->sample_rate);
+        c->step           = c->base_step;
+    }
+    c->phase = 0;
+    for (int t = 0; t < MIXER_TAPS_MAX; t++) {
+        c->tap_l[t] = 0;
+        c->tap_r[t] = 0;
+    }
+    c->tap_primed = false;
+}
+
 void mixer_channel_start(AudioMixer *m, size_t channel) {
     if (channel >= m->channel_count) return;
     MixerChannel *c = &m->channels[channel];
@@ -619,6 +645,18 @@ size_t mixer_write_channel(AudioMixer *m, size_t channel,
         rb_push(&c->rb, bytes + i * frame_bytes);
     }
     return count;
+}
+
+size_t mixer_channel_free_frames(const AudioMixer *m, size_t channel) {
+    if (!m || channel >= m->channel_count) return 0;
+    const MixerChannel *c = &m->channels[channel];
+    if (c->rb.capacity == 0) return 0;
+    /* rb_push overwrites on full, so "free" is the capacity-minus-count
+     * delta — the number of frames that can be pushed without
+     * displacing already-queued data. Callers (PCM-stream FEED) use
+     * this for back-pressure. */
+    if (c->rb.count >= c->rb.capacity) return 0;
+    return c->rb.capacity - c->rb.count;
 }
 
 /* ============================================================

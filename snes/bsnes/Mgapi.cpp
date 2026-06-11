@@ -67,7 +67,22 @@ static bool resolve(DllHandle h, const char *name, F &out) {
 bool Mgapi::try_load() {
   if(dll_handle) return true;
   DllHandle h = dll_open("mgapi.dll");
-  if(!h) return false;
+  if(!h) {
+#if defined(_WIN32)
+    fprintf(stderr,
+            "mgapi: LoadLibrary(\"mgapi.dll\") FAILED, GetLastError=%lu\n",
+            (unsigned long)::GetLastError());
+#else
+    fprintf(stderr, "mgapi: dlopen(\"mgapi.dll\") FAILED: %s\n", dlerror());
+#endif
+    fprintf(stderr,
+            "mgapi: cart bus will fall through to the loaded .sfc bytes;\n"
+            "  the smoke ROM's 65816 menu will appear instead of the mgapi runtime.\n"
+            "  fix: make sure mgapi.dll + libgcc_s_seh-1.dll + libwinpthread-1.dll\n"
+            "  are present alongside bsnes.exe.\n");
+    fflush(stderr);
+    return false;
+  }
 
   bool ok =
     resolve(h, "mgapi_init",              p_init)              &&
@@ -87,7 +102,7 @@ bool Mgapi::try_load() {
 
   MgapiConfigABI cfg = {};
   cfg.cart_window_size  = 64 * 1024;
-  cfg.audio_sample_rate = 44100;
+  cfg.audio_sample_rate = 0;        // 0 = auto-detect (WASAPI default endpoint)
   cfg.audio_frames_max  = 4096;
   cfg.tcp_listen_port   = 2323;
   cfg.pad_count         = 2;

@@ -49,12 +49,14 @@ void vm_reset(VmCpu *cpu) {
     if (!cpu) return;
 
     VmRegion saved_regions[VM_REGION_COUNT];
+    VmRegion saved_l2 = cpu->l2_shared;
     memcpy(saved_regions, cpu->regions, sizeof(saved_regions));
     uint16_t saved_id = cpu->vm_id;
 
     memset(cpu, 0, sizeof(*cpu));
 
     memcpy(cpu->regions, saved_regions, sizeof(saved_regions));
+    cpu->l2_shared = saved_l2;
     cpu->vm_id = saved_id;
     cpu->block_child_vm = UINT16_MAX;
 }
@@ -69,13 +71,37 @@ void vm_reset(VmCpu *cpu) {
  *  expected to check trap_cause and bail.
  * ============================================================ */
 
+/* Pick the (region, offset) pair for an address. Most regions are a
+ * straight 2-bit selector / 30-bit offset split. SHARED is split a
+ * second time at bit 29 so we can carry an L2 sub-region (PSRAM on
+ * the MCU) alongside the existing system-wide mailbox storage:
+ *
+ *     0xC000_0000 - 0xDFFF_FFFF  -> regions[SHARED]  (L1; bit 29 = 0)
+ *     0xE000_0000 - 0xFFFF_FFFF  -> l2_shared        (L2; bit 29 = 1)
+ *
+ * When l2_shared.length is 0 (the default; embedder didn't install
+ * an L2 backing), an access to the upper half just fails the bounds
+ * check and traps — matching the pre-split behavior bit-for-bit. */
+static inline VmRegion *xlat_pick(VmCpu *cpu, uint32_t addr, uint32_t *out_off) {
+    uint32_t region = addr >> 30;
+    if (region == VM_REGION_SHARED) {
+        if (addr & 0x20000000u) {
+            *out_off = addr & 0x1FFFFFFFu;
+            return &cpu->l2_shared;
+        }
+        *out_off = addr & 0x1FFFFFFFu;
+        return &cpu->regions[VM_REGION_SHARED];
+    }
+    *out_off = addr & 0x3FFFFFFFu;
+    return &cpu->regions[region];
+}
+
 static inline const uint8_t *xlat_read(VmCpu *cpu,
                                        uint32_t addr,
                                        uint32_t size,
                                        VmTrapCause fault_cause) {
-    uint32_t region = addr >> 30;
-    uint32_t offset = addr & 0x3FFFFFFFu;
-    VmRegion *r = &cpu->regions[region];
+    uint32_t offset;
+    VmRegion *r = xlat_pick(cpu, addr, &offset);
 
     /* Region must be populated and the access must fit. */
     if (r->length == 0 || offset > r->length || size > r->length - offset) {
@@ -90,9 +116,8 @@ static inline const uint8_t *xlat_read(VmCpu *cpu,
 static inline uint8_t *xlat_write(VmCpu *cpu,
                                   uint32_t addr,
                                   uint32_t size) {
-    uint32_t region = addr >> 30;
-    uint32_t offset = addr & 0x3FFFFFFFu;
-    VmRegion *r = &cpu->regions[region];
+    uint32_t offset;
+    VmRegion *r = xlat_pick(cpu, addr, &offset);
 
     if (r->length == 0 || offset > r->length || size > r->length - offset) {
         cpu->trap_cause = TRAP_STORE_FAULT;

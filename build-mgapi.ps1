@@ -94,6 +94,7 @@ $mgapiSrcs = @(
     (Join-Path $MgapiSrcDir "cart_window.c"),
     (Join-Path $MgapiSrcDir "psram_pool.c"),
     (Join-Path $MgapiSrcDir "audio_init.c"),
+    (Join-Path $MgapiSrcDir "audio_device_win32.c"),
     (Join-Path $MgapiSrcDir "cart_volume.c"),
     (Join-Path $MgapiSrcDir "l2_alloc.c"),
     (Join-Path $MgapiSrcDir "l2_init.c")
@@ -144,6 +145,11 @@ $mgapiSrcs += (Join-Path $MgapiSrcDir "copro_mg_handlers.c")
 
 # Stage 4: TCP listener for PuTTY shell sessions.
 $mgapiSrcs += (Join-Path $MgapiSrcDir "tcp_listen.c")
+
+# Stage 5 (v1.68): worker thread that runs the per-vblank tick body
+# off the bsnes-plus thread. Embedder's mgapi_step becomes a
+# sub-microsecond signal; VM/audio/TCP all run concurrently.
+$mgapiSrcs += (Join-Path $MgapiSrcDir "worker.c")
 
 # Stage 3a: build the shell guest ELF + bake it into the DLL so the
 # embedder doesn't need a separate file. Lifted from build-win.ps1's
@@ -198,7 +204,8 @@ if (-not $NoGuest) {
         # M7 swaps the same source to the hardware CORDIC peripheral.
         $mgGuestImpls = @(
             "mg_bg.c","mg_frame.c","mg_gfx.c","mg_hdma.c","mg_input.c",
-            "mg_mode7.c","mg_panic.c","mg_sprite.c","mg_audio.c","mg_actor.c"
+            "mg_mode7.c","mg_panic.c","mg_sprite.c","mg_audio.c","mg_actor.c",
+            "mg_stream.c","mg_nmi.c"
         ) | ForEach-Object { Join-Path $guestCommon $_ }
         $mgGuestImpls += (Join-Path $RepoRoot "src\math\trig_q16.c")
         $guestSources = @(
@@ -206,9 +213,15 @@ if (-not $NoGuest) {
             @{ src = "tools\guests\menu.c";    sym = "menu_elf";    out = "menu.elf";    gen = "menu_elf_data.c";    extra = @() },
             @{ src = "tools\guests\demos\demo_palette.c";   sym = "demo_palette_elf";   out = "demo_palette.elf";   gen = "demo_palette_elf_data.c";   extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_letterbox.c"; sym = "demo_letterbox_elf"; out = "demo_letterbox.elf"; gen = "demo_letterbox_elf_data.c"; extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_dynamic_letterbox.c"; sym = "demo_dynamic_letterbox_elf"; out = "demo_dynamic_letterbox.elf"; gen = "demo_dynamic_letterbox_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_sprite.c";    sym = "demo_sprite_elf";    out = "demo_sprite.elf";    gen = "demo_sprite_elf_data.c";    extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_mode7.c";     sym = "demo_mode7_elf";     out = "demo_mode7.elf";     gen = "demo_mode7_elf_data.c";     extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_mode7_3d.c";  sym = "demo_mode7_3d_elf";  out = "demo_mode7_3d.elf";  gen = "demo_mode7_3d_elf_data.c";  extra = $mgGuestImpls }
+            @{ src = "tools\guests\demos\demo_mode7_3d.c";  sym = "demo_mode7_3d_elf";  out = "demo_mode7_3d.elf";  gen = "demo_mode7_3d_elf_data.c";  extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_audio_mixer.c"; sym = "demo_audio_mixer_elf"; out = "demo_audio_mixer.elf"; gen = "demo_audio_mixer_elf_data.c"; extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_pcm_stream.c"; sym = "demo_pcm_stream_elf"; out = "demo_pcm_stream.elf"; gen = "demo_pcm_stream_elf_data.c"; extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_fmv.c";        sym = "demo_fmv_elf";        out = "demo_fmv.elf";        gen = "demo_fmv_elf_data.c";        extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_fmv_still.c";  sym = "demo_fmv_still_elf";  out = "demo_fmv_still.elf";  gen = "demo_fmv_still_elf_data.c";  extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_nmi_smoke.c";  sym = "demo_nmi_smoke_elf";  out = "demo_nmi_smoke.elf";  gen = "demo_nmi_smoke_elf_data.c";  extra = $mgGuestImpls }
         )
         foreach ($g in $guestSources) {
             $srcPath = Join-Path $RepoRoot $g.src
@@ -229,7 +242,7 @@ if (-not $NoGuest) {
     }
 }
 if (-not $baked) {
-    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`n" |
+    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_dynamic_letterbox_elf[] = {0};`nconst size_t demo_dynamic_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`nconst unsigned char demo_audio_mixer_elf[] = {0};`nconst size_t demo_audio_mixer_elf_len = 0;`nconst unsigned char demo_pcm_stream_elf[] = {0};`nconst size_t demo_pcm_stream_elf_len = 0;`nconst unsigned char demo_fmv_elf[] = {0};`nconst size_t demo_fmv_elf_len = 0;`nconst unsigned char demo_fmv_still_elf[] = {0};`nconst size_t demo_fmv_still_elf_len = 0;`nconst unsigned char demo_nmi_smoke_elf[] = {0};`nconst size_t demo_nmi_smoke_elf_len = 0;`n" |
         Set-Content -Path $shellDataC -Encoding ASCII
 }
 $mgapiSrcs += $shellDataC
@@ -275,6 +288,14 @@ $audioSrcs = @(
     "src\containers\spsc_ring.c",
     "src\containers\bitset.c",
     "src\containers\ring_buffer.c",
+    # v2.10: stream arbiter — round-robin SD/host-file streaming. FMV
+    # and music players register against it; the worker tick fills
+    # per-stream rings before vm_step so guests find chunks ready
+    # without per-iter blocking on fs_read. stream_ecalls.c hosts
+    # the SYS_STREAM_* (1223-1226) ecall handlers guests reach via
+    # the mg_stream guest lib.
+    "src\io\stream_arbiter.c",
+    "src\io\stream_ecalls.c",
     "src\audio\audio_service.c",
     "src\audio\audio_arbiter.c",
     "src\audio\audio_pool.c",
@@ -284,7 +305,17 @@ $audioSrcs = @(
     "src\audio\audio_fft.c",
     "src\audio\audio_fft_kernel.c",
     "src\audio\audio_wav_read.c",
-    "src\audio\audio_file_stream.c"
+    "src\audio\audio_file_stream.c",
+    # v1.89: direct Win32 audio output. audio_sink_wav.c already owns
+    # the AudioSink dispatcher (open/write/close — selects backend by
+    # name); audio_sink_waveout.c is the actual waveOut driver. We
+    # never open the "wav" backend at runtime in mgapi but its symbol
+    # is part of the dispatcher closure, so both files are linked.
+    "src\audio\audio_sink_wav.c",
+    "src\audio\audio_sink_waveout.c",
+    # v1.97: WASAPI sink — the modern Win audio path. waveOut is kept
+    # in the dispatcher closure as a fallback selectable by name.
+    "src\audio\audio_sink_wasapi.c"
 ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
 $mgapiSrcs += $audioSrcs
@@ -304,7 +335,7 @@ Write-Step "compiling mgapi.dll..."
 $dllArgs = $cflags + @(
     "-shared",
     "-o", $dll
-) + $mgapiSrcs + @("-lws2_32", "-lwinmm")
+) + $mgapiSrcs + @("-lws2_32", "-lwinmm", "-lole32")
 & $Cc @dllArgs
 if ($LASTEXITCODE -ne 0) { Die "mgapi.dll link failed (exit $LASTEXITCODE)" }
 Write-Step "built $dll"

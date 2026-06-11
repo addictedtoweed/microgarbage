@@ -45,7 +45,11 @@ M7X       = $211F      ; center x (13-bit signed)
 M7Y       = $2120      ; center y
 
 ; --- CPU / DMA ($42xx, $43xx) ---
-NMITIMEN  = $4200      ; b7 NMI enable, b0 auto-joypad read
+NMITIMEN  = $4200      ; b7 NMI enable, b0 auto-joypad read, b4 HIRQ, b5 VIRQ
+HTIMEL    = $4207      ; H-counter IRQ target low byte
+HTIMEH    = $4208      ; H-counter IRQ target high byte (bit 0)
+VTIMEL    = $4209      ; V-counter IRQ target low byte
+VTIMEH    = $420A      ; V-counter IRQ target high byte (bit 0)
 JOYSER0   = $4016      ; manual joypad serial port 1 (write latch / read bits)
 JOYSER1   = $4017      ; manual joypad serial port 2
 RDNMI     = $4210      ; read to acknowledge NMI (b7 = vblank flag)

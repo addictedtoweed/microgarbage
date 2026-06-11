@@ -97,6 +97,9 @@
 #define SYS_AUDIO_FFT_ENABLE        1168
 #define SYS_AUDIO_LOAD_WAV          1169
 #define SYS_AUDIO_STREAM_WAV        1170
+#define SYS_AUDIO_PCM_STREAM_OPEN   1171
+#define SYS_AUDIO_PCM_STREAM_FEED   1172
+#define SYS_AUDIO_PCM_STREAM_CLOSE  1173
 
 /* Cart-coprocessor staging (must match host vm_ecall.h 1180..1184) */
 #define SYS_COPRO_STAGE_PAYLOAD     1180
@@ -157,6 +160,24 @@
 #define SYS_MG_PANIC                1219
 #define SYS_MG_FRAME_STATE          1220
 #define SYS_MG_PPU_CLEAN_SLATE      1221
+#define SYS_MG_CHR_UPLOAD_TRANSIENT 1222
+
+/* Stream arbiter (1223..1226). See include/io/stream_arbiter.h. */
+#define SYS_STREAM_REGISTER  1223
+#define SYS_STREAM_CONSUME   1224
+#define SYS_STREAM_CLOSE     1225
+#define SYS_STREAM_EOF       1226
+
+/* NMI builder (1227). See examples/common/guest/mg_nmi.h. */
+#define SYS_MG_NMI_INSTALL   1227
+
+/* HIRQ builder (1228, v2.26 Phase 2.5). See examples/common/guest/mg_nmi.h. */
+#define SYS_MG_HIRQ_INSTALL    1228
+#define SYS_MG_HIRQ_CONFIGURE  1229  /* (vtime, htime, nmitimen_bits) */
+
+/* Phase 3a unified kernel — layout + siphon (1230..1231). */
+#define SYS_MG_KERNEL_LAYOUT     1230  /* (top_lb, bottom_lb) */
+#define SYS_MG_SIPHON_CONFIGURE  1231  /* (bytes_per_line, src_off, wram_dst) */
 
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.

@@ -45,7 +45,7 @@ echo "06_scheduler: compiling scheduler demo..."
 # Platform link flags: POSIX needs pthread + rt; detect a non-Windows host.
 LINK_FLAGS="-lpthread"
 case "$(uname -s 2>/dev/null)" in
-    *NT*|*MINGW*|*MSYS*|*CYGWIN*) ;;   # Windows-ish: Win32 threads, no -lrt
+    *NT*|*MINGW*|*MSYS*) ;;   # Windows-ish: Win32 threads, no -lrt
     *) LINK_FLAGS="$LINK_FLAGS -lrt" ;; # Linux/BSD: realtime timer
 esac
 

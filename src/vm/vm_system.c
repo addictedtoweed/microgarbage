@@ -1172,6 +1172,8 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
         .region_data_size  = data_region_size,
         .shared_base       = sys->config.shared_storage,
         .shared_size       = (uint32_t)sys->config.shared_storage_size,
+        .l2_shared_base    = sys->config.l2_shared_storage,
+        .l2_shared_size    = (uint32_t)sys->config.l2_shared_storage_size,
     };
     VmLoadResult lr = vm_load(cpu, elf_image, elf_size, &loader_cfg);
     if (lr != VM_LOAD_OK) {

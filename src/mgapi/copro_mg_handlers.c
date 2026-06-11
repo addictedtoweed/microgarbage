@@ -64,6 +64,12 @@
 #define SYS_MG_PANIC               1219
 #define SYS_MG_FRAME_STATE         1220
 #define SYS_MG_PPU_CLEAN_SLATE     1221
+#define SYS_MG_CHR_UPLOAD_TRANSIENT 1222
+
+/* v2.18: install a per-app custom NMI handler. See vm_ecall.h. */
+#ifndef SYS_MG_NMI_INSTALL
+#define SYS_MG_NMI_INSTALL          1227
+#endif
 
 /* MgResult values mirrored from mg_panic.h. */
 #define MG_R_OK             0
@@ -570,6 +576,26 @@ static void h_chr_upload(VmCpu *cpu, void *sys_) {
     else cpu->regs[VM_REG_A0] = MG_R_OK;
 }
 
+/* v2.04: transient CHR upload for streaming sources (FMV per-frame
+ * CHR, future dynamic-CHR demos). Same as h_chr_upload but routes
+ * through mg_state_queue_dma_transient so the bytes don't pile up
+ * in the persistent checkpoint across frames. */
+static void h_chr_upload_transient(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint16_t vram_word = (uint16_t)cpu->regs[VM_REG_A0];
+    uint32_t srcp      = cpu->regs[VM_REG_A1];
+    uint16_t bytes     = (uint16_t)cpu->regs[VM_REG_A2];
+
+    if (bytes == 0) { cpu->regs[VM_REG_A0] = MG_R_OK; return; }
+    const void *src = vm_translate_read(cpu, srcp, bytes);
+    if (!src) { cpu->regs[VM_REG_A0] = MG_R_ERR_INVALID; return; }
+
+    int rc = mg_state_queue_dma_transient(src, bytes, 0x18, 0x01, vram_word);
+    if (rc == -1) cpu->regs[VM_REG_A0] = MG_R_ERR_DMA_SLOTS;
+    else if (rc == -2) cpu->regs[VM_REG_A0] = MG_R_ERR_DMA_BYTES;
+    else cpu->regs[VM_REG_A0] = MG_R_OK;
+}
+
 static void h_palette_write(VmCpu *cpu, void *sys_) {
     (void)sys_;
     uint8_t  start = (uint8_t)cpu->regs[VM_REG_A0];
@@ -837,6 +863,144 @@ static void h_panic(VmCpu *cpu, void *sys_) {
  * 64KB VRAM DMA happens entirely in vblank — 32K word writes at 8
  * master cycles each = 1024us, which fits in the ~2.4ms NTSC vblank
  * with margin. OAM (544 bytes) and CGRAM (512 bytes) DMAs also fit. */
+/* v2.18: SYS_MG_NMI_INSTALL(code_ptr, size) → 0 or -errno.
+ *
+ * Guest stages 65816 bytes for a custom NMI handler. The host:
+ *   1. Translates+validates the guest buffer
+ *   2. memcpy()s up to CW_NMI_CODE_BYTES into the cart window at
+ *      CW_OFF_NMI_CODE
+ *   3. Increments the version byte at CW_OFF_NMI_VERSION
+ *
+ * The SNES kernel's @loop polls the version each main-loop iteration
+ * (i.e., once per active-display window between vblanks); when it
+ * notices the bump, it block-copies the cart-window region into WRAM
+ * at K_NMI_CODE_BASE and rewrites RAMVEC_NMI to dispatch there. The
+ * very next NMI runs the new handler. */
+static void h_nmi_install(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint32_t code_ptr = cpu->regs[VM_REG_A0];
+    uint32_t size     = cpu->regs[VM_REG_A1];
+
+    if (size == 0 || size > CW_NMI_CODE_BYTES) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
+        return;
+    }
+    const void *src = vm_translate_read(cpu, code_ptr, size);
+    if (!src) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EFAULT;
+        return;
+    }
+    /* Stage the bytes. We zero-pad the tail of the region so that if
+     * the new handler is shorter than the previous one's residue, the
+     * leftover bytes (which would otherwise still execute after the
+     * new handler's RTI) are guaranteed-zero ($00 = BRK, a clear
+     * trap-on-crash signal rather than silently running stale code). */
+    cart_window_load_blob(CW_OFF_NMI_CODE, src, size);
+    if (size < CW_NMI_CODE_BYTES) {
+        static const uint8_t zeros[256] = {0};
+        uint32_t off  = CW_OFF_NMI_CODE + size;
+        uint32_t left = CW_NMI_CODE_BYTES - size;
+        while (left > 0) {
+            uint32_t n = left > sizeof(zeros) ? sizeof(zeros) : left;
+            cart_window_load_blob(off, zeros, n);
+            off  += n;
+            left -= n;
+        }
+    }
+    /* Bump version so the kernel @loop notices on next iteration. */
+    cart_window_bump_nmi_version();
+    cpu->regs[VM_REG_A0] = 0;
+}
+
+/* v2.26 Phase 2.5: SYS_MG_HIRQ_INSTALL(code_ptr, size) → 0 or -errno.
+ *
+ * Same shape as h_nmi_install — stages 65816 bytes for a per-app
+ * HBLANK-triggered IRQ handler at CW_OFF_HIRQ_CODE, zero-pads the
+ * tail, and bumps CW_OFF_HIRQ_VERSION so the kernel @loop notices.
+ * Kernel copies to WRAM at K_HIRQ_CODE_BASE ($1200) and rewrites the
+ * IRQ vector at $0202. */
+static void h_hirq_install(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint32_t code_ptr = cpu->regs[VM_REG_A0];
+    uint32_t size     = cpu->regs[VM_REG_A1];
+
+    if (size == 0 || size > CW_HIRQ_CODE_BYTES) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EINVAL;
+        return;
+    }
+    const void *src = vm_translate_read(cpu, code_ptr, size);
+    if (!src) {
+        cpu->regs[VM_REG_A0] = (uint32_t)-VM_EFAULT;
+        return;
+    }
+    cart_window_load_blob(CW_OFF_HIRQ_CODE, src, size);
+    if (size < CW_HIRQ_CODE_BYTES) {
+        static const uint8_t zeros[256] = {0};
+        uint32_t off  = CW_OFF_HIRQ_CODE + size;
+        uint32_t left = CW_HIRQ_CODE_BYTES - size;
+        while (left > 0) {
+            uint32_t n = left > sizeof(zeros) ? sizeof(zeros) : left;
+            cart_window_load_blob(off, zeros, n);
+            off  += n;
+            left -= n;
+        }
+    }
+    cart_window_bump_hirq_version();
+    cpu->regs[VM_REG_A0] = 0;
+}
+
+/* v2.26 Phase 2.5b SYS_MG_HIRQ_CONFIGURE handler removed in v2.29 —
+ * the cart_window-driven HIRQ schedule was superseded by Phase 3a's
+ * NMI-driven unified ISR. mg_kernel_layout + mg_siphon_configure are
+ * the replacement APIs. */
+
+/* v2.29 Phase 3a: SYS_MG_KERNEL_LAYOUT(top_lb, bottom_lb) → 0.
+ * Writes 2 bytes at CW_OFF_KERNEL_LAYOUT. The kernel's NMI handler
+ * caches these into WRAM at next vblank and the default HIRQ ISR
+ * uses them to drive INIDISP transitions. */
+static void h_kernel_layout(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint8_t top    = (uint8_t)cpu->regs[VM_REG_A0];
+    uint8_t bottom = (uint8_t)cpu->regs[VM_REG_A1];
+    /* Clamp to half the visible region (112 lines) so layout never
+     * leaves a negative visible region. */
+    if (top    > 112u) top    = 112u;
+    if (bottom > 112u) bottom = 112u;
+    /* v2.30.9: pack top+bottom into a single u16 and use the atomic
+     * 16-bit store so the SNES NMI's matching 16-bit lda f: read
+     * never sees a torn (new-top, old-bottom) pair. */
+    cart_window_store_u16_le(CW_OFF_KERNEL_LAYOUT,
+                             (uint16_t)top | ((uint16_t)bottom << 8));
+    cpu->regs[VM_REG_A0] = 0;
+}
+
+/* v2.29 Phase 3a: SYS_MG_SIPHON_CONFIGURE(bytes_per_line, src_off, wram_dst)
+ *   bytes_per_line : 0..32 (0 = siphon disabled)
+ *   src_off        : 16-bit offset within cart-window bank where source
+ *                    bytes live (host pre-stages bytes there each frame)
+ *   wram_dst       : 24-bit WRAM address where siphoned bytes accumulate
+ *                    (high bit usually 0 since WRAM tops at $7FFF)
+ *
+ * Writes 6 bytes at CW_OFF_SIPHON_CONFIG. NMI handler caches into WRAM
+ * at next vblank; default HIRQ ISR fires per-scanline siphon DMAs
+ * during the visible region. */
+static void h_siphon_configure(VmCpu *cpu, void *sys_) {
+    (void)sys_;
+    uint8_t  bytes = (uint8_t)cpu->regs[VM_REG_A0];
+    uint16_t src   = (uint16_t)cpu->regs[VM_REG_A1];
+    uint32_t wram  = cpu->regs[VM_REG_A2];
+    if (bytes > 32u) bytes = 32u;
+    uint8_t buf[6];
+    buf[0] = bytes;
+    buf[1] = (uint8_t)(src & 0xFFu);
+    buf[2] = (uint8_t)((src >> 8) & 0xFFu);
+    buf[3] = (uint8_t)(wram & 0xFFu);
+    buf[4] = (uint8_t)((wram >> 8) & 0xFFu);
+    buf[5] = (uint8_t)((wram >> 16) & 0x01u);
+    cart_window_load_blob(CW_OFF_SIPHON_CONFIG, buf, sizeof buf);
+    cpu->regs[VM_REG_A0] = 0;
+}
+
 static void h_ppu_clean_slate(VmCpu *cpu, void *sys_) {
     (void)sys_;
     MgState *st = mg_state();
@@ -908,12 +1072,19 @@ static const struct mg_handler_entry s_handlers[] = {
     { SYS_MG_HDMA_UPLOAD,          h_hdma_upload        },
     { SYS_MG_HDMA_ENABLE,          h_hdma_enable        },
     { SYS_MG_CHR_UPLOAD,           h_chr_upload         },
+    { SYS_MG_CHR_UPLOAD_TRANSIENT, h_chr_upload_transient },
     { SYS_MG_PALETTE_WRITE,        h_palette_write      },
     { SYS_MG_PALETTE_SNAP_RESTORE, h_palette_snap_restore },
     { SYS_MG_PACK_CHR,             h_pack_chr           },
     { SYS_MG_PANIC,                h_panic              },
     { SYS_MG_FRAME_STATE,          h_frame_state        },
     { SYS_MG_PPU_CLEAN_SLATE,      h_ppu_clean_slate    },
+    { SYS_MG_NMI_INSTALL,          h_nmi_install        },
+    { SYS_MG_HIRQ_INSTALL,         h_hirq_install       },
+    /* SYS_MG_HIRQ_CONFIGURE handler removed in v2.29 — see h_kernel_layout
+     * + h_siphon_configure as the replacement APIs. */
+    { SYS_MG_KERNEL_LAYOUT,        h_kernel_layout      },
+    { SYS_MG_SIPHON_CONFIGURE,     h_siphon_configure   },
 };
 
 #define MG_HANDLER_COUNT ((unsigned)(sizeof(s_handlers) / sizeof(s_handlers[0])))

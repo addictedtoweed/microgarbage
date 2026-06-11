@@ -105,6 +105,14 @@ typedef struct {
     uint16_t generation;   /* bumped on free; matched against handle  */
     uint16_t owner_vm;     /* vm_id that created it (for orphan sweep)*/
     bool     in_use;       /* slot occupied                           */
+    /* Source sample rate (Hz). Set by audio_pool_alloc_with_rate when
+     * the object is loaded; 0 means "assume mixer output rate" — the
+     * mixer treats it as no-resample. Callers that need linear/cubic
+     * interpolation at play time look this up via
+     * audio_pool_object_sample_rate(). Per docs/audio-architecture.md:
+     * per-channel source rate is the design intent; this is the per-
+     * sample metadata that backs it. */
+    uint32_t sample_rate;
 } AudioObject;
 
 /* ---- the pool ---- */
@@ -150,6 +158,22 @@ void audio_pool_destroy(AudioPool *p);
 AudioPoolResult audio_pool_alloc(AudioPool *p, uint32_t size,
                                  uint16_t owner_vm,
                                  AudioObjHandle *out_handle);
+
+/* Same as audio_pool_alloc but also records the sample rate of the
+ * data the caller is about to write into the object. The mixer reads
+ * this back at play time (via audio_pool_object_sample_rate) and
+ * configures per-channel linear/cubic interpolation. Pass 0 to skip
+ * the metadata (mixer assumes source == output rate, no resample). */
+AudioPoolResult audio_pool_alloc_with_rate(AudioPool *p, uint32_t size,
+                                           uint16_t owner_vm,
+                                           uint32_t sample_rate,
+                                           AudioObjHandle *out_handle);
+
+/* Read back the source sample rate stored on a pool object (set by
+ * audio_pool_alloc_with_rate). Returns 0 if the handle is invalid or
+ * no rate was recorded — callers should interpret 0 as "assume
+ * mixer output rate." */
+uint32_t audio_pool_object_sample_rate(const AudioPool *p, AudioObjHandle h);
 
 /* Increment an object's refcount (e.g. a new voice references it, or
  * another VM takes a reference). */

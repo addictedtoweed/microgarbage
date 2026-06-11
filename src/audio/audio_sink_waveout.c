@@ -33,7 +33,7 @@
 
 #include "audio/audio_sink.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(_WIN32)
 
 #include <windows.h>
 #include <mmsystem.h>

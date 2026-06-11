@@ -397,6 +397,13 @@ bool vm_sched_wake_mailbox(VmSched *s, uint16_t vm_id, int32_t a0_value);
  * isn't currently blocked on BLOCK_ON_CHILD. */
 bool vm_sched_wake_child(VmSched *s, uint16_t vm_id, int32_t a0_value);
 
+/* Walk all VMs currently blocked on BLOCK_FRAME_CONSUMED and wake
+ * any whose stored deadline (= frame_consumed value at the moment
+ * of the wait call) is less than `now_consumed`. Returns the number
+ * of VMs woken. Intended to be called from the cart_window port-7
+ * read callback (which is when frame_consumed bumps). */
+unsigned vm_sched_wake_frame_consumed(VmSched *s, uint32_t now_consumed);
+
 /* Force a VM into the halted state. Removes from both bitmaps,
  * sets cpu->halted. Subsequent vm_step calls return HALTED
  * immediately. */

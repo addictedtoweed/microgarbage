@@ -98,6 +98,13 @@ struct AudioService {
     const char     *pend_stream_path;
     bool            pend_is_stream;
 
+    /* PCM stream handoff (REQ_AUDIO_PCM_STREAM_OPEN). Same single-call
+     * scope as pend_is_stream above: handle_one stashes the requested
+     * source rate before calling audio_arbiter_play_external so the
+     * sink can configure the mixer channel for it. */
+    bool            pend_is_pcm_stream;
+    uint32_t        pend_pcm_stream_rate;
+
     /* FFT band meter over the final mixed output (enable-gated). The
      * enable is REFCOUNTED across consumers so one app disabling it (on
      * quit) doesn't kill the equalizer for every other app. fft_vm_on[]
@@ -167,6 +174,29 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
     AudioService *svc = (AudioService *)ctx;
 
     if (kind == AUDIO_VOICE_MUSIC) {
+        /* v2.02: PCM-stream voice — arms the channel for guest-fed
+         * frames, no MusicSlot or MusicPlayer needed because the
+         * guest pushes samples straight into the mixer channel via
+         * REQ_AUDIO_PCM_STREAM_FEED → mixer_write_channel. The mixer's
+         * per-channel source-rate interpolator (v2.00) handles any
+         * rate mismatch with the mixer output rate; per-channel ring
+         * (v2.01 = 32768 frames = ~743 ms at 44100) is the buffer.
+         *
+         * We forward through the MUSIC path so the arbiter's "never
+         * auto-reaped" policy applies — a PCM stream lives until the
+         * guest closes it (or the owning VM is swept). */
+        if (svc->pend_is_pcm_stream) {
+            if (p) {
+                mixer_set_volume(svc->mixer, track, (q15_t)p->gain);
+                mixer_set_pan(svc->mixer, track, (q15_t)p->pan);
+            }
+            mixer_set_source_rate(svc->mixer, track,
+                                   svc->pend_pcm_stream_rate);
+            mixer_channel_reset(svc->mixer, track);
+            mixer_channel_start(svc->mixer, track);
+            return true;
+        }
+
         MusicSlot *ms = find_free_music_slot(svc);
         if (!ms) return false;     /* no free music stream slot */
 
@@ -293,6 +323,14 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
         mixer_set_volume(svc->mixer, track, (q15_t)p->gain);
         mixer_set_pan(svc->mixer, track, (q15_t)p->pan);
     }
+    /* v2.00: pick up the SFX's source sample rate (stored on the pool
+     * object by audio_pool_alloc_with_rate) and configure the channel
+     * before resetting + feeding samples. The mixer's per-channel
+     * resampler handles the source→output ratio with linear interp,
+     * matching the design in docs/audio-architecture.md. 0 here means
+     * the loader didn't record a rate, mixer falls back to identity. */
+    uint32_t src_rate = audio_pool_object_sample_rate(&svc->pool, object);
+    mixer_set_source_rate(svc->mixer, track, src_rate);
     mixer_channel_reset(svc->mixer, track);
 
     /* SFX pool data is mono16; the mixer channel is stereo16. Promote
@@ -394,7 +432,18 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
     if (!chans) { audio_pool_destroy(&svc->pool); free(svc); return NULL; }
     for (uint32_t i = 0; i < tracks; i++) {
         chans[i].format         = MIXER_SRC_PCM16_STEREO;
-        chans[i].buffer_samples = 4096;          /* per-channel ring */
+        /* v2.01: per-channel ring sized to hold the whole SFX. The old
+         * 4096 stereo frames was 186 ms at 22050 Hz source — anything
+         * longer overflowed and rb_push (overwrite-old) kept only the
+         * tail. With per-channel source-rate interpolation now landing
+         * resampled output at the mixer rate, the ring needs enough
+         * SOURCE frames to cover the whole SFX. 32768 frames =
+         * ~1.5 sec at 22050 / 743 ms at 44100 — fits the demo's three
+         * SFX (max 30720 src frames). For longer SFX a streamed pool-
+         * stream adapter is the proper path (TODO); for now this is
+         * simple and works. Heap cost: tracks × 32768 × 4 B =
+         * 2 MB total at 16 tracks. */
+        chans[i].buffer_samples = 32768;
         chans[i].volume         = Q15_ONE;
     }
     MixerOutputFormat out = { .bits = 16, .is_signed = true,
@@ -608,17 +657,20 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         break;
     }
     case REQ_AUDIO_LOAD_STAGED: {
-        /* a0 = byte size, a1 = owner_vm. PCM is already in the shared
-         * staging buffer (the requester put it there). Alloc a pool
-         * object and copy staging->pool, service-side (no race). */
+        /* a0 = byte size, a1 = owner_vm, a2 = source sample rate (0 =
+         * "assume mixer rate"). PCM is already in the shared staging
+         * buffer (the requester put it there). Alloc a pool object,
+         * stash the rate, copy staging->pool service-side (no race). */
         uint32_t size = m->a0;
+        uint32_t src_rate = m->a2;
         if (!svc->staging || size == 0 || size > svc->staging_cap) {
             respond(svc, m, (uint32_t)AUDIO_POOL_ERR_INVALID_ARG, 0);
             break;
         }
         AudioObjHandle h;
-        AudioPoolResult r = audio_pool_alloc(&svc->pool, size,
-                                             (uint16_t)m->a1, &h);
+        AudioPoolResult r = audio_pool_alloc_with_rate(&svc->pool, size,
+                                                       (uint16_t)m->a1,
+                                                       src_rate, &h);
         if (r != AUDIO_POOL_OK) { respond(svc, m, (uint32_t)r, 0); break; }
         uint32_t wrote = 0;
         audio_pool_write(&svc->pool, h, 0, svc->staging, size, &wrote);
@@ -702,6 +754,78 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
          * naturally serialized against the mixer pump. */
         audio_service_sweep_vm(svc, (uint16_t)m->a0);
         respond(svc, m, (uint32_t)AUDIO_ARB_OK, 0);
+        break;
+    }
+    case REQ_AUDIO_PCM_STREAM_OPEN: {
+        /* a0 = sample_rate, a1 = channels (1 reserved/ignored, must be 2
+         * for v2.02 — caller duplicates mono to L=R before feeding),
+         * a2 = owner_vm. Returns a voice handle. The mixer's per-channel
+         * source-rate path handles any rate mismatch with the mixer's
+         * output rate. */
+        uint32_t rate = m->a0;
+        uint32_t channels = m->a1;
+        if (rate < 8000 || channels != 2) {
+            respond(svc, m, (uint32_t)AUDIO_ARB_INVALID_ARG, 0);
+            break;
+        }
+        svc->pend_is_pcm_stream   = true;
+        svc->pend_pcm_stream_rate = rate;
+        AudioVoiceParams p = { .gain = Q15_ONE, .pan = 0,
+                               .priority = 0, .loop = 0 };
+        AudioVoiceHandle v;
+        AudioArbResult r = audio_arbiter_play_external(&svc->arbiter, &p,
+                                                       (uint16_t)m->a2, &v);
+        svc->pend_is_pcm_stream   = false;
+        svc->pend_pcm_stream_rate = 0;
+        respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
+        break;
+    }
+    case REQ_AUDIO_PCM_STREAM_FEED: {
+        /* a0 = voice handle, a1 = frame_count to feed. Stereo int16
+         * frames already in svc->staging (caller wrote them). Pushes
+         * straight into the voice's mixer channel ring. Returns the
+         * frame count actually fed (may be less than requested if the
+         * channel ring filled; caller retries with the remainder).
+         *
+         * NB: the voice handle's low 16 bits encode (track + 1); we
+         * reach in here rather than adding a public arbiter getter
+         * since the encoding is documented and stable. */
+        AudioVoiceHandle voice = m->a0;
+        uint32_t frame_count   = m->a1;
+        if (!audio_arbiter_voice_valid(&svc->arbiter, voice)) {
+            respond(svc, m, (uint32_t)AUDIO_ARB_BAD_VOICE, 0);
+            break;
+        }
+        uint32_t track_plus_one = voice & 0xFFFFu;
+        if (track_plus_one == 0) {
+            respond(svc, m, (uint32_t)AUDIO_ARB_BAD_VOICE, 0);
+            break;
+        }
+        uint32_t track = track_plus_one - 1u;
+        /* size check: stereo int16 = 4 bytes/frame */
+        if ((uint64_t)frame_count * 4u > svc->staging_cap) {
+            respond(svc, m, (uint32_t)AUDIO_ARB_INVALID_ARG, 0);
+            break;
+        }
+        /* Back-pressure: respect the channel ring's free space so the
+         * guest's feed loop blocks when the mixer is "full enough."
+         * mixer_write_channel itself uses an overwrite-on-full ring
+         * (rb_push), which is what the SFX path wants but would let
+         * a streaming guest sprint past the audio clock. */
+        size_t free = mixer_channel_free_frames(svc->mixer, track);
+        uint32_t cap = (free < frame_count) ? (uint32_t)free : frame_count;
+        size_t fed = 0;
+        if (cap > 0) {
+            fed = mixer_write_channel(svc->mixer, track, svc->staging, cap);
+        }
+        respond(svc, m, (uint32_t)AUDIO_ARB_OK, (uint32_t)fed);
+        break;
+    }
+    case REQ_AUDIO_PCM_STREAM_CLOSE: {
+        /* a0 = voice. Stops the voice + frees the track. */
+        AudioVoiceHandle voice = m->a0;
+        AudioArbResult r = audio_arbiter_stop(&svc->arbiter, voice);
+        respond(svc, m, (uint32_t)r, 0);
         break;
     }
     default:

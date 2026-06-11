@@ -65,6 +65,10 @@ static void build_chr(void) {
 #define Q16_FROM_DEG(d) ((q16_16_t)(((int64_t)(d) * Q16_TWO_PI) / 360))
 
 void _start(void) {
+    /* v2.24: clean_slate so leftover VRAM / CGRAM from the previous demo
+     * doesn't bleed through. */
+    mg_ppu_clean_slate();
+
     build_chr();
 
     /* Mode 7: BG1 is the plane; BG2..4 don't exist in this mode. */

@@ -29,7 +29,7 @@
 
 /* Feature-test macro MUST precede all includes (for timer_t, sigaction,
  * sigevent on glibc). */
-#if !(defined(_WIN32) && !defined(__CYGWIN__))
+#if !(defined(_WIN32))
 #  ifndef _GNU_SOURCE
 #    define _GNU_SOURCE   /* sigwait, pthread_kill, timer_t, sigaction */
 #  endif
@@ -43,7 +43,7 @@
 
 typedef enum { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_DONE } TaskState;
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
+#if defined(_WIN32)
 /* ===================== Native Windows ===================== */
 #include <windows.h>
 

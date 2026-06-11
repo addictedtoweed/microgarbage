@@ -17,6 +17,9 @@
 #ifndef MGAPI_AUDIO_INIT_H
 #define MGAPI_AUDIO_INIT_H
 
+#include "vm/vm_system.h"
+
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,13 +28,33 @@ extern "C" {
 #endif
 
 /* Bring the service up on the given pool region. region/size are the
- * `audio` slice handed back by psram_pool_init. Returns 0 / -errno.
+ * `audio` slice handed back by psram_pool_init.
+ *
+ * `requested_rate_hz` is the host's preferred mixer + sink rate.
+ * Pass 0 to auto-detect: on Windows we query the default WASAPI render
+ * endpoint's mix format; on the MCU there is no device to ask and the
+ * caller MUST pass a concrete rate (typically 44100 for PCM5100-class
+ * DACs). Any non-zero value is taken as-is — the mixer renders at
+ * that rate and the audio sink opens at the same rate, eliminating
+ * any post-mixer resampling on the way out.
+ *
+ * Returns 0 / -errno.
  */
-int  mgapi_audio_init(void *pool_region, size_t pool_region_size);
+int  mgapi_audio_init(void *pool_region, size_t pool_region_size,
+                      uint32_t requested_rate_hz);
 
 /* Tear down: stop the service, destroy the channel. Safe to call
  * even if init failed. */
 void mgapi_audio_shutdown(void);
+
+/* Install SYS_AUDIO_* ecall handlers on the given VmSystem and
+ * register /host_fs_root/ as the resolution root for "/host/foo.wav"
+ * style paths. Call AFTER mgapi_audio_init and AFTER the VmSystem
+ * is up. Returns true on success. Without this call, mg_sfx_load /
+ * mg_stream_play / audio_get_levels all return -ENOSYS and silently
+ * no-op on the guest side. */
+bool mgapi_audio_install_ecalls(VmSystem *sys,
+                                const char *host_fs_root);
 
 /* Advance the audio engine by `frames` mixed stereo frames, pushed
  * into the ring buffer. If the ring is full this clamps internally

@@ -7,6 +7,10 @@
 #   tools/encode_fmv.sh movie.mp4            # whole video
 #   tools/encode_fmv.sh movie.mp4 -t 6       # first 6 seconds
 #   tools/encode_fmv.sh movie.mp4 -o intro   # -> intro.fmv
+#   tools/encode_fmv.sh movie.mp4 -1         # FMV1 video-only + .wav sidecar
+#                                            # (for the mgapi guest player —
+#                                            # audio plays via mg_stream_play,
+#                                            # video reads chunked from .fmv)
 #
 # Works in the repo (builds fmv_encode + demo_fmv from source via gcc) or as a
 # standalone demo package: drop fmv_encode(.exe), demo_fmv(.exe) and ffmpeg(.exe)
@@ -20,14 +24,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # tools/
 repo="$(cd "$here/.." && pwd)"
 src="$here/fmv_encode.c"
 
-usage() { echo "usage: $0 INPUT [-t SECONDS] [-o OUTBASE]"; exit 1; }
+usage() { echo "usage: $0 INPUT [-t SECONDS] [-o OUTBASE] [-1]"; exit 1; }
 [ $# -ge 1 ] || usage
 in="$1"; shift
-dur=""; out=""
+dur=""; out=""; fmv1=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -t) dur="${2:-}"; shift 2 ;;
     -o) out="${2:-}"; shift 2 ;;
+    -1) fmv1=1; shift ;;     # FMV1 video-only + .wav sidecar
     -h|--help) usage ;;
     *) echo "unknown option: $1"; usage ;;
   esac
@@ -72,26 +77,49 @@ fi
 
 tflag=(); [ -n "$dur" ] && tflag=(-t "$dur")
 
-# 1) extract the audio track to a temp raw-PCM file. It gets muxed into the
-#    .fmv below, then deleted — the clip is a single self-contained file.
-tmp_pcm="$out.tmp.pcm"
-echo "audio -> (temp)  (${RATE} Hz s16 stereo)"
-if ! ffmpeg -hide_banner -loglevel error -y -i "$in" ${tflag[@]+"${tflag[@]}"} \
-       -vn -ar "$RATE" -ac 2 -f s16le "$tmp_pcm" 2>/dev/null; then
-  echo "  (no audio track — encoding silent)"; rm -f "$tmp_pcm"; tmp_pcm="none"
+if [ "$fmv1" = 1 ]; then
+  # ---- FMV1 mode: video-only .fmv + .wav sidecar ---------------------------
+  # The mgapi guest player uses this layout: audio plays via mg_stream_play
+  # (reuses the proven music-streaming path), video is read chunked from the
+  # .fmv via SYS_FS_READ. No new mgapi ecalls needed. Same encoder, just no
+  # audio-mux step.
+  echo "audio -> $out.wav  (${RATE} Hz s16 stereo)"
+  if ! ffmpeg -hide_banner -loglevel error -y -i "$in" ${tflag[@]+"${tflag[@]}"} \
+         -vn -ar "$RATE" -ac 2 "$out.wav" 2>/dev/null; then
+    echo "  (no audio track — guest will need to skip mg_stream_play)"; rm -f "$out.wav"
+  fi
+
+  echo "video -> $out.fmv  (${W}x${H}, ${FPS} fps, video-only/FMV1)"
+  ffmpeg -hide_banner -loglevel error -i "$in" ${tflag[@]+"${tflag[@]}"} \
+    -vf "scale=${W}:${H},fps=${FPS}" -f rawvideo -pix_fmt rgb24 - \
+    | "$enc" - "$out.fmv"           # no audio arg => encoder emits FMV1
+
+  echo
+  echo "done:  $out.fmv + $out.wav  (guest player layout)"
+  echo "       cp $out.fmv $out.wav <bsnes-out>/host/   # then run /demos/fmv.elf"
+else
+  # ---- FMV2 mode (default): single self-contained muxed file ---------------
+  # 1) extract the audio track to a temp raw-PCM file. It gets muxed into the
+  #    .fmv below, then deleted — the clip is a single self-contained file.
+  tmp_pcm="$out.tmp.pcm"
+  echo "audio -> (temp)  (${RATE} Hz s16 stereo)"
+  if ! ffmpeg -hide_banner -loglevel error -y -i "$in" ${tflag[@]+"${tflag[@]}"} \
+         -vn -ar "$RATE" -ac 2 -f s16le "$tmp_pcm" 2>/dev/null; then
+    echo "  (no audio track — encoding silent)"; rm -f "$tmp_pcm"; tmp_pcm="none"
+  fi
+
+  # 2) pipe video frames into the encoder; it interleaves one audio chunk per
+  #    frame (audio first) into the FMV2 container. ffmpeg piped straight in, so
+  #    no giant intermediate .rgb — the whole movie is fine.
+  echo "video+audio -> $out.fmv  (${W}x${H}, ${FPS} fps, muxed)"
+  ffmpeg -hide_banner -loglevel error -i "$in" ${tflag[@]+"${tflag[@]}"} \
+    -vf "scale=${W}:${H},fps=${FPS}" -f rawvideo -pix_fmt rgb24 - \
+    | "$enc" - "$out.fmv" "$tmp_pcm"
+
+  [ "$tmp_pcm" != "none" ] && rm -f "$tmp_pcm"
+
+  echo
+  echo "done:  $out.fmv  (audio muxed in)"
+  if [ -n "$player" ] && [ -x "$player" ]; then echo "play:  $player $out.fmv"
+  else echo "play:  demo_fmv $out.fmv   (copy the demo_fmv player next to this script to enable playback)"; fi
 fi
-
-# 2) pipe video frames into the encoder; it interleaves one audio chunk per
-#    frame (audio first) into the FMV2 container. ffmpeg piped straight in, so
-#    no giant intermediate .rgb — the whole movie is fine.
-echo "video+audio -> $out.fmv  (${W}x${H}, ${FPS} fps, muxed)"
-ffmpeg -hide_banner -loglevel error -i "$in" ${tflag[@]+"${tflag[@]}"} \
-  -vf "scale=${W}:${H},fps=${FPS}" -f rawvideo -pix_fmt rgb24 - \
-  | "$enc" - "$out.fmv" "$tmp_pcm"
-
-[ "$tmp_pcm" != "none" ] && rm -f "$tmp_pcm"
-
-echo
-echo "done:  $out.fmv  (audio muxed in)"
-if [ -n "$player" ] && [ -x "$player" ]; then echo "play:  $player $out.fmv"
-else echo "play:  demo_fmv $out.fmv   (copy the demo_fmv player next to this script to enable playback)"; fi

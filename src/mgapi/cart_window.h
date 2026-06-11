@@ -109,18 +109,121 @@ extern "C" {
 
 /* HDMA tables area — game stages per-scanline tables for channels
  * 0..6 here via mg_hdma_upload_table. The runtime bump-allocates
- * within this 4096-byte slab each frame the same way it does with
+ * within this 2048-byte slab each frame the same way it does with
  * payload-area DMA staging.
  *
- * Sized at 4KB (up from 1280) to accommodate mode7_3d's four M7A-D
- * tables under bsnes-plus's hybrid-encoding scheme (~450 bytes per
- * table × 4 = ~1800 bytes), with headroom for more channels or
- * smaller granularities. Tucked into the back of the previous
- * payload area at $6000-$6FFF; payload now ends at $6000 (24KB
- * instead of 28KB), still comfortably more than any demo's per-
- * frame DMA payload needs. */
-#define CW_OFF_HDMA_TABLES    0x6000u
-#define CW_HDMA_TABLES_BYTES  0x1000u  /* 4096 bytes — fits mode7_3d */
+ * v2.04: moved from $6000 to $7000, shrunk from 4KB to 2KB so the
+ * payload area can grow back to 28KB. demo_fmv's per-frame CHR
+ * upload (24,960 B) + tilemap (2,048 B) + CGRAM (256 B) = ~27 KB
+ * needs the bigger payload; 2KB is still enough for mode7_3d's
+ * ~1800-byte M7A-D table set (the largest current HDMA user). The
+ * old 4KB sizing had room for "more channels or smaller granularities"
+ * but no demo actually used that headroom. */
+#define CW_OFF_HDMA_TABLES    0x7000u
+#define CW_HDMA_TABLES_BYTES  0x0800u  /* 2048 bytes — fits mode7_3d ~1800 */
+
+/* v2.18: per-app custom NMI handler region. Guest stages 65816 bytes
+ * here via SYS_MG_NMI_INSTALL; the kernel @loop polls
+ * CW_OFF_NMI_VERSION, copies the region into WRAM at $0E00 when the
+ * version changes, and updates RAMVEC_NMI to point at WRAM. Allows
+ * each guest to install a minimal NMI tailored to its frame shape
+ * (FMV: ~250-cycle handler with no Mode 7 / HDMA setup vs the
+ * generic kernel's ~1100-cycle preamble).
+ *
+ * Carved from the high end of the payload area: payload was 28 KB,
+ * now 27 KB. FMV's per-commit staged data is ~26.6 KB — 400 B
+ * margin. The future 1/3-buffer streaming design will reclaim
+ * substantial payload space (per-commit drops from ~27 KB to ~9 KB),
+ * at which point this region can grow if needed. */
+#define CW_OFF_NMI_CODE       0x6C00u
+#define CW_NMI_CODE_BYTES     0x0400u  /* 1 KB */
+
+/* v2.26 Phase 2.5: per-app HIRQ (HBLANK-triggered IRQ) handler region.
+ * Same shape as the NMI region — guest stages 65816 bytes via
+ * SYS_MG_HIRQ_INSTALL, kernel polls CW_OFF_HIRQ_VERSION, byte-copies
+ * to WRAM at $1200, and rewrites the WRAM IRQ vector at $0202. The
+ * HIRQ ISR fires per-scanline during the active-display siphon window
+ * (start_line/end_line/bytes-per-line configured via SYS_MG_HIRQ_CONFIG
+ * — Phase 2.5b) to do per-scanline CPU DMA siphons from cart-window
+ * source bytes to WRAM, expanding the demo's per-frame DMA budget
+ * beyond the vblank+force-blank baseline. See [[fmv-player-design]]
+ * for the broader design.
+ *
+ * Carved from the existing payload's top — payload now $0000–$67FF
+ * (26 KB), HIRQ code $6800–$6BFF (1 KB), NMI code $6C00–$6FFF (1 KB),
+ * HDMA tables $7000–$77FF (2 KB). The siphon source pool layout
+ * lands in Phase 2.5b once the actual byte budget per frame is
+ * verified — the bytes can either share payload space (host stages
+ * them like any other DMA payload) or get a dedicated region. */
+#define CW_OFF_HIRQ_CODE      0x6800u
+#define CW_HIRQ_CODE_BYTES    0x0400u  /* 1 KB */
+#define CW_OFF_NMI_VERSION    0x79B2u  /* host bumps on install */
+#define CW_OFF_HIRQ_VERSION   0x79B3u  /* v2.26 — host bumps on HIRQ install */
+
+/* v2.26 Phase 2.5b: HIRQ schedule struct (5 bytes).
+ *   +0  HTIMEL (low byte of $4207 H-counter target, 0..339)
+ *   +1  HTIMEH (high byte of $4208, bit 0 only)
+ *   +2  VTIMEL (low byte of $4209 V-counter target, 0..261)
+ *   +3  VTIMEH (high byte of $420A, bit 0 only)
+ *   +4  NMITIMEN_BITS — caller-supplied bits 4 (HIRQ) and 5 (VIRQ).
+ *                       Kernel ORs with $80 (NMI enable) before
+ *                       writing $4200, so the NMI bit is never lost.
+ *
+ * v2.27.8 moved from $7900 to $79B4: original location was INSIDE the
+ * INIDISP HDMA table region ($7868-$7967, 256 bytes), which
+ * emit_inidisp_table rewrites every frame — that silently clobbered
+ * the schedule with INIDISP value bytes. The new location at $79B4
+ * is past the INIDISP HDMA region and after the HIRQ_VERSION byte,
+ * in clean per-byte-defined space.
+ *
+ * Programmed by the kernel every main-loop iteration so the guest
+ * can dynamically reconfigure by writing the cart_window bytes; the
+ * next iteration picks them up. Initial state = all zeros = HIRQ
+ * disabled (kernel writes NMITIMEN=$80, just NMI). */
+#define CW_OFF_HIRQ_SCHED       0x79B4u
+#define CW_OFF_HIRQ_SCHED_HTIMEL    (CW_OFF_HIRQ_SCHED + 0u)
+#define CW_OFF_HIRQ_SCHED_HTIMEH    (CW_OFF_HIRQ_SCHED + 1u)
+#define CW_OFF_HIRQ_SCHED_VTIMEL    (CW_OFF_HIRQ_SCHED + 2u)
+#define CW_OFF_HIRQ_SCHED_VTIMEH    (CW_OFF_HIRQ_SCHED + 3u)
+#define CW_OFF_HIRQ_SCHED_NMITIMEN  (CW_OFF_HIRQ_SCHED + 4u)
+
+/* v2.29 Phase 3a: unified kernel layout + siphon config.
+ *
+ * Kernel layout (2 bytes at $79B9-$79BA):
+ *   +0  top_lb     (0..127 — scanlines of top force-blank)
+ *   +1  bottom_lb  (0..127 — scanlines of bottom force-blank)
+ *
+ * The kernel's NMI handler reads these at vblank, caches in WRAM, and
+ * programs HIRQ to fire INIDISP transitions at the appropriate
+ * scanlines. Default (0, 0) = full 224-line visible, no letterbox.
+ *
+ * Siphon config (7 bytes at $79BB-$79C1):
+ *   +0  bytes_per_line  (0..32 — 0 disables siphon)
+ *   +1  src_offset_lo   (low byte of source pool offset within bank $C0)
+ *   +2  src_offset_hi
+ *   +3  wram_dst_lo     (low byte of WRAM destination, where bytes accumulate)
+ *   +4  wram_dst_mid    (mid byte; WRAM address is 17 bits)
+ *   +5  wram_dst_hi     (high byte / bit 0)
+ *   +6  reserved
+ *
+ * Siphon fires per-scanline during the visible region (between
+ * top_lb and (224 - bottom_lb)), via the kernel's default HIRQ
+ * handler. Each fire reads `bytes_per_line` bytes from cart_window
+ * starting at src_offset (advancing src per line) and writes to
+ * WMDATA ($2180), with WMADDR set to wram_dst at start of siphon.
+ *
+ * All values 0 = siphon disabled. */
+#define CW_OFF_KERNEL_LAYOUT          0x79B9u
+#define CW_OFF_KERNEL_LAYOUT_TOP_LB   (CW_OFF_KERNEL_LAYOUT + 0u)
+#define CW_OFF_KERNEL_LAYOUT_BOT_LB   (CW_OFF_KERNEL_LAYOUT + 1u)
+
+#define CW_OFF_SIPHON_CONFIG          0x79BBu
+#define CW_OFF_SIPHON_BYTES           (CW_OFF_SIPHON_CONFIG + 0u)
+#define CW_OFF_SIPHON_SRC_LO          (CW_OFF_SIPHON_CONFIG + 1u)
+#define CW_OFF_SIPHON_SRC_HI          (CW_OFF_SIPHON_CONFIG + 2u)
+#define CW_OFF_SIPHON_WRAM_LO         (CW_OFF_SIPHON_CONFIG + 3u)
+#define CW_OFF_SIPHON_WRAM_MID        (CW_OFF_SIPHON_CONFIG + 4u)
+#define CW_OFF_SIPHON_WRAM_HI         (CW_OFF_SIPHON_CONFIG + 5u)
 
 /* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
  * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap
@@ -244,6 +347,42 @@ void cart_window_set_mode7_batch(const Mode7Batch *batch);
  * mailbox reads in $7000-$77FF.
  */
 void cart_window_post_pads(const uint16_t pads[4]);
+
+/* v2.18: bump the per-app NMI version byte at CW_OFF_NMI_VERSION.
+ * Called by SYS_MG_NMI_INSTALL after staging the new handler bytes.
+ * Wraps at 256 — the kernel @loop only checks for inequality vs its
+ * cached value, so wrap-around still triggers correctly. */
+void cart_window_bump_nmi_version(void);
+
+/* v2.30.9 Phase 3b: write a 16-bit value into the cart window at
+ * `offset` (low byte at offset, high byte at offset+1). Done as a
+ * single 16-bit store (compiles to one mov on x86) so it's
+ * byte-atomic against the SNES side's reads. Use this instead of
+ * cart_window_load_blob for any 2-byte struct the SNES kernel reads
+ * with `rep #$20 / lda f:abs` to avoid torn reads on host/SNES
+ * thread overlap. */
+void cart_window_store_u16_le(uint32_t offset, uint16_t value);
+
+/* v2.30.7 Phase 3b: hook called when g_frame_consumed bumps.
+ * Wires the cart_window's frame-ack signal to the VM scheduler so
+ * BLOCK_FRAME_CONSUMED waiters wake. Registered by mgapi_vm_init. */
+typedef void (*CartWindowFrameConsumedHook)(uint32_t now_consumed, void *userdata);
+void cart_window_set_frame_consumed_hook(CartWindowFrameConsumedHook hook,
+                                         void *userdata);
+
+/* v2.21: clear the NMI version byte to 0. The kernel @loop reads this
+ * as "uninstall — restore RAMVEC_NMI to the default kernel proc" so
+ * the next demo gets a clean default handler instead of inheriting
+ * the previous demo's installed NMI. Called from the VM unload hook
+ * (vm_init.c) at demo teardown. */
+void cart_window_clear_nmi_version(void);
+
+/* v2.26: HIRQ version (CW_OFF_HIRQ_VERSION). Same semantics as the
+ * NMI version pair — host bumps on install, clears to 0 on unload;
+ * kernel polls and copies code into WRAM + rewrites the IRQ vector
+ * at $0202 when the version changes. */
+void cart_window_bump_hirq_version(void);
+void cart_window_clear_hirq_version(void);
 
 /* Read one pad word back. i = 0..3 (P0..P3); out-of-range returns 0.
  * Used by the SYS_COPRO_READ_PADS ecall handler. */

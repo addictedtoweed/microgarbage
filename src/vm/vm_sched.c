@@ -195,6 +195,35 @@ bool vm_sched_wake_child(VmSched *s, uint16_t vm_id, int32_t a0_value) {
     return true;
 }
 
+unsigned vm_sched_wake_frame_consumed(VmSched *s, uint32_t now_consumed) {
+    if (!s) return 0;
+    unsigned woken = 0;
+    VmSchedBitmap blocked = s->blocked;
+    while (blocked) {
+        uint16_t id = 0;
+        VmSchedBitmap b = blocked;
+        while ((b & 1u) == 0) { b >>= 1; id++; }
+        blocked &= blocked - 1;
+
+        VmCpu *cpu = s->vms[id];
+        if (!cpu) continue;
+        if (cpu->block_reason != BLOCK_FRAME_CONSUMED) continue;
+
+        /* block_deadline stores the target frame_consumed value that
+         * the wait should reach (typically g_frame_staged at wait
+         * call time). Wake when consumed has caught up. */
+        if (now_consumed >= cpu->block_deadline) {
+            cpu->block_reason   = BLOCK_NONE;
+            cpu->block_deadline = 0;
+            cpu->regs[VM_REG_A0] = 0;
+            bm_clear(&s->blocked, id);
+            bm_set(&s->ready, id);
+            woken++;
+        }
+    }
+    return woken;
+}
+
 void vm_sched_halt(VmSched *s, uint16_t vm_id) {
     if (!s) return;
     if (vm_id >= VM_SCHED_MAX_VMS) return;
@@ -287,6 +316,14 @@ static uint32_t wake_expired_timeouts(VmSched *s) {
              * (vm_system_reap_halted_children) calls
              * vm_sched_wake_child. Nothing to do here — leave it
              * blocked and don't contribute a deadline. */
+            break;
+
+        case BLOCK_FRAME_CONSUMED:
+            /* Event-driven, no timeout: stays blocked until the
+             * cart_window port-7 read callback bumps frame_consumed
+             * past block_deadline (the staged-at-commit value), at
+             * which point vm_sched_wake_frame_consumed wakes us.
+             * Don't contribute a deadline. */
             break;
 
         case BLOCK_NONE:

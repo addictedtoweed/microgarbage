@@ -372,6 +372,11 @@ typedef enum {
     BLOCK_SLEEP,             /* SYS_SLEEP waiting for ticks      */
     BLOCK_ON_CHILD,          /* SYS_SPAWN_AND_WAIT — wakes when   *
                               * the spawned child VM halts        */
+    BLOCK_FRAME_CONSUMED,    /* SYS_COPRO_WAIT_VBLANK — wakes when *
+                              * cart_window frame_consumed counter *
+                              * advances past block_deadline       *
+                              * (which stores the staged-at-commit *
+                              * value the wait should pass)        */
 } VmBlockReason;
 
 /* ============================================================
@@ -429,6 +434,28 @@ typedef struct VmCpu {
     /* === Memory regions — set by the loader === */
 
     VmRegion regions[VM_REGION_COUNT];
+
+    /* === Optional L2 sub-region (upper half of SHARED) ===
+     *
+     * Splits VM_REGION_SHARED at bit 29 of the address:
+     *
+     *   0xC000_0000 - 0xDFFF_FFFF  -> regions[VM_REGION_SHARED]  (L1; existing)
+     *   0xE000_0000 - 0xFFFF_FFFF  -> l2_shared                  (L2)
+     *
+     * The L2 backing is system-wide — typically a slice of QSPI PSRAM
+     * on the MCU, a `malloc`'d chunk on Windows — set by the embedder
+     * via vm_system_set_l2_shared and propagated to each new VM at
+     * load time. When length == 0 (the default) accesses to the L2
+     * half of SHARED fault as before, so the split is a strict
+     * extension: existing tests and consumers are unaffected.
+     *
+     * The 30-bit -> 29-bit offset cut shrinks each half's virtual
+     * span to 512 MB, which is still enormous compared to any
+     * realistic backing (the existing SHARED region uses 64 KB; the
+     * L2 typical case is a few MB). Within the SHARED region the
+     * translate functions therefore extract a 29-bit offset.
+     */
+    VmRegion l2_shared;
 
     /* === Trap state — populated on every VM_STEP_TRAPPED/ECALL === */
 

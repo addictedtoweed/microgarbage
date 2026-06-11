@@ -10,7 +10,9 @@
  *  Public domain (CC0). No warranty.
  * ============================================================ */
 #include "cart_window.h"
+#include "copro_mg_state.h"   /* mg_state_advance_subframe (v2.05) */
 
+#include <stdio.h>
 #include <string.h>
 
 /* ----------------------------------------------------------------
@@ -24,6 +26,13 @@
 static uint8_t  g_window[CART_WINDOW_BYTES];
 static uint8_t  g_status;            /* served at $7F00      */
 static uint8_t  g_frame_ready;       /* served at $7800      */
+/* v2.05: count $7800 reads ever. Each read corresponds to one NMI
+ * starting (kernel reads it at the top of every NMI handler). Used by
+ * sub-frame chaining to figure out how many NMIs have already fired
+ * since the most recent commit, so the port-7 advance trigger doesn't
+ * race ahead of the actual slot-walk completions. */
+static uint32_t g_frame_ready_reads;
+static uint32_t g_subframe_init_reads;   /* read count at commit time */
 
 /* Frame-flow counters. g_frame_staged ticks every time we set
  * g_frame_ready to non-zero (= the guest committed a frame).
@@ -38,6 +47,17 @@ static uint32_t g_frame_consumed;
 static uint16_t g_pads[4];           /* served via mailbox   */
 static unsigned g_last_pad_port;     /* last polled, 0..7    */
 static uint32_t g_reset_count;       /* bumped on reset_begin */
+
+/* v2.30.7 Phase 3b: optional hook for frame_consumed bumps —
+ * lets the VM scheduler wake BLOCK_FRAME_CONSUMED waiters. */
+static CartWindowFrameConsumedHook g_frame_consumed_hook;
+static void                       *g_frame_consumed_hook_userdata;
+
+void cart_window_set_frame_consumed_hook(CartWindowFrameConsumedHook hook,
+                                         void *userdata) {
+    g_frame_consumed_hook         = hook;
+    g_frame_consumed_hook_userdata = userdata;
+}
 
 /* DMA list lives at $7808-$7847 directly inside g_window so reads
  * in that range can just hit the array. Producers go through
@@ -72,6 +92,17 @@ void cart_window_shutdown(void) {
  *  Producers
  * ---------------------------------------------------------------- */
 
+void cart_window_store_u16_le(uint32_t offset, uint16_t value) {
+    if (offset + 2u > CART_WINDOW_BYTES) return;
+    /* Cast through uint16_t* so the compiler emits a single 16-bit
+     * store. Unaligned 16-bit stores on x86/x64 are single uops and
+     * are atomic at the byte level — meaning the SNES side reading
+     * via `rep #$20 / lda f:abs` (a 16-bit read) sees either the
+     * full old value or the full new value, never a mix. */
+    uint8_t *p = g_window + offset;
+    *(uint16_t *)p = value;
+}
+
 void cart_window_load_blob(uint32_t offset, const void *src, uint32_t len) {
     if (offset >= CART_WINDOW_BYTES) return;
     uint32_t avail = CART_WINDOW_BYTES - offset;
@@ -81,12 +112,48 @@ void cart_window_load_blob(uint32_t offset, const void *src, uint32_t len) {
 
 void cart_window_set_frame_ready(uint8_t byte) {
     g_frame_ready = byte;
+    /* v2.05: latch the current NMI-tick counter so port-7's advance
+     * trigger can tell how many NMIs have fired since this commit. */
+    if (byte != 0) g_subframe_init_reads = g_frame_ready_reads;
     if (byte != 0) g_frame_staged++;
 }
 uint8_t cart_window_get_frame_ready(void)      { return g_frame_ready; }
 
 uint32_t cart_window_frame_staged(void)  { return g_frame_staged; }
 uint32_t cart_window_frame_consumed(void){ return g_frame_consumed; }
+
+void cart_window_bump_nmi_version(void) {
+    /* Single byte. The kernel compares for inequality against a WRAM
+     * cache. Skip 0 on wrap so we never falsely re-enter the
+     * "uninstall" sentinel after a real install. */
+    uint8_t v = (uint8_t)(g_window[CW_OFF_NMI_VERSION] + 1u);
+    if (v == 0) v = 1;
+    g_window[CW_OFF_NMI_VERSION] = v;
+}
+
+void cart_window_clear_nmi_version(void) {
+    /* v2.21: signal "uninstall" to the kernel. Setting the byte to 0
+     * causes the @loop's next version-poll to see a mismatch (cache
+     * holds the previous install's value), and the "new value is 0"
+     * branch restores RAMVEC_NMI to the default kernel proc.
+     *
+     * We DON'T zero the CW_OFF_NMI_CODE region — the kernel never
+     * reads from there during the uninstall branch (it just restores
+     * RAMVEC_NMI from K_NMI_DEFAULT). A subsequent install will
+     * overwrite the region. */
+    g_window[CW_OFF_NMI_VERSION] = 0;
+}
+
+/* v2.26: HIRQ version helpers — same shape as the NMI pair. */
+void cart_window_bump_hirq_version(void) {
+    uint8_t v = (uint8_t)(g_window[CW_OFF_HIRQ_VERSION] + 1u);
+    if (v == 0) v = 1;
+    g_window[CW_OFF_HIRQ_VERSION] = v;
+}
+
+void cart_window_clear_hirq_version(void) {
+    g_window[CW_OFF_HIRQ_VERSION] = 0;
+}
 
 void cart_window_set_dma_slot(unsigned index, const CartDmaSlot *slot) {
     if (index >= 8 || !slot) return;
@@ -144,8 +211,13 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
     /* Status byte. */
     if (off == CW_OFF_STATUS) return g_status;
 
-    /* Frame-ready byte. */
-    if (off == CW_OFF_FRAME_READY) return g_frame_ready;
+    /* Frame-ready byte. The kernel reads this at the top of every NMI
+     * handler; counting reads gives us a reliable per-NMI tick the
+     * sub-frame chaining can use to gate advance() against. */
+    if (off == CW_OFF_FRAME_READY) {
+        g_frame_ready_reads++;
+        return g_frame_ready;
+    }
 
     /* Boot strobe — one-shot side effect: clear kernel-ready bit so
      * the copro (us) knows the SNES is now running from RAM and we
@@ -193,8 +265,36 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
          * port-7 reads (from idle NMI loop iterations after demo
          * exit, or before next commit) don't keep bumping. */
         if (port == 7 && g_frame_ready != 0) {
-            g_frame_consumed++;
-            g_frame_ready = 0;
+            /* v2.05: only advance once a real NMI has fired since the
+             * commit that loaded the current sub-frame. The kernel's
+             * @loop reads port 7 BEFORE its wai-for-NMI, so a naive
+             * advance on every read would skip sub-frame 0 (the read
+             * happens after commit but before NMI 1 processes it).
+             * `nmis_seen` counts $7800 reads since commit; the first
+             * port-7 read while nmis_seen == 0 must wait for NMI 1
+             * to actually fire before advancing. */
+            uint32_t nmis_seen = g_frame_ready_reads - g_subframe_init_reads;
+            if (nmis_seen > 0) {
+                /* NMI has fired (and processed the slots that were
+                 * loaded). Either load the next sub-frame, or close
+                 * out the logical frame if the queue is empty. */
+                if (mg_state_advance_subframe()) {
+                    /* keep g_frame_ready set */
+                    /* Re-latch baseline so subsequent reads gate on
+                     * the *next* NMI rather than the one that already
+                     * fired. */
+                    g_subframe_init_reads = g_frame_ready_reads;
+                } else {
+                    g_frame_consumed++;
+                    g_frame_ready = 0;
+                    if (g_frame_consumed_hook) {
+                        g_frame_consumed_hook(g_frame_consumed,
+                                              g_frame_consumed_hook_userdata);
+                    }
+                }
+            }
+            /* else: no NMI yet — leave the current sub-frame's slots
+             * alone so NMI 1 still processes them. */
         }
         return 0;
     }

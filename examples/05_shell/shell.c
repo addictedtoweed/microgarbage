@@ -580,7 +580,7 @@ typedef enum {
 #define HIST_AT_DRAFT  ((unsigned)-1)
 
 /* ============================================================
- *  Tab completion (round T.6)
+ *  Tab completion
  *
  *  When Tab is pressed mid-line, we figure out what kind of
  *  token the cursor is in (first token vs. an argument), build
@@ -619,7 +619,7 @@ static const char *g_builtins[] = {
 };
 
 /* ============================================================
- *  /builtin/ synthetic mount (round T.7)
+ *  /builtin/ synthetic mount
  *
  *  Builtins are also discoverable via /builtin/<name>. Useful
  *  for `ls /builtin/` to see what's available, and for explicit
@@ -945,9 +945,9 @@ static CompResult try_complete(char *buf, unsigned cap, unsigned *pos_io,
 
     if (tok_idx == 0 && !sfind_char(prefix, '/')) {
         /* First token, no '/' in it → cwd entries only. Builtins
-         * are now only surfaced through /builtin/ (T.7). Bare
-         * builtin names still dispatch from the table at command
-         * time, but they don't pollute Tab completion. */
+         * are only surfaced through /builtin/; bare builtin names
+         * still dispatch from the table at command time, but they
+         * don't pollute Tab completion. */
         comp_collect_dir(&cl, g_cwd, prefix, plen, 1);
     } else {
         /* Path completion. Split partial path into dir + leaf. */
@@ -1767,6 +1767,54 @@ static void exec_path(const char *path) {
     }
 }
 
+/* Read /td0/etc/autostart (if present) and run every non-empty,
+ * non-# line as a guest ELF path. Called once from _start after the
+ * banner, before the main prompt loop. Errors at every step are
+ * non-fatal — a missing file silently no-ops, a failing spawn
+ * surfaces via exec_path's existing per-line reporting.
+ *
+ * Format: one path per line. Leading/trailing whitespace ignored;
+ * '#' starts a comment. Example:
+ *     # autostart
+ *     /cart/game.elf
+ *     # other test programs go here
+ */
+static void run_autostart(void) {
+    static char buf[4096];
+    int fd = sys_openat(AT_FDCWD, "/td0/etc/autostart", O_RDONLY, 0);
+    if (fd < 0) return;   /* no autostart file present, that's fine */
+
+    int total = 0;
+    while (total < (int)sizeof(buf) - 1) {
+        int r = sys_read(fd, buf + total, sizeof(buf) - 1 - total);
+        if (r <= 0) break;
+        total += r;
+    }
+    sys_close(fd);
+    if (total <= 0) return;
+    buf[total] = '\0';
+
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        if (*p) { *p++ = '\0'; }
+        /* Trim leading whitespace; skip blanks and comments. */
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '\0' || *line == '#') continue;
+        /* Trim trailing whitespace. */
+        char *end = line;
+        while (*end) end++;
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (*line == '\0') continue;
+
+        puts_("autostart: ");
+        puts_(line);
+        putln("");
+        exec_path(line);
+    }
+}
+
 static void dispatch(char *line) {
     char *argv[16];
     int argc = tokenize(line, argv, 16);
@@ -1838,6 +1886,12 @@ void _start(void) {
     int have_raw = (sys_tty_set_raw(1) == 0);
 
     putln("VM shell -- type 'help' for commands");
+
+    /* Optional /td0/etc/autostart: one ELF path per line, runs at
+     * boot before the user gets a prompt. Used by mgapi.dll's TCP
+     * shell to autostart a game on connect, and by anything else
+     * that wants a deterministic startup script. */
+    run_autostart();
 
     char line[LINE_CAP];
     int first = 1;

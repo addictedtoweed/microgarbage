@@ -15,11 +15,16 @@
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_fs.h"
 #include "storage/trashfs.h"
+#include "audio_init.h"
 #include "copro_ecalls.h"
 #include "l2_ecalls.h"
 
+#include "cart_window.h"
 #include "copro_mg_handlers.h"
 #include "copro_mg_state.h"
+
+#include "io/stream_arbiter.h"
+#include "io/stream_ecalls.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -42,12 +47,36 @@ extern const unsigned char demo_palette_elf  [];
 extern const size_t        demo_palette_elf_len;
 extern const unsigned char demo_letterbox_elf[];
 extern const size_t        demo_letterbox_elf_len;
+extern const unsigned char demo_dynamic_letterbox_elf[];
+extern const size_t        demo_dynamic_letterbox_elf_len;
 extern const unsigned char demo_sprite_elf   [];
 extern const size_t        demo_sprite_elf_len;
 extern const unsigned char demo_mode7_elf    [];
 extern const size_t        demo_mode7_elf_len;
 extern const unsigned char demo_mode7_3d_elf [];
 extern const size_t        demo_mode7_3d_elf_len;
+extern const unsigned char demo_audio_mixer_elf [];
+extern const size_t        demo_audio_mixer_elf_len;
+extern const unsigned char demo_pcm_stream_elf [];
+extern const size_t        demo_pcm_stream_elf_len;
+extern const unsigned char demo_fmv_elf [];
+extern const size_t        demo_fmv_elf_len;
+extern const unsigned char demo_fmv_still_elf [];
+extern const size_t        demo_fmv_still_elf_len;
+extern const unsigned char demo_nmi_smoke_elf [];
+extern const size_t        demo_nmi_smoke_elf_len;
+
+/* v2.30.7 Phase 3b: cart_window frame_consumed hook → VM scheduler.
+ * Called whenever cart_window's port-7-read callback bumps
+ * g_frame_consumed (i.e., the SNES kernel processed a frame).
+ * Wakes any VM blocked on BLOCK_FRAME_CONSUMED whose stored target
+ * has been reached. */
+static void frame_consumed_wake_hook(uint32_t now_consumed, void *userdata) {
+    VmSystem *sys = (VmSystem *)userdata;
+    if (sys && sys->sched) {
+        (void)vm_sched_wake_frame_consumed(sys->sched, now_consumed);
+    }
+}
 
 /* Adapter for vm_system unload hook (which passes vm_id + userdata) to
  * mg_state_reset's parameterless signature. Registered once at init.
@@ -56,6 +85,48 @@ static void mg_state_reset_on_unload(uint16_t vm_id, void *userdata) {
     (void)vm_id;
     (void)userdata;
     mg_state_reset();
+    /* v2.21: drop any custom NMI handler the unloading guest installed,
+     * so the next guest gets the kernel's default NMI proc instead of
+     * inheriting a stale handler (which manifested as "after running
+     * nmi_smoke, everything stays red regardless of which demo runs
+     * next" — the no-op handler from nmi_smoke stage C kept being
+     * dispatched). */
+    cart_window_clear_nmi_version();
+    /* v2.26: same uninstall protocol for HIRQ — set version 0 so the
+     * kernel @loop's HIRQ poll restores the IRQ vector to default
+     * (disabled — boot init leaves $0202 = 0). Also zero the HIRQ
+     * schedule so the kernel writes NMITIMEN=$80 (just NMI, no IRQ
+     * enables) on its next loop iter, even if the previous demo had
+     * armed HIRQ. Otherwise the next demo would keep firing the
+     * stale IRQ vector. */
+    cart_window_clear_hirq_version();
+    {
+        static const uint8_t zeros[5] = {0};
+        cart_window_load_blob(CW_OFF_HIRQ_SCHED, zeros, sizeof zeros);
+    }
+    /* v2.29 Phase 3a: clear unified-kernel layout + siphon config so
+     * the previous demo's letterbox / siphon doesn't leak into the
+     * next guest. NMI handler picks up the zero values at next vblank
+     * and the default HIRQ ISR returns to "no letterbox, no siphon"
+     * baseline. */
+    {
+        static const uint8_t zeros[8] = {0};
+        cart_window_load_blob(CW_OFF_KERNEL_LAYOUT, zeros, sizeof zeros);
+    }
+    /* v2.24 (bisect): the v2.22 auto-arm of a VRAM clear here regressed
+     * demo_audio_mixer's second-run-onwards: CGRAM[1] (the yellow font
+     * color) came up pure black, with similar effects on CGRAM[129]
+     * (cyan FFT bar). The full-region-CGRAM DMA staged by the demo's
+     * own clean_slate apparently doesn't fully land when slot 0's VRAM
+     * clear was first armed by the unload hook (instead of by the demo
+     * itself), even though clean_slate calls mg_state_reset which is
+     * supposed to discard the unload-armed slot. Root cause is somewhere
+     * in the interaction between the two arms; for now, dropping the
+     * unload-side arm restores the v2.20 behavior for audio_mixer / sprite
+     * while keeping the v2.21 NMI version clear that fixes nmi_smoke.
+     * Demos that don't call clean_slate (palette / letterbox / mode7)
+     * will again inherit the previous demo's VRAM — to compensate, those
+     * demos should be patched to call mg_ppu_clean_slate at startup. */
 }
 
 /* install_bundled_demos lives below the g_td0_vol definition so the
@@ -139,6 +210,12 @@ int mgapi_vm_init(void *cart_volume_handle) {
     if (!vm_system_init(&g_sys, &cfg)) return -ENOMEM;
     g_sys_alive = 1;
 
+    /* v2.30.7 Phase 3b: wire cart_window's frame_consumed bump to
+     * the VM scheduler so BLOCK_FRAME_CONSUMED waiters wake
+     * deterministically when the SNES kernel acks a frame. */
+    cart_window_set_frame_consumed_hook(
+        &frame_consumed_wake_hook, &g_sys);
+
     /* 3. Install bridges.
      *
      *    Stdio handler registration is unconditional -- the SYS_READ /
@@ -201,16 +278,48 @@ int mgapi_vm_init(void *cart_volume_handle) {
             goto fail_sys;
     }
 
+    /* v2.10: SYS_STREAM_* ecalls + the global round-robin file-stream
+     * arbiter that drives them. The arbiter ticks once per worker
+     * tick (before vm_step, see mgapi_step_body) so guests find their
+     * ring filled when they call mg_stream_consume. Cheap when no
+     * streams are registered. */
+    if (!stream_arbiter_init()) goto fail_sys;
+    if (!mgapi_install_stream_ecalls(&g_sys)) goto fail_sys;
+
     /* 4. Mount table:
      *      /td0/  small RAM-disk scratch (writable, this DLL's BSS)
      *      /cart/ large PSRAM read-mostly bulk (the volume stage 2c
-     *              brought up; we just register its handle). */
+     *              brought up; we just register its handle).
+     *      /host/ read-only passthrough to the bsnes-plus working dir's
+     *             "host" subfolder. Lets demos load assets the developer
+     *             dropped next to bsnes.exe (music.wav, sfx*.wav,
+     *             video.fmv) without rebuilding the trashfs image. */
     if (!vm_host_fs_mount_trashfs("td0", &g_td0_vol)) goto fail_sys;
     if (cart_volume_handle) {
         if (!vm_host_fs_mount_trashfs("cart", cart_volume_handle)) {
             /* Non-fatal: the rest of the system still works without
              * /cart/. Log via stderr so the embedder notices. */
         }
+    }
+    /* Non-fatal if the host directory doesn't exist; the user just
+     * doesn't get /host/ access until they create it. */
+    if (!vm_host_fs_mount_host("host", "./host", /*writable=*/false)) {
+        fprintf(stderr,
+                "mgapi: /host/ mount skipped (./host not a directory) "
+                "— demos that read /host/*.wav or /host/video.fmv will "
+                "see ENOENT until you create ./host next to bsnes.exe\n");
+    }
+
+    /* Now that the VmSystem is up, hand the SYS_AUDIO_* ecall handlers
+     * to it so guests calling mg_sfx_load / mg_stream_play /
+     * audio_get_levels actually reach the audio service mgapi_audio_init
+     * brought up earlier. host_fs_root="./host" matches the /host/ mount
+     * above so the resolved host paths agree. Non-fatal if it fails -
+     * audio just stays unavailable (mg_sfx_load returns 0). */
+    if (!mgapi_audio_install_ecalls(&g_sys, "./host")) {
+        fprintf(stderr,
+                "mgapi: audio ecalls not installed -- guests' mg_sfx_load "
+                "and friends will return 0\n");
     }
 
     /* Drop bundled demo ELFs into /td0/demos/ so a PuTTY shell can
@@ -264,9 +373,15 @@ static void install_bundled_demos(void) {
     (void)trashfs_mkdir(&g_td0_vol, "/demos", /*now=*/0);
     install_demo("/demos/palette.elf",   demo_palette_elf,   demo_palette_elf_len);
     install_demo("/demos/letterbox.elf", demo_letterbox_elf, demo_letterbox_elf_len);
+    install_demo("/demos/dynamic_letterbox.elf", demo_dynamic_letterbox_elf, demo_dynamic_letterbox_elf_len);
     install_demo("/demos/sprite.elf",    demo_sprite_elf,    demo_sprite_elf_len);
     install_demo("/demos/mode7.elf",     demo_mode7_elf,     demo_mode7_elf_len);
-    install_demo("/demos/mode7_3d.elf",  demo_mode7_3d_elf,  demo_mode7_3d_elf_len);
+    install_demo("/demos/mode7_3d.elf",    demo_mode7_3d_elf,    demo_mode7_3d_elf_len);
+    install_demo("/demos/audio_mixer.elf", demo_audio_mixer_elf, demo_audio_mixer_elf_len);
+    install_demo("/demos/pcm_stream.elf",  demo_pcm_stream_elf,  demo_pcm_stream_elf_len);
+    install_demo("/demos/fmv.elf",         demo_fmv_elf,         demo_fmv_elf_len);
+    install_demo("/demos/fmv_still.elf",   demo_fmv_still_elf,   demo_fmv_still_elf_len);
+    install_demo("/demos/nmi_smoke.elf",   demo_nmi_smoke_elf,   demo_nmi_smoke_elf_len);
 }
 
 void mgapi_vm_shutdown(void) {

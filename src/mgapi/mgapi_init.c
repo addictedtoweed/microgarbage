@@ -19,7 +19,9 @@
 #include "l2_init.h"
 #include "vm_init.h"
 #include "tcp_listen.h"
+#include "worker.h"
 
+#include "io/stream_arbiter.h"
 #include "storage/trashfs.h"
 
 #include <errno.h>
@@ -45,6 +47,10 @@ static uint32_t     g_reset_t_start_ms;
 
 extern uint32_t host_platform_monotonic_ms(void *userdata);
 
+/* Forward decl for the per-vblank tick body. Defined further down,
+ * but mgapi_init hands its address to the worker thread at startup. */
+static void mgapi_step_body(uint64_t elapsed_ns);
+
 /* ----------------------------------------------------------------
  *  Lifecycle
  * ---------------------------------------------------------------- */
@@ -53,7 +59,16 @@ int mgapi_init(const MgapiConfig *cfg) {
     if (g_initialized) return -EALREADY;
     if (!cfg) return -EINVAL;
     if (cfg->cart_window_size != MGAPI_CART_WINDOW_BYTES) return -EINVAL;
-    if (cfg->audio_sample_rate != MGAPI_AUDIO_SAMPLE_RATE_HZ) return -EINVAL;
+    /* v1.94: audio_sample_rate == 0 means "auto-detect" (Windows queries
+     * WASAPI; MCU build falls back to 44100). Any non-zero value is
+     * taken as-is — embedders that want a specific rate (MCU twin
+     * builds for a fixed I2S clock, host harnesses pinning a known
+     * rate) just pass it. The old equality check on
+     * MGAPI_AUDIO_SAMPLE_RATE_HZ was hostile to platforms where 44100
+     * isn't the right answer; the constant remains the MCU default. */
+    if (cfg->audio_sample_rate != 0 && cfg->audio_sample_rate < 8000) {
+        return -EINVAL;
+    }
     if (cfg->audio_frames_max == 0) return -EINVAL;
     if (cfg->pad_count > 4) return -EINVAL;
     if (cfg->rom_select > MGAPI_ROM_NONE) return -EINVAL;
@@ -115,7 +130,8 @@ int mgapi_init(const MgapiConfig *cfg) {
      * the mixer just runs idle. The ring path is the thing under
      * test; channel + service are wired so stage 3's VM lands on a
      * working seam. */
-    rc = mgapi_audio_init(g_psram.audio, g_psram.audio_size);
+    rc = mgapi_audio_init(g_psram.audio, g_psram.audio_size,
+                          cfg->audio_sample_rate);
     if (rc != 0) {
         psram_pool_shutdown();
         cart_window_shutdown();
@@ -189,11 +205,38 @@ int mgapi_init(const MgapiConfig *cfg) {
     (void)cfg->autostart_path;
 
     g_initialized = 1;
+
+    /* Stage 5 (v1.68): hand the per-vblank tick body off to the
+     * worker thread. Embedder's mgapi_step now just signals the
+     * worker; everything that used to run synchronously on the
+     * bsnes-plus thread (VM, audio mixing, TCP poll, diag) now
+     * runs concurrently on this dedicated thread. Started LAST so
+     * the worker only runs against a fully-initialized runtime. */
+    if (mgapi_worker_start(mgapi_step_body) != 0) {
+        /* Non-fatal: without the worker, mgapi_step is a no-op and
+         * nothing advances — but the embedder can still poll the
+         * cart window. Log and continue so a CI host running
+         * without thread support can still build-test. */
+        fprintf(stderr, "mgapi_init: worker_start failed; runtime will not "
+                        "advance VM/audio until restarted\n");
+        fflush(stderr);
+    }
+
     return 0;
 }
 
 void mgapi_shutdown(void) {
     if (!g_initialized) return;
+    /* Stop the worker FIRST so the tick body never sees a half-
+     * torn-down VM/audio/TCP. After stop() returns the worker
+     * thread has joined and will not touch any of the subsystems
+     * we're about to shut down. */
+    mgapi_worker_stop();
+    /* Worker is joined; safe to tear down the stream arbiter (it has
+     * no producer thread of its own — the worker tick was the only
+     * writer). Closes any still-registered streams + frees ring
+     * storage. */
+    stream_arbiter_shutdown();
     mgapi_tcp_listen_shutdown();
     mgapi_vm_shutdown();
     mgapi_l2_shutdown();
@@ -269,6 +312,18 @@ void mgapi_diag_note_cart_read(uint16_t off, uint32_t full) {
 
 static void mgapi_diag_periodic(uint64_t elapsed_ns) {
     g_diag_clock_ns += elapsed_ns;
+    /* v1.85: gated behind MGAPI_DIAG=1. The per-second cart_reads /
+     * ppu_batch / slot listing was useful during bring-up but the
+     * fprintf traffic was holding up the worker thread enough to
+     * cause audible FFT/audio skips. Set MGAPI_DIAG=1 in the env
+     * if you need to see this again (e.g., a new demo not rendering).
+     * One env-var read per second is negligible vs the I/O it saves. */
+    static int s_diag_enabled = -1;   /* -1 = unread, 0 = off, 1 = on */
+    if (s_diag_enabled == -1) {
+        const char *e = getenv("MGAPI_DIAG");
+        s_diag_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!s_diag_enabled) return;
     /* One-line status per ~1 second of wall-clock so the user can see
      * if the SNES is actually executing without spamming the log. */
     if (g_diag_clock_ns - g_diag_last_print_ns < 1000000000ull) return;
@@ -321,7 +376,11 @@ static void mgapi_diag_periodic(uint64_t elapsed_ns) {
  *  Per-frame tick + audio pull (stubbed for stage 1)
  * ---------------------------------------------------------------- */
 
-void mgapi_step(uint64_t elapsed_ns) {
+/* Per-vblank tick body. Runs on the worker thread (see worker.c).
+ * The embedder's mgapi_step just kicks the worker; everything that
+ * touches the VM, audio service, or TCP listener lives in here so
+ * the bsnes-plus thread is never stalled by ecall I/O or mixing. */
+static void mgapi_step_body(uint64_t elapsed_ns) {
     if (!g_initialized) return;
 
     /* Convert elapsed wall-clock to a frame count at the audio rate.
@@ -353,6 +412,17 @@ void mgapi_step(uint64_t elapsed_ns) {
      * Cheap when no listener is configured (early-out inside). */
     mgapi_tcp_listen_poll();
 
+    /* v2.10: pump the stream arbiter BEFORE the VM step. Producer-
+     * first ordering: any guest about to call SYS_STREAM_CONSUME
+     * inside vm_step finds its ring already topped up this tick,
+     * so it returns a chunk immediately instead of having to
+     * sleep-and-retry. Cheap when no streams are registered (the
+     * for-loop inside walks STREAM_ARBITER_MAX empty slots and
+     * exits). The arbiter and vm_step share a thread; any
+     * critical section inside the vm_step that would block
+     * doesn't delay this read because reads already happened. */
+    (void)stream_arbiter_tick();
+
     /* Stage 3a: drive the cooperative scheduler. We step until it
      * goes idle (no ready VMs) or runs out of budget. The audio
      * pump already happened, so the audio service has up-to-date
@@ -360,6 +430,15 @@ void mgapi_step(uint64_t elapsed_ns) {
     for (int i = 0; i < 64; i++) {
         if (!mgapi_vm_step()) break;
     }
+}
+
+/* Embedder-facing kick. The actual per-vblank work happens on the
+ * worker thread (see worker.c + mgapi_step_body above). This is
+ * deliberately sub-microsecond: an atomic store + atomic add +
+ * SetEvent. The bsnes-plus thread never blocks on VM/audio/TCP. */
+void mgapi_step(uint64_t elapsed_ns) {
+    if (!g_initialized) return;
+    mgapi_worker_signal(elapsed_ns);
 }
 
 uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
@@ -372,7 +451,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 1.54 (mode7_3d: infinite WRAP plane, per-scanline M7SEL, Tron grid)";
+    return "mgapi 2.30.9 (atomic u16 layout read/write — kills the rare torn-byte flicker)";
 }
 
 /* ----------------------------------------------------------------

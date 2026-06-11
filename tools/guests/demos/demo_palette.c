@@ -60,6 +60,11 @@ static void rainbow(uint8_t phase, uint8_t *r, uint8_t *g, uint8_t *b) {
 }
 
 void _start(void) {
+    /* v2.24: clean_slate so leftover VRAM / CGRAM from the previous demo
+     * doesn't bleed through (especially when this demo is run after
+     * letterbox.elf / audio_mixer.elf). */
+    mg_ppu_clean_slate();
+
     /* Minimal backdrop-only demo (simplified from the original rainbow
      * version during the v1.x debugging arc). BG2 is enabled with no
      * CHR upload and no tilemap blit, so BG2 reads zeros from VRAM and

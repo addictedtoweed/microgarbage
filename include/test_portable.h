@@ -29,7 +29,7 @@ static inline const char *tp_tmpdir(void) {
     const char *t = getenv("TMPDIR");
     if (!t || !*t) t = getenv("TEMP");
     if (!t || !*t) t = getenv("TMP");
-#if defined(_WIN32) && !defined(__CYGWIN__)
+#if defined(_WIN32)
     if (!t || !*t) t = ".";
 #else
     if (!t || !*t) t = "/tmp";
@@ -43,7 +43,7 @@ static inline char *tp_path(char *buf, size_t cap, const char *name) {
     return buf;
 }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
+#if defined(_WIN32)
   #include <io.h>      /* _commit, _pipe */
   #include <direct.h>  /* _mkdir */
   #include <fcntl.h>   /* _O_BINARY */

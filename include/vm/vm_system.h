@@ -125,6 +125,17 @@ typedef struct {
     void   *shared_storage;
     size_t  shared_storage_size;
 
+    /* L2 sub-region (upper half of SHARED, 0xE000_0000+).
+     *
+     * Optional system-wide PSRAM backing applied to every VM the
+     * system loads. NULL/0 leaves the L2 half absent — accesses to
+     * 0xE000_0000+ fault, matching the pre-split behavior bit-for-
+     * bit (lets existing consumers ignore this field). The embedder
+     * is responsible for the actual allocator over this region;
+     * the VM core only does address translation. */
+    void   *l2_shared_storage;
+    size_t  l2_shared_storage_size;
+
     /* Local storage: per-VM data regions, mailbox buffers, and
      * copy-to-RAM segments. Managed by the system's bump arena.
      * Should be large enough for all VMs the system will hold. */

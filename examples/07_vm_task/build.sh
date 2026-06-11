@@ -58,7 +58,7 @@ fi
 echo "07_vm_task: compiling host..."
 LINK_FLAGS="-lpthread"
 case "$(uname -s 2>/dev/null)" in
-    *NT*|*MINGW*|*MSYS*|*CYGWIN*) ;;
+    *NT*|*MINGW*|*MSYS*) ;;
     *) LINK_FLAGS="$LINK_FLAGS -lrt" ;;
 esac
 

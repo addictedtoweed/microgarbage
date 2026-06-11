@@ -48,43 +48,12 @@ unset _VM_OBJS_DIR
 # Host compilation.
 # ---------------------------------------------------------------
 
-# Pick a host compiler. On Cygwin we strongly prefer Cygwin's own
-# gcc over any mingw-w64 gcc that might be on PATH — the host
-# binary needs to share Cygwin's pty/tty layer so that running
-# from PuTTY (via SSH) doesn't pop a separate console window.
-#
-# Order of preference:
-#   1. $CC if the caller set it (no override)
-#   2. /usr/bin/gcc (this is Cygwin's gcc on Cygwin systems)
-#   3. plain 'cc'
-#
-# If we detect that the chosen compiler is mingw, we warn — the
-# user may want to install Cygwin's gcc-core for proper terminal
-# integration.
+# Host compiler: caller's $CC wins; default to whichever gcc the
+# shell finds first (under MinGW64 bash that's the mingw-w64 gcc;
+# under Linux it's gcc). Cygwin paths have been retired.
 if [ -z "${CC+x}" ]; then
-    if [ -x /usr/bin/gcc ]; then
-        CC=/usr/bin/gcc
-    else
-        CC=cc
-    fi
+    if command -v gcc >/dev/null 2>&1; then CC=gcc; else CC=cc; fi
 fi
-
-# Detect mingw and warn. We test the resulting binary's target
-# triplet via -dumpmachine, which is fast and unambiguous.
-_HOST_MACHINE=$("$CC" -dumpmachine 2>/dev/null || echo unknown)
-case "$_HOST_MACHINE" in
-    *mingw*|*MinGW*|*w64*windows*)
-        cat >&2 << EOF
-WARN: $CC is a mingw/native-Windows compiler (target $_HOST_MACHINE).
-      The host binary will not share Cygwin's pty layer, which means
-      running it from PuTTY (over SSH to cygwin sshd) pops a new
-      console window instead of drawing in PuTTY itself.
-      For PuTTY support, install Cygwin's gcc-core package and
-      re-run with CC=/usr/bin/gcc.
-EOF
-        ;;
-esac
-unset _HOST_MACHINE
 
 # CFLAGS as an array. Each token is a separate element so spaces
 # inside REPO_ROOT don't get word-split when expanded. If the
@@ -168,23 +137,6 @@ esac
 GUEST_LD="${REPO_ROOT}/examples/common/guest.ld"
 
 # ---------------------------------------------------------------
-# Cygwin / native-Windows toolchain compatibility
-#
-# When Cygwin invokes a native Windows executable (e.g., xPack's
-# riscv-none-elf-gcc.exe), the .exe doesn't understand Cygwin's
-# "/cygdrive/c/..." path style — it only knows Windows paths
-# ("C:\..."). Cygwin auto-translates SOME arguments but doesn't
-# do it for filenames embedded inside flags like -o or -Wl,-T,...
-# so we have to convert paths to Windows form ourselves.
-#
-# guest_path() returns its argument unchanged on Linux/macOS and
-# under MSYS2, and converts it to a Windows path under Cygwin
-# IF the guest compiler is a Windows-native .exe. Use it for
-# every path you hand to the guest compiler (input .c, output
-# -o, and -Wl,-T,linker_script).
-#
-# Host paths (handed to /usr/bin/cc) are NOT translated — the
-# host compiler is Cygwin-native and speaks Cygwin paths.
 # ---------------------------------------------------------------
 
 # Pick the first available RISC-V cross-compiler. Common names:
@@ -212,49 +164,11 @@ if [ -z "${GUEST_CC:-}" ]; then
     unset _candidate
 fi
 
-# Detect once: is the guest compiler a native Windows binary
-# that we'll need to feed Windows-style paths to?
-#
-# This matters specifically for xPack's riscv-none-elf-gcc.exe
-# (and similar Windows-native cross compilers) when invoked from
-# Cygwin. Cygwin-native tools, including any RISC-V toolchain
-# installed via apt-cyg or built inside Cygwin, speak Cygwin
-# paths natively and do NOT need translation.
-#
-# Heuristic: under Cygwin (cygpath exists), the compiler needs
-# Windows-path translation IFF its installed path is OUTSIDE
-# Cygwin's rootfs — i.e., somewhere under /cygdrive/<letter>/
-# rather than /usr, /usr/local, /opt, /home, etc.
-#
-# NOTE: this block MUST come after GUEST_CC is selected, since
-# the detection resolves it via `command -v`. Moving it before
-# the auto-detect block above leaves GUEST_CC empty and the
-# detection silently fails.
-_VM_OBJS_GUEST_NEEDS_WINPATH=0
-if command -v cygpath >/dev/null 2>&1; then
-    _vm_objs_guest_cc_path=$(command -v "$GUEST_CC" 2>/dev/null || true)
-    case "$_vm_objs_guest_cc_path" in
-        /cygdrive/*)
-            # Lives on a Windows drive — must be a native binary.
-            _VM_OBJS_GUEST_NEEDS_WINPATH=1
-            ;;
-        *)
-            # Inside Cygwin rootfs — treat as Cygwin-native.
-            # (Even if the file is named *.exe, Cygwin tools are
-            # typically built that way and still accept POSIX paths.)
-            ;;
-    esac
-    unset _vm_objs_guest_cc_path
-fi
-
-# Translate a path for the guest compiler (no-op outside Cygwin).
-guest_path() {
-    if [ "$_VM_OBJS_GUEST_NEEDS_WINPATH" = "1" ]; then
-        cygpath -w "$1"
-    else
-        printf '%s' "$1"
-    fi
-}
+# guest_path: identity helper retained for callers that still
+# invoke it from when we had cygpath-based translation. Cygwin
+# support has been retired; MinGW64 bash and Linux both speak
+# the same path style to the cross compiler.
+guest_path() { printf '%s' "$1"; }
 if [ -z "${GUEST_CFLAGS+x}" ]; then
     GUEST_CFLAGS=(
         -march=rv32imc -mabi=ilp32
