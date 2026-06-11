@@ -114,10 +114,16 @@ void _start(void) {
                            RAINBOW[i][0], RAINBOW[i][1], RAINBOW[i][2]);
     }
 
-    /* Sweep state. */
-    bool    sweep_on    = true;
-    uint8_t top_lb      = 0;
-    uint8_t bot_lb      = 0;
+    /* v2.30.11 flicker bisect: start with FIXED letterbox values
+     * (sweep disabled by default) to test whether the flicker
+     * happens with nothing changing. If flicker persists at fixed
+     * top=15/bot=10, the bug is NOT in the sweep update path — it's
+     * either the unified ISR firing wrong scanlines or a more
+     * fundamental NMI->ISR setup race. Press START to enable
+     * sweep, D-pad for manual adjustment. */
+    bool    sweep_on    = false;
+    uint8_t top_lb      = 15;
+    uint8_t bot_lb      = 10;
     uint8_t last_top    = 255;  /* force initial write */
     uint8_t last_bot    = 255;
     int8_t  top_dir     = +1;
@@ -141,7 +147,15 @@ void _start(void) {
             if (++top_div >= 15) {
                 top_div = 0;
                 int v = (int)top_lb + top_dir;
-                if (v < 0)  { v = 0;  top_dir = +1; }
+                /* v2.30.10 flicker bisect: floor at 10 instead of 0
+                 * to test whether very small top_lb values cause
+                 * NMI's $4209 write to miss the IRQ comparator
+                 * (theory: NMI writes V target = 1..3 AFTER V has
+                 * already reached that line, so IRQ doesn't fire
+                 * for that frame and the screen flashes black). If
+                 * the flicker disappears with this floor, theory
+                 * confirmed. */
+                if (v < 10) { v = 10; top_dir = +1; }
                 if (v > 32) { v = 32; top_dir = -1; }
                 top_lb = (uint8_t)v;
             }

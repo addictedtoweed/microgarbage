@@ -451,7 +451,7 @@ uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
  * ---------------------------------------------------------------- */
 
 const char *mgapi_version(void) {
-    return "mgapi 2.30.9 (atomic u16 layout read/write — kills the rare torn-byte flicker)";
+    return "mgapi 2.30.14 (NMI re-arms HIRQ even when frame_ready=0 — fixes whole-screen-black flicker)";
 }
 
 /* ----------------------------------------------------------------

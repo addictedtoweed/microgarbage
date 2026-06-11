@@ -277,8 +277,12 @@
     ; stays on screen."
     lda f:COPRO_FRAME_RDY_L
     bne @do_frame
-    jmp @out               ; long jump — short branch range was exceeded
-                           ; when the PPU register batch was added below
+    ; v2.30.14: when no new frame has been staged, skip the slot
+    ; walk + INIDISP $0F transition, but STILL re-arm the HIRQ for
+    ; this frame. Otherwise the kernel's HIRQ leftover from the
+    ; previous frame's ISR (state 2 = dormant, V target = $FF) means
+    ; no IRQ fires this frame, INIDISP stays $80, whole screen black.
+    jmp @hirq_setup
 @do_frame:
 
     ; Reaffirm INIDISP visible at every NMI start so the screen survives
@@ -652,6 +656,13 @@
     ;                          NMITIMEN = $A0.
     ;   all zero            : no transitions needed. NMITIMEN = $80
     ;                          (just NMI, IRQ disabled).
+    ;
+    ; v2.30.14: also entered when frame_ready=0 (no new commit this
+    ; vblank). Without this, the HIRQ stayed dormant from the previous
+    ; ISR's state-2 setup ($4209=$FF, NMITIMEN=$B0 still enabled),
+    ; INIDISP=$80 from previous frame's ISR, no IRQ fired → whole
+    ; screen black for that frame.
+@hirq_setup:
     .i8
     sep #$10
 
@@ -681,14 +692,19 @@
 
     ; Has top letterbox: state 0 (VISIBLE_START), V target = top_lb,
     ; INIDISP = $80. ISR at line top_lb will unblank.
+    ; v2.30.12: use HV-IRQ mode (NMITIMEN=$B0, bits 4+5 set) at
+    ; H=1 so IRQ fires at a specific (V, H) point each frame instead
+    ; of "somewhere on the V line" — eliminates the H-position
+    ; jitter the V-IRQ-only mode was producing.
     stz K_FRAME_STATE       ; state 0 = VISIBLE_START
     sta VTIMEL
     stz VTIMEH
-    stz HTIMEL
+    lda #22                 ; H=22 dots = master cyc 88, just past HBLANK
+    sta HTIMEL
     stz HTIMEH
     lda #$80
     sta INIDISP
-    lda #$A0                ; NMI + VIRQ
+    lda #$B0                ; NMI + HVIRQ (bits 7+5+4)
     sta NMITIMEN
     bra @nmi_hirq_done
 
@@ -704,9 +720,10 @@
     lda K_LAYOUT_VIS_END
     sta VTIMEL
     stz VTIMEH
-    stz HTIMEL
+    lda #22                 ; H=22 dots = master cyc 88, just past HBLANK
+    sta HTIMEL
     stz HTIMEH
-    lda #$A0
+    lda #$B0                ; NMI + HVIRQ
     sta NMITIMEN
     bra @nmi_hirq_done
 
@@ -823,7 +840,8 @@
     ; --- State 0: VISIBLE_START — unblank, schedule next event ---
     lda #$0F
     sta INIDISP
-    ; If bot_lb > 0, next event = visible_end (transition back to blank)
+    ; If bot_lb > 0, next event = visible_end (transition back to blank).
+    ; H target (HTIMEL=22) was already set by NMI and unchanged.
     lda K_LAYOUT_BOT_LB
     beq @vs_no_bot_lb
     lda K_LAYOUT_VIS_END
