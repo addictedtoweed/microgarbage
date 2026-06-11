@@ -136,8 +136,11 @@ static int read_full(int fd, void *buf, uint32_t n) {
  * into s_frame[]; we split it in-place via pointer math. With the
  * arbiter pre-reading 3 chunks ahead, a sudden 50+ ms SD hiccup
  * doesn't starve playback. */
-#define MAX_AUDIO_BYTES   8820                        /* 50 ms @ 44.1 kHz stereo */
-#define MAX_FRAME_BYTES   (MAX_AUDIO_BYTES + VIDEO_BLOCK_BYTES)   /* 35596 */
+/* v2.31: size MAX_AUDIO_BYTES for 15 fps (67 ms/frame = 11760 B audio).
+ * Old 20 fps was 8820 B; new buffer fits both. The actual abytes is read
+ * from the FMV header — this constant is just the upper-bound cap. */
+#define MAX_AUDIO_BYTES   11760                       /* 67 ms @ 44.1 kHz stereo */
+#define MAX_FRAME_BYTES   (MAX_AUDIO_BYTES + VIDEO_BLOCK_BYTES)   /* 38536 */
 static uint8_t  s_frame[MAX_FRAME_BYTES];
 static MgBgTile s_tilemap[32 * 32];      /* 32×32 with BLANK_TILE margins */
 /* v2.06: previous frame's CGRAM cached so the palette upload in the
@@ -182,27 +185,16 @@ void _start(void) {
     mg_bg_setup(MG_BG_LAYER_1, TM_B_WORD, MG_BG_SIZE_32x32, CHR_B_WORD);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
 
-    /* v2.16: mg_force_blank(8, 0) — TOP-only HDMA encoding.
+    /* v2.31: mg_force_blank(8, 0) — TOP-only HDMA.
      *
-     * emit_inidisp_table emits 8 × $80 + terminator. HDMA ch7 writes
-     * $80 to INIDISP for scanlines 0..7 (matching the kernel-set $80
-     * from before the DMA loop), then reads the terminator at line 8
-     * and goes idle for the rest of the frame.
-     *
-     * Why TOP-only matters: with full force_blank(8, 8) the HDMA table
-     * also writes $0F for the visible portion (lines 8..215) and $80
-     * for bottom (lines 216..223). The chr2/chr3 sub-frame DMAs are
-     * 9120 B = 72,960 cycles ≈ 17 scanlines of overrun past vblank.
-     * If HDMA writes $0F at line 8 while our DMA is still in flight,
-     * the PPU drops every VRAM write from that point — ~1.3 KB of
-     * chr2 lost as visible CHR garbling.
-     *
-     * TOP-only mode keeps INIDISP at $80 from the kernel's NMI-entry
-     * write through the entire overrun, until @done writes $0F. Every
-     * DMA byte makes it to VRAM cleanly. The natural "letterbox" is
-     * the ~17 scanlines the DMA takes past vblank — visible area is
-     * lines ~17..223 = 207 lines, which (combined with the BLANK_TILE
-     * tilemap margins) frames the 208-line FMV exactly. */
+     * At 15 fps the FMV is split into 4 sub-frame DMAs (one per NMI)
+     * of ~7000 B each. Per-NMI budget = (38 vblank + ~3 lines of DMA
+     * overrun) × ~165 = ~6700 B safe; each chunk fits with some
+     * give. The 8 lines of HDMA-written $80 are mostly decorative —
+     * with this small a per-NMI DMA, the kernel's @done writes $0F
+     * at around line 3-4 of next frame and FMV pixels start at line
+     * 8 (BLANK_TILE row 0 in the tilemap), so no clipping. Full
+     * 240×208 FMV visible, 8 lines of backdrop margin top + bottom. */
     mg_force_blank(8, 0);
 
     init_tilemap_margins();
@@ -223,10 +215,23 @@ void _start(void) {
         fs_close(fd);
         sys_exit(1);
     }
+    /* FMV2 header offsets (matches tools/fmv_encode.c hdr()):
+     *   +0  "FMV2"
+     *   +4  w (u16)
+     *   +6  h (u16)
+     *   +8  fps (u16)          ← v2.31: now read this; was hardcoded
+     *   +10 audio_channels (u16)
+     *   +12 nframes (u32)
+     *   +16 audio_rate (u32)
+     *   +20 audio_bits + _ (u32)
+     *   +24 audio_bytes_per_frame (u32)
+     *   +28 _ (u32)                                                   */
+    uint32_t fps      = (uint32_t)rd_u16le(hdr + 8);
     uint32_t nframes  = rd_u32le(hdr + 12);
     uint32_t arate    = rd_u32le(hdr + 16);
     uint32_t abytes   = rd_u32le(hdr + 24);
-    dbg("fmv: nframes="); dbg_u32(nframes);
+    dbg("fmv: fps="); dbg_u32(fps);
+    dbg(" nframes="); dbg_u32(nframes);
     dbg(" rate="); dbg_u32(arate);
     dbg(" abytes="); dbg_u32(abytes); dbg("\r\n");
     /* abytes is bytes/audio-chunk; sanity-cap so we never overrun s_frame. */
@@ -235,6 +240,8 @@ void _start(void) {
         fs_close(fd);
         sys_exit(1);
     }
+    if (fps == 0 || fps > 60) fps = 20;   /* fallback for old/synth clips */
+    uint32_t ms_per_frame = 1000u / fps;
 
     /* v2.10: hand the fd to the stream arbiter so it pre-reads
      * ahead of our 50 ms consumption. chunk_bytes = abytes + video
@@ -332,19 +339,25 @@ void _start(void) {
         splat_fmv_tilemap(tm);
         mg_chr_upload_transient(back_tm, s_tilemap, TILEMAP_BYTES);
 
-        /* CHR in 3 sub-frame-budget-sized chunks targeted at BACK's
-         * CHR base. Per-chunk sizes pack with shadows in sub-frame 0
-         * (cgram+tilemap+chr1 = ~9KB), then chr2 and chr3 each get
-         * their own ≤9.2 KB sub-frame. */
-        const uint16_t CHR_C1 = 6720;
-        const uint16_t CHR_C2 = 9120;
-        const uint16_t CHR_C3 = (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2);
+        /* v2.31: CHR split across 4 sub-frame-sized chunks (was 3).
+         * At 15 fps the kernel processes 4 NMI sub-frames per FMV
+         * frame, so we get 4× the per-NMI DMA budget windows. Per-NMI
+         * budget at (38+8) lines × ~165 B/line ≈ 7590 B; sizes below
+         * fit with margin. Mid-tile splits land contiguously in VRAM
+         * after all 4 chunks complete (each frame's BG1 buffer is the
+         * one fully uploaded the PREVIOUS iteration, double-buffered). */
+        const uint16_t CHR_C1 = 4160;
+        const uint16_t CHR_C2 = 6900;
+        const uint16_t CHR_C3 = 6900;
+        const uint16_t CHR_C4 = (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2 - CHR_C3);
         mg_chr_upload_transient(back_chr + 0u,
                                  chr + 0u, CHR_C1);
         mg_chr_upload_transient((uint16_t)(back_chr + CHR_C1 / 2u),
                                  chr + CHR_C1, CHR_C2);
         mg_chr_upload_transient((uint16_t)(back_chr + (CHR_C1 + CHR_C2) / 2u),
                                  chr + CHR_C1 + CHR_C2, CHR_C3);
+        mg_chr_upload_transient((uint16_t)(back_chr + (CHR_C1 + CHR_C2 + CHR_C3) / 2u),
+                                 chr + CHR_C1 + CHR_C2 + CHR_C3, CHR_C4);
 
         /* Feed audio (may partially fail if ring is near full; the
          * absolute-time pacing below blocks 50 ms per iter so the
@@ -360,17 +373,18 @@ void _start(void) {
          * window, displaying clean. */
         mg_frame_commit();
 
-        /* Absolute-time pacing — block until 50 ms from this iter's
-         * start. Eliminates the drift of sleep_ticks(50)'s per-call
-         * "at least 50 ms but maybe up to 67" granularity since each
-         * iter starts at a known clock offset (target_ms). Long-term
-         * average is exactly 50 ms/iter regardless of work jitter. */
-        target_ms += 50u;
-        uint32_t now = sys_ticks_now();
-        int32_t  to_sleep = (int32_t)(target_ms - now);
-        if (to_sleep > 0) {
-            sys_sleep_ticks((unsigned)to_sleep);
-        }
+        /* v2.31: pace by waiting for the kernel to consume the
+         * committed frame (= all sub-frames processed). At 15 fps
+         * with 4 sub-frames, that's exactly 4 NMIs = 4/60 s =
+         * 66.67 ms — which doesn't divide evenly into integer ms,
+         * so the old time-based sleep at 66 ms woke up 0.67 ms
+         * early and h_frame_commit silently dropped commits whose
+         * predecessors hadn't been fully consumed yet. mg_wait_frame
+         * gives exact kernel-cadence pacing with no drift. The
+         * target_ms accounting stays for the elapsed-time profile
+         * print at exit. */
+        target_ms += ms_per_frame;
+        mg_wait_frame();
 
         /* Stage BG1 swap: after this iteration, BG1 should display
          * what we just uploaded (back becomes new front in next iter

@@ -973,6 +973,17 @@ static void emit_inidisp_table(void) {
             LB_CHUNK(n, 0x80);
             t = (uint8_t)(t - n);
         }
+        /* v2.31: explicit $0F transition at line t (after the $80
+         * chunk, before the terminator). Without this, the HDMA
+         * channel terminates with INIDISP at whatever the last $80
+         * write left it (always $80 in this branch). The kernel's
+         * @done write of $0F gets overridden by HDMA's $80 writes
+         * at any line ≤ 7, so @done lands too early to stick. With
+         * this explicit $0F at line t = force_blank_top, INIDISP
+         * is guaranteed $0F from line t onwards regardless of
+         * @done timing — and regardless of frame_ready (idle NMI
+         * still gets a proper unblank from HDMA). */
+        LB_CHUNK(1, 0x0F);
         *p++ = 0x00;                  /* terminator — ch7 done for rest of frame */
 #undef LB_CHUNK
         /* v2.23: write the FULL CW_INIDISP_HDMA_BYTES region (not just

@@ -54,7 +54,12 @@
 #ifndef COLOR_LLOYD
 #define COLOR_LLOYD   4    /* v2: Lloyd iterations refining each palette's 15 colors */
 #endif
-#define FPS 20
+#ifndef FPS
+#define FPS 20             /* default; override with `gcc -DFPS=N` for re-encoding
+                            * at a different rate (e.g. 15). RATE must stay
+                            * evenly divisible by the chosen FPS — 44100 works
+                            * for 15, 20, 25, 30, ... */
+#endif
 #define RATE  44100        /* audio sample rate (CD); must divide evenly by FPS */
 #define ACH   2            /* audio channels (stereo) */
 #define ABITS 16           /* audio bits/sample (s16le, matches the mixer)      */
@@ -295,6 +300,31 @@ static void write_audio(FILE *o, FILE *af){
     fwrite(abuf,1,ABYTES,o);
 }
 
+/* Progress bar to stderr. If total > 0, shows percent + bar; otherwise
+ * just shows frame count. Updates only when percent changes (to avoid
+ * spamming the terminal each frame at high frame counts). */
+static int g_progress_total = 0;
+static int g_progress_last_pct = -1;
+static void progress(int nf_done) {
+    if (g_progress_total <= 0) {
+        fprintf(stderr, "\rencoding: frame %d", nf_done);
+        fflush(stderr);
+        return;
+    }
+    int pct = (int)((100.0 * nf_done) / g_progress_total);
+    if (pct == g_progress_last_pct) return;
+    g_progress_last_pct = pct;
+    int barw = 32;
+    int filled = (pct * barw) / 100;
+    if (filled > barw) filled = barw;
+    fputc('\r', stderr);
+    fputc('[', stderr);
+    for (int i = 0; i < filled; i++) fputc('#', stderr);
+    for (int i = filled; i < barw; i++) fputc('-', stderr);
+    fprintf(stderr, "] %3d%% (%d/%d)", pct, nf_done, g_progress_total);
+    fflush(stderr);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "synth")) {       /* synth N out.fmv (silent audio) */
         int n = atoi(argv[2]); FILE *o = fopen(argv[3], "wb"); if (!o) { perror(argv[3]); return 1; }
@@ -315,13 +345,20 @@ int main(int argc, char **argv) {
         } else { in = fopen(argv[1], "rb"); if (!in) { perror(argv[1]); return 1; } }
         FILE *o = fopen(argv[2], "wb"); if (!o) { perror(argv[2]); return 1; }
         FILE *af = NULL; int maxf = (1<<30);
-        for (int i = 3; i < argc; i++) {                /* optional audio path and/or -n N */
+        for (int i = 3; i < argc; i++) {                /* optional audio path, -n N, --total N */
             if (!strcmp(argv[i], "-n") && i+1 < argc) maxf = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--total") && i+1 < argc) g_progress_total = atoi(argv[++i]);
             else if (strcmp(argv[i], "none") != 0) { af = fopen(argv[i], "rb"); if (!af) perror(argv[i]); }
         }
         hdr(o, 0);                                      /* nframes patched at end */
         int nf = 0;
-        while (nf < maxf && read_frame(in)) { quantize(); write_audio(o,af); write_block(o); if (nf==0) write_preview("fmv_preview.ppm"); nf++; }
+        while (nf < maxf && read_frame(in)) {
+            quantize(); write_audio(o,af); write_block(o);
+            if (nf==0) write_preview("fmv_preview.ppm");
+            nf++;
+            progress(nf);
+        }
+        if (g_progress_total > 0 || nf > 0) fputc('\n', stderr);
         fseek(o, 12, SEEK_SET); w32(o, nf);
         fclose(o); if (in != stdin) fclose(in); if (af) fclose(af);
         printf("encoded %d frames -> %s  (%d+%d B/frame, total %ld B, %.1fs @ %dfps, audio %s)\n",

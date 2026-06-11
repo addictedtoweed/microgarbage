@@ -399,19 +399,38 @@
     lda f:M7B_Y_LO + 1
     sta M7Y
 
-    ; --- HDMA channels 1..6 setup -------------------------------------
+    ; --- HDMA channels 1..7 setup -------------------------------------
     ; Channel 0 is reserved for the kernel's DMA-list dispatch below.
-    ; Channel 7 stays as INIDISP letterbox (set up at boot).
+    ; v2.31: Channel 7 re-armed for INIDISP letterbox via cart_window
+    ; table. Phase 3a had disabled it in favor of the unified ISR-driven
+    ; INIDISP path, but the ISR-only path lets @done's INIDISP=$0F race
+    ; the variable per-NMI DMA size — small sub-frames finish early
+    ; and unblank the screen earlier than big ones, producing a per-
+    ; sub-frame top force-blank height flutter. HDMA channel 7 with the
+    ; emit_inidisp_table TOP-only encoding ($80 × t, then $0F at line t,
+    ; then terminator) gives a stable t-line top force-blank regardless
+    ; of when @done fires.
     ; For each channel C in 1..6: if the copro-staged enabled byte at
     ; COPRO_HDMA_CONFIG + C*8 is non-zero, program DMAP_C / BBAD_C /
     ; A1T_C / A1B_C and OR (1 << C) into the HDMAEN accumulator.
-    ; Then write HDMAEN once with channel-7 bit pre-set.
     .a8
     sep #$10
     .i8
-    ldy #$00                              ; v2.29 Phase 3a: ch7 no longer
-                                          ; armed; guest HDMA channels 1-6
-                                          ; still OR their bits below
+
+    ; v2.31: arm channel 7 — DMAP=$00 (1 byte to 1 reg, direct mode),
+    ; BBAD=$00 ($2100 = INIDISP), source = COPRO_INIDISP_HDMA in bank
+    ; COPRO_BANK.
+    stz DMAP7                             ; $00 = 1-byte 1-reg direct
+    stz BBAD7                             ; $00 = $2100 (INIDISP)
+    lda #<COPRO_INIDISP_HDMA
+    sta A1T7L
+    lda #>COPRO_INIDISP_HDMA
+    sta A1T7H
+    lda #COPRO_BANK
+    sta A1B7
+
+    ldy #$80                              ; pre-set ch7 bit in HDMAEN
+                                          ; accumulator
 
     ; Channel 1
     lda f:COPRO_HDMA_CONFIG + 1*COPRO_HDMA_CONFIG_STRIDE + 0

@@ -11,6 +11,10 @@
 #                                            # (for the mgapi guest player —
 #                                            # audio plays via mg_stream_play,
 #                                            # video reads chunked from .fmv)
+#   tools/encode_fmv.sh movie.mp4 -r 15      # re-encode at 15 fps (= 4 NMI sub-
+#                                            # frames per FMV frame; smaller per-
+#                                            # NMI DMA budget; needs the guest
+#                                            # player to read FPS from header)
 #
 # Works in the repo (builds fmv_encode + demo_fmv from source via gcc) or as a
 # standalone demo package: drop fmv_encode(.exe), demo_fmv(.exe) and ffmpeg(.exe)
@@ -24,7 +28,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # tools/
 repo="$(cd "$here/.." && pwd)"
 src="$here/fmv_encode.c"
 
-usage() { echo "usage: $0 INPUT [-t SECONDS] [-o OUTBASE] [-1]"; exit 1; }
+usage() { echo "usage: $0 INPUT [-t SECONDS] [-o OUTBASE] [-r FPS] [-1]"; exit 1; }
 [ $# -ge 1 ] || usage
 in="$1"; shift
 dur=""; out=""; fmv1=0
@@ -32,6 +36,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -t) dur="${2:-}"; shift 2 ;;
     -o) out="${2:-}"; shift 2 ;;
+    -r) FPS="${2:-}"; shift 2 ;;
     -1) fmv1=1; shift ;;     # FMV1 video-only + .wav sidecar
     -h|--help) usage ;;
     *) echo "unknown option: $1"; usage ;;
@@ -48,9 +53,9 @@ have_gcc() { command -v gcc >/dev/null 2>&1; }
 
 # --- encoder: build from source if present (+gcc), else use the prebuilt exe ---
 enc="$here/fmv_encode"; [ -x "$enc" ] || enc="$here/fmv_encode.exe"
-if [ -f "$src" ] && have_gcc && { [ ! -x "$enc" ] || [ "$src" -nt "$enc" ]; }; then
-  echo "building fmv_encode ..."
-  gcc -Wall -O2 -o "$here/fmv_encode" "$src"
+if [ -f "$src" ] && have_gcc && { [ ! -x "$enc" ] || [ "$src" -nt "$enc" ] || [ "$FPS" != "20" ]; }; then
+  echo "building fmv_encode (FPS=$FPS) ..."
+  gcc -Wall -O2 -DFPS=$FPS -o "$here/fmv_encode" "$src"
   enc="$here/fmv_encode"; [ -x "$enc" ] || enc="$here/fmv_encode.exe"
 fi
 [ -x "$enc" ] || { echo "fmv_encode(.exe) not found in $here (and no source+gcc to build it)"; exit 1; }
@@ -89,10 +94,24 @@ if [ "$fmv1" = 1 ]; then
     echo "  (no audio track — guest will need to skip mg_stream_play)"; rm -f "$out.wav"
   fi
 
+  # Total-frames hint for the encoder's progress bar.
+  if [ -n "$dur" ]; then
+    total_frames=$(awk "BEGIN { printf \"%d\", $dur * $FPS }")
+  else
+    src_dur=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$in" 2>/dev/null || echo "")
+    if [ -n "$src_dur" ]; then
+      total_frames=$(awk "BEGIN { printf \"%d\", $src_dur * $FPS }")
+    else
+      total_frames=0
+    fi
+  fi
+  total_arg=()
+  [ "$total_frames" -gt 0 ] && total_arg=(--total "$total_frames")
+
   echo "video -> $out.fmv  (${W}x${H}, ${FPS} fps, video-only/FMV1)"
   ffmpeg -hide_banner -loglevel error -i "$in" ${tflag[@]+"${tflag[@]}"} \
     -vf "scale=${W}:${H},fps=${FPS}" -f rawvideo -pix_fmt rgb24 - \
-    | "$enc" - "$out.fmv"           # no audio arg => encoder emits FMV1
+    | "$enc" - "$out.fmv" "${total_arg[@]}"     # no audio arg => encoder emits FMV1
 
   echo
   echo "done:  $out.fmv + $out.wav  (guest player layout)"
@@ -111,10 +130,27 @@ else
   # 2) pipe video frames into the encoder; it interleaves one audio chunk per
   #    frame (audio first) into the FMV2 container. ffmpeg piped straight in, so
   #    no giant intermediate .rgb — the whole movie is fine.
+  #
+  # Compute total frames for the encoder's progress bar (=duration × FPS). If
+  # -t was used, that's the cap; otherwise probe the input. Falls back to
+  # "unknown" (encoder shows just a frame counter) if probing fails.
+  if [ -n "$dur" ]; then
+    total_frames=$(awk "BEGIN { printf \"%d\", $dur * $FPS }")
+  else
+    src_dur=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$in" 2>/dev/null || echo "")
+    if [ -n "$src_dur" ]; then
+      total_frames=$(awk "BEGIN { printf \"%d\", $src_dur * $FPS }")
+    else
+      total_frames=0
+    fi
+  fi
+  total_arg=()
+  [ "$total_frames" -gt 0 ] && total_arg=(--total "$total_frames")
+
   echo "video+audio -> $out.fmv  (${W}x${H}, ${FPS} fps, muxed)"
   ffmpeg -hide_banner -loglevel error -i "$in" ${tflag[@]+"${tflag[@]}"} \
     -vf "scale=${W}:${H},fps=${FPS}" -f rawvideo -pix_fmt rgb24 - \
-    | "$enc" - "$out.fmv" "$tmp_pcm"
+    | "$enc" - "$out.fmv" "$tmp_pcm" "${total_arg[@]}"
 
   [ "$tmp_pcm" != "none" ] && rm -f "$tmp_pcm"
 
