@@ -67,6 +67,11 @@ typedef struct {
     int16_t  hofs, vofs;
     uint8_t  shadow[MG_BG_TILEMAP_BYTES];   /* shadow tilemap (32x32) */
     uint16_t dirty_lo, dirty_hi; /* byte range; hi=lo means clean      */
+    bool     shadow_ever_written;/* true after the first dirty_bg call —
+                                  * gates the clean_slate re-upload window
+                                  * so demos that bypass the shadow path
+                                  * (mg_chr_upload_transient) don't get
+                                  * 2 KB of zeros DMA'd over their VRAM. */
 } MgBgLayerState;
 
 /* Snapshot of the whole shadow PPU state. */

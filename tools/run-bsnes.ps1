@@ -31,8 +31,16 @@ param(
     [string]$Rom,
     [switch]$Smoke,
     [switch]$Boot,    # backward-compat alias for the (now default) boot flow
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [switch]$Trace,   # set MG_DMA_TRACE=1 and capture bsnes stderr to mgdma.log
+    [string]$TraceLog = "mgdma.log"
 )
+
+# DMA-slot trace: gated on the -Trace switch. Bsnes is a GUI app, so
+# without redirection its stderr lands nowhere visible. We swap the
+# default Start-Process launch for a direct call with stderr piped to
+# a file.
+if ($Trace) { $env:MG_DMA_TRACE = "1" } else { Remove-Item Env:\MG_DMA_TRACE -ErrorAction SilentlyContinue }
 
 # Default mgapi rom_select to "boot" (the runtime kernel that picks up
 # cart-window staging from PuTTY-launched demos). -Smoke flips to the
@@ -193,7 +201,23 @@ if ($qtCandidates) {
 # absolute so the cwd swap is invisible to the load.
 $RomAbs = (Resolve-Path $Rom).Path
 Write-Step "launching..."
-Start-Process -FilePath $BsnesExe `
-              -ArgumentList @("`"$RomAbs`"") `
-              -WorkingDirectory $BsnesHome
+if ($Trace) {
+    # -Trace mode: capture stderr (the mgapi.dll MG_DMA_TRACE log)
+    # to $TraceLog. Use Start-Process -RedirectStandardError so the
+    # call still detaches and the user gets their PS prompt back.
+    $TraceLogAbs = if ([System.IO.Path]::IsPathRooted($TraceLog)) {
+        $TraceLog
+    } else {
+        Join-Path (Get-Location).Path $TraceLog
+    }
+    Write-Step "MG_DMA_TRACE=1 -> stderr to $TraceLogAbs"
+    Start-Process -FilePath $BsnesExe `
+                  -ArgumentList @("`"$RomAbs`"") `
+                  -WorkingDirectory $BsnesHome `
+                  -RedirectStandardError $TraceLogAbs
+} else {
+    Start-Process -FilePath $BsnesExe `
+                  -ArgumentList @("`"$RomAbs`"") `
+                  -WorkingDirectory $BsnesHome
+}
 Write-Step "done. (close the bsnes window to exit)"

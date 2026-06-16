@@ -220,6 +220,7 @@ if (-not $NoGuest) {
             @{ src = "tools\guests\demos\demo_audio_mixer.c"; sym = "demo_audio_mixer_elf"; out = "demo_audio_mixer.elf"; gen = "demo_audio_mixer_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_pcm_stream.c"; sym = "demo_pcm_stream_elf"; out = "demo_pcm_stream.elf"; gen = "demo_pcm_stream_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_fmv.c";        sym = "demo_fmv_elf";        out = "demo_fmv.elf";        gen = "demo_fmv_elf_data.c";        extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_fmv_flip.c";   sym = "demo_fmv_flip_elf";   out = "demo_fmv_flip.elf";   gen = "demo_fmv_flip_elf_data.c";   extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_fmv_still.c";  sym = "demo_fmv_still_elf";  out = "demo_fmv_still.elf";  gen = "demo_fmv_still_elf_data.c";  extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_nmi_smoke.c";  sym = "demo_nmi_smoke_elf";  out = "demo_nmi_smoke.elf";  gen = "demo_nmi_smoke_elf_data.c";  extra = $mgGuestImpls }
         )

@@ -354,7 +354,11 @@ int main(int argc, char **argv) {
         int nf = 0;
         while (nf < maxf && read_frame(in)) {
             quantize(); write_audio(o,af); write_block(o);
-            if (nf==0) write_preview("fmv_preview.ppm");
+            /* Write preview every frame so the final fmv_preview.ppm is
+             * always the LAST encoded frame — useful for the "what did
+             * this clip look like at the end?" diagnostic. Cheap (~150 KB
+             * write per frame), still well under encode CPU time. */
+            write_preview("fmv_preview.ppm");
             nf++;
             progress(nf);
         }

@@ -23,15 +23,17 @@
     .i16
     ; arrives native, A8/I16, DBR=$00 (set by boot.s)
 
-    ; install our NMI handler into the RAM vector the trampoline uses,
-    ; and stash a copy at K_NMI_DEFAULT so @loop can restore it on
-    ; "uninstall" (cart version rolls back to 0 when the host unloads
-    ; the guest VM).
+    ; v2.34 virtual-NMI: NMI is DISABLED. A single self-chaining H+V
+    ; timer IRQ (proc `irq`) does all per-frame work — state A blanks +
+    ; runs the DMA burst at the bottom-letterbox line, state B unblanks
+    ; at the top-letterbox line. Point the IRQ vector at it; park the
+    ; unused NMI vector at a bare RTI so a stray NMI is harmless.
     rep #$20
     .a16
-    lda #.loword(nmi)
+    lda #.loword(irq)
+    sta RAMVEC_IRQ
+    lda #.loword(nmi_stub)
     sta RAMVEC_NMI
-    sta K_NMI_DEFAULT
     sep #$20
     .a8
 
@@ -57,44 +59,36 @@
     ; for reuse.
     stz HDMAEN              ; no HDMA channels armed at boot
 
-    lda #$0F
-    sta INIDISP             ; screen on, full brightness
-    lda #$80
-    sta NMITIMEN            ; NMI on (b7); auto-joypad read OFF (b0=0). The
-                            ; kernel bit-bangs $4016/$4017 in active display
-                            ; instead (see read_joypads below), reclaiming the
-                            ; ~3 lines the auto-read would have eaten from the
-                            ; vblank DMA window.
+    ; Force NON-INTERLACE. The virtual-NMI design pins fixed H+V IRQ
+    ; targets each frame; interlace (262/263-line field alternation)
+    ; would drift them every other frame. Cold-boot default is already
+    ; 0, but assert it defensively since the kernel never wrote $2133.
+    stz SETINI
 
-    ; v2.19: explicitly zero the cached NMI-builder version. boot.s does
-    ; NOT scrub all of WRAM (only KRAM at $0400+ via the kernel copy), so
-    ; $022A holds whatever the platform left at cold boot. If that happens
-    ; to be non-zero, the @loop version-poll below would compare against
-    ; cart-window version 0, see "different," and install the all-zero
-    ; staged region as a 1 KB BRK loop -- screen goes black until the
-    ; next reset. STZ here makes the cache deterministic.
-    stz K_NMI_VERSION
-    ; v2.26: same defensive zero for HIRQ.
-    stz K_HIRQ_VERSION
-
-    ; v2.29 Phase 3a: install the default HIRQ handler at RAMVEC_IRQ
-    ; and cache its address at K_HIRQ_DEFAULT so the @loop's HIRQ
-    ; uninstall path can restore it. Also zero the layout / siphon
-    ; WRAM cache so the first frame's NMI handler doesn't read stale
-    ; cold-boot WRAM and end up with garbage line counts.
-    rep #$20
-    .a16
-    lda #.loword(default_hirq_handler)
-    sta RAMVEC_IRQ
-    sta K_HIRQ_DEFAULT
-    sep #$20
-    .a8
+    ; --- per-frame state (cached by @loop, consumed by the IRQ) ---
+    stz K_FRAME_STATE       ; 0 = state A (blank + burst)
+    stz K_FRAME_READY       ; no staged frame yet
+    stz K_SLOT_CURSOR       ; chainer starts at slot 0
     stz K_LAYOUT_TOP_LB
     stz K_LAYOUT_BOT_LB
     lda #224
-    sta K_LAYOUT_VIS_END
+    sta K_LAYOUT_VIS_END    ; 224 - bot_lb (bot_lb = 0 at boot)
     stz K_SIPHON_BYTES
-    stz K_FRAME_STATE
+
+    ; --- arm the self-chaining H+V IRQ: state A at V=VIS_END, H=22 ---
+    ; H+V mode (NMITIMEN bits 4+5) fires once per frame at an exact
+    ; (V,H). NMI (b7) OFF; auto-joypad (b0) OFF — the kernel bit-bangs
+    ; pads in active display (see read_joypads).
+    lda #22
+    sta HTIMEL
+    stz HTIMEH
+    lda K_LAYOUT_VIS_END
+    sta VTIMEL
+    stz VTIMEH
+    lda #$0F
+    sta INIDISP             ; visible until the first burst
+    lda #$30
+    sta NMITIMEN
 
     cli
 
@@ -106,6 +100,19 @@
     ; wait for the next vblank.
     sep #$10
     .i8
+
+    ; v2.34 virtual-NMI: there are TWO IRQ events per frame (state A =
+    ; blank+burst, state B = unblank); the loop wakes on BOTH. Run the
+    ; per-frame handshake (joypad post + frame-ready + layout reads)
+    ; ONLY before the state-A burst. K_FRAME_STATE holds the NEXT IRQ's
+    ; state (0 = A). Doing it on both events would double-count the
+    ; host's $7800/port-7 sub-frame handshake — advancing a sub-frame
+    ; right before a state-B IRQ that does no walk, so that sub-frame's
+    ; DMA is skipped (visible as checker/partial CHR).
+    sep #$20
+    .a8
+    lda K_FRAME_STATE
+    bne @wait_only                  ; state B coming (unblank only) -> wait
 
     ; 1) manual joypad read (auto-joypad is disabled in NMITIMEN). Fills PADS,
     ;    16 bits per pad, order matching the auto-read register layout.
@@ -136,166 +143,50 @@
     rep #$10
     .i16
 
-    ; v2.21: NMI-builder version poll with uninstall support.
+    ; v2.34 virtual-NMI: cache the per-frame cart-window state HERE, in
+    ; active display (CPU-idle time — slow cart reads are free), so the
+    ; time-critical IRQ touches only cheap cached WRAM values. This is
+    ; also where a future per-scanline siphon source would be cached.
     ;
-    ; Cart version semantics:
-    ;   0    = "no custom NMI active" (boot default; written by host
-    ;          on VM unload to clear the previous demo's handler)
-    ;   1..N = "use the handler staged at COPRO_NMI_CODE_L"
-    ;
-    ; Cache cmp finds three cases:
-    ;   match                 -> nothing to do
-    ;   diff, new = 0         -> UNINSTALL: restore RAMVEC_NMI to default
-    ;   diff, new != 0        -> INSTALL: copy + RAMVEC_NMI = $0E00
-    ;
-    ; Byte-copy (not MVN) deliberately: MVN's operand-order pitfall
-    ; was the suspected v2.18 regression. The copy runs once per
-    ; install (rare), so the ~9700-cycle (~57-scanline) cost is
-    ; absorbed in active-display CPU idle time and never affects
-    ; the next NMI.
+    ; ORDER MATTERS: the $7800 frame-ready read must stay AFTER the
+    ; port-7 ($7700) joypad post above. The host gates sub-frame advance
+    ; on the port-7 read seeing a $7800 read since the last commit, so
+    ; the sequence (port-7, then $7800, then wai->burst) preserves the
+    ; existing handshake with zero host changes.
     .a8
-    lda f:COPRO_NMI_VERSION_L
-    cmp K_NMI_VERSION
-    beq @nmi_unchanged              ; cache matches -> already at this version
-    sta K_NMI_VERSION
-    cmp #0                          ; set Z based on A (sta itself doesn't!)
-    bne @nmi_install                ; non-zero -> install new handler
+    lda f:COPRO_FRAME_RDY_L
+    sta K_FRAME_READY
 
-    ; UNINSTALL — restore RAMVEC_NMI to the default kernel proc.
-    rep #$20
-    .a16
-    lda K_NMI_DEFAULT
-    sta RAMVEC_NMI
-    sep #$20
-    .a8
-    bra @nmi_unchanged
+    ; Cache letterbox layout; recompute VIS_END = 224 - bot_lb.
+    lda f:COPRO_LAYOUT_TOP_LB_L
+    sta K_LAYOUT_TOP_LB
+    lda f:COPRO_LAYOUT_BOT_LB_L
+    sta K_LAYOUT_BOT_LB
+    lda #224
+    sec
+    sbc K_LAYOUT_BOT_LB
+    sta K_LAYOUT_VIS_END
 
-@nmi_install:
-    rep #$30
-    .a16
-    .i16
-    ldx #$0000
-@nmi_copy:
-    lda f:COPRO_NMI_CODE_L,x        ; long,X — 16-bit read from cart
-    sta a:K_NMI_CODE_BASE,x         ; abs,X  — 16-bit write to WRAM
-    inx
-    inx
-    cpx #COPRO_NMI_CODE_BYTES
-    bne @nmi_copy
-
-    lda #K_NMI_CODE_BASE
-    sta RAMVEC_NMI                  ; trampoline now lands in WRAM at $0E00
-
-    sep #$20
-    .a8
-@nmi_unchanged:
-
-    ; v2.26 Phase 2.5: HIRQ-builder version poll. Same shape as the NMI
-    ; poll above. Cart version 0 = no HIRQ active; the install path
-    ; copies the staged code into WRAM at K_HIRQ_CODE_BASE and points
-    ; RAMVEC_IRQ at it. Uninstall path clears RAMVEC_IRQ to 0 — the
-    ; trampoline at $FFEE does `jmp (RAMVEC_IRQ)`, so if a guest later
-    ; arms HIRQ with no handler the SNES will spin in a tight loop at
-    ; bank $00:$0000 (BRK), which is preferable to silently running a
-    ; stale handler.
-    .a8
-    lda f:COPRO_HIRQ_VERSION_L
-    cmp K_HIRQ_VERSION
-    beq @hirq_unchanged
-    sta K_HIRQ_VERSION
-    cmp #0
-    bne @hirq_install
-
-    ; v2.29 Phase 3a: UNINSTALL restores RAMVEC_IRQ to the kernel's
-    ; default_hirq_handler (cached at K_HIRQ_DEFAULT) instead of
-    ; clearing to 0, so the unified layout/siphon ISR keeps working
-    ; even after a custom-installed HIRQ uninstalls.
-    rep #$20
-    .a16
-    lda K_HIRQ_DEFAULT
-    sta RAMVEC_IRQ
-    sep #$20
-    .a8
-    bra @hirq_unchanged
-
-@hirq_install:
-    rep #$30
-    .a16
-    .i16
-    ldx #$0000
-@hirq_copy:
-    lda f:COPRO_HIRQ_CODE_L,x       ; long,X — 16-bit read from cart
-    sta a:K_HIRQ_CODE_BASE,x        ; abs,X  — 16-bit write to WRAM
-    inx
-    inx
-    cpx #COPRO_HIRQ_CODE_BYTES
-    bne @hirq_copy
-
-    lda #K_HIRQ_CODE_BASE
-    sta RAMVEC_IRQ                  ; trampoline now lands in WRAM at $1200
-
-    sep #$20
-    .a8
-@hirq_unchanged:
-
-    ; v2.29 Phase 3a: the cart_window-driven schedule programming
-    ; (Phase 2.5b) was removed. The NMI handler now drives the unified
-    ; HIRQ ISR by reading CW_OFF_KERNEL_LAYOUT/SIPHON_CONFIG at vblank
-    ; and programming $4207-$420A + NMITIMEN there. Guest demos use
-    ; mg_kernel_layout / mg_siphon_configure instead of the raw
-    ; mg_hirq_configure path.
-
-    ; 3) sleep until the next vblank. NMI fires, reads COPRO_DMACTRL, and
-    ;    dispatches whichever DMAs the copro requested (or none if it wrote
-    ;    $00). After RTI we land back here in active display and loop.
-    ;
-    ; v2.26: bra @loop became out-of-range (~176 bytes) once both the NMI
-    ; and HIRQ version polls landed in the loop body. Use a jmp; the
-    ; extra byte costs ~1 master cycle per iteration, negligible.
+    ; Sleep until the next H+V IRQ event (state A blank+burst at VIS_END,
+    ; or state B unblank at top_lb). The IRQ does all per-frame PPU work;
+    ; we resume here in active display afterward.
+@wait_only:
     wai
     jmp @loop
 .endproc
 
 ; ------------------------------------------------------------------
-; vblank: push the copro-staged transfer list into the PPU.
+; frame_dma — apply the copro's staged per-frame PPU work: register
+; batch, Mode-7 batch, HDMA ch1-6 arm, then the DMA-list walk.
+;
+; Called from the `irq` state-A handler, which has ALREADY force-
+; blanked the screen and confirmed a staged frame (K_FRAME_READY != 0),
+; and saved A/X/Y. Touches no INIDISP — the irq state machine owns the
+; blank/unblank transitions. Entry/exit: A8, I16. DBR=$00.
 ; ------------------------------------------------------------------
-.proc nmi
-    rep #$30
-    .a16
-    .i16
-    pha
-    phx
-    phy
-    sep #$20
+.proc frame_dma
     .a8
-    lda RDNMI               ; acknowledge NMI
-
-    ; --- frame_ready gate ----------------------------------------------
-    ; The copro writes COPRO_FRAME_RDY to a non-zero value once it has
-    ; finished staging the per-frame payload AND the DMA list. 0 here
-    ; means "nothing to do this vblank; just RTI and the previous frame
-    ; stays on screen."
-    lda f:COPRO_FRAME_RDY_L
-    bne @do_frame
-    ; v2.30.14: when no new frame has been staged, skip the slot
-    ; walk + INIDISP $0F transition, but STILL re-arm the HIRQ for
-    ; this frame. Otherwise the kernel's HIRQ leftover from the
-    ; previous frame's ISR (state 2 = dormant, V target = $FF) means
-    ; no IRQ fires this frame, INIDISP stays $80, whole screen black.
-    jmp @hirq_setup
-@do_frame:
-
-    ; Reaffirm INIDISP visible at every NMI start so the screen survives
-    ; even if HDMA channel 7's source table is malformed or never
-    ; touched this frame. Belt-and-suspenders against the bsnes-plus
-    ; HDMA repeat-mode discrepancy (see emit_inidisp_table in
-    ; copro_mg_state.c). Real-hardware no-op when HDMA writes $0F
-    ; anyway; cheap diagnostic safety on emulators.
-    lda #$0F
-    sta INIDISP
-
-    ; (Real hardware: assert/extend forced blank for the letterbox lines so the
-    ;  whole 54-line window is DMA-able -- see the DMA-budget notes. TODO.)
+    .i16
 
     ; --- apply PPU register batch -------------------------------------
     ; 32 bytes at COPRO_PPU_BATCH the copro filled this frame: BGMODE,
@@ -399,17 +290,11 @@
     lda f:M7B_Y_LO + 1
     sta M7Y
 
-    ; --- HDMA channels 1..7 setup -------------------------------------
-    ; Channel 0 is reserved for the kernel's DMA-list dispatch below.
-    ; v2.31: Channel 7 re-armed for INIDISP letterbox via cart_window
-    ; table. Phase 3a had disabled it in favor of the unified ISR-driven
-    ; INIDISP path, but the ISR-only path lets @done's INIDISP=$0F race
-    ; the variable per-NMI DMA size — small sub-frames finish early
-    ; and unblank the screen earlier than big ones, producing a per-
-    ; sub-frame top force-blank height flutter. HDMA channel 7 with the
-    ; emit_inidisp_table TOP-only encoding ($80 × t, then $0F at line t,
-    ; then terminator) gives a stable t-line top force-blank regardless
-    ; of when @done fires.
+    ; --- HDMA channels 1..6 setup -------------------------------------
+    ; Channel 0 is reserved for the DMA-list dispatch below. Channel 7
+    ; (INIDISP letterbox) is NO LONGER armed — the v2.34 irq state
+    ; machine drives INIDISP blank/unblank directly, so the HDMA INIDISP
+    ; table is retired (it would otherwise fight the irq for INIDISP).
     ; For each channel C in 1..6: if the copro-staged enabled byte at
     ; COPRO_HDMA_CONFIG + C*8 is non-zero, program DMAP_C / BBAD_C /
     ; A1T_C / A1B_C and OR (1 << C) into the HDMAEN accumulator.
@@ -417,20 +302,7 @@
     sep #$10
     .i8
 
-    ; v2.31: arm channel 7 — DMAP=$00 (1 byte to 1 reg, direct mode),
-    ; BBAD=$00 ($2100 = INIDISP), source = COPRO_INIDISP_HDMA in bank
-    ; COPRO_BANK.
-    stz DMAP7                             ; $00 = 1-byte 1-reg direct
-    stz BBAD7                             ; $00 = $2100 (INIDISP)
-    lda #<COPRO_INIDISP_HDMA
-    sta A1T7L
-    lda #>COPRO_INIDISP_HDMA
-    sta A1T7H
-    lda #COPRO_BANK
-    sta A1B7
-
-    ldy #$80                              ; pre-set ch7 bit in HDMAEN
-                                          ; accumulator
+    ldy #$00                              ; HDMAEN accumulator (no ch7)
 
     ; Channel 1
     lda f:COPRO_HDMA_CONFIG + 1*COPRO_HDMA_CONFIG_STRIDE + 0
@@ -573,25 +445,56 @@
     lda #$80
     sta INIDISP
 
-    ; --- walk the 8-slot DMA list -------------------------------------
-    ; For each slot whose bbus byte is non-zero: program channel 0 from
-    ; the slot, write the prep value to the corresponding PPU dest
-    ; register (CGADD/VMADD/OAMADDR), and fire MDMAEN bit 0. Channel 0
-    ; is reused across slots -- SNES DMA channels never run in parallel
-    ; anyway, so this is functionally identical to using 8 channels.
-    rep #$10
+    ; --- cycle-budgeted DMA-list chainer ------------------------------
+    ; Walk staged slots from the persistent cursor K_SLOT_CURSOR. Before
+    ; each slot, read the LIVE beam position (calc_bytes_rem) and fire
+    ; only if the remaining blank window can still sink the slot; else
+    ; DEFER (leave the cursor) so the next burst resumes here. A bbus of
+    ; 0 marks the end of the staged (contiguous) list. When the last
+    ; slot is walked, reset the cursor and strobe COPRO_FRAME_DONE so the
+    ; host bumps frame_consumed + clears frame_ready.
+    ;
+    ; Y counts slots fired THIS burst: an oversized FIRST slot is fired
+    ; anyway (the host must chunk uploads <= one window; this just keeps
+    ; an over-budget slot from hanging the chainer forever).
+    rep #$30
+    .a16
     .i16
-    ldx #0
+    lda K_SLOT_CURSOR
+    and #$00FF
+    asl a
+    asl a
+    asl a                        ; X = cursor * 8 (entry size)
+    tax
+    ldy #$0000                   ; slots fired this burst
+    sep #$20
+    .a8
 @slot:
-    cpx #(8 * 8)            ; processed all 8 slots? -> done
+    cpx #(8 * 8)                 ; walked all 8 slots? -> frame complete
     bne :+
-    jmp @done
+    jmp @frame_complete
 :
-
-    lda f:COPRO_DMA_LIST_L+0,x    ; bbus (0 => empty slot, skip)
+    lda f:COPRO_DMA_LIST_L+0,x    ; bbus (0 => empty = end of list)
     bne :+
-    jmp @next
+    jmp @frame_complete
 :
+    ; --- budget check ---
+    pha                          ; save bbus (A8)
+    jsr calc_bytes_rem           ; -> K_BYTES_REM (window bytes left); A8 out
+    rep #$20
+    .a16
+    lda f:COPRO_DMA_LIST_L+4,x    ; slot byte count
+    cmp K_BYTES_REM
+    sep #$20
+    .a8
+    bcc @fits                    ; size <  window remaining -> fits
+    beq @fits                    ; size == window remaining -> fits
+    cpy #$0000                   ; size > remaining: defer UNLESS nothing
+    beq @fits                    ;   fired yet (avoid hang on a huge slot)
+    pla                          ; discard saved bbus
+    jmp @defer
+@fits:
+    pla                          ; restore bbus (A8)
     sta BBAD0
     lda f:COPRO_DMA_LIST_L+1,x    ; dmap
     sta DMAP0
@@ -644,122 +547,173 @@
 @fire:
     lda #$01
     sta MDMAEN              ; fire channel 0; CPU pauses until this slot completes
+    iny                     ; count a fired slot
 
 @next:
-    ; advance to the next slot (entry size = 8 bytes)
+    inc K_SLOT_CURSOR            ; advance cursor + X to the next slot
     .repeat 8
     inx
     .endrepeat
     jmp @slot
 
-@done:
-    ; Un-blank the PPU now that all VRAM/CGRAM/OAM writes have landed.
-    ; The HDMA letterbox channel (if armed) will re-write INIDISP per
-    ; scanline starting next frame; this $0F is what the screen shows
-    ; for the rest of the visible frame.
-    lda #$0F
-    sta INIDISP
+@defer:
+    ; Window full — leave K_SLOT_CURSOR at the un-fired slot; the next
+    ; burst resumes the walk from here. frame_ready stays set (no strobe).
+    rts
 
-    ; v2.29 Phase 3a: program unified HIRQ for the next frame's
-    ; letterbox / siphon. Reads cart_window layout config, caches
-    ; into WRAM (default_hirq_handler reads from there to avoid
-    ; per-fire cart accesses), then sets V counter target and
-    ; NMITIMEN bits. Cases:
-    ;
-    ;   top_lb > 0          : V target = top_lb, INIDISP forced to $80
-    ;                          (so the top_lb lines stay force-blanked
-    ;                          until the ISR fires the visible
-    ;                          transition). NMITIMEN = $A0.
-    ;   top_lb = 0, has_lower: V target = visible_end (= 224 - bot_lb).
-    ;                          INIDISP stays $0F (visible from line 0).
-    ;                          NMITIMEN = $A0.
-    ;   all zero            : no transitions needed. NMITIMEN = $80
-    ;                          (just NMI, IRQ disabled).
-    ;
-    ; v2.30.14: also entered when frame_ready=0 (no new commit this
-    ; vblank). Without this, the HIRQ stayed dormant from the previous
-    ; ISR's state-2 setup ($4209=$FF, NMITIMEN=$B0 still enabled),
-    ; INIDISP=$80 from previous frame's ISR, no IRQ fired → whole
-    ; screen black for that frame.
-@hirq_setup:
-    .i8
-    sep #$10
+@frame_complete:
+    stz K_SLOT_CURSOR            ; ready for the next frame's staged list
+    lda f:COPRO_FRAME_DONE_L     ; strobe: host bumps frame_consumed
+    rts
+.endproc
 
-    ; v2.30.9: read top_lb + bot_lb in a SINGLE 16-bit load. Pairs
-    ; with the host's cart_window_store_u16_le write so we never see
-    ; a torn (new-top, old-bottom) pair — the source of the
-    ; occasional dynamic_letterbox flicker. K_LAYOUT_TOP_LB and
-    ; K_LAYOUT_BOT_LB are adjacent in WRAM ($0230, $0231), so the
-    ; matching 16-bit sta stores both bytes in one instruction.
+; ------------------------------------------------------------------
+; calc_bytes_rem — read the live 9-bit V counter and set K_BYTES_REM
+; to a CONSERVATIVE estimate of how many DMA bytes the blank window can
+; still sink before the unblank deadline (V=top_lb of the next frame).
+;
+;   lines_rem = V in [vis_end,261]: (262 + top_lb) - V
+;               V in [0, top_lb]   : top_lb - V
+;               V in (top_lb,vis_end): 0  (visible region — never fire)
+;   K_BYTES_REM = lines_rem * 160        (160 < the ~170 B/line real
+;                                         rate, so we under-estimate =
+;                                         defer slightly early = safe)
+; Uses cached K_LAYOUT_VIS_END / K_LAYOUT_TOP_LB. Entry/exit A8; touches
+; A only (X/Y preserved). DBR=$00.
+; ------------------------------------------------------------------
+.proc calc_bytes_rem
+    .a8
+    lda SLHV                     ; latch H/V counters
+    lda STAT78                   ; reset OPHCT/OPVCT read toggle
+    lda OPVCT                    ; V low byte
+    sta K_VLO
+    lda OPVCT                    ; V high byte
+    and #$01                     ; bit0 = V bit8
+    sta K_VHI
+
     rep #$20
     .a16
-    lda f:COPRO_LAYOUT_TOP_LB_L
-    sta K_LAYOUT_TOP_LB
+    lda K_LAYOUT_VIS_END
+    and #$00FF
+    sta K_BYTES_REM              ; scratch = vis_end
+    lda K_VLO                    ; V (16-bit: K_VLO | K_VHI<<8)
+    cmp K_BYTES_REM
+    bcc @below                   ; V < vis_end
+
+    ; V >= vis_end: lines = (262 + top_lb) - V
+    sta K_BYTES_REM              ; scratch = V
+    lda K_LAYOUT_TOP_LB
+    and #$00FF
+    clc
+    adc #262
+    sec
+    sbc K_BYTES_REM              ; (262 + top_lb) - V
+    bra @lines_done
+
+@below:
+    ; V < vis_end. Is V <= top_lb (next-frame top region) or visible?
+    sta K_BYTES_REM              ; scratch = V
+    lda K_LAYOUT_TOP_LB
+    and #$00FF
+    cmp K_BYTES_REM              ; top_lb vs V
+    bcc @visible                 ; top_lb < V -> visible region
+    sec
+    sbc K_BYTES_REM              ; top_lb - V
+    bra @lines_done
+
+@visible:
+    lda #0
+
+@lines_done:
+    ; A = lines_rem. bytes = lines * 160 = (lines<<5) * 5.
+    asl a
+    asl a
+    asl a
+    asl a
+    asl a                        ; A = lines * 32
+    sta K_BYTES_REM
+    asl a
+    asl a                        ; A = lines * 128
+    clc
+    adc K_BYTES_REM              ; + lines*32 = lines*160
+    sta K_BYTES_REM
     sep #$20
     .a8
-    lda f:COPRO_SIPHON_BYTES_L
-    sta K_SIPHON_BYTES
+    rts
+.endproc
 
-    ; Compute visible_end = 224 - bot_lb
-    lda #224
-    sec
-    sbc K_LAYOUT_BOT_LB
-    sta K_LAYOUT_VIS_END
+; ------------------------------------------------------------------
+; irq — the virtual-NMI handler. Self-chaining H+V timer IRQ with two
+; states (cached in K_FRAME_STATE):
+;
+;   State A (0) — fires at V=VIS_END (bottom-letterbox blank line):
+;       force-blank; if a frame is staged (K_FRAME_READY != 0) run
+;       frame_dma (PPU batch + HDMA ch1-6 + DMA-list walk); then
+;       schedule the unblank at V=top_lb and advance to state B.
+;
+;   State B (1) — fires at V=top_lb (visible-region start):
+;       unblank; schedule the next blank+burst at V=VIS_END; → state A.
+;
+; H+V mode (NMITIMEN=$30) is armed once at init and never changed here;
+; only the V target (VTIMEL/H) is reprogrammed per event. HTIME stays
+; 22. The screen stays force-blanked from VIS_END through vblank and
+; the top letterbox — the full DMA-able window — and unblanks at top_lb.
+; ------------------------------------------------------------------
+.proc irq
+    rep #$30
+    .a16
+    .i16
+    pha
+    phx
+    phy
+    sep #$20
+    .a8
 
-    lda K_LAYOUT_TOP_LB
-    beq @nmi_no_top_lb
+    lda K_FRAME_STATE
+    bne @state_b
 
-    ; Has top letterbox: state 0 (VISIBLE_START), V target = top_lb,
-    ; INIDISP = $80. ISR at line top_lb will unblank.
-    ; v2.30.12: use HV-IRQ mode (NMITIMEN=$B0, bits 4+5 set) at
-    ; H=1 so IRQ fires at a specific (V, H) point each frame instead
-    ; of "somewhere on the V line" — eliminates the H-position
-    ; jitter the V-IRQ-only mode was producing.
-    stz K_FRAME_STATE       ; state 0 = VISIBLE_START
-    sta VTIMEL
-    stz VTIMEH
-    lda #22                 ; H=22 dots = master cyc 88, just past HBLANK
-    sta HTIMEL
-    stz HTIMEH
+    ; ===== State A: blank, then (if staged) burst =====
     lda #$80
     sta INIDISP
-    lda #$B0                ; NMI + HVIRQ (bits 7+5+4)
-    sta NMITIMEN
-    bra @nmi_hirq_done
+    lda K_FRAME_READY
+    beq @a_schedule         ; no staged frame -> keep letterbox, skip DMA
+    jsr frame_dma           ; PPU batch + HDMA ch1-6 + DMA-list walk
+    sep #$20                ; frame_dma is A8 on return, but be explicit
+    .a8
+@a_schedule:
+    ; schedule the unblank at V = top_lb (state B)
+    lda K_LAYOUT_TOP_LB
+    sta VTIMEL
+    stz VTIMEH
+    lda #$01
+    sta K_FRAME_STATE       ; -> state B
+    bra @ack
 
-@nmi_no_top_lb:
-    ; No top letterbox. Skip directly to state 1 (VISIBLE_END) so the
-    ; ISR's first fire at visible_end re-blanks for the bottom region.
-    ; If bot_lb=0 too AND no siphon, no IRQ needed at all.
-    lda K_LAYOUT_BOT_LB
-    ora K_SIPHON_BYTES
-    beq @nmi_no_hirq
-    lda #1                  ; state 1 = VISIBLE_END
-    sta K_FRAME_STATE
+@state_b:
+    ; ===== State B: unblank for the visible region =====
+    lda #$0F
+    sta INIDISP
     lda K_LAYOUT_VIS_END
     sta VTIMEL
     stz VTIMEH
-    lda #22                 ; H=22 dots = master cyc 88, just past HBLANK
-    sta HTIMEL
-    stz HTIMEH
-    lda #$B0                ; NMI + HVIRQ
-    sta NMITIMEN
-    bra @nmi_hirq_done
+    stz K_FRAME_STATE       ; -> state A
 
-@nmi_no_hirq:
-    lda #$80
-    sta NMITIMEN
-
-@nmi_hirq_done:
-    rep #$10                ; restore 16-bit X for the epilogue
-
-@out:
+@ack:
+    lda TIMEUP              ; ack the timer IRQ (read $4211)
     rep #$30
     .a16
     .i16
     ply
     plx
     pla
+    rti
+.endproc
+
+; ------------------------------------------------------------------
+; nmi_stub — NMI is disabled (NMITIMEN bit7 = 0); park RAMVEC_NMI at a
+; bare RTI so a stray/edge NMI is harmless rather than a wild jump.
+; ------------------------------------------------------------------
+.proc nmi_stub
     rti
 .endproc
 
@@ -820,79 +774,5 @@
     rts
 .endproc
 
-; ------------------------------------------------------------------
-; v2.29 Phase 3a: default HIRQ handler.
-;
-; State-machine dispatcher driven by K_FRAME_STATE (cached in WRAM
-; at vblank by the NMI handler). Handles letterbox transitions
-; (INIDISP toggling at top_lb and visible_end) using the cached
-; K_LAYOUT_TOP_LB / K_LAYOUT_VIS_END values. Siphon support stubbed
-; for Phase 3a — a future iteration extends the SIPHON state with
-; per-fire CPU DMA.
-;
-; State 0 (VISIBLE_START): fired at line top_lb. Set INIDISP=$0F.
-;                          If bot_lb>0, advance to state 1 with V
-;                          target = visible_end. Else state 2 (done).
-; State 1 (VISIBLE_END):   fired at line visible_end (= 224 - bot_lb).
-;                          Set INIDISP=$80. Move to state 2.
-; State 2 (DORMANT):       NMI hasn't reset us yet — should not fire,
-;                          but if it does, just ack and exit.
-;
-; Cycle cost per fire (worst — state 0 with bot_lb>0):
-;   IRQ entry 7 + PHP/SEP/PHA 30 + state dispatch 25 + INIDISP write
-;   25 + V target update 35 + state update 20 + $4211 ack 12 + PLA/PLP/
-;   RTI 50 = ~204 master cycles, well within the 1364-master scanline.
-; ------------------------------------------------------------------
-.proc default_hirq_handler
-    .a8
-    .i8
-    php                         ; save P (carries M/X flags)
-    sep #$20                    ; force M=8 for 1-byte ops
-    pha
-
-    lda K_FRAME_STATE
-    cmp #1
-    beq @state_visible_end
-    cmp #2
-    beq @state_dormant
-
-    ; --- State 0: VISIBLE_START — unblank, schedule next event ---
-    lda #$0F
-    sta INIDISP
-    ; If bot_lb > 0, next event = visible_end (transition back to blank).
-    ; H target (HTIMEL=22) was already set by NMI and unchanged.
-    lda K_LAYOUT_BOT_LB
-    beq @vs_no_bot_lb
-    lda K_LAYOUT_VIS_END
-    sta VTIMEL
-    stz VTIMEH
-    lda #1                      ; state 1 = waiting on VISIBLE_END
-    sta K_FRAME_STATE
-    bra @hirq_ack
-
-@vs_no_bot_lb:
-    ; No bottom letterbox — nothing more to do this frame.
-    lda #2
-    sta K_FRAME_STATE
-    bra @hirq_ack
-
-@state_visible_end:
-    ; --- State 1: VISIBLE_END — force-blank the bottom region ---
-    lda #$80
-    sta INIDISP
-    lda #2
-    sta K_FRAME_STATE
-    ; (Could also set V target to vblank to stop firing this frame;
-    ; for now leave VTIMEL at visible_end — next IRQ won't fire until
-    ; V wraps and matches again, which won't happen this frame.)
-    bra @hirq_ack
-
-@state_dormant:
-    ; --- State 2: DORMANT — shouldn't fire, but ack defensively ---
-
-@hirq_ack:
-    lda $4211                   ; ack IRQ (read TIMEUP)
-    pla
-    plp
-    rti
-.endproc
+; default_hirq_handler removed in v2.34 — the unified `irq` proc above
+; now owns the letterbox INIDISP transitions (state A/B) directly.

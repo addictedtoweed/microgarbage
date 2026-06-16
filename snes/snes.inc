@@ -34,6 +34,11 @@ CGADD     = $2121      ; CGRAM word address
 CGDATA    = $2122      ; CGRAM data write
 TM        = $212C      ; main-screen layer enable
 TS        = $212D      ; sub-screen layer enable
+SETINI    = $2133      ; screen mode / interlace (bit0 = interlace)
+SLHV      = $2137      ; software latch of H/V counters (read to latch)
+OPVCT     = $213D      ; V counter (read low then high; bit8 in high byte)
+STAT78    = $213F      ; PPU2 status (read resets OPHCT/OPVCT read toggle)
+TIMEUP    = $4211      ; read to acknowledge an H/V-timer IRQ
 
 ; --- Mode 7 PPU registers (write-twice 8-bit each) ---
 M7SEL     = $211A      ; wrap / fill / flip

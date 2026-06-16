@@ -61,6 +61,8 @@ extern const unsigned char demo_pcm_stream_elf [];
 extern const size_t        demo_pcm_stream_elf_len;
 extern const unsigned char demo_fmv_elf [];
 extern const size_t        demo_fmv_elf_len;
+extern const unsigned char demo_fmv_flip_elf [];
+extern const size_t        demo_fmv_flip_elf_len;
 extern const unsigned char demo_fmv_still_elf [];
 extern const size_t        demo_fmv_still_elf_len;
 extern const unsigned char demo_nmi_smoke_elf [];
@@ -380,6 +382,7 @@ static void install_bundled_demos(void) {
     install_demo("/demos/audio_mixer.elf", demo_audio_mixer_elf, demo_audio_mixer_elf_len);
     install_demo("/demos/pcm_stream.elf",  demo_pcm_stream_elf,  demo_pcm_stream_elf_len);
     install_demo("/demos/fmv.elf",         demo_fmv_elf,         demo_fmv_elf_len);
+    install_demo("/demos/fmv_flip.elf",    demo_fmv_flip_elf,    demo_fmv_flip_elf_len);
     install_demo("/demos/fmv_still.elf",   demo_fmv_still_elf,   demo_fmv_still_elf_len);
     install_demo("/demos/nmi_smoke.elf",   demo_nmi_smoke_elf,   demo_nmi_smoke_elf_len);
 }

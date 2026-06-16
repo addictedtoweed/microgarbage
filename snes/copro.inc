@@ -99,6 +99,13 @@ COPRO_SIPHON_WRAM_LO_L        = (COPRO_BANK << 16) | $79BE
 COPRO_SIPHON_WRAM_MID_L       = (COPRO_BANK << 16) | $79BF
 COPRO_SIPHON_WRAM_HI_L        = (COPRO_BANK << 16) | $79C0
 
+; v2.34 virtual-NMI chainer: frame-done strobe. The kernel reads this
+; (the read IS the signal) once it has walked the LAST staged DMA slot
+; of a frame. The host, on this read, bumps frame_consumed + clears
+; frame_ready. If the chainer defers (window full) it does NOT read
+; this, so frame_ready stays set and the next burst resumes the walk.
+COPRO_FRAME_DONE_L            = (COPRO_BANK << 16) | $79C1
+
 ; --- per-frame DMA dispatch ------------------------------------------
 ; The kernel checks COPRO_FRAME_RDY in NMI; 0 means the copro is mid-stage
 ; (do nothing this vblank, the previous frame stays on screen). When the
@@ -224,7 +231,17 @@ PL_CHR_LEN      = 24960
 ;   $0200-$02FF kernel vars    $0400-$1FFF kernel code (copied here)
 RAMVEC_NMI      = $0200         ; RAM kernel installs its NMI handler addr here
 RAMVEC_IRQ      = $0202         ; ...and its IRQ handler
-                                ; $0210-$021F: free (was DMA_CACHE in the bitmask design)
+; v2.34 virtual-NMI: NMI is disabled; the unified H+V IRQ does all the
+; per-frame work. The main @loop caches the frame-ready byte + a slot
+; cursor here for the IRQ's state-A burst.
+K_FRAME_READY   = $0210         ; cached COPRO_FRAME_RDY (read once per @loop)
+K_SLOT_CURSOR   = $0211         ; chainer: next DMA-list slot index (0..8),
+                                ; persists across bursts for defer/resume
+K_VLO           = $0212         ; chainer: V-counter assembly (K_VLO/K_VHI
+K_VHI           = $0213         ;   adjacent so a 16-bit load reads both)
+K_BYTES_REM     = $0214         ; chainer: bytes the blank window can still
+                                ; sink before the unblank deadline (16-bit)
+                                ; $0216-$021F: free
 PADS            = $0220         ; 4 pads x 16 bits = 8 bytes (PADS+0..+7); see
                                 ; read_joypads in kernel.s for layout. Order
                                 ; mirrors auto-joypad register format ($4218):

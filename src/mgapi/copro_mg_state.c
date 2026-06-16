@@ -22,7 +22,23 @@
 #include "cart_window.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* DMA-slot tracing — enabled by setting MG_DMA_TRACE=1 in the env.
+ * Logs every stage_dma accept, every flush_subframes split, and every
+ * write_subframe_to_cart_window emit so we can see where slots are
+ * dropped (test ROM proved the SNES side is fine — bug is in this
+ * staging path). Gated to keep production runs quiet. */
+static int dma_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MG_DMA_TRACE");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+static unsigned s_trace_frame = 0;
 
 /* The payload area in the cart window (offset 0 .. CW_OFF_JOY_BASE).
  * We bump-allocate within it each frame; reset on every build_frame
@@ -230,6 +246,7 @@ void mg_state_reset(void) {
         bg->enabled_sub   = false;
         bg->hofs = bg->vofs = 0;
         bg->dirty_lo = bg->dirty_hi = 0;
+        bg->shadow_ever_written = false;
     }
 
     /* Sprite config defaults: smallest size pair, CHR base 0. */
@@ -487,6 +504,7 @@ void mg_state_dirty_bg(uint8_t layer, uint16_t lo, uint16_t hi) {
     if (lo >= hi || hi > MG_BG_TILEMAP_BYTES) return;
     widen_range(&s_state.bg[layer].dirty_lo,
                 &s_state.bg[layer].dirty_hi, lo, hi);
+    s_state.bg[layer].shadow_ever_written = true;
 }
 
 /* ----------------------------------------------------------------
@@ -508,11 +526,29 @@ static uint32_t alloc_payload(uint32_t bytes) {
  * slot pointing at them. Returns true on success. */
 static bool stage_dma(const void *src, uint32_t size,
                       uint8_t bbus, uint8_t dmap, uint16_t prep) {
-    if (s_staged_count >= MG_MAX_STAGED_SLOTS) return false;
+    if (s_staged_count >= MG_MAX_STAGED_SLOTS) {
+        if (dma_trace_enabled()) {
+            fprintf(stderr, "[mgdma f%u] stage_dma OVERFLOW (staged=%u cap=%u) "
+                            "drop size=%u bbus=%02x dmap=%02x\n",
+                    s_trace_frame, s_staged_count,
+                    (unsigned)MG_MAX_STAGED_SLOTS,
+                    (unsigned)size, bbus, dmap);
+        }
+        return false;
+    }
     if (size == 0) return true;     /* nothing to do, success */
 
     uint32_t off = alloc_payload(size);
-    if (off == UINT32_MAX) return false;
+    if (off == UINT32_MAX) {
+        if (dma_trace_enabled()) {
+            fprintf(stderr, "[mgdma f%u] stage_dma PAYLOAD_FULL "
+                            "(used=%u + need=%u > %u) drop bbus=%02x dmap=%02x\n",
+                    s_trace_frame, s_payload_used, (unsigned)size,
+                    (unsigned)(PAYLOAD_AREA_END - PAYLOAD_AREA_START),
+                    bbus, dmap);
+        }
+        return false;
+    }
 
     cart_window_load_blob(off, src, size);
 
@@ -523,6 +559,12 @@ static bool stage_dma(const void *src, uint32_t size,
         .src  = (uint16_t)off,
         .size = (uint16_t)size,
     };
+    if (dma_trace_enabled()) {
+        fprintf(stderr, "[mgdma f%u] stage[%2u] size=%5u bbus=%02x dmap=%02x "
+                        "prep=%04x src=$%04x\n",
+                s_trace_frame, s_staged_count - 1,
+                (unsigned)size, bbus, dmap, prep, (unsigned)off);
+    }
     /* Keep s_slot_used as a parallel byte-counter for legacy budget
      * APIs (mg_state_slots_remaining). One slot of any size counts
      * once toward the 8-slot soft limit the older API exposes; with
@@ -552,6 +594,18 @@ static void write_subframe_to_cart_window(const SubFrame *sf) {
             cart_window_set_dma_slot(i, &empty_slot);
         }
     }
+    if (dma_trace_enabled()) {
+        fprintf(stderr, "[mgdma f%u]   SF[%u/%u] emit %u slot(s):",
+                s_trace_frame, s_subframe_index,
+                s_subframe_count ? s_subframe_count - 1 : 0,
+                sf->slot_count);
+        for (unsigned i = 0; i < sf->slot_count; i++) {
+            fprintf(stderr, " #%u(sz=%u bb=%02x dm=%02x)",
+                    i, sf->slots[i].size,
+                    sf->slots[i].bbus, sf->slots[i].dmap);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 /* Greedy-pack s_staged[] into sub-frames of ≤8 slots and ≤BUDGET bytes
@@ -561,6 +615,11 @@ static void write_subframe_to_cart_window(const SubFrame *sf) {
 static void flush_subframes(void) {
     s_subframe_count = 0;
     s_subframe_index = 0;
+    if (dma_trace_enabled()) {
+        s_trace_frame++;
+        fprintf(stderr, "[mgdma f%u] flush: %u staged slot(s)\n",
+                s_trace_frame, s_staged_count);
+    }
     if (s_staged_count == 0) {
         /* No work — clear cart-window slots so any leftover from a
          * previous frame's tail entries doesn't fire. */
@@ -602,6 +661,21 @@ static void flush_subframes(void) {
         }
         cur->slots[cur->slot_count++] = *s;
         cur_bytes += slot_bytes;
+    }
+
+    if (dma_trace_enabled()) {
+        fprintf(stderr, "[mgdma f%u] packed → %u sub-frame(s):",
+                s_trace_frame, s_subframe_count);
+        for (unsigned k = 0; k < s_subframe_count; k++) {
+            uint32_t sb = 0;
+            for (unsigned m = 0; m < s_subframes[k].slot_count; m++) {
+                uint32_t sz = s_subframes[k].slots[m].size;
+                sb += (sz == 0) ? 65536u : sz;
+            }
+            fprintf(stderr, " SF%u(%u slots, %u B)",
+                    k, s_subframes[k].slot_count, sb);
+        }
+        fprintf(stderr, "\n");
     }
 
     write_subframe_to_cart_window(&s_subframes[0]);
@@ -1091,12 +1165,26 @@ void mg_state_build_frame(void) {
     /* Same trick for BG tilemaps — widen each enabled layer's dirty
      * range to the full 2 KB so the emission below re-DMAs it. Three
      * frames cover the clean_slate VRAM-clear overrun window (see
-     * s_bg_reupload_frames at top of file). Disabled layers stay
-     * skipped — the emit_bg loop's enabled-check still gates each DMA. */
+     * s_bg_reupload_frames at top of file).
+     *
+     * Skip layers the guest has never written via the shadow path:
+     * widening an empty shadow buffer DMAs 2 KB of zeros onto the
+     * layer's current tilemap address, clobbering whatever else was
+     * uploaded there (e.g. demo_fmv uses mg_chr_upload_transient to
+     * write the visible tilemap and bypasses the shadow entirely —
+     * the reupload window was both wasting 488 B/frame of payload
+     * AND actively smearing zeros onto BG1's displayed buffer every
+     * frame, found via MG_DMA_TRACE log on 2026-06-12).
+     *
+     * Also skip layers the guest has already dirtied this frame — the
+     * guest's smaller dirty range is correct and widening it to the
+     * full 2 KB needlessly inflates payload. */
     if (s_bg_reupload_frames > 0) {
         for (unsigned i = 0; i < MG_BG_LAYERS; i++) {
             MgBgLayerState *bg = &s_state.bg[i];
             if (!bg->enabled_main && !bg->enabled_sub) continue;
+            if (!bg->shadow_ever_written) continue;     /* nothing to re-upload */
+            if (bg->dirty_hi > bg->dirty_lo) continue;  /* guest owns it */
             bg->dirty_lo = 0;
             bg->dirty_hi = MG_BG_TILEMAP_BYTES;
         }

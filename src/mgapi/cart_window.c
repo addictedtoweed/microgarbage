@@ -219,6 +219,28 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
         return g_frame_ready;
     }
 
+    /* v2.34 virtual-NMI chainer frame-done strobe. The kernel reads this
+     * once its DMA-list cursor has walked the last slot of the current
+     * sub-frame. Advance to the next sub-frame, or close out the logical
+     * frame (bump frame_consumed + clear frame_ready). This replaces the
+     * old port-7 advance trigger — the chainer decides completion, not a
+     * fixed per-frame joypad read. */
+    if (off == CW_OFF_FRAME_DONE) {
+        if (g_frame_ready != 0) {
+            if (mg_state_advance_subframe()) {
+                /* more sub-frames queued — keep frame_ready set */
+            } else {
+                g_frame_consumed++;
+                g_frame_ready = 0;
+                if (g_frame_consumed_hook) {
+                    g_frame_consumed_hook(g_frame_consumed,
+                                          g_frame_consumed_hook_userdata);
+                }
+            }
+        }
+        return 0;
+    }
+
     /* Boot strobe — one-shot side effect: clear kernel-ready bit so
      * the copro (us) knows the SNES is now running from RAM and we
      * can switch to runtime serving. Returned byte is don't-care. */
@@ -245,57 +267,12 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
     if (off >= CW_OFF_JOY_BASE && off < CW_OFF_JOY_END) {
         unsigned port = (unsigned)(off - CW_OFF_JOY_BASE) >> CW_JOY_PAGE_SHIFT;
         g_last_pad_port = port;
-        /* Port 7 = the LAST joypad mailbox read in the kernel's
-         * @loop sequence (pad 3 high byte). The kernel reads it on
-         * EVERY main-loop iteration regardless of whether NMI just
-         * processed a staged frame — so blindly bumping consumed
-         * every time would let it race far ahead of staged during
-         * the shell's idle period (no demo running). When the first
-         * demo finally commits, `staged > consumed` is already
-         * FALSE (consumed >> 1), so the very next iter's commit
-         * wouldn't early-return and would clear the just-staged
-         * slot BEFORE NMI 1 dispatched it. Result: frame 1's CGRAM
-         * DMA never lands in PPU; the screen is blank for demos
-         * that only re-dirty CGRAM once at setup (the visible
-         * symptom in mode7.elf).
-         *
-         * Fix: only bump consumed when frame_ready was 1 at the
-         * time of this port-7 read — i.e., NMI just walked a real
-         * staged frame. Also clear frame_ready to 0 so subsequent
-         * port-7 reads (from idle NMI loop iterations after demo
-         * exit, or before next commit) don't keep bumping. */
-        if (port == 7 && g_frame_ready != 0) {
-            /* v2.05: only advance once a real NMI has fired since the
-             * commit that loaded the current sub-frame. The kernel's
-             * @loop reads port 7 BEFORE its wai-for-NMI, so a naive
-             * advance on every read would skip sub-frame 0 (the read
-             * happens after commit but before NMI 1 processes it).
-             * `nmis_seen` counts $7800 reads since commit; the first
-             * port-7 read while nmis_seen == 0 must wait for NMI 1
-             * to actually fire before advancing. */
-            uint32_t nmis_seen = g_frame_ready_reads - g_subframe_init_reads;
-            if (nmis_seen > 0) {
-                /* NMI has fired (and processed the slots that were
-                 * loaded). Either load the next sub-frame, or close
-                 * out the logical frame if the queue is empty. */
-                if (mg_state_advance_subframe()) {
-                    /* keep g_frame_ready set */
-                    /* Re-latch baseline so subsequent reads gate on
-                     * the *next* NMI rather than the one that already
-                     * fired. */
-                    g_subframe_init_reads = g_frame_ready_reads;
-                } else {
-                    g_frame_consumed++;
-                    g_frame_ready = 0;
-                    if (g_frame_consumed_hook) {
-                        g_frame_consumed_hook(g_frame_consumed,
-                                              g_frame_consumed_hook_userdata);
-                    }
-                }
-            }
-            /* else: no NMI yet — leave the current sub-frame's slots
-             * alone so NMI 1 still processes them. */
-        }
+        /* v2.34: port 7 no longer advances sub-frames. The kernel's
+         * virtual-NMI chainer signals completion explicitly via the
+         * CW_OFF_FRAME_DONE strobe (handled above) when it has walked
+         * the last slot of a sub-frame — so advance is driven by the
+         * chainer's actual progress, not a fixed per-frame joypad read.
+         * Here we just record which port was polled. */
         return 0;
     }
 

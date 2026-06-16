@@ -13,6 +13,8 @@
 #    ./tools/run-bsnes.sh --bsnes-dir /c/bsnes  # explicit bsnes-plus location
 #    ./tools/run-bsnes.sh --rom path/to.sfc     # arbitrary ROM file
 #    ./tools/run-bsnes.sh --no-build            # skip snes/build.ps1
+#    ./tools/run-bsnes.sh --trace               # MG_DMA_TRACE=1 -> mgdma.log
+#    ./tools/run-bsnes.sh --trace --trace-log foo.log    # custom log path
 #
 #  Resolution order for bsnes (first match wins):
 #    1. --bsnes-dir argument
@@ -37,6 +39,8 @@ BSNES_DIR=""
 ROM=""
 SMOKE=0
 NO_BUILD=0
+TRACE=0
+TRACE_LOG="mgdma.log"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bsnes-dir) BSNES_DIR="$2"; shift 2 ;;
@@ -44,11 +48,23 @@ while [[ $# -gt 0 ]]; do
         --smoke)     SMOKE=1;        shift   ;;
         --boot)      SMOKE=0;        shift   ;;  # backward-compat alias for the default
         --no-build)  NO_BUILD=1;     shift   ;;
+        --trace)     TRACE=1;        shift   ;;
+        --trace-log) TRACE_LOG="$2"; shift 2 ;;
         -h|--help)
-            sed -n '3,18p' "$0"; exit 0 ;;
+            sed -n '3,20p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (use -h for usage)" ;;
     esac
 done
+
+# DMA-slot trace: gated on --trace. Bsnes is a GUI process and its
+# stderr lands nowhere by default; --trace exports MG_DMA_TRACE=1 and
+# redirects the detached child's stderr to $TRACE_LOG so the per-frame
+# stage/flush/emit lines from copro_mg_state.c are captureable.
+if (( TRACE )); then
+    export MG_DMA_TRACE=1
+else
+    unset MG_DMA_TRACE
+fi
 
 # Default mgapi rom_select to "boot" (the runtime kernel that picks up
 # the cart-window staging from running demos). --smoke flips to the
@@ -198,11 +214,25 @@ if [[ -n "$QT_BIN" ]]; then
 fi
 
 step "launching..."
+# Resolve the trace log path BEFORE the subshell cd's into BSNES_HOME,
+# so a relative --trace-log is anchored to the user's cwd, not bsnes's
+# install dir.
+if (( TRACE )); then
+    case "$TRACE_LOG" in
+        /*|[A-Za-z]:[/\\]*) TRACE_LOG_ABS="$TRACE_LOG" ;;
+        *)                  TRACE_LOG_ABS="$PWD/$TRACE_LOG" ;;
+    esac
+    step "MG_DMA_TRACE=1 -> stderr to $TRACE_LOG_ABS"
+fi
 (
     cd "$BSNES_HOME"
     # nohup-style: detach so bash returns immediately. The user
     # presumably wants the bsnes GUI plus their bash prompt back.
-    "$BSNES_EXE" "$ROM_W" &
+    if (( TRACE )); then
+        "$BSNES_EXE" "$ROM_W" 2> "$TRACE_LOG_ABS" &
+    else
+        "$BSNES_EXE" "$ROM_W" &
+    fi
     disown
 )
 step "done. (close the bsnes window to exit)"

@@ -185,17 +185,26 @@ void _start(void) {
     mg_bg_setup(MG_BG_LAYER_1, TM_B_WORD, MG_BG_SIZE_32x32, CHR_B_WORD);
     mg_bg_enable(MG_BG_LAYER_1, /*main=*/true, /*sub=*/false);
 
-    /* v2.31: mg_force_blank(8, 0) — TOP-only HDMA.
+    /* v2.32: mg_force_blank(7, 7) + BG1 vofs = -1.
      *
-     * At 15 fps the FMV is split into 4 sub-frame DMAs (one per NMI)
-     * of ~7000 B each. Per-NMI budget = (38 vblank + ~3 lines of DMA
-     * overrun) × ~165 = ~6700 B safe; each chunk fits with some
-     * give. The 8 lines of HDMA-written $80 are mostly decorative —
-     * with this small a per-NMI DMA, the kernel's @done writes $0F
-     * at around line 3-4 of next frame and FMV pixels start at line
-     * 8 (BLANK_TILE row 0 in the tilemap), so no clipping. Full
-     * 240×208 FMV visible, 8 lines of backdrop margin top + bottom. */
-    mg_force_blank(8, 0);
+     * Top=7: end force-blank one line earlier than where FMV content
+     * starts (= line 8), so the PPU has a warmup scanline of blank
+     * between unblank and first visible content. Without this, line 8
+     * flickers because PPU fetch starts on the same line where BG1
+     * content begins.
+     *
+     * Shift content down 1 px via vofs = -1 (511 in 9-bit). With the
+     * 32×32 tilemap's outer ring of BLANK_TILE margin, the image now
+     * occupies screen lines 9..216 (208 lines of FMV). Line 7-8 are
+     * visible blank margin (no flicker), 217..223 are bottom margin.
+     *
+     * Bottom=7: the bottom 7 lines (217..223) are already blank margin,
+     * so force-blanking them costs nothing visually AND grows the
+     * per-NMI DMA budget from 6479 + 7*117 = 7298 B to 6479 + 14*117
+     * = 8117 B — enough room for the 6800 B chunks with 1300+ B
+     * margin on every sub-frame instead of a marginal ~300 B. */
+    mg_force_blank(7, 7);
+    mg_bg_scroll(MG_BG_LAYER_1, 0, -1);
 
     init_tilemap_margins();
     dbg("fmv: opening file\r\n");
@@ -300,18 +309,32 @@ void _start(void) {
      * the START of the playback loop and END to validate that wall-
      * clock elapsed matches FMV duration (600 frames × 50 ms = 30 s). */
     uint32_t demo_start_ms = sys_ticks_now();
-    for (;;) {
+
+    /* 1-frame audio lookahead (cushion). The video upload STAGES into
+     * the host cart window, so once frame N is staged we can reload the
+     * single s_frame buffer with frame N+1 and feed its audio EARLY —
+     * while frame N is still on screen. The PCM-stream ring then stays
+     * ~1 frame ahead of the playhead and never drains to silence between
+     * the once-per-video-frame feeds (the source of the per-frame audio
+     * gaps). One buffer only — a second 38 KB chunk buffer overflows the
+     * guest data region. */
+
+    /* Prime: pull frame 0 and feed its audio before the display loop. */
+    bool have_cur = mg_stream_consume(stream, s_frame, chunk_bytes);
+    if (have_cur) {
+        (void)mg_audio_pcm_stream_feed(voice,
+                                        (const int16_t *)s_frame, abytes / 4u);
+    }
+
+    while (have_cur) {
         MgPads pads = mg_pads();
         if (mg_pad_pressed(pads.p0, MG_BTN_START)) break;
 
         if (frame >= nframes) break;
 
-        /* Pull one chunk = [audio | video] from the arbiter. Blocks
-         * with short sleep-retries if the ring is briefly empty;
-         * returns false on true EOF. */
-        if (!mg_stream_consume(stream, s_frame, chunk_bytes)) break;
-
-        /* split chunk: audio | CGRAM | tilemap | CHR */
+        /* split the CURRENT chunk (frame N) in s_frame. Its audio was
+         * already fed (prime / previous iter's lookahead); we use the
+         * video pointers. */
         const uint8_t *audio = s_frame;
         const uint8_t *cg    = audio + abytes;
         const uint8_t *tm    = cg + CGRAM_BYTES;
@@ -332,24 +355,43 @@ void _start(void) {
         }
 
         /* Tilemap: build the 32×32 with margins + FMV centered, then
-         * upload as raw 2048 B to the BACK tilemap address. Bypasses
+         * upload the full 2048 B to the BACK tilemap address. Bypasses
          * mg_bg_blit (which targets BG1's current tilemap_word, which
          * is FRONT for us). The runtime treats this as a transient
-         * VRAM-write DMA. */
+         * VRAM-write DMA.
+         *
+         * v2.32: was uploading only TILEMAP_BYTES (= 1560 = the raw FMV
+         * tilemap size of 30×26 cells), but the layout in s_tilemap is
+         * 32-wide so 1560 bytes only covers ~24 of the 32 rows —
+         * leaving the bottom 2-3 rows of the FMV image with stale
+         * tilemap cells from a previous frame. Visible symptom was a
+         * "flicker at the top of the FMV image" that moved down with
+         * the image when vofs shifted; was actually mis-rendered
+         * cells at the bottom edge. Full 32×32 upload (2048 B) covers
+         * every row of s_tilemap and eliminates the staleness. */
         splat_fmv_tilemap(tm);
-        mg_chr_upload_transient(back_tm, s_tilemap, TILEMAP_BYTES);
+        mg_chr_upload_transient(back_tm, s_tilemap, sizeof(s_tilemap));
 
-        /* v2.31: CHR split across 4 sub-frame-sized chunks (was 3).
-         * At 15 fps the kernel processes 4 NMI sub-frames per FMV
-         * frame, so we get 4× the per-NMI DMA budget windows. Per-NMI
-         * budget at (38+8) lines × ~165 B/line ≈ 7590 B; sizes below
-         * fit with margin. Mid-tile splits land contiguously in VRAM
-         * after all 4 chunks complete (each frame's BG1 buffer is the
-         * one fully uploaded the PREVIOUS iteration, double-buffered). */
-        const uint16_t CHR_C1 = 4160;
-        const uint16_t CHR_C2 = 6900;
-        const uint16_t CHR_C3 = 6900;
-        const uint16_t CHR_C4 = (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2 - CHR_C3);
+        /* CHR split across 4 sub-frame-sized chunks. SF0 also carries
+         * CGRAM (256) + tilemap (2048) = 2304 B of overhead, so chr1
+         * has the smallest CHR budget; chr2..4 each go into their own
+         * SF and split the rest.
+         *
+         * v2.32: ALL chunks must be 32-byte multiples (= whole tiles)
+         * so each chunk boundary lands BETWEEN tiles, not mid-tile.
+         * The previous 4560/6800/6800/6800 split was 142.5/212.5/212.5
+         * /212.5 tiles — each boundary in the middle of a tile, so
+         * any timing wobble on either side corrupted that single tile's
+         * CHR bytes (visible as a checkerboard band where the affected
+         * tilemap cells referenced those boundary tiles).
+         *
+         * 780 tiles split 150/210/210/210 = 4800/6720/6720/6720 bytes.
+         * SF0 = 4800 + 2304 overhead = 7104 vs 8117 budget = 1013 B
+         * margin. SF1..3 = 6720 vs 8117 = 1397 B margin. */
+        const uint16_t CHR_C1 = 4800;   /* 150 tiles */
+        const uint16_t CHR_C2 = 6720;   /* 210 tiles */
+        const uint16_t CHR_C3 = 6720;   /* 210 tiles */
+        const uint16_t CHR_C4 = (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2 - CHR_C3); /* 6720 / 210 tiles */
         mg_chr_upload_transient(back_chr + 0u,
                                  chr + 0u, CHR_C1);
         mg_chr_upload_transient((uint16_t)(back_chr + CHR_C1 / 2u),
@@ -359,46 +401,41 @@ void _start(void) {
         mg_chr_upload_transient((uint16_t)(back_chr + (CHR_C1 + CHR_C2 + CHR_C3) / 2u),
                                  chr + CHR_C1 + CHR_C2 + CHR_C3, CHR_C4);
 
-        /* Feed audio (may partially fail if ring is near full; the
-         * absolute-time pacing below blocks 50 ms per iter so the
-         * mixer drains enough that the FOLLOWING iter's feed will
-         * succeed fully). */
-        uint32_t aframes = abytes / 4u;
-        (void)mg_audio_pcm_stream_feed(voice,
-                                        (const int16_t *)audio,
-                                        aframes);
+        /* Save frame N's palette (pairs with this buffer when it goes
+         * FRONT next iter) NOW, while s_frame still holds frame N —
+         * BEFORE the lookahead reload below clobbers it. */
+        my_memcpy(s_prev_palette, cg, CGRAM_BYTES);
 
-        /* Commit. Sub-frame chaining DMAs the back buffer across 3
-         * NMIs. BG1 stays on the previous-back-now-front during this
-         * window, displaying clean. */
+        /* LOOK AHEAD: frame N's video is already STAGED into the cart
+         * window, so s_frame is free to reload. Pull the NEXT frame and
+         * feed its audio NOW, while frame N is still on screen — keeping
+         * the PCM-stream ring ~1 frame ahead so it never drains to
+         * silence between feeds. have_next is false at EOF; we still
+         * display frame N this iter, then exit. */
+        bool have_next = mg_stream_consume(stream, s_frame, chunk_bytes);
+        if (have_next) {
+            (void)mg_audio_pcm_stream_feed(voice,
+                                            (const int16_t *)s_frame,
+                                            abytes / 4u);
+        }
+
+        /* Commit + pace. mg_wait_frame blocks until the kernel has
+         * consumed the committed frame (all sub-frames walked), giving
+         * exact kernel-cadence pacing with no drift. target_ms stays for
+         * the elapsed-time profile print at exit. */
         mg_frame_commit();
-
-        /* v2.31: pace by waiting for the kernel to consume the
-         * committed frame (= all sub-frames processed). At 15 fps
-         * with 4 sub-frames, that's exactly 4 NMIs = 4/60 s =
-         * 66.67 ms — which doesn't divide evenly into integer ms,
-         * so the old time-based sleep at 66 ms woke up 0.67 ms
-         * early and h_frame_commit silently dropped commits whose
-         * predecessors hadn't been fully consumed yet. mg_wait_frame
-         * gives exact kernel-cadence pacing with no drift. The
-         * target_ms accounting stays for the elapsed-time profile
-         * print at exit. */
         target_ms += ms_per_frame;
         mg_wait_frame();
 
-        /* Stage BG1 swap: after this iteration, BG1 should display
-         * what we just uploaded (back becomes new front in next iter
-         * when the PPU batch with these values is applied). */
+        /* Stage BG1 swap: BG1 displays what we just uploaded once the
+         * PPU batch with these values is applied next iter. */
         mg_bg_setup(MG_BG_LAYER_1, back_tm, MG_BG_SIZE_32x32, back_chr);
-
-        /* Save this frame's palette to apply when this buffer goes
-         * front (NEXT iteration's CGRAM upload). */
-        my_memcpy(s_prev_palette, cg, CGRAM_BYTES);
 
         if ((frame & 31) == 0) {
             dbg("fmv: frame "); dbg_u32(frame); dbg("\r\n");
         }
         frame++;
+        have_cur = have_next;
     }
     /* Elapsed-time profile. Same SYS_TICKS_NOW read at start +
      * finish; difference is wall-clock ms. Prints sec.ms + a frame

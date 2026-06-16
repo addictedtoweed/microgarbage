@@ -178,7 +178,7 @@ write_full_stub() {
                    demo_palette_elf demo_letterbox_elf demo_dynamic_letterbox_elf \
                    demo_sprite_elf demo_mode7_elf demo_mode7_3d_elf \
                    demo_audio_mixer_elf demo_pcm_stream_elf demo_fmv_elf \
-                   demo_fmv_still_elf demo_nmi_smoke_elf; do
+                   demo_fmv_flip_elf demo_fmv_still_elf demo_nmi_smoke_elf; do
             echo "const unsigned char ${sym}[] = {0};"
             echo "const size_t ${sym}_len = 0;"
         done
@@ -238,6 +238,7 @@ if [ "$no_guest" = 0 ] && [ -n "$GUESTCC" ]; then
         "tools/guests/demos/demo_audio_mixer.c|demo_audio_mixer_elf|demo_audio_mixer.elf|demo_audio_mixer_elf_data.c|mg"
         "tools/guests/demos/demo_pcm_stream.c|demo_pcm_stream_elf|demo_pcm_stream.elf|demo_pcm_stream_elf_data.c|mg"
         "tools/guests/demos/demo_fmv.c|demo_fmv_elf|demo_fmv.elf|demo_fmv_elf_data.c|mg"
+        "tools/guests/demos/demo_fmv_flip.c|demo_fmv_flip_elf|demo_fmv_flip.elf|demo_fmv_flip_elf_data.c|mg"
         "tools/guests/demos/demo_fmv_still.c|demo_fmv_still_elf|demo_fmv_still.elf|demo_fmv_still_elf_data.c|mg"
         "tools/guests/demos/demo_nmi_smoke.c|demo_nmi_smoke_elf|demo_nmi_smoke.elf|demo_nmi_smoke_elf_data.c|mg"
     )

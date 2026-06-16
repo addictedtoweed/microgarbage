@@ -225,6 +225,13 @@ extern "C" {
 #define CW_OFF_SIPHON_WRAM_MID        (CW_OFF_SIPHON_CONFIG + 4u)
 #define CW_OFF_SIPHON_WRAM_HI         (CW_OFF_SIPHON_CONFIG + 5u)
 
+/* v2.34 virtual-NMI chainer: frame-done strobe. The kernel reads this
+ * once it has walked the last slot of the current sub-frame (the read
+ * IS the signal). The host advances to the next sub-frame, or closes
+ * the logical frame (bump frame_consumed + clear frame_ready). Replaces
+ * the old port-7 advance trigger. */
+#define CW_OFF_FRAME_DONE             0x79C1u
+
 /* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
  * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap
  * between Mode 7 batch ($79A0..$79AF) and HDMA tables ($7A00..). A
