@@ -21,7 +21,21 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* v2.36 diagnostic toggle: max frames in flight. 2 = commit-ahead
+ * pipeline (20fps target); set env MG_NO_COMMIT_AHEAD=1 to force 1 =
+ * the old single-frame behaviour, for A/B isolating render glitches.
+ * Cached on first read. */
+static unsigned pipeline_max_inflight(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MG_NO_COMMIT_AHEAD");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 2;
+    }
+    return (unsigned)cached;
+}
 
 /* SYS_COPRO_STAGE_PAYLOAD(window_off, guest_buf, size) → 0/-errno */
 static void h_stage_payload(VmCpu *cpu, void *system) {
@@ -104,8 +118,15 @@ static void h_frame_commit(VmCpu *cpu, void *system) {
      *
      * "byte=0" is the explicit cancel path; still honor it so a
      * guest can pull a frame back if it decides to. */
+    /* v2.36 commit-ahead: allow up to TWO frames in flight (active +
+     * queued) instead of one. Only drop a commit when the queue is
+     * genuinely full (in-flight >= 2) — the guest's commit→wait loop
+     * blocks at depth 2, so this drop path is defensive. Permitting the
+     * second commit is what lets the guest stage frame N+1 while the SNES
+     * is still bursting N, so the kernel never idles between frames. */
     if (byte != 0 &&
-        cart_window_frame_staged() > cart_window_frame_consumed()) {
+        (cart_window_frame_staged() - cart_window_frame_consumed())
+            >= pipeline_max_inflight()) {
         /* Drop the HDMA-table bump pointer so the next iteration's
          * mg_hdma_upload_table calls start from offset 0 again — the
          * pool would otherwise accumulate this iteration's uploads on
@@ -197,13 +218,20 @@ static void h_wait_vblank(VmCpu *cpu, void *system) {
     (void)system;
     uint32_t staged   = cart_window_frame_staged();
     uint32_t consumed = cart_window_frame_consumed();
-    if (consumed >= staged) {
-        /* Nothing in flight — return immediately. */
+    /* v2.36 commit-ahead: block only when the 2-deep queue is FULL
+     * (in-flight >= 2). With room for another frame the guest returns
+     * immediately and goes on to stage N+1 while the SNES bursts N —
+     * that overlap is the 20fps pipeline. Wake when consumed catches up
+     * to staged-1 (i.e. in-flight drops back to 1). staged>=2 here, so
+     * staged-1 never underflows. */
+    unsigned maxinflight = pipeline_max_inflight();
+    if ((staged - consumed) < maxinflight) {
+        /* Room for another commit — return immediately. */
         cpu->regs[VM_REG_A0] = 0;
         return;
     }
     cpu->block_reason   = BLOCK_FRAME_CONSUMED;
-    cpu->block_deadline = staged;
+    cpu->block_deadline = staged - (maxinflight - 1u);
     cpu->regs[VM_REG_A0] = 0;   /* set on wake, but be defensive */
 }
 

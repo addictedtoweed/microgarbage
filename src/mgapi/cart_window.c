@@ -227,11 +227,19 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
      * fixed per-frame joypad read. */
     if (off == CW_OFF_FRAME_DONE) {
         if (g_frame_ready != 0) {
-            if (mg_state_advance_subframe()) {
-                /* more sub-frames queued — keep frame_ready set */
+            int adv = mg_state_advance_subframe();
+            if (adv == MG_ADVANCE_MORE) {
+                /* more sub-frames of the active frame — keep frame_ready */
             } else {
+                /* A logical frame completed (PROMOTED or EMPTY). Bump
+                 * consumed either way so mg_wait_frame's back-pressure
+                 * releases. Clear frame_ready ONLY when the queue is
+                 * empty; on PROMOTED the next frame is already active and
+                 * resident, so the kernel keeps bursting with no gap. */
                 g_frame_consumed++;
-                g_frame_ready = 0;
+                if (adv == MG_ADVANCE_EMPTY) {
+                    g_frame_ready = 0;
+                }
                 if (g_frame_consumed_hook) {
                     g_frame_consumed_hook(g_frame_consumed,
                                           g_frame_consumed_hook_userdata);

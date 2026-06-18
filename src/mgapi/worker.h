@@ -49,6 +49,12 @@ void mgapi_worker_stop(void);
  * to call before mgapi_worker_start (becomes a no-op then). */
 void mgapi_worker_signal(uint64_t elapsed_ns);
 
+/* v2.35: wake the worker to run a tick without advancing the vblank
+ * clock — used by the frame-consumed hook so mg_wait_frame waiters
+ * resume immediately instead of waiting for the next periodic signal.
+ * Returns immediately; safe from any thread. */
+void mgapi_worker_wake(void);
+
 #ifdef __cplusplus
 }
 #endif

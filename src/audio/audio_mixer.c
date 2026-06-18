@@ -581,7 +581,22 @@ void mixer_set_source_rate(AudioMixer *m, size_t channel, uint32_t source_rate) 
      * Reset phase + interpolation taps so the new rate kicks in cleanly
      * at the next sample fed to the channel — callers typically pair
      * this with mixer_channel_reset before feeding a new sample. */
-    if (source_rate == 0 || (int)source_rate == m->sample_rate) {
+    if (m->sync_enabled) {
+        /* Under sync (drift correction) ALL channels stay on the
+         * resampling path so the runtime step correction applies to
+         * them. Native-rate channels get base_step = 1.0; the next
+         * mixer_observe_sync trims step around it. Otherwise a 44.1 kHz
+         * PCM stream would be flagged passthrough (step=0) and the
+         * drift correction could never reach it. */
+        c->needs_resample = true;
+        if (source_rate == 0 || (int)source_rate == m->sample_rate) {
+            c->base_step = (uint64_t)1 << 32;          /* 1.0 in q32.32 */
+        } else {
+            c->base_step = compute_step_q32_32((int)source_rate,
+                                                m->sample_rate);
+        }
+        c->step = c->base_step;   /* correction reapplied on next observe */
+    } else if (source_rate == 0 || (int)source_rate == m->sample_rate) {
         c->needs_resample = false;
         c->base_step      = 0;
         c->step           = 0;

@@ -20,10 +20,37 @@
 #include "copro_mg_state.h"
 
 #include "cart_window.h"
+#include "l2_init.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* v2.36: commit-ahead pipeline needs one lock. Commit runs on the
+ * worker thread; the FRAME_DONE promotion runs on the bsnes (cart-read)
+ * thread. The single-frame model dodged this race by gating (commit
+ * dropped while a frame was in flight); commit-ahead removes the gate,
+ * so the active/pending state transition must be serialized. Critical
+ * section is tiny (flag flips + one ~27 KB host->cart-window copy,
+ * ~3 µs), so the bsnes thread never meaningfully stalls. */
+#if defined(_WIN32)
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+  static CRITICAL_SECTION s_queue_cs;
+  static int              s_queue_cs_ready;
+  static inline void queue_lock_init(void) {
+      if (!s_queue_cs_ready) { InitializeCriticalSection(&s_queue_cs);
+                               s_queue_cs_ready = 1; }
+  }
+  static inline void queue_lock(void)   { EnterCriticalSection(&s_queue_cs); }
+  static inline void queue_unlock(void) { LeaveCriticalSection(&s_queue_cs); }
+#else
+  #include <pthread.h>
+  static pthread_mutex_t s_queue_mx = PTHREAD_MUTEX_INITIALIZER;
+  static inline void queue_lock_init(void) { }
+  static inline void queue_lock(void)   { pthread_mutex_lock(&s_queue_mx); }
+  static inline void queue_unlock(void) { pthread_mutex_unlock(&s_queue_mx); }
+#endif
 
 /* DMA-slot tracing — enabled by setting MG_DMA_TRACE=1 in the env.
  * Logs every stage_dma accept, every flush_subframes split, and every
@@ -64,6 +91,39 @@ static unsigned s_trace_frame = 0;
 
 /* The singleton state. */
 static MgState s_state;
+
+/* v2.35: host-side payload staging buffer (the FMV pipeline / MCU model).
+ *
+ * Guest uploads no longer land directly in the cart window. They land
+ * HERE — a buffer carved from the L2 allocator (QSPI PSRAM on the MCU,
+ * a malloc slice on Windows). flush_subframes then copies the used
+ * range from here into the cart window (DTCM on the MCU) in one shot.
+ * This is the PSRAM->DTCM copy seam ([[mcu-copy-architecture]]).
+ *
+ * Why bother (vs. staging straight into the window): it decouples
+ * "where the guest stages" from "what the SNES is currently DMAing",
+ * which is the prerequisite for double-buffering the staging a frame
+ * ahead (20fps pipeline, task #55). Step 1 keeps it single-buffered —
+ * same behaviour, same fps — to validate the indirection in isolation.
+ *
+ * Bulk frame data -> L2 (PSRAM). The cart window itself is the L1/DTCM
+ * side. Lazily allocated on first stage so it costs nothing for hosts
+ * that never stage a frame; freed by mg_state_shutdown. */
+static uint8_t *s_host_payload;
+#define HOST_PAYLOAD_BYTES  (PAYLOAD_AREA_END - PAYLOAD_AREA_START)
+
+static uint8_t *ensure_host_payload(void) {
+    if (!s_host_payload) {
+        s_host_payload = mgapi_l2_host_alloc(HOST_PAYLOAD_BYTES, 16);
+        if (!s_host_payload) {
+            fprintf(stderr,
+                "mgapi: L2 host payload alloc FAILED (%u bytes) — "
+                "is mgapi_l2_init wired before staging?\n",
+                (unsigned)HOST_PAYLOAD_BYTES);
+        }
+    }
+    return s_host_payload;
+}
 
 /* Bump pointer + DMA slot count for the cart-window payload + DMA
  * list. The "checkpoint" pair is what build_frame resets to instead
@@ -110,12 +170,15 @@ static unsigned s_prev_mg_slots;
  * commit demos (demo_fmv_still) failed to display anything.
  * 8 covers 2× the worst-case + headroom; ~80 B extra BSS. */
 #define MG_MAX_SUBFRAMES       8u   /* hard cap */
-/* Per-NMI DMA byte budget. Per the FMV design:
- *   (vblank_lines + force_blanked_lines) × 1364 cycles / 8 = bytes/NMI
+/* Per-burst DMA byte budget. Per the FMV design:
+ *   (vblank_lines + force_blanked_lines) × 1364 cycles / 8 = bytes/burst
  *   = (38 + 16) × 1364 / 8 = 9207 with force_blank(8, 8).
- * Round down a touch so callers' uploads don't bump right against
- * the wall. Sub-frame packing keeps total bytes ≤ this per group. */
-#define MG_SUBFRAME_BYTE_BUDGET 9200u
+ * Kept ≤ the kernel chainer's per-burst window (54 × 170 = 9180) so the
+ * host never packs a sub-frame the chainer would have to split across
+ * two bursts (which would cost a 4th burst and drop 20 fps → 15 fps).
+ * v2.36: was 9200 (> kernel 9180) while the kernel still budgeted the
+ * conservative 160 B/line; both now align on the real ~170 B/line. */
+#define MG_SUBFRAME_BYTE_BUDGET 9180u
 
 typedef struct {
     uint8_t  bbus;
@@ -134,9 +197,53 @@ static StagedSlot s_staged[MG_MAX_STAGED_SLOTS];
 static unsigned   s_staged_count;
 static unsigned   s_staged_checkpoint;   /* persistent prefix end */
 
+/* The ACTIVE frame — the one the SNES is currently DMAing. Its payload
+ * is resident in the cart window; s_subframe_index walks its slot sets. */
 static SubFrame s_subframes[MG_MAX_SUBFRAMES];
 static unsigned s_subframe_count;
 static unsigned s_subframe_index;
+static bool     s_active_valid;     /* a frame is being consumed */
+
+/* The QUEUED frame — committed while the active is still in flight
+ * (commit-ahead). Its payload sits in s_host_payload (the guest blocks
+ * at depth 2, so it never overwrites it) until the active completes and
+ * the FRAME_DONE handler promotes it. flush_subframes builds into these;
+ * the partition is gated by s_queued_valid so the bsnes thread only
+ * reads them once valid is published under the lock. (Distinct from the
+ * pre-flush s_pending_* transient-CHR buffer — this is the frame queue.) */
+static SubFrame s_queued_subframes[MG_MAX_SUBFRAMES];
+static unsigned s_queued_count;
+static uint32_t s_queued_used;      /* payload bytes to copy at promotion */
+static bool     s_queued_valid;     /* a frame is queued behind the active */
+
+/* v2.36 DIAGNOSTIC (MG_PIPE_CHECK=1): FNV-1a of the queued frame's
+ * payload, taken at flush time and re-checked at activation/promotion.
+ * A mismatch means s_host_payload was overwritten between commit and
+ * promotion (the single-buffer hazard) — i.e. the depth-2 shimmer is a
+ * payload race. Cheap; only the diagnostic env arms the re-check log. */
+static uint32_t s_queued_checksum;
+static int pipe_check_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MG_PIPE_CHECK");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+static uint32_t payload_fnv(const uint8_t *p, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+/* v2.36: the PPU register batch ($7848, incl. bg12nba = the double-
+ * buffer flip + scrolls) must be promoted ATOMICALLY with the payload,
+ * not written to the window at build time. Otherwise commit-ahead's
+ * frame N+1 build overwrites the flip while frame N is still on screen
+ * → premature flip → a half-loaded buffer shows. So emit_ppu_batch
+ * captures it here and activate_queued_locked writes it to the window
+ * at activation/promotion, in lockstep with the frame's payload. */
+static PpuBatch s_queued_ppu_batch;
 
 /* Clean-slate VRAM-clear arming state. Set by
  * mg_state_arm_clean_slate_vram_clear (called from h_ppu_clean_slate)
@@ -204,12 +311,24 @@ static unsigned s_bg_reupload_frames;
  * ---------------------------------------------------------------- */
 
 void mg_state_init(void) {
+    queue_lock_init();
     memset(&s_state, 0, sizeof(s_state));
+    /* Drop any stale L2 pointer from a prior init/shutdown cycle — the
+     * previous PSRAM pool was torn down, so re-allocate lazily from the
+     * fresh one on the next stage. (mg_state_init runs after
+     * mgapi_l2_init, so the pool is live by the time we stage.) */
+    s_host_payload = NULL;
     mg_state_reset();
 }
 
 void mg_state_shutdown(void) {
-    /* Nothing to release; state is static. */
+    /* Release the L2 staging buffer and null it so a subsequent
+     * mgapi_init re-allocates rather than reusing a pointer into the
+     * freed PSRAM pool. */
+    if (s_host_payload) {
+        mgapi_l2_host_free(s_host_payload);
+        s_host_payload = NULL;
+    }
 }
 
 void mg_state_reset(void) {
@@ -327,6 +446,18 @@ void mg_state_reset(void) {
     s_subframe_count = 0;
     s_subframe_index = 0;
 
+    /* v2.36: tear down the commit-ahead frame queue so a stale active/
+     * queued frame from the previous demo can't leak across a transition
+     * (the [[staged-leak-across-demos]] discipline). Under the lock since
+     * the bsnes thread may still be issuing FRAME_DONE strobes from the
+     * outgoing demo's last frame. */
+    queue_lock();
+    s_active_valid  = false;
+    s_queued_valid  = false;
+    s_queued_count  = 0;
+    s_queued_used   = 0;
+    queue_unlock();
+
     /* Drop any in-flight clean-slate VRAM-clear arming from a
      * previous demo. If this reset is being called by h_ppu_clean_slate
      * itself, the handler will re-arm via mg_state_arm_clean_slate_*
@@ -389,7 +520,11 @@ bool mg_state_stage_vram_clear(void) {
     static const uint8_t zeros[2] = {0, 0};
     uint32_t off = alloc_payload(2);
     if (off == UINT32_MAX) return false;
-    cart_window_load_blob(off, zeros, 2);
+    {
+        uint8_t *hp = ensure_host_payload();
+        if (!hp) return false;
+        memcpy(hp + off, zeros, 2);   /* stage into L2/PSRAM, not the window */
+    }
 
     CartDmaSlot slot = {
         .bbus = BBUS_VMDATAL,
@@ -550,7 +685,11 @@ static bool stage_dma(const void *src, uint32_t size,
         return false;
     }
 
-    cart_window_load_blob(off, src, size);
+    {
+        uint8_t *hp = ensure_host_payload();
+        if (!hp) return false;
+        memcpy(hp + off, src, size);   /* stage into L2/PSRAM, not the window */
+    }
 
     s_staged[s_staged_count++] = (StagedSlot){
         .bbus = bbus,
@@ -608,32 +747,70 @@ static void write_subframe_to_cart_window(const SubFrame *sf) {
     }
 }
 
-/* Greedy-pack s_staged[] into sub-frames of ≤8 slots and ≤BUDGET bytes
- * each. Writes the FIRST sub-frame to the cart window's slot list so
- * the next NMI can process it. Subsequent sub-frames sit in
- * s_subframes[] waiting for mg_state_advance_subframe. */
-static void flush_subframes(void) {
-    s_subframe_count = 0;
+/* Promote the QUEUED frame to ACTIVE: copy its payload from the L2 host
+ * buffer into the cart window (the PSRAM->DTCM seam), move its sub-frame
+ * list into the active slot, and load sub-frame 0 into the DMA list.
+ * The kernel's next burst then reads a fully-resident frame. Caller must
+ * hold the queue lock. Used by flush_subframes (idle commit) and
+ * mg_state_advance_subframe (cross-frame promotion). */
+static void activate_queued_locked(void) {
+    if (pipe_check_enabled() && s_host_payload && s_queued_used > 0) {
+        uint32_t now = payload_fnv(s_host_payload, s_queued_used);
+        if (now != s_queued_checksum) {
+            fprintf(stderr,
+                "[pipe] PAYLOAD RACE: queued fnv=%08x now=%08x used=%u "
+                "(s_host_payload overwritten before promotion)\n",
+                s_queued_checksum, now, s_queued_used);
+        }
+    }
+    if (s_host_payload && s_queued_used > 0) {
+        cart_window_load_blob(PAYLOAD_AREA_START, s_host_payload,
+                              s_queued_used);
+    }
+    /* Publish this frame's PPU batch (BG-base flip + scrolls) to the
+     * window in lockstep with its payload — never earlier (see
+     * s_queued_ppu_batch). */
+    cart_window_set_ppu_batch(&s_queued_ppu_batch);
+    memcpy(s_subframes, s_queued_subframes,
+           sizeof(SubFrame) * (s_queued_count ? s_queued_count : 1));
+    s_subframe_count = s_queued_count;
     s_subframe_index = 0;
+    write_subframe_to_cart_window(&s_subframes[0]);
+    s_active_valid = true;
+}
+
+/* Greedy-pack s_staged[] into the QUEUED frame's sub-frames (≤8 slots,
+ * ≤BUDGET bytes each), then route: if no frame is being consumed,
+ * activate it immediately; otherwise queue it behind the active frame
+ * (commit-ahead, depth 2). The payload stays in the L2 host buffer until
+ * activation/promotion copies it into the window, so building here never
+ * disturbs the active frame's resident payload. */
+static void flush_subframes(void) {
     if (dma_trace_enabled()) {
         s_trace_frame++;
         fprintf(stderr, "[mgdma f%u] flush: %u staged slot(s)\n",
                 s_trace_frame, s_staged_count);
     }
     if (s_staged_count == 0) {
-        /* No work — clear cart-window slots so any leftover from a
-         * previous frame's tail entries doesn't fire. */
-        static const CartDmaSlot empty_slot = {0};
-        for (unsigned i = 0; i < 8; i++) {
-            cart_window_set_dma_slot(i, &empty_slot);
+        /* No work. Only clear the cart-window slots when nothing is in
+         * flight — clearing them while a frame is being consumed would
+         * yank the active frame's DMA list out from under the kernel. */
+        queue_lock();
+        bool idle = !s_active_valid;
+        queue_unlock();
+        if (idle) {
+            static const CartDmaSlot empty_slot = {0};
+            for (unsigned i = 0; i < 8; i++) {
+                cart_window_set_dma_slot(i, &empty_slot);
+            }
         }
         return;
     }
 
-    SubFrame *cur = &s_subframes[0];
+    SubFrame *cur = &s_queued_subframes[0];
     cur->slot_count = 0;
     uint32_t cur_bytes = 0;
-    s_subframe_count = 1;
+    s_queued_count = 1;
 
     for (unsigned i = 0; i < s_staged_count; i++) {
         const StagedSlot *s = &s_staged[i];
@@ -646,7 +823,7 @@ static void flush_subframes(void) {
             (cur->slot_count > 0 &&
              cur_bytes + slot_bytes > MG_SUBFRAME_BYTE_BUDGET);
         if (need_new_subframe) {
-            if (s_subframe_count >= MG_MAX_SUBFRAMES) {
+            if (s_queued_count >= MG_MAX_SUBFRAMES) {
                 /* Out of sub-frame slots — drop the remaining
                  * stage entries. Should be rare; bump the cap if it
                  * fires (stderr to surface for tuning). */
@@ -655,48 +832,77 @@ static void flush_subframes(void) {
                     s_staged_count, i);
                 break;
             }
-            cur = &s_subframes[s_subframe_count++];
+            cur = &s_queued_subframes[s_queued_count++];
             cur->slot_count = 0;
             cur_bytes = 0;
         }
         cur->slots[cur->slot_count++] = *s;
         cur_bytes += slot_bytes;
     }
+    s_queued_used = s_payload_used;
+    if (pipe_check_enabled() && s_host_payload && s_queued_used > 0) {
+        s_queued_checksum = payload_fnv(s_host_payload, s_queued_used);
+    }
 
     if (dma_trace_enabled()) {
         fprintf(stderr, "[mgdma f%u] packed → %u sub-frame(s):",
-                s_trace_frame, s_subframe_count);
-        for (unsigned k = 0; k < s_subframe_count; k++) {
+                s_trace_frame, s_queued_count);
+        for (unsigned k = 0; k < s_queued_count; k++) {
             uint32_t sb = 0;
-            for (unsigned m = 0; m < s_subframes[k].slot_count; m++) {
-                uint32_t sz = s_subframes[k].slots[m].size;
+            for (unsigned m = 0; m < s_queued_subframes[k].slot_count; m++) {
+                uint32_t sz = s_queued_subframes[k].slots[m].size;
                 sb += (sz == 0) ? 65536u : sz;
             }
             fprintf(stderr, " SF%u(%u slots, %u B)",
-                    k, s_subframes[k].slot_count, sb);
+                    k, s_queued_subframes[k].slot_count, sb);
         }
         fprintf(stderr, "\n");
     }
 
-    write_subframe_to_cart_window(&s_subframes[0]);
+    queue_lock();
+    if (!s_active_valid) {
+        /* Idle — activate this frame now so the kernel starts bursting.
+         * (Safe: no frame in flight means the bsnes thread isn't issuing
+         * promotions, so no concurrent cart-window write.) */
+        activate_queued_locked();
+    } else {
+        /* A frame is being consumed — queue behind it. The bsnes-side
+         * FRAME_DONE handler promotes it when the active frame finishes,
+         * so the SNES bursts continuously with no inter-frame gap. */
+        s_queued_valid = true;
+    }
+    queue_unlock();
 }
 
-/* Advance to the next sub-frame's slot list. Called by cart_window
- * when the kernel reads port 7 (which it does once per main-loop
- * iteration, i.e. between NMIs). Returns true if another sub-frame
- * was loaded into the cart window (caller keeps FRAME_RDY=1), false
- * if the queue is empty (caller bumps frame_consumed and clears
- * FRAME_RDY). */
-bool mg_state_advance_subframe(void) {
+/* Called by cart_window on the FRAME_DONE strobe (bsnes thread) once the
+ * kernel's chainer has walked the last slot of the current sub-frame.
+ * Returns one of MG_ADVANCE_*:
+ *   MORE     — another sub-frame of the active frame was loaded; caller
+ *              keeps frame_ready, does NOT bump frame_consumed.
+ *   PROMOTED — the active frame finished and the queued frame was
+ *              promoted to active (no gap); caller keeps frame_ready AND
+ *              bumps frame_consumed (a logical frame completed).
+ *   EMPTY    — the active frame finished and nothing was queued; caller
+ *              clears frame_ready and bumps frame_consumed. */
+int mg_state_advance_subframe(void) {
+    int r;
+    queue_lock();
     s_subframe_index++;
-    if (s_subframe_index >= s_subframe_count) {
-        /* Logical frame fully delivered. */
-        s_subframe_index = 0;
+    if (s_active_valid && s_subframe_index < s_subframe_count) {
+        write_subframe_to_cart_window(&s_subframes[s_subframe_index]);
+        r = MG_ADVANCE_MORE;
+    } else if (s_queued_valid) {
+        activate_queued_locked();
+        s_queued_valid = false;
+        r = MG_ADVANCE_PROMOTED;
+    } else {
+        s_active_valid   = false;
         s_subframe_count = 0;
-        return false;
+        s_subframe_index = 0;
+        r = MG_ADVANCE_EMPTY;
     }
-    write_subframe_to_cart_window(&s_subframes[s_subframe_index]);
-    return true;
+    queue_unlock();
+    return r;
 }
 
 /* Public version of stage_dma for handlers like mg_chr_upload that
@@ -931,7 +1137,11 @@ static void emit_ppu_batch(void) {
     b.bg4hofs = (uint16_t)s->bg[3].hofs;
     b.bg4vofs = (uint16_t)s->bg[3].vofs;
 
-    cart_window_set_ppu_batch(&b);
+    /* v2.36: capture for atomic promotion (see s_queued_ppu_batch) instead
+     * of writing the window now — commit-ahead would otherwise flip the
+     * active frame's BG base out from under it. Written to the window by
+     * activate_queued_locked. */
+    s_queued_ppu_batch = b;
 }
 
 /* Build the INIDISP HDMA table for the current force_blank_top /

@@ -185,3 +185,23 @@ void mgapi_worker_signal(uint64_t elapsed_ns) {
     sem_post(&g_sem);
 #endif
 }
+
+/* v2.35: wake the worker to run a tick WITHOUT advancing the embedder's
+ * vblank clock. Used by the frame-consumed hook so a guest blocked in
+ * mg_wait_frame resumes the instant the SNES acks the frame, instead of
+ * waiting up to one mgapi_step period (~23 ms at the emulator's ~43 Hz
+ * step cadence) for the next periodic signal — that latency was capping
+ * FMV at ~11 fps. Bumps pending so worker_drain runs the tick, but
+ * leaves g_last_elapsed_ns alone (the tick reuses the last real dt; the
+ * audio pump is a no-op so dt is immaterial here). Safe from any
+ * thread. */
+void mgapi_worker_wake(void) {
+    if (!g_started) return;
+    atomic_fetch_add_explicit(&g_pending_vblanks, 1u,
+                              memory_order_acq_rel);
+#if defined(_WIN32)
+    SetEvent(g_evt);
+#else
+    sem_post(&g_sem);
+#endif
+}

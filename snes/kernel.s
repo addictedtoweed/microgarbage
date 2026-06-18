@@ -252,11 +252,17 @@
     lda f:PB_SCROLLS + $0F
     sta BG4VOFS
 
-    ; --- Mode 7 batch ------------------------------------------------
-    ; Written every frame regardless of BGMODE; harmless when bgmode != 7
-    ; and avoids a conditional branch. M7A-D + M7X/Y are write-twice
-    ; 8-bit registers — the PPU latches low byte, then high byte gives
-    ; the 16-bit value.
+    ; --- Mode 7 batch (skipped unless BGMODE selects mode 7) ----------
+    ; v2.36: gated on bgmode==7 so non-Mode-7 demos (the FMV is Mode 1)
+    ; hand ~13 register writes of the force-blank DMA window back to the
+    ; chainer every burst — those M7 matrix writes are dead anyway when
+    ; bgmode!=7 (the PPU ignores M7A-D/M7X/Y outside Mode 7). Mode-7
+    ; demos (bgmode==7) take the same path as before. M7A-D + M7X/Y are
+    ; write-twice 8-bit (PPU latches low byte, then high byte).
+    lda f:PB_BGMODE
+    and #$07
+    cmp #$07
+    bne @skip_m7
     lda f:M7B_SEL
     sta M7SEL
 
@@ -289,6 +295,7 @@
     sta M7Y
     lda f:M7B_Y_LO + 1
     sta M7Y
+@skip_m7:
 
     ; --- HDMA channels 1..6 setup -------------------------------------
     ; Channel 0 is reserved for the DMA-list dispatch below. Channel 7
@@ -479,8 +486,17 @@
     jmp @frame_complete
 :
     ; --- budget check ---
+    ; v2.36: read the live beam ONLY on the first slot fired this burst;
+    ; subsequent slots use a running K_BYTES_REM that @fire decrements by
+    ; each slot's bytes. Re-reading the beam (SLHV/OPVCT + the *170
+    ; multiply) before EVERY slot was itself the per-slot DMA-setup
+    ; overhead that pushed 240x208/20fps sub-frames a hair over the thin
+    ; ~92 B margin -> defer whole slot -> waste the rest of the burst.
     pha                          ; save bbus (A8)
-    jsr calc_bytes_rem           ; -> K_BYTES_REM (window bytes left); A8 out
+    cpy #$0000                   ; first slot fired this burst?
+    bne @have_budget             ; no -> K_BYTES_REM is the running value
+    jsr calc_bytes_rem           ; yes -> read live beam (accurate start); A8 out
+@have_budget:
     rep #$20
     .a16
     lda f:COPRO_DMA_LIST_L+4,x    ; slot byte count
@@ -548,6 +564,26 @@
     lda #$01
     sta MDMAEN              ; fire channel 0; CPU pauses until this slot completes
     iny                     ; count a fired slot
+    ; v2.36: decrement the running window budget by this slot's bytes +
+    ; a small fudge for inter-slot setup time (so the next slot needn't
+    ; re-read the beam). Clamp to 0 on underflow so an exhausted budget
+    ; correctly defers the next slot instead of wrapping to ~64 KB.
+    rep #$20
+    .a16
+    lda K_BYTES_REM
+    sec
+    sbc f:COPRO_DMA_LIST_L+4,x    ; - slot byte count
+    bcc @budget_zero
+    sec
+    sbc #24                       ; - inter-slot setup fudge
+    bcc @budget_zero
+    sta K_BYTES_REM
+    bra @budget_done
+@budget_zero:
+    stz K_BYTES_REM
+@budget_done:
+    sep #$20
+    .a8
 
 @next:
     inc K_SLOT_CURSOR            ; advance cursor + X to the next slot
@@ -625,7 +661,13 @@
     lda #0
 
 @lines_done:
-    ; A = lines_rem. bytes = lines * 160 = (lines<<5) * 5.
+    ; A = lines_rem. bytes = lines * 170 (the real ~170.5 B/line for the
+    ; force-blank window: 54 lines * 1364 master-cyc / 8 = 9207 B). Raised
+    ; from the old conservative 160 so three ~9 KB sub-frames each fit ONE
+    ; burst at FB(8,8) -> 20 fps. Overrun safety is the per-slot live-V
+    ; re-check above + the host's ~120 B/sub-frame margin (sub-frames are
+    ; sized < window). 170 = 128 + 32 + 8 + 2.
+    pha                          ; preserve lines across the *160 build
     asl a
     asl a
     asl a
@@ -636,6 +678,16 @@
     asl a                        ; A = lines * 128
     clc
     adc K_BYTES_REM              ; + lines*32 = lines*160
+    sta K_BYTES_REM
+    pla                          ; lines
+    asl a                        ; lines * 2
+    sta K_VLO                    ; stash (K_VLO/K_VHI free — V already used)
+    asl a
+    asl a                        ; lines * 8
+    clc
+    adc K_VLO                    ; + lines*2 = lines*10
+    clc
+    adc K_BYTES_REM              ; + lines*160 = lines*170
     sta K_BYTES_REM
     sep #$20
     .a8

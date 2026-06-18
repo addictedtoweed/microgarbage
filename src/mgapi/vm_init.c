@@ -78,6 +78,15 @@ static void frame_consumed_wake_hook(uint32_t now_consumed, void *userdata) {
     if (sys && sys->sched) {
         (void)vm_sched_wake_frame_consumed(sys->sched, now_consumed);
     }
+    /* v2.35: also wake the worker THREAD. Marking the scheduler waiter
+     * ready isn't enough — the worker sleeps on its event until the next
+     * periodic mgapi_step (~23 ms at the emulator's step cadence), so a
+     * guest in mg_wait_frame stalled a full signal-period each frame
+     * (capping FMV at ~11 fps). This fires on the bsnes thread when the
+     * SNES acks the frame; the wake lets the guest stage the next frame
+     * immediately. */
+    extern void mgapi_worker_wake(void);
+    mgapi_worker_wake();
 }
 
 /* Adapter for vm_system unload hook (which passes vm_id + userdata) to

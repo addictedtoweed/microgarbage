@@ -162,13 +162,19 @@ void mg_state_build_frame(void);
 int  mg_state_queue_dma(const void *src, uint32_t size,
                         uint8_t bbus, uint8_t dmap, uint16_t prep);
 
-/* v2.05: sub-frame chaining. Called by cart_window when the kernel
- * reads the port-7 mailbox (which happens once per main-loop iteration
- * between NMIs). Returns true if a NEXT sub-frame's slot list was just
- * loaded into the cart window — caller should KEEP FRAME_RDY = 1 so
- * the next NMI processes it. Returns false if the queue is empty —
- * caller bumps frame_consumed and clears FRAME_RDY. */
-bool mg_state_advance_subframe(void);
+/* v2.05: sub-frame chaining. Called by cart_window on the FRAME_DONE
+ * strobe once the kernel's chainer has walked the last slot of the
+ * current sub-frame.
+ *
+ * v2.36 commit-ahead: the return now distinguishes three cases so the
+ * caller knows whether a logical frame just completed (bump consumed)
+ * and whether to keep FRAME_RDY set: */
+enum {
+    MG_ADVANCE_MORE     = 0,  /* another sub-frame loaded; keep RDY, no consumed bump */
+    MG_ADVANCE_PROMOTED = 1,  /* frame done + queued promoted (no gap); keep RDY, bump consumed */
+    MG_ADVANCE_EMPTY    = 2,  /* frame done + queue empty; clear RDY, bump consumed */
+};
+int mg_state_advance_subframe(void);
 
 /* Transient variant — same as mg_state_queue_dma except it does NOT
  * advance the persistent checkpoint, so the bytes are freed on the

@@ -198,12 +198,30 @@ void _start(void) {
      * occupies screen lines 9..216 (208 lines of FMV). Line 7-8 are
      * visible blank margin (no flicker), 217..223 are bottom margin.
      *
-     * Bottom=7: the bottom 7 lines (217..223) are already blank margin,
-     * so force-blanking them costs nothing visually AND grows the
-     * per-NMI DMA budget from 6479 + 7*117 = 7298 B to 6479 + 14*117
-     * = 8117 B — enough room for the 6800 B chunks with 1300+ B
-     * margin on every sub-frame instead of a marginal ~300 B. */
-    mg_force_blank(7, 7);
+     * v2.36 20fps: bumped to force_blank(8, 8). The kernel chainer's
+     * virtual-NMI window is now the full bottom-LB(8) + vblank(38) +
+     * top-LB(8) = 54 lines = 54*1364/8 = 9207 B/burst (kernel budgets
+     * 170 B/line = 9180). That fits THREE ~9 KB sub-frames at one burst
+     * each → 3 SNES frames/logical-frame → 20 fps (vs 4 sub-frames /
+     * 15 fps at FB7). Content is 208 lines on the 208-line visible band
+     * (lines 8..215). */
+    /* v2.36 FIX: drive the kernel's force-blank window via the LIVE
+     * mg_kernel_layout API. The virtual-NMI kernel's State-A/B timing
+     * (and the chainer's per-burst byte budget) reads K_LAYOUT, which
+     * ONLY mg_kernel_layout writes. mg_force_blank feeds the retired
+     * ch7 INIDISP-HDMA letterbox — DEAD in this kernel — so the FMV was
+     * silently running on the default layout, not 8/8. Setting (8,8)
+     * here gives the real 54-line / 9180 B burst window the 3-sub-frame
+     * 20 fps budget needs; 8/8 keeps the full 208 visible lines. */
+    /* v2.36 20fps at full 240x208: 8-line top + 8-line bottom force-blank
+     * (54-line / ~9180 B burst window). The 3 sub-frames (9088 B) fit
+     * one burst each now that the kernel chainer reads the beam ONCE per
+     * burst instead of before every slot — that per-slot DMA-setup
+     * overhead was the only thing pushing them over the thin ~92 B
+     * margin. No crop, no siphon needed for the FMV itself; the siphon
+     * (if added) is then pure sprite/OAM budget. */
+    mg_kernel_layout(8, 8);
+    mg_force_blank(8, 8);   /* legacy/cosmetic; keeps bytes_remaining sane */
     mg_bg_scroll(MG_BG_LAYER_1, 0, -1);
 
     init_tilemap_margins();
@@ -309,6 +327,14 @@ void _start(void) {
      * the START of the playback loop and END to validate that wall-
      * clock elapsed matches FMV duration (600 frames × 50 ms = 30 s). */
     uint32_t demo_start_ms = sys_ticks_now();
+    /* v2.35 DIAG: split each frame's wall-clock into guest "work"
+     * (stream-consume + tilemap build + CHR/palette upload ecalls) vs
+     * "wait" (mg_wait_frame = the SNES burst cadence). Locates the
+     * 20fps bottleneck: work-dominated -> overlap/optimize staging;
+     * wait-dominated -> cut sub-frames / close the handshake gap.
+     * Accumulated totals printed at exit. */
+    uint32_t work_ms = 0;
+    uint32_t wait_ms = 0;
 
     /* 1-frame audio lookahead (cushion). The video upload STAGES into
      * the host cart window, so once frame N is staged we can reload the
@@ -331,6 +357,8 @@ void _start(void) {
         if (mg_pad_pressed(pads.p0, MG_BTN_START)) break;
 
         if (frame >= nframes) break;
+
+        uint32_t t_loop = sys_ticks_now();   /* DIAG: start of guest work */
 
         /* split the CURRENT chunk (frame N) in s_frame. Its audio was
          * already fed (prime / previous iter's lookahead); we use the
@@ -372,34 +400,31 @@ void _start(void) {
         splat_fmv_tilemap(tm);
         mg_chr_upload_transient(back_tm, s_tilemap, sizeof(s_tilemap));
 
-        /* CHR split across 4 sub-frame-sized chunks. SF0 also carries
-         * CGRAM (256) + tilemap (2048) = 2304 B of overhead, so chr1
-         * has the smallest CHR budget; chr2..4 each go into their own
-         * SF and split the rest.
-         *
-         * v2.32: ALL chunks must be 32-byte multiples (= whole tiles)
-         * so each chunk boundary lands BETWEEN tiles, not mid-tile.
-         * The previous 4560/6800/6800/6800 split was 142.5/212.5/212.5
-         * /212.5 tiles — each boundary in the middle of a tile, so
-         * any timing wobble on either side corrupted that single tile's
-         * CHR bytes (visible as a checkerboard band where the affected
-         * tilemap cells referenced those boundary tiles).
-         *
-         * 780 tiles split 150/210/210/210 = 4800/6720/6720/6720 bytes.
-         * SF0 = 4800 + 2304 overhead = 7104 vs 8117 budget = 1013 B
-         * margin. SF1..3 = 6720 vs 8117 = 1397 B margin. */
-        const uint16_t CHR_C1 = 4800;   /* 150 tiles */
-        const uint16_t CHR_C2 = 6720;   /* 210 tiles */
-        const uint16_t CHR_C3 = 6720;   /* 210 tiles */
-        const uint16_t CHR_C4 = (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2 - CHR_C3); /* 6720 / 210 tiles */
-        mg_chr_upload_transient(back_chr + 0u,
-                                 chr + 0u, CHR_C1);
-        mg_chr_upload_transient((uint16_t)(back_chr + CHR_C1 / 2u),
-                                 chr + CHR_C1, CHR_C2);
-        mg_chr_upload_transient((uint16_t)(back_chr + (CHR_C1 + CHR_C2) / 2u),
-                                 chr + CHR_C1 + CHR_C2, CHR_C3);
-        mg_chr_upload_transient((uint16_t)(back_chr + (CHR_C1 + CHR_C2 + CHR_C3) / 2u),
-                                 chr + CHR_C1 + CHR_C2 + CHR_C3, CHR_C4);
+        /* v2.36 20fps: CHR split into FIVE chunks → 3 sub-frames of
+         * 9088 B each:
+         *   SF0 = CGRAM(256) + tilemap(2048) + C1(6784) = 9088
+         *   SF1 = C2(4544) + C3(4544)                   = 9088
+         *   SF2 = C4(4544) + C5(4544)                   = 9088
+         * Against the ~96-line / ~16,300 B window (bottom-50 sacrifice
+         * via mg_kernel_layout(8,50)) each fits one burst with ~7200 B
+         * headroom → 3 bursts = 20 fps, clean (no edge deferral/over-run
+         * — the 5-chunk's old deferral was purely the tight 9180 window),
+         * and the headroom is the per-frame sprite/OAM budget. Multi-slot
+         * so no single 9088 slot rides the anti-hang valve. All ×32
+         * (whole tiles): 212+142+142+142+142 = 780. */
+        const uint16_t CHR_C1 = 6784;   /* 212 tiles (rides with CGRAM+tilemap) */
+        const uint16_t CHR_C2 = 4544;   /* 142 tiles */
+        const uint16_t CHR_C3 = 4544;   /* 142 tiles */
+        const uint16_t CHR_C4 = 4544;   /* 142 tiles */
+        const uint16_t CHR_C5 =
+            (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2 - CHR_C3 - CHR_C4); /* 4544 */
+        uint16_t cw = back_chr;          /* VRAM word cursor   */
+        const uint8_t *cs = chr;         /* source byte cursor */
+        mg_chr_upload_transient(cw, cs, CHR_C1); cw += CHR_C1 / 2u; cs += CHR_C1;
+        mg_chr_upload_transient(cw, cs, CHR_C2); cw += CHR_C2 / 2u; cs += CHR_C2;
+        mg_chr_upload_transient(cw, cs, CHR_C3); cw += CHR_C3 / 2u; cs += CHR_C3;
+        mg_chr_upload_transient(cw, cs, CHR_C4); cw += CHR_C4 / 2u; cs += CHR_C4;
+        mg_chr_upload_transient(cw, cs, CHR_C5);
 
         /* Save frame N's palette (pairs with this buffer when it goes
          * FRONT next iter) NOW, while s_frame still holds frame N —
@@ -424,8 +449,12 @@ void _start(void) {
          * exact kernel-cadence pacing with no drift. target_ms stays for
          * the elapsed-time profile print at exit. */
         mg_frame_commit();
+        uint32_t t_commit = sys_ticks_now();   /* DIAG: end of guest work */
         target_ms += ms_per_frame;
         mg_wait_frame();
+        uint32_t t_wake = sys_ticks_now();      /* DIAG: end of wait */
+        work_ms += (uint32_t)(t_commit - t_loop);
+        wait_ms += (uint32_t)(t_wake  - t_commit);
 
         /* Stage BG1 swap: BG1 displays what we just uploaded once the
          * PPU batch with these values is applied next iter. */
@@ -458,6 +487,17 @@ void _start(void) {
         dbg_u32(fps10 % 10u); dbg(" fps)");
     }
     dbg("\r\n");
+
+    /* v2.35 DIAG: work-vs-wait breakdown. work = guest staging per
+     * frame; wait = mg_wait_frame (SNES burst cadence). Per-frame
+     * averages tell us which to attack for 20fps. */
+    if (frame > 0u) {
+        dbg("fmv: work="); dbg_u32(work_ms);
+        dbg("ms wait="); dbg_u32(wait_ms);
+        dbg("ms (avg work="); dbg_u32(work_ms / frame);
+        dbg("ms wait="); dbg_u32(wait_ms / frame);
+        dbg("ms/frame)\r\n");
+    }
 
     /* --- clean up --- */
     mg_audio_pcm_stream_close(voice);

@@ -424,10 +424,14 @@ static void mgapi_step_body(uint64_t elapsed_ns) {
     (void)stream_arbiter_tick();
 
     /* Stage 3a: drive the cooperative scheduler. We step until it
-     * goes idle (no ready VMs) or runs out of budget. The audio
-     * pump already happened, so the audio service has up-to-date
-     * output even if the VM is blocked. */
-    for (int i = 0; i < 64; i++) {
+     * goes idle (no ready VMs / all blocked) or runs out of budget.
+     * v2.35: cap raised 64 -> 4096. The loop already exits early when
+     * mgapi_vm_step() returns false (idle/blocked), so in normal play
+     * this just lets a guest stage a WHOLE frame in one tick instead of
+     * being truncated mid-staging and forced to wait for the next signal
+     * (which, combined with the wake-on-frame-consumed fix, is what gets
+     * FMV from ~11 fps back to a full 15). 4096 is a runaway backstop. */
+    for (int i = 0; i < 4096; i++) {
         if (!mgapi_vm_step()) break;
     }
 }

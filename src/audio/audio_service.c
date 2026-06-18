@@ -18,6 +18,7 @@
 #include "audio/audio_service.h"
 #include "audio/audio_fft.h"
 
+#include <stdio.h>   /* v2.35 DIAG: fprintf/stderr for the drift readout */
 #include <stdlib.h>
 #include <string.h>
 
@@ -71,6 +72,19 @@ struct AudioService {
     AudioMixer     *mixer;
     uint32_t        sample_rate;
     uint32_t        track_count;
+
+    /* v2.35 drift correction (mixer sync). total_fed = cumulative PCM-
+     * stream frames the guest has fed (external clock, emulator-paced);
+     * total_output = cumulative frames the mixer has rendered (internal,
+     * WASAPI-paced). Each FEED calls mixer_observe_sync(total_output,
+     * total_fed) so the WASAPI-paced consumption rate is trimmed to track
+     * the emulator-paced feed — eliminating ring under/overflow (the
+     * periodic FMV skip) while staying frame-locked. The reference is the
+     * FEED, not any nominal SNES crystal. Assumes the PCM voice rate ==
+     * sample_rate (44.1 kHz); revisit external_ticks_per_second if a
+     * future stream feeds at a different rate. */
+    uint64_t        total_fed;
+    uint64_t        total_output;
 
     /* shared staging buffer for staged loads */
     uint8_t        *staging;
@@ -194,6 +208,14 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
                                    svc->pend_pcm_stream_rate);
             mixer_channel_reset(svc->mixer, track);
             mixer_channel_start(svc->mixer, track);
+            /* v2.35: re-baseline the drift PLL for the new stream. The
+             * total_fed/total_output counters are cumulative; without a
+             * reset the first observe would see the whole inter-clip
+             * silence gap as a massive drift and slam the correction to
+             * the clamp. reset_sync clears the baseline so it re-arms on
+             * the next FEED. */
+            svc->total_fed = svc->total_output;
+            mixer_reset_sync(svc->mixer);
             return true;
         }
 
@@ -448,7 +470,20 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
     }
     MixerOutputFormat out = { .bits = 16, .is_signed = true,
                               .storage_bits = 16, .channels = 2 };
-    svc->mixer = mixer_create(chans, tracks, svc->sample_rate, out, 0);
+    /* v2.35: create the mixer with drift correction (sync) ENABLED. The
+     * external clock is the PCM-stream FEED (frames the guest pushes,
+     * emulator-paced), at sample_rate ticks/sec — NOT the SNES master
+     * crystal. mixer_observe_sync (driven from each FEED, see below)
+     * trims per-channel playback so WASAPI-paced consumption tracks the
+     * feed. Smoothing Q15/64 (slow, smooth — the feed is bursty at the
+     * video rate); clamp Q15/50 (~2%) so a bad sample can't run away. */
+    MixerSyncConfig sync_cfg = {
+        .external_ticks_per_second = (uint64_t)svc->sample_rate,
+        .correction_smoothing      = (q15_t)(Q15_ONE / 64),
+        .max_correction            = (q15_t)(Q15_ONE / 50),
+    };
+    svc->mixer = mixer_create_with_sync(chans, tracks, svc->sample_rate, out, 0,
+                                        &sync_cfg, NULL, NULL);
     free(chans);
     if (!svc->mixer) { audio_pool_destroy(&svc->pool); free(svc); return NULL; }
 
@@ -818,6 +853,32 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         if (cap > 0) {
             fed = mixer_write_channel(svc->mixer, track, svc->staging, cap);
         }
+        /* v2.35: drive the drift-correction PLL. external = cumulative
+         * frames fed (emulator-paced), internal = cumulative frames the
+         * mixer rendered (WASAPI-paced). The mixer trims per-channel
+         * playback so consumption tracks the feed, holding the voice
+         * ring level steady — no underrun skip, frame-locked. Runs on
+         * the same worker thread as render, so the counters are race-free. */
+        if (fed > 0) {
+            svc->total_fed += fed;
+            int32_t corr_ppm = mixer_observe_sync(svc->mixer,
+                                     svc->total_output, svc->total_fed);
+            /* v2.35 DIAG: once/sec (~every 15 feeds at 15 fps), report the
+             * ring emptiness at feed time (free; near the 32768 capacity =
+             * ring drained = underrun risk), the requested vs accepted feed
+             * size (frame_count/fed -> arate clue + overflow), and the PLL
+             * correction in PPM (should converge to a small steady value;
+             * slamming to the ~20000 clamp = wrong external-rate assumption
+             * or non-drift cause). Remove once audio is clean. */
+            static unsigned s_dbgc = 0;
+            if ((s_dbgc++ % 15u) == 0u) {
+                fprintf(stderr,
+                    "fmv-audio: free=%u/32768 req=%u fed=%u corr=%+dppm\n",
+                    (unsigned)free, (unsigned)frame_count,
+                    (unsigned)fed, (int)corr_ppm);
+                fflush(stderr);
+            }
+        }
         respond(svc, m, (uint32_t)AUDIO_ARB_OK, (uint32_t)fed);
         break;
     }
@@ -866,6 +927,7 @@ uint32_t audio_service_process(AudioService *svc, uint32_t max) {
 void audio_service_render(AudioService *svc, int16_t *out, uint32_t frames) {
     if (!svc || !out) return;
     mixer_render(svc->mixer, out, frames);
+    svc->total_output += frames;   /* v2.35: internal clock for drift sync */
     /* RT-safe: append the mixed output to the FFT capture window.
      * No-op when meters are disabled. The FFT itself runs in the
      * non-RT process loop (audio_fft_update), never here. */
