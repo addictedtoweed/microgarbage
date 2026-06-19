@@ -220,8 +220,13 @@ void _start(void) {
      * overhead was the only thing pushing them over the thin ~92 B
      * margin. No crop, no siphon needed for the FMV itself; the siphon
      * (if added) is then pure sprite/OAM budget. */
-    mg_kernel_layout(8, 8);
-    mg_force_blank(8, 8);   /* legacy/cosmetic; keeps bytes_remaining sane */
+    /* Burst is sized to the REAL ~7488 B one-burst window (not 9180), so it
+     * carries 630 tiles (21 rows / 168 px). Letterbox the un-bursted bottom
+     * 5 rows black: top_lb=8 -> content lines 8..175, force-blank 176..223
+     * (bottom_lb=48). This is the clean 20 fps state (no top-1/3 flicker that
+     * the 9088 B sub-frames caused by deferring past the burst budget). */
+    mg_kernel_layout(8, 48);
+    mg_force_blank(8, 48);  /* legacy/cosmetic; keeps bytes_remaining sane */
     mg_bg_scroll(MG_BG_LAYER_1, 0, -1);
 
     init_tilemap_margins();
@@ -412,12 +417,19 @@ void _start(void) {
          * and the headroom is the per-frame sprite/OAM budget. Multi-slot
          * so no single 9088 slot rides the anti-hang valve. All ×32
          * (whole tiles): 212+142+142+142+142 = 780. */
-        const uint16_t CHR_C1 = 6784;   /* 212 tiles (rides with CGRAM+tilemap) */
-        const uint16_t CHR_C2 = 4544;   /* 142 tiles */
-        const uint16_t CHR_C3 = 4544;   /* 142 tiles */
-        const uint16_t CHR_C4 = 4544;   /* 142 tiles */
-        const uint16_t CHR_C5 =
-            (uint16_t)(CHR_BYTES - CHR_C1 - CHR_C2 - CHR_C3 - CHR_C4); /* 4544 */
+        /* The real one-burst force-blank window holds ~7488 B, NOT the 9180
+         * theoretical — so 9088 B sub-frames DEFER their tail and at depth-2
+         * the deferred part never resumes (= the top-1/3 flicker). Size each
+         * sub-frame to 7488 instead: that drops the burst to 630 tiles (the
+         * bottom 150 are letterboxed black via mg_kernel_layout(8,48) above).
+         *   SF0 = CGRAM(256) + tilemap(2048) + C1(5184) = 7488
+         *   SF1 = C2(3744) + C3(3744)                   = 7488
+         *   SF2 = C4(3744) + C5(3744)                   = 7488   (630 tiles) */
+        const uint16_t CHR_C1 = 5184;   /* 162 tiles (rides with CGRAM+tilemap) */
+        const uint16_t CHR_C2 = 3744;   /* 117 tiles */
+        const uint16_t CHR_C3 = 3744;   /* 117 tiles */
+        const uint16_t CHR_C4 = 3744;   /* 117 tiles */
+        const uint16_t CHR_C5 = 3744;   /* 117 tiles — total 20160 = 630 tiles */
         uint16_t cw = back_chr;          /* VRAM word cursor   */
         const uint8_t *cs = chr;         /* source byte cursor */
         mg_chr_upload_transient(cw, cs, CHR_C1); cw += CHR_C1 / 2u; cs += CHR_C1;
