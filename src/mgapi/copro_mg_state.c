@@ -112,6 +112,15 @@ static MgState s_state;
 static uint8_t *s_host_payload;
 #define HOST_PAYLOAD_BYTES  (PAYLOAD_AREA_END - PAYLOAD_AREA_START)
 
+/* v2.37j: the QUEUED frame's payload snapshot — fixes the depth-2 commit-
+ * ahead shimmer. s_host_payload is the BUILD target (worker thread); once
+ * a frame is queued, flush_subframes snapshots its payload here, and
+ * activate_queued_locked copies the cart window FROM here at promotion. So
+ * the worker building the next frame into s_host_payload can no longer
+ * overwrite the queued frame's payload before it's promoted (the single-
+ * buffer hazard that the MG_PIPE_CHECK probe was added to catch). */
+static uint8_t *s_queued_hold;
+
 static uint8_t *ensure_host_payload(void) {
     if (!s_host_payload) {
         s_host_payload = mgapi_l2_host_alloc(HOST_PAYLOAD_BYTES, 16);
@@ -120,6 +129,13 @@ static uint8_t *ensure_host_payload(void) {
                 "mgapi: L2 host payload alloc FAILED (%u bytes) — "
                 "is mgapi_l2_init wired before staging?\n",
                 (unsigned)HOST_PAYLOAD_BYTES);
+        }
+    }
+    if (!s_queued_hold) {
+        s_queued_hold = mgapi_l2_host_alloc(HOST_PAYLOAD_BYTES, 16);
+        if (!s_queued_hold) {
+            fprintf(stderr, "mgapi: L2 queued-hold alloc FAILED (%u bytes)\n",
+                    (unsigned)HOST_PAYLOAD_BYTES);
         }
     }
     return s_host_payload;
@@ -318,6 +334,7 @@ void mg_state_init(void) {
      * fresh one on the next stage. (mg_state_init runs after
      * mgapi_l2_init, so the pool is live by the time we stage.) */
     s_host_payload = NULL;
+    s_queued_hold  = NULL;   /* v2.37j: same stale-pointer drop as above */
     mg_state_reset();
 }
 
@@ -328,6 +345,10 @@ void mg_state_shutdown(void) {
     if (s_host_payload) {
         mgapi_l2_host_free(s_host_payload);
         s_host_payload = NULL;
+    }
+    if (s_queued_hold) {
+        mgapi_l2_host_free(s_queued_hold);
+        s_queued_hold = NULL;
     }
 }
 
@@ -754,8 +775,8 @@ static void write_subframe_to_cart_window(const SubFrame *sf) {
  * hold the queue lock. Used by flush_subframes (idle commit) and
  * mg_state_advance_subframe (cross-frame promotion). */
 static void activate_queued_locked(void) {
-    if (pipe_check_enabled() && s_host_payload && s_queued_used > 0) {
-        uint32_t now = payload_fnv(s_host_payload, s_queued_used);
+    if (pipe_check_enabled() && s_queued_hold && s_queued_used > 0) {
+        uint32_t now = payload_fnv(s_queued_hold, s_queued_used);
         if (now != s_queued_checksum) {
             fprintf(stderr,
                 "[pipe] PAYLOAD RACE: queued fnv=%08x now=%08x used=%u "
@@ -763,8 +784,8 @@ static void activate_queued_locked(void) {
                 s_queued_checksum, now, s_queued_used);
         }
     }
-    if (s_host_payload && s_queued_used > 0) {
-        cart_window_load_blob(PAYLOAD_AREA_START, s_host_payload,
+    if (s_queued_hold && s_queued_used > 0) {
+        cart_window_load_blob(PAYLOAD_AREA_START, s_queued_hold,
                               s_queued_used);
     }
     /* Publish this frame's PPU batch (BG-base flip + scrolls) to the
@@ -840,8 +861,17 @@ static void flush_subframes(void) {
         cur_bytes += slot_bytes;
     }
     s_queued_used = s_payload_used;
-    if (pipe_check_enabled() && s_host_payload && s_queued_used > 0) {
-        s_queued_checksum = payload_fnv(s_host_payload, s_queued_used);
+    /* v2.37j: snapshot the just-built payload into s_queued_hold NOW, while
+     * s_host_payload still matches this frame's slot list. activate copies
+     * the cart window FROM this snapshot, so the worker overwriting
+     * s_host_payload while building the next frame can't tear the promotion
+     * (queued slots + clobbered bytes). Fixes the depth-2 commit-ahead
+     * shimmer. */
+    if (s_host_payload && s_queued_hold && s_queued_used > 0) {
+        memcpy(s_queued_hold, s_host_payload, s_queued_used);
+    }
+    if (pipe_check_enabled() && s_queued_hold && s_queued_used > 0) {
+        s_queued_checksum = payload_fnv(s_queued_hold, s_queued_used);
     }
 
     if (dma_trace_enabled()) {
