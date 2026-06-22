@@ -383,6 +383,8 @@ void _start(void) {
         /* Upload PREVIOUS frame's palette now — it pairs with the
          * FRONT buffer we're about to display. Skip on the very first
          * iteration (front is empty/black anyway). */
+        /* Upload PREVIOUS frame's palette now — it pairs with the FRONT
+         * buffer we're about to display. Skip on the very first iteration. */
         if (frame > 0u) {
             mg_palette_load(0, (const uint16_t *)s_prev_palette, 128);
         }

@@ -97,7 +97,11 @@ $mgapiSrcs = @(
     (Join-Path $MgapiSrcDir "audio_device_win32.c"),
     (Join-Path $MgapiSrcDir "cart_volume.c"),
     (Join-Path $MgapiSrcDir "l2_alloc.c"),
-    (Join-Path $MgapiSrcDir "l2_init.c")
+    (Join-Path $MgapiSrcDir "l2_init.c"),
+    (Join-Path $MgapiSrcDir "dma_engine.c"),
+    (Join-Path $MgapiSrcDir "fmv_video_stream.c"),
+    (Join-Path $MgapiSrcDir "fmv_player.c"),
+    (Join-Path $MgapiSrcDir "fmv_ecalls.c")
 )
 
 # Stage 2c: trashfs implementation. The /cart/ volume formats + mounts on
@@ -222,6 +226,7 @@ if (-not $NoGuest) {
             @{ src = "tools\guests\demos\demo_fmv.c";        sym = "demo_fmv_elf";        out = "demo_fmv.elf";        gen = "demo_fmv_elf_data.c";        extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_fmv_flip.c";   sym = "demo_fmv_flip_elf";   out = "demo_fmv_flip.elf";   gen = "demo_fmv_flip_elf_data.c";   extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_fmv_still.c";  sym = "demo_fmv_still_elf";  out = "demo_fmv_still.elf";  gen = "demo_fmv_still_elf_data.c";  extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_fmv_player.c"; sym = "demo_fmv_player_elf"; out = "demo_fmv_player.elf"; gen = "demo_fmv_player_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_nmi_smoke.c";  sym = "demo_nmi_smoke_elf";  out = "demo_nmi_smoke.elf";  gen = "demo_nmi_smoke_elf_data.c";  extra = $mgGuestImpls }
         )
         foreach ($g in $guestSources) {
@@ -243,7 +248,7 @@ if (-not $NoGuest) {
     }
 }
 if (-not $baked) {
-    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_dynamic_letterbox_elf[] = {0};`nconst size_t demo_dynamic_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`nconst unsigned char demo_audio_mixer_elf[] = {0};`nconst size_t demo_audio_mixer_elf_len = 0;`nconst unsigned char demo_pcm_stream_elf[] = {0};`nconst size_t demo_pcm_stream_elf_len = 0;`nconst unsigned char demo_fmv_elf[] = {0};`nconst size_t demo_fmv_elf_len = 0;`nconst unsigned char demo_fmv_still_elf[] = {0};`nconst size_t demo_fmv_still_elf_len = 0;`nconst unsigned char demo_nmi_smoke_elf[] = {0};`nconst size_t demo_nmi_smoke_elf_len = 0;`n" |
+    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_dynamic_letterbox_elf[] = {0};`nconst size_t demo_dynamic_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`nconst unsigned char demo_audio_mixer_elf[] = {0};`nconst size_t demo_audio_mixer_elf_len = 0;`nconst unsigned char demo_pcm_stream_elf[] = {0};`nconst size_t demo_pcm_stream_elf_len = 0;`nconst unsigned char demo_fmv_elf[] = {0};`nconst size_t demo_fmv_elf_len = 0;`nconst unsigned char demo_fmv_still_elf[] = {0};`nconst size_t demo_fmv_still_elf_len = 0;`nconst unsigned char demo_fmv_player_elf[] = {0};`nconst size_t demo_fmv_player_elf_len = 0;`nconst unsigned char demo_nmi_smoke_elf[] = {0};`nconst size_t demo_nmi_smoke_elf_len = 0;`n" |
         Set-Content -Path $shellDataC -Encoding ASCII
 }
 $mgapiSrcs += $shellDataC

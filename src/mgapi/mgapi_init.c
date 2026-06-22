@@ -13,6 +13,7 @@
 #include "mgapi/mgapi.h"
 
 #include "cart_window.h"
+#include "fmv_player.h"
 #include "psram_pool.h"
 #include "audio_init.h"
 #include "cart_volume.h"
@@ -232,6 +233,9 @@ void mgapi_shutdown(void) {
      * thread has joined and will not touch any of the subsystems
      * we're about to shut down. */
     mgapi_worker_stop();
+    /* Worker is joined; tear the FMV player down first (it unregisters its
+     * FMV_VIDEO stream from the arbiter and closes its fd). */
+    fmv_player_shutdown();
     /* Worker is joined; safe to tear down the stream arbiter (it has
      * no producer thread of its own — the worker tick was the only
      * writer). Closes any still-registered streams + frees ring
@@ -422,6 +426,11 @@ static void mgapi_step_body(uint64_t elapsed_ns) {
      * critical section inside the vm_step that would block
      * doesn't delay this read because reads already happened. */
     (void)stream_arbiter_tick();
+
+    /* FMV player: runs the deferred teardown when a stop is pending. Its
+     * producer rides the stream_arbiter_tick above; its consumer is the
+     * bsnes-thread FRAME_DONE path. */
+    fmv_player_tick();
 
     /* Stage 3a: drive the cooperative scheduler. We step until it
      * goes idle (no ready VMs / all blocked) or runs out of budget.

@@ -25,6 +25,7 @@
 
 #include "io/stream_arbiter.h"
 #include "io/stream_ecalls.h"
+#include "fmv_ecalls.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -65,6 +66,8 @@ extern const unsigned char demo_fmv_flip_elf [];
 extern const size_t        demo_fmv_flip_elf_len;
 extern const unsigned char demo_fmv_still_elf [];
 extern const size_t        demo_fmv_still_elf_len;
+extern const unsigned char demo_fmv_player_elf [];
+extern const size_t        demo_fmv_player_elf_len;
 extern const unsigned char demo_nmi_smoke_elf [];
 extern const size_t        demo_nmi_smoke_elf_len;
 
@@ -296,6 +299,9 @@ int mgapi_vm_init(void *cart_volume_handle) {
      * streams are registered. */
     if (!stream_arbiter_init()) goto fail_sys;
     if (!mgapi_install_stream_ecalls(&g_sys)) goto fail_sys;
+    /* FMV player ecalls (SYS_FMV_*) ride on the same arbiter — its
+     * FMV_VIDEO producer registers as a stream. */
+    if (!mgapi_install_fmv_ecalls(&g_sys)) goto fail_sys;
 
     /* 4. Mount table:
      *      /td0/  small RAM-disk scratch (writable, this DLL's BSS)
@@ -393,6 +399,7 @@ static void install_bundled_demos(void) {
     install_demo("/demos/fmv.elf",         demo_fmv_elf,         demo_fmv_elf_len);
     install_demo("/demos/fmv_flip.elf",    demo_fmv_flip_elf,    demo_fmv_flip_elf_len);
     install_demo("/demos/fmv_still.elf",   demo_fmv_still_elf,   demo_fmv_still_elf_len);
+    install_demo("/demos/fmv_player.elf",  demo_fmv_player_elf,  demo_fmv_player_elf_len);
     install_demo("/demos/nmi_smoke.elf",   demo_nmi_smoke_elf,   demo_nmi_smoke_elf_len);
 }
 

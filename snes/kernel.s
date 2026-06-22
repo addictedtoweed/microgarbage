@@ -112,7 +112,9 @@
     sep #$20
     .a8
     lda K_FRAME_STATE
-    bne @wait_only                  ; state B coming (unblank only) -> wait
+    beq @do_handshake               ; state 0 (A next) -> do the per-frame handshake
+    jmp @wait_only                  ; states 1/2 (B / SIPHON) -> wait only
+@do_handshake:
 
     ; 1) manual joypad read (auto-joypad is disabled in NMITIMEN). Fills PADS,
     ;    16 bits per pad, order matching the auto-read register layout.
@@ -167,11 +169,37 @@
     sbc K_LAYOUT_BOT_LB
     sta K_LAYOUT_VIS_END
 
+    ; v2.40: cache the per-scanline VRAM siphon config (bytes/line, source
+    ; base, VRAM word dst, scanline count). Stable for the logical frame;
+    ; state B arms it from these, state SIPHON walks it. All zero = no siphon
+    ; (the common case for non-FMV demos), so this is harmless overhead.
+    lda f:COPRO_SIPHON_BYTES_L
+    sta K_SIPHON_BYTES
+    lda f:COPRO_SIPHON_SRC_LO_L
+    sta K_SIPHON_SRC_BASE_LO
+    lda f:COPRO_SIPHON_SRC_HI_L
+    sta K_SIPHON_SRC_BASE_HI
+    lda f:COPRO_SIPHON_VRAM_LO_L
+    sta K_SIPHON_VRAM_LO
+    lda f:COPRO_SIPHON_VRAM_HI_L
+    sta K_SIPHON_VRAM_HI
+    lda f:COPRO_SIPHON_LINES_L
+    sta K_SIPHON_LINE_BASE
+    lda f:COPRO_SIPHON_HTIME_L
+    sta K_SIPHON_HTIME
+
     ; Sleep until the next H+V IRQ event (state A blank+burst at VIS_END,
     ; or state B unblank at top_lb). The IRQ does all per-frame PPU work;
     ; we resume here in active display afterward.
 @wait_only:
     wai
+    ; During the siphon (state 2) the lean siphon_isr handles every scanline.
+    ; Keep this wait TIGHT — just wai + a 3-instruction state check — so each
+    ; per-line IRQ fires from wai with minimal latency jitter, instead of from
+    ; somewhere in the full @loop body (which would jitter the force-blank H).
+    lda K_FRAME_STATE
+    cmp #$02
+    beq @wait_only
     jmp @loop
 .endproc
 
@@ -496,6 +524,21 @@
     cpy #$0000                   ; first slot fired this burst?
     bne @have_budget             ; no -> K_BYTES_REM is the running value
     jsr calc_bytes_rem           ; yes -> read live beam (accurate start); A8 out
+    ; DEBUG (v2.37m): strobe the burst-start budget so the host can log what
+    ; window each burst actually begins with. First slot only (we just ran
+    ; calc_bytes_rem). Read COPRO_DBG_BUDGET_L + (K_BYTES_REM>>8); the read
+    ; is the signal, value discarded. X holds the slot cursor -> save it.
+    phx                          ; save slot cursor (i16)
+    rep #$20
+    .a16
+    lda K_BYTES_REM              ; full 16-bit budget
+    xba                          ; A.lo = budget >> 8
+    and #$00FF                   ; A = budget >> 8 (0..62)
+    tax                          ; X = bucket
+    sep #$20
+    .a8
+    lda f:COPRO_DBG_BUDGET_L,x   ; strobe; host logs the offset
+    plx                          ; restore slot cursor
 @have_budget:
     rep #$20
     .a16
@@ -505,8 +548,23 @@
     .a8
     bcc @fits                    ; size <  window remaining -> fits
     beq @fits                    ; size == window remaining -> fits
-    cpy #$0000                   ; size > remaining: defer UNLESS nothing
-    beq @fits                    ;   fired yet (avoid hang on a huge slot)
+    ; size > remaining window. Force-firing here overruns into active
+    ; display -- harmless for VRAM (PPU drops it) but CORRUPTS CGRAM (slot 0
+    ; = the palette). The budget strobe shows ~1.6/sec tight bursts on real
+    ; video (min=0B); this is the depth-2 shimmer. So DEFER (resume next burst
+    ; at the full window) -- EXCEPT a slot too big to fit ANY window
+    ; (clean_slate's 64 KB VRAM clear) would hang the chainer, so force-fire
+    ; only that. bbus stays on the stack until @fits/@over_defer (balanced).
+    cpy #$0000                   ; first slot this burst?
+    bne @over_defer              ;   no -> later over-budget slot -> defer
+    rep #$20
+    .a16
+    lda f:COPRO_DMA_LIST_L+4,x    ; size (X = slot cursor, still valid)
+    cmp #$4000                   ; > 16 KB = bigger than any real window?
+    sep #$20
+    .a8
+    bcs @fits                    ;   genuinely huge -> force-fire (avoid hang)
+@over_defer:
     pla                          ; discard saved bbus
     jmp @defer
 @fits:
@@ -722,8 +780,12 @@
     .a8
 
     lda K_FRAME_STATE
-    bne @state_b
+    beq @state_a            ; 0 -> state A (blank + burst)
+    jmp @state_b            ; 1 -> state B. State 2 (siphon) never reaches this
+                            ; handler: State B installs the lean siphon_isr in
+                            ; RAMVEC_IRQ, so the per-line IRQs go straight there.
 
+@state_a:
     ; ===== State A: blank, then (if staged) burst =====
     lda #$80
     sta INIDISP
@@ -739,16 +801,70 @@
     stz VTIMEH
     lda #$01
     sta K_FRAME_STATE       ; -> state B
-    bra @ack
+    jmp @ack
 
 @state_b:
-    ; ===== State B: unblank for the visible region =====
+    ; ===== State B: arm the siphon (if any) WHILE STILL FORCE-BLANKED, then
+    ; unblank for the visible region. =====
+    ; v2.42: per nesdev (forums.nesdev.org t=19896), writing VMADD during ACTIVE
+    ; display corrupts ("black lines across the tile"); it must be set while
+    ; blanked and then only auto-incremented. State A left $80 (force-blank) on
+    ; through vblank, so program the siphon DMA + VMADD NOW, before unblanking.
+    lda K_SIPHON_BYTES
+    beq @b_no_siphon
+
+    stz HDMAEN              ; disable HDMA during the visible siphon — HDMA fires
+                           ; in every H-blank too and would contend with the
+                           ; siphon's ch0 DMA -> mangled tiles (ChatGPT 2nd
+                           ; opinion). frame_dma re-arms HDMAEN next vblank.
+    lda #$01
+    sta DMAP0               ; 2 regs -> VMDATAL/H
+    lda #<VMDATAL
+    sta BBAD0
+    lda #$80
+    sta VMAIN               ; word increment after the $2119 write
+    rep #$20
+    .a16
+    lda K_SIPHON_VRAM_LO
+    sta VMADDL              ; VRAM dst — set ONCE here while blanked; per-line
+                           ; DMA only auto-increments it (never rewritten live)
+    lda K_SIPHON_SRC_BASE_LO
+    sta K_SIPHON_SRC_LO    ; seed the running source cursor (A1T0 per line)
+    sep #$20
+    .a8
     lda #$0F
-    sta INIDISP
+    sta INIDISP            ; NOW unblank for the visible region
+    stz CGADD              ; v2.37o CGADD reset (after re-enabling rendering)
+    lda K_SIPHON_LINE_BASE
+    sta K_SIPHON_LINE_REM   ; scanline counter (siphon_isr decrements)
+    ; H+V mode (NMITIMEN=$30); re-arm V per scanline (first = top_lb+1). HTIME
+    ; is only a COARSE fire point now — siphon_isr spin-waits the H-blank flag
+    ; before the DMA, so the force-blank always lands at dot ~278 (H-blank).
+    lda K_LAYOUT_TOP_LB
+    inc a
+    sta K_SIPHON_VLINE
+    sta VTIMEL
+    stz VTIMEH
+    lda K_SIPHON_HTIME
+    sta HTIMEL
+    stz HTIMEH
+    lda #<siphon_isr
+    sta RAMVEC_IRQ
+    lda #>siphon_isr
+    sta RAMVEC_IRQ+1
+    lda #$02
+    sta K_FRAME_STATE       ; main loop tight-wai's (state 2)
+    jmp @ack
+
+@b_no_siphon:
+    lda #$0F
+    sta INIDISP             ; unblank (non-siphon path)
+    stz CGADD               ; v2.37o CGADD reset
     lda K_LAYOUT_VIS_END
     sta VTIMEL
     stz VTIMEH
     stz K_FRAME_STATE       ; -> state A
+    jmp @ack
 
 @ack:
     lda TIMEUP              ; ack the timer IRQ (read $4211)
@@ -758,6 +874,111 @@
     ply
     plx
     pla
+    rti
+.endproc
+
+; ------------------------------------------------------------------
+; siphon_isr — LEAN per-scanline VRAM siphon handler. State B installs this
+; in RAMVEC_IRQ for the siphon phase; the main loop tight-wai's at state 2.
+;
+; Deliberately minimal to cut the trigger->force-blank latency (and its
+; jitter) so the per-line force-blank lands reliably in the right pillar /
+; H-blank:
+;   - NO register save (A/X/Y are scratch — the main loop only wai's).
+;   - Runs at the main loop's A8/I8 width (no rep/sep).
+;   - DMA channel 0 (DMAP0/BBAD0/A1B0/VMADD/A1T0) is pre-armed in State B;
+;     A1T0 + VMADD auto-advance across lines, so we only reset DAS0 (the
+;     transfer zeroes it), fire blank/DMA/unblank, and re-arm the V target.
+; On the last line: restore the burst handler (irq) + schedule state A.
+; ------------------------------------------------------------------
+; GPT reference version: NO H-blank spin (HTIME is positioned so the handler
+; begins where we want the force-blank); full per-line DMA re-setup (VMAIN/
+; VMADD/A1T0/DMAP0/BBAD0/DAS0); settle NOPs both sides; BYTES==0 stop sentinel;
+; INIDISP restored on every exit. Removing the spin frees the cycles the per-
+; line re-setup needs (which stalled when bundled with the spin).
+.proc siphon_isr
+    .a8
+    .i8
+    lda TIMEUP              ; $4211: ACK FIRST
+    lda K_SIPHON_BYTES
+    beq @done               ; sentinel: no DMA
+
+    lda #$8F
+    sta INIDISP             ; force-blank immediately (HTIME positions this)
+    nop                     ; PPU settle guard
+    nop
+    nop
+    nop
+
+    lda #$80
+    sta VMAIN               ; $2115: increment after high byte
+    rep #$20
+    .a16
+    lda K_SIPHON_VRAM_LO
+    sta VMADDL              ; VRAM WORD address, per line
+    lda K_SIPHON_SRC_LO
+    sta A1T0L               ; source, per line
+    sep #$20
+    .a8
+    lda #$01
+    sta DMAP0               ; mode 1: $2118/$2119 alternation
+    lda #<VMDATAL
+    sta BBAD0               ; $18
+    lda K_SIPHON_BYTES
+    sta DAS0L
+    stz DAS0H
+    lda #$01
+    sta MDMAEN              ; fire DMA channel 0
+
+    nop                     ; guard before rendering returns
+    nop
+    nop
+    nop
+    lda #$0F
+    sta INIDISP             ; restore visible display
+
+    ; advance source += bytes
+    rep #$20
+    .a16
+    lda K_SIPHON_BYTES
+    and #$00FF
+    clc
+    adc K_SIPHON_SRC_LO
+    sta K_SIPHON_SRC_LO
+    ; advance VRAM word address += bytes / 2
+    lda K_SIPHON_BYTES
+    and #$00FF
+    lsr a
+    clc
+    adc K_SIPHON_VRAM_LO
+    sta K_SIPHON_VRAM_LO
+    sep #$20
+    .a8
+
+    dec K_SIPHON_LINE_REM
+    beq @done
+    ; re-arm same H, next V
+    inc K_SIPHON_VLINE
+    lda K_SIPHON_VLINE
+    sta VTIMEL
+    stz VTIMEH
+    rti
+
+@done:
+    lda #$0F
+    sta INIDISP             ; ALWAYS restore display
+    lda #<irq
+    sta RAMVEC_IRQ
+    lda #>irq
+    sta RAMVEC_IRQ+1
+    lda #22
+    sta HTIMEL
+    stz HTIMEH
+    lda K_LAYOUT_VIS_END
+    sta VTIMEL
+    stz VTIMEH
+    stz K_FRAME_STATE       ; -> state A
+    stz K_SIPHON_BYTES      ; hard-stop sentinel (handshake re-arms next frame)
     rti
 .endproc
 

@@ -92,12 +92,15 @@ COPRO_HIRQ_SCHED_NMITIMEN_L   = (COPRO_BANK << 16) | $79B8
 ; at vblank to set up the next frame's HIRQ schedule.
 COPRO_LAYOUT_TOP_LB_L         = (COPRO_BANK << 16) | $79B9
 COPRO_LAYOUT_BOT_LB_L         = (COPRO_BANK << 16) | $79BA
+; v2.40: the 6-byte siphon config — bytes/line, source offset (16),
+; VRAM word dst (16), scanline count. (VRAM_* reuse the retired WRAM_LO/MID
+; offsets; LINE_COUNT reuses WRAM_HI.)
 COPRO_SIPHON_BYTES_L          = (COPRO_BANK << 16) | $79BB
 COPRO_SIPHON_SRC_LO_L         = (COPRO_BANK << 16) | $79BC
 COPRO_SIPHON_SRC_HI_L         = (COPRO_BANK << 16) | $79BD
-COPRO_SIPHON_WRAM_LO_L        = (COPRO_BANK << 16) | $79BE
-COPRO_SIPHON_WRAM_MID_L       = (COPRO_BANK << 16) | $79BF
-COPRO_SIPHON_WRAM_HI_L        = (COPRO_BANK << 16) | $79C0
+COPRO_SIPHON_VRAM_LO_L        = (COPRO_BANK << 16) | $79BE
+COPRO_SIPHON_VRAM_HI_L        = (COPRO_BANK << 16) | $79BF
+COPRO_SIPHON_LINES_L          = (COPRO_BANK << 16) | $79C0
 
 ; v2.34 virtual-NMI chainer: frame-done strobe. The kernel reads this
 ; (the read IS the signal) once it has walked the LAST staged DMA slot
@@ -105,6 +108,15 @@ COPRO_SIPHON_WRAM_HI_L        = (COPRO_BANK << 16) | $79C0
 ; frame_ready. If the chainer defers (window full) it does NOT read
 ; this, so frame_ready stays set and the next burst resumes the walk.
 COPRO_FRAME_DONE_L            = (COPRO_BANK << 16) | $79C1
+COPRO_SIPHON_HTIME_L          = (COPRO_BANK << 16) | $79C2  ; live siphon HTIME knob
+
+; DEBUG (v2.37m): burst-start budget probe. The kernel reads
+; COPRO_DBG_BUDGET_L + (K_BYTES_REM >> 8) on the first slot of each burst;
+; the host logs the low-byte offset = the budget in 256-byte units. A
+; 64-byte read-only window ($7A00-$7A3F); returns don't-care. Remove with
+; the host-side handler once the depth-2 over-budget cause is found.
+COPRO_DBG_BUDGET_L            = (COPRO_BANK << 16) | $7A00
+COPRO_DBG_SIPHON_L            = (COPRO_BANK << 16) | $7A40  ; siphon ground-truth strobe
 
 ; --- per-frame DMA dispatch ------------------------------------------
 ; The kernel checks COPRO_FRAME_RDY in NMI; 0 means the copro is mid-stage
@@ -278,17 +290,25 @@ K_LAYOUT_TOP_LB     = $0230     ; cached top letterbox line count
 K_LAYOUT_BOT_LB     = $0231     ; cached bottom letterbox line count
 K_LAYOUT_VIS_END    = $0232     ; computed: 224 - bot_lb (first bottom-LB line)
 
+; v2.40 VRAM siphon (repurposed from the retired WRAM-accumulate model).
+; The per-scanline State-SIPHON DMAs CHR from the cart-window payload into
+; VRAM. *_BASE / *_LINE_BASE are cached from the cart window each @loop;
+; State B copies them into the running cursors (SRC, LINE_REM) at siphon
+; start, and State SIPHON advances them per visible scanline.
 K_SIPHON_BYTES      = $0233     ; cached bytes_per_line (0 = disabled)
-K_SIPHON_SRC_LO     = $0234     ; current source pointer (within bank $C0)
+K_SIPHON_SRC_LO     = $0234     ; running source offset (within COPRO_BANK)
 K_SIPHON_SRC_HI     = $0235
-K_SIPHON_SRC_BASE_LO= $0236     ; reset value (NMI reloads SRC_LO from here)
+K_SIPHON_SRC_BASE_LO= $0236     ; cached source base (State B reloads SRC from here)
 K_SIPHON_SRC_BASE_HI= $0237
-K_SIPHON_WRAM_LO    = $0238     ; WMADDR value to set at siphon start
-K_SIPHON_WRAM_MID   = $0239
-K_SIPHON_WRAM_HI    = $023A
+K_SIPHON_VRAM_LO    = $0238     ; cached VRAM WORD dst (VMADD value set once at start)
+K_SIPHON_VRAM_HI    = $0239
+K_SIPHON_LINE_BASE  = $023A     ; cached scanline count (State B reloads LINE_REM)
 
-K_FRAME_STATE       = $023B     ; per-frame ISR state (see kernel.s default_hirq)
+K_FRAME_STATE       = $023B     ; per-frame ISR state (see kernel.s irq)
 K_CURRENT_LINE      = $023C     ; cached V counter target (for write-only VTIMEL)
 K_HIRQ_DEFAULT      = $023D     ; cached address of default_hirq_handler so the
                                 ; @loop's HIRQ uninstall path can restore it
                                 ; (2 bytes — same shape as K_NMI_DEFAULT)
+K_SIPHON_LINE_REM   = $023F     ; running scanline counter (State SIPHON dec→0)
+K_SIPHON_HTIME      = $0240     ; cached HTIME for the per-scanline siphon IRQ
+K_SIPHON_VLINE      = $0241     ; running V target — re-armed per siphon scanline

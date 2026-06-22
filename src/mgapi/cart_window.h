@@ -232,6 +232,26 @@ extern "C" {
  * the old port-7 advance trigger. */
 #define CW_OFF_FRAME_DONE             0x79C1u
 
+/* v2.40: live siphon HTIME knob (1 byte). The H-counter value at which the
+ * per-scanline State-SIPHON IRQ fires — tune so the force-blank lands in the
+ * right pillar / H-blank (after this line's visible pixels), not mid-visible.
+ * Driven by $env:MG_SIPHON_HTIME so it can be swept without a rebuild. */
+#define CW_OFF_SIPHON_HTIME           0x79C2u
+
+/* DEBUG (v2.37m): burst-start budget probe window. The kernel reads
+ * CW_OFF_DBG_BUDGET + (K_BYTES_REM>>8) on the first slot of each burst;
+ * the host logs the offset (= budget in 256-byte units) to find why
+ * depth-2 bursts start over-budget. 64-byte read-only window in the free
+ * 0x79C2-0x7FFF gap. Remove with the kernel strobe once diagnosed. */
+#define CW_OFF_DBG_BUDGET             0x7A00u
+
+/* DEBUG (v2.40): siphon ground-truth strobe window (0x7A40-0x7A7F). The
+ * kernel strobes CW_OFF_DBG_SIPHON + K_SIPHON_BYTES at every State B (arm
+ * check), and CW_OFF_DBG_SIPHON + 40 once per State-SIPHON scanline. The
+ * host logs both: confirms whether the config reaches the kernel (bytes) and
+ * whether the per-scanline siphon actually fires. Remove once diagnosed. */
+#define CW_OFF_DBG_SIPHON             0x7A40u
+
 /* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
  * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap
  * between Mode 7 batch ($79A0..$79AF) and HDMA tables ($7A00..). A

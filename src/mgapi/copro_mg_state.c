@@ -20,6 +20,7 @@
 #include "copro_mg_state.h"
 
 #include "cart_window.h"
+#include "cart_frame_types.h"   /* StagedSlot, SubFrame, MgCompleteFrame, MG_MAX_* */
 #include "l2_init.h"
 
 #include <stdio.h>
@@ -175,39 +176,9 @@ static unsigned s_prev_mg_slots;
  * happens at the end of build_frame; subsequent sub-frame writes
  * happen in mg_state_advance_subframe (called from cart_window's
  * port-7 read handler). */
-#define MG_MAX_STAGED_SLOTS   48u   /* 8 slots × up to 6 sub-frames + margin */
-/* MG_MAX_SUBFRAMES bumped from 4 → 8 (v2.11). The 4 cap silently
- * dropped cgram + bg-tilemap shadow DMAs on the first commit after
- * mg_ppu_clean_slate when a demo also chunked CHR into 3 slots —
- * SF0 spent on the 65536-B clean_slate VRAM-clear budget, SF1-3 on
- * the three CHR chunks, leaving no room for SF4 (cgram + tilemap).
- * Multi-commit demos hid this via s_cgram_reupload_frames /
- * s_bg_reupload_frames widening dirty for 3 / 60 follow-ups; single-
- * commit demos (demo_fmv_still) failed to display anything.
- * 8 covers 2× the worst-case + headroom; ~80 B extra BSS. */
-#define MG_MAX_SUBFRAMES       8u   /* hard cap */
-/* Per-burst DMA byte budget. Per the FMV design:
- *   (vblank_lines + force_blanked_lines) × 1364 cycles / 8 = bytes/burst
- *   = (38 + 16) × 1364 / 8 = 9207 with force_blank(8, 8).
- * Kept ≤ the kernel chainer's per-burst window (54 × 170 = 9180) so the
- * host never packs a sub-frame the chainer would have to split across
- * two bursts (which would cost a 4th burst and drop 20 fps → 15 fps).
- * v2.36: was 9200 (> kernel 9180) while the kernel still budgeted the
- * conservative 160 B/line; both now align on the real ~170 B/line. */
-#define MG_SUBFRAME_BYTE_BUDGET 9180u
-
-typedef struct {
-    uint8_t  bbus;
-    uint8_t  dmap;
-    uint16_t prep;
-    uint16_t src;    /* offset into cart-window payload area */
-    uint16_t size;
-} StagedSlot;
-
-typedef struct {
-    uint8_t     slot_count;
-    StagedSlot  slots[8];
-} SubFrame;
+/* StagedSlot, SubFrame, MG_MAX_STAGED_SLOTS, MG_MAX_SUBFRAMES,
+ * MG_SUBFRAME_BYTE_BUDGET now live in cart_frame_types.h (shared with the
+ * host FMV pipeline). */
 
 static StagedSlot s_staged[MG_MAX_STAGED_SLOTS];
 static unsigned   s_staged_count;
@@ -738,7 +709,7 @@ static bool stage_dma(const void *src, uint32_t size,
 /* Stuff the eight cart-window slot entries from one sub-frame, padding
  * remaining slot indices with empty (bbus=0) so the kernel skips them
  * cleanly. */
-static void write_subframe_to_cart_window(const SubFrame *sf) {
+void write_subframe_to_cart_window(const SubFrame *sf) {
     static const CartDmaSlot empty_slot = {0};
     for (unsigned i = 0; i < 8; i++) {
         if (i < sf->slot_count) {
@@ -795,6 +766,27 @@ static void activate_queued_locked(void) {
     memcpy(s_subframes, s_queued_subframes,
            sizeof(SubFrame) * (s_queued_count ? s_queued_count : 1));
     s_subframe_count = s_queued_count;
+    if (dma_trace_enabled()) {
+        /* v2.37n flip/cadence probe: which CHR page the DISPLAY flips to
+         * (bg12nba low nibble) vs which page the active frame BURSTS to
+         * (SF0's first CHR-VRAM slot VMADD >> 12). They MUST differ —
+         * if equal, the flip is showing the buffer we're overwriting =
+         * the depth-2 double-buffer shimmer. count != 3 = cadence stutter. */
+        unsigned disp_pg = (unsigned)(s_queued_ppu_batch.bg12nba & 0x0Fu);
+        unsigned burst_pg = 0xFFu;
+        for (unsigned i = 0; i < s_subframes[0].slot_count; i++) {
+            const StagedSlot *sl = &s_subframes[0].slots[i];
+            if (sl->bbus == 0x18u && sl->prep < 0x7000u) {   /* CHR, not tilemap */
+                burst_pg = (unsigned)(sl->prep >> 12);
+                break;
+            }
+        }
+        static unsigned s_flip_n;
+        s_flip_n++;
+        fprintf(stderr, "[flip] n=%u disp_pg=%u burst_pg=%u count=%u%s\n",
+                s_flip_n, disp_pg, burst_pg, s_queued_count,
+                (disp_pg == burst_pg) ? "  <<< CONFLICT (display==burst)" : "");
+    }
     s_subframe_index = 0;
     write_subframe_to_cart_window(&s_subframes[0]);
     s_active_valid = true;
@@ -1097,7 +1089,7 @@ static uint8_t compute_obsel(const MgSpriteConfig *cfg) {
  *   bits 2-7: tilemap base / 1024 words = word >> 10
  *   bits 0-1: size_code (MgBgSize) */
 static uint8_t compute_bgxsc(const MgBgLayerState *bg) {
-    return (uint8_t)(((bg->tilemap_word >> 10) << 2) | (bg->size_code & 3));
+    return mg_bg_sc(bg->tilemap_word, bg->size_code);   /* cart_frame_types.h */
 }
 
 /* Compute the CHR-page index for BG12NBA / BG34NBA.
@@ -1113,7 +1105,7 @@ static uint8_t compute_bgxsc(const MgBgLayerState *bg) {
  * page 2 (= $2000) in BG12NBA. BG1 looked at $2000, the actual
  * upload at VRAM $1000 went unused, screen rendered backdrop. */
 static uint8_t chr_page(const MgBgLayerState *bg) {
-    return (uint8_t)((bg->chr_word >> 12) & 0x0F);
+    return mg_chr_page(bg->chr_word);                   /* cart_frame_types.h */
 }
 
 static void emit_ppu_batch(void) {

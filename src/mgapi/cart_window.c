@@ -11,6 +11,7 @@
  * ============================================================ */
 #include "cart_window.h"
 #include "copro_mg_state.h"   /* mg_state_advance_subframe (v2.05) */
+#include "fmv_player.h"       /* FMV consumer dispatch (v2.40) */
 
 #include <stdio.h>
 #include <string.h>
@@ -116,6 +117,14 @@ void cart_window_set_frame_ready(uint8_t byte) {
      * trigger can tell how many NMIs have fired since this commit. */
     if (byte != 0) g_subframe_init_reads = g_frame_ready_reads;
     if (byte != 0) g_frame_staged++;
+    /* v2.40: a normal (non-FMV) staged frame must not inherit a leftover siphon
+     * config from a prior FMV run — the kernel caches CW_OFF_SIPHON_* each
+     * @loop and would arm a bogus per-scanline siphon. Only the FMV player sets
+     * a non-zero config, so clear it on any non-FMV staged frame. */
+    if (byte != 0 && !fmv_player_active()) {
+        static const uint8_t off[6] = {0};
+        cart_window_load_blob(CW_OFF_SIPHON_CONFIG, off, sizeof off);
+    }
 }
 uint8_t cart_window_get_frame_ready(void)      { return g_frame_ready; }
 
@@ -216,6 +225,13 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
      * sub-frame chaining can use to gate advance() against. */
     if (off == CW_OFF_FRAME_READY) {
         g_frame_ready_reads++;
+        /* FMV path: the player owns the frame-ready byte outright, overriding
+         * any stale value the demo's pre-FMV clean_slate left set. It returns
+         * 0 while pre-rolling / after EOF, 1 once a frame is loaded — and
+         * loads the first frame as a side effect once the ring is primed. */
+        if (fmv_player_active()) {
+            g_frame_ready = fmv_player_frame_ready_byte();
+        }
         return g_frame_ready;
     }
 
@@ -227,7 +243,12 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
      * fixed per-frame joypad read. */
     if (off == CW_OFF_FRAME_DONE) {
         if (g_frame_ready != 0) {
-            int adv = mg_state_advance_subframe();
+            /* FMV path consumes pre-built frames from the ring; the normal
+             * path advances the guest-staged sub-frame queue. Both return
+             * the same MG_ADVANCE_* contract, so the frame_ready/consumed
+             * bookkeeping below is identical. */
+            int adv = fmv_player_active() ? fmv_player_on_frame_done()
+                                          : mg_state_advance_subframe();
             if (adv == MG_ADVANCE_MORE) {
                 /* more sub-frames of the active frame — keep frame_ready */
             } else {
@@ -245,6 +266,51 @@ uint8_t cart_window_read(uint32_t snes_addr_24) {
                                           g_frame_consumed_hook_userdata);
                 }
             }
+        }
+        return 0;
+    }
+
+    /* DEBUG (v2.37m): burst-start budget probe. The kernel reads
+     * CW_OFF_DBG_BUDGET + (K_BYTES_REM>>8) on the first slot of each burst.
+     * The offset IS the value (budget in 256-byte units). Track min/max/last
+     * + a count of "tight" starts (< 4 KB) and print a summary every 120
+     * strobes (~2 s at 20 fps x 3 sub-frames) so we see, without flooding,
+     * what window each depth-2 burst actually begins with. */
+    if (off >= CW_OFF_DBG_BUDGET && off < CW_OFF_DBG_BUDGET + 64u) {
+        unsigned bucket = (unsigned)(off - CW_OFF_DBG_BUDGET);   /* budget>>8 */
+        static unsigned dbg_n, dbg_lo, dbg_min = 999u, dbg_max;
+        dbg_n++;
+        if (bucket < dbg_min) dbg_min = bucket;
+        if (bucket > dbg_max) dbg_max = bucket;
+        if (bucket < 16u) dbg_lo++;            /* budget < 4096 B = tight */
+        if ((dbg_n % 120u) == 0u) {
+            fprintf(stderr,
+                "mgapi: burst-budget strobe n=%u last=%uB min=%uB max=%uB "
+                "tight(<4K)=%u\n",
+                dbg_n, bucket * 256u, dbg_min * 256u, dbg_max * 256u, dbg_lo);
+            fflush(stderr);
+        }
+        return 0;
+    }
+
+    /* DEBUG (v2.40): siphon ground-truth strobe. bucket = K_SIPHON_BYTES at
+     * State B (arm: 0 = config not reaching the kernel, 24 = armed), or 40 =
+     * one State-SIPHON scanline fired. Tells us whether the siphon arms and
+     * whether it actually runs per-line. */
+    if (off >= CW_OFF_DBG_SIPHON && off < CW_OFF_DBG_SIPHON + 64u) {
+        unsigned bucket = (unsigned)(off - CW_OFF_DBG_SIPHON);
+        static unsigned sip_arm_n, sip_last_bytes, sip_line_n;
+        if (bucket == 40u) {
+            sip_line_n++;
+        } else {
+            sip_arm_n++;
+            sip_last_bytes = bucket;
+        }
+        if (((sip_arm_n + sip_line_n) % 600u) == 0u) {
+            fprintf(stderr,
+                "mgapi: siphon strobe — arm_n=%u last_bytes=%u line_fires=%u\n",
+                sip_arm_n, sip_last_bytes, sip_line_n);
+            fflush(stderr);
         }
         return 0;
     }

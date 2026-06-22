@@ -446,6 +446,17 @@
 #define SYS_MG_KERNEL_LAYOUT  1230 /* (top_lb, bottom_lb) → 0, v2.29 Phase 3a */
 #define SYS_MG_SIPHON_CONFIGURE 1231 /* (bytes_per_line, src_off, wram_dst) → 0 */
 
+/* v2.40: host-driven FMV playback. The guest opens the .fmv via fs_open
+ * and hands the fd to SYS_FMV_PLAY; the host FMV player parses the header,
+ * spins up the FMV_VIDEO stream producer (frames built ahead into a ring),
+ * and drives the cart window directly from the FRAME_DONE consumer. The
+ * player owns the fd after PLAY (closes it on STOP). The guest loop shrinks
+ * to: play; while(status != EOF){ poll input; mg_wait_frame; }; stop. */
+#define SYS_FMV_PLAY    1232  /* (fd) → 0 or -errno; player takes the fd */
+#define SYS_FMV_STOP    1233  /* () → 0 */
+#define SYS_FMV_STATUS  1234  /* () → 0 idle / 1 playing / 2 eof */
+#define SYS_FMV_SET_HTIME 1235 /* (htime 1..254) → 0; live siphon force-blank tune */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

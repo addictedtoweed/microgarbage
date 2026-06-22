@@ -105,8 +105,40 @@ StreamHandle stream_arbiter_register(int fd,
                                      uint32_t chunk_bytes,
                                      uint32_t depth);
 
+/* Per-stream PRODUCER vtable — generalizes the arbiter beyond reading
+ * fixed chunks from a file fd. Each stream type supplies a fill function
+ * the arbiter calls (on the producer/worker side) whenever the stream's
+ * ring has a free slot. On the desktop a producer typically does a
+ * synchronous read/decode; on the MCU it kicks a DMA and the next tick
+ * checks completion. The built-in FILE_CHUNK producer (used by
+ * stream_arbiter_register above) is one instance of this. */
+typedef struct {
+    /* Fill `slot` (slot_bytes, the size given at registration) with one
+     * element. Return true if an element was produced (the arbiter pushes
+     * it into the ring), false if nothing was produced this tick (the
+     * arbiter then consults at_eof to decide EOF vs. retry-next-tick). */
+    bool (*fill)(void *ctx, void *slot);
+    /* True once the source is exhausted — no more elements will ever be
+     * produced. Consulted only after a fill returns false. */
+    bool (*at_eof)(void *ctx);
+    /* Release producer-owned resources at unregister. May be NULL. */
+    void (*close)(void *ctx);
+    void *ctx;
+} StreamProducer;
+
+/* Register a stream driven by a custom producer. `slot_bytes` is the ring
+ * element size (== what stream_arbiter_consume copies and
+ * stream_arbiter_chunk_bytes reports). `depth` is a power of two ≥ 2. The
+ * producer struct is copied. Returns a handle ≥ 0, or STREAM_HANDLE_INVALID
+ * on bad args / no free slot / allocation failure (on failure the caller
+ * still owns producer->ctx). */
+StreamHandle stream_arbiter_register_producer(const StreamProducer *producer,
+                                              uint32_t slot_bytes,
+                                              uint32_t depth);
+
 /* Unregister and free ring storage. Idempotent for an invalid
- * handle. Does NOT close the fd. */
+ * handle. Calls the producer's close() (if any). Does NOT close any fd
+ * passed to stream_arbiter_register (caller still owns that). */
 void stream_arbiter_unregister(StreamHandle h);
 
 /* Producer step. Walks registered streams in rotated order; for

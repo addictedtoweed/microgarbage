@@ -24,6 +24,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cart_frame_types.h"   /* SubFrame, MgCompleteFrame, StagedSlot */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -175,6 +177,12 @@ enum {
     MG_ADVANCE_EMPTY    = 2,  /* frame done + queue empty; clear RDY, bump consumed */
 };
 int mg_state_advance_subframe(void);
+
+/* Write one sub-frame's slots into the cart-window DMA slot list
+ * (StagedSlot → CartDmaSlot, padding unused slots empty). Exposed for the
+ * FMV player consumer, which drives the cart window directly from
+ * pre-built MgCompleteFrames instead of the guest staging path. */
+void write_subframe_to_cart_window(const SubFrame *sf);
 
 /* Transient variant — same as mg_state_queue_dma except it does NOT
  * advance the persistent checkpoint, so the bytes are freed on the

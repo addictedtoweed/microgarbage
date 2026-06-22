@@ -179,6 +179,12 @@
 #define SYS_MG_KERNEL_LAYOUT     1230  /* (top_lb, bottom_lb) */
 #define SYS_MG_SIPHON_CONFIGURE  1231  /* (bytes_per_line, src_off, wram_dst) */
 
+/* Host-driven FMV playback (1232..1234). See mg_fmv.h. */
+#define SYS_FMV_PLAY             1232  /* (fd) → 0/-errno; host owns fd */
+#define SYS_FMV_STOP             1233  /* () → 0 */
+#define SYS_FMV_STATUS           1234  /* () → 0 idle / 1 playing / 2 eof */
+#define SYS_FMV_SET_HTIME        1235  /* (htime) → 0; live siphon HTIME tune */
+
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
  * Clobber a0 (return), preserve a1..a6 (they're used as inputs).
