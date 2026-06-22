@@ -199,6 +199,28 @@ uint16_t cart_window_get_pads(unsigned i) {
     return (i < 4) ? g_pads[i] : 0;
 }
 
+/* Port-2 mouse mailbox. Deltas accumulate across posts and reset on consume;
+ * buttons hold the latest state. Single-threaded (bsnes thread) — the embedder
+ * posts in Mgapi::enter() and the FMV overlay consumes in on_frame_done, both
+ * on that thread, so no locking. */
+static int     g_mouse_dx;
+static int     g_mouse_dy;
+static uint8_t g_mouse_buttons;
+
+void cart_window_post_mouse(int dx, int dy, uint8_t buttons) {
+    g_mouse_dx += dx;
+    g_mouse_dy += dy;
+    g_mouse_buttons = buttons;
+}
+
+void cart_window_consume_mouse(int *dx, int *dy, uint8_t *buttons) {
+    if (dx)      *dx = g_mouse_dx;
+    if (dy)      *dy = g_mouse_dy;
+    if (buttons) *buttons = g_mouse_buttons;
+    g_mouse_dx = 0;
+    g_mouse_dy = 0;
+}
+
 /* ----------------------------------------------------------------
  *  Read dispatcher
  * ---------------------------------------------------------------- */

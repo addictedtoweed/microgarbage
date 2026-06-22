@@ -100,6 +100,11 @@ bool Mgapi::try_load() {
     return false;
   }
 
+  // Optional export (older DLLs lack it): the port-2 mouse forward for the
+  // cursor overlay. Resolved directly so a missing symbol is silent, not a
+  // scary "missing export" line — the runtime stays fully functional without it.
+  p_post_mouse = reinterpret_cast<decltype(p_post_mouse)>(dll_sym(h, "mgapi_post_mouse"));
+
   MgapiConfigABI cfg = {};
   cfg.cart_window_size  = 64 * 1024;
   cfg.audio_sample_rate = 0;        // 0 = auto-detect (WASAPI default endpoint)
@@ -192,13 +197,27 @@ void Mgapi::enter() {
         // before reading individual buttons.
         SNES::input.poll();
         uint16_t pads[4] = {0, 0, 0, 0};
-        pads[0] = mgapi_pack_joypad_port(false);   // port 1
-        pads[1] = mgapi_pack_joypad_port(true);    // port 2
-        // Pads 2/3 stay zero (multitap not wired through this path
-        // yet; we'd need to use Device::Multitap + per-controller
-        // deviceindex 1..3 and pull through input.port_read's
-        // multitap branch instead of the Joypad branch).
+        pads[0] = mgapi_pack_joypad_port(false);   // port 1 (pad: Start exits)
+        // Port 2 is read as a SNES Mouse below (32-bit serial), NOT packed as a
+        // pad, so pads[1] stays 0. Pads 2/3 unused (no multitap path yet).
         p_post_joypads(pads);
+
+        // Port 2 = SNES Mouse: clock out its 32-bit report and forward dx/dy +
+        // L/R to the cursor overlay. port_read(true)'s per-port counter was
+        // reset by poll() and is untouched (port 2 wasn't packed as a pad), so
+        // reads return mouse cases 0..31. If port 2 is actually a pad, these are
+        // just pad bits → no meaningful cursor motion.
+        if(p_post_mouse) {
+          unsigned b[32];
+          for(unsigned i = 0; i < 32; i++) b[i] = SNES::input.port_read(true) & 1u;
+          int xmag = (b[25]<<6)|(b[26]<<5)|(b[27]<<4)|(b[28]<<3)|(b[29]<<2)|(b[30]<<1)|b[31];
+          int ymag = (b[17]<<6)|(b[18]<<5)|(b[19]<<4)|(b[20]<<3)|(b[21]<<2)|(b[22]<<1)|b[23];
+          int dx = b[24] ? -xmag : xmag;   // bit 24 = X direction (1 = negative)
+          int dy = b[16] ? -ymag : ymag;   // bit 16 = Y direction (1 = negative)
+          unsigned btn = (b[9] ? 1u : 0u) | (b[8] ? 2u : 0u);  // bit9=Left, bit8=Right
+          p_post_mouse(dx, dy, btn);
+        }
+
         p_step(16666666ull);
         samples_until_step = 735;
       } else {

@@ -235,6 +235,13 @@ MGAPI_API uint8_t mgapi_cart_read(uint32_t addr);
  */
 MGAPI_API void mgapi_post_joypads(const uint16_t pads[4]);
 
+/* Post one frame's SNES-Mouse delta + button state (port 2). dx/dy are signed
+ * pixel deltas since the last post; buttons bit0 = left, bit1 = right. Deltas
+ * accumulate until consumed by the host-side overlay (e.g. the FMV cursor).
+ * The embedder clocks the mouse's 32-bit serial report and calls this each
+ * frame; harmless to omit (older embedders simply never call it). */
+MGAPI_API void mgapi_post_mouse(int dx, int dy, unsigned buttons);
+
 /* ----------------------------------------------------------------
  *  Per-frame tick + audio pull
  * ---------------------------------------------------------------- */

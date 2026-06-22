@@ -45,6 +45,7 @@ private:
   void     (*p_shutdown)();
   uint8_t  (*p_cart_read)(uint32_t);
   void     (*p_post_joypads)(const uint16_t *);
+  void     (*p_post_mouse)(int, int, unsigned);   /* port-2 mouse -> cursor overlay (optional export) */
   void     (*p_step)(uint64_t);
   uint32_t (*p_audio_pull)(int16_t *, uint32_t);
   const char *(*p_version)();

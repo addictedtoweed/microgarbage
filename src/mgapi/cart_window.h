@@ -252,6 +252,32 @@ extern "C" {
  * whether the per-scanline siphon actually fires. Remove once diagnosed. */
 #define CW_OFF_DBG_SIPHON             0x7A40u
 
+/* Sprite overlay (cursor + bullethole pool over FMV). Dedicated CLEAN region
+ * 0x7A80-0x7D5F: above the payload (0x0000-0x6FFF = MG_FRAME_PAYLOAD_BYTES) so
+ * promote_current's payload blit never touches it, and past the DBG strobe
+ * windows (end 0x7A7F) so cart_window_read serves these as plain bytes. mgapi
+ * writes them once at FMV start (M1) / per-frame for the live cursor (M2/M3);
+ * the FMV producer adds DMA slots that push them to VRAM / CGRAM / OAM.
+ *   CHR   : 2x 8x8 4bpp tiles (cursor 269, bullethole 270) -> VRAM word 28880
+ *           (OBSEL base 0x6000; tile 269 = base + 269*16). Word 28864 (tile 268)
+ *           is AVOIDED: at BG1 CHR base 0x4000 the FMV's BLANK_TILE (780) maps to
+ *           28864, so a sprite tile there paints the crosshair into the FMV
+ *           border on odd frames. BG1 never references tiles past 780, so 28880+
+ *           is truly free.
+ *   CGRAM : OBJ palettes 0-3 (64 entries) -> CGADD 128
+ *   OAM   : full 544 B (sprite 0 = cursor, 1-127 hidden at y=240)            */
+#define CW_OFF_SPR_CHR    0x7A80u   /* 64 B  (2 tiles)            */
+#define CW_OFF_SPR_CGRAM  0x7AC0u   /* 128 B (OBJ pal 0-3)        */
+#define CW_OFF_SPR_OAM    0x7B40u   /* 544 B (128 sprites)        */
+#define CW_SPR_CHR_BYTES   64u
+#define CW_SPR_CGRAM_BYTES 128u
+#define CW_SPR_OAM_BYTES   544u
+#define CW_SPR_OAM_ACTIVE_BYTES 128u   /* sprites 0-31 low table — the 60 Hz per-frame push */
+#define CW_SPR_VRAM_WORD   28880u   /* tile 269 @ OBSEL base 0x6000 (24576+269*16) */
+#define CW_SPR_TILE_CURSOR 269u     /* OAM tile number for the cursor (CHR @ 28880) */
+#define CW_SPR_TILE_HOLE   270u     /* OAM tile number for the bullethole          */
+#define CW_SPR_OBSEL       0x03u    /* size pair 8/16, namesel 0, base 3 (0x6000) */
+
 /* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
  * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap
  * between Mode 7 batch ($79A0..$79AF) and HDMA tables ($7A00..). A
@@ -414,6 +440,12 @@ void cart_window_clear_hirq_version(void);
 /* Read one pad word back. i = 0..3 (P0..P3); out-of-range returns 0.
  * Used by the SYS_COPRO_READ_PADS ecall handler. */
 uint16_t cart_window_get_pads(unsigned i);
+
+/* Port-2 mouse mailbox (see cart_window.c). post accumulates dx/dy deltas +
+ * latches buttons (bit0=left, bit1=right); consume returns the accumulated
+ * delta + buttons and zeroes the delta. */
+void cart_window_post_mouse(int dx, int dy, uint8_t buttons);
+void cart_window_consume_mouse(int *dx, int *dy, uint8_t *buttons);
 
 /* ----------------------------------------------------------------
  *  Consumer (the cart-bus read).

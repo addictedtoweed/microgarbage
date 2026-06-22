@@ -104,6 +104,131 @@ static void fmv_player_finalize(void) {
     atomic_store(&s_state, FMV_STATUS_IDLE);
 }
 
+/* ----------------------------------------------------------------
+ *  Sprite overlay (M1): a cursor + bullethole pool drawn over the FMV.
+ *
+ *  Writes the static cursor/hole CHR, OBJ palettes, and an initial OAM
+ *  (sprite 0 = cursor centered, 1-127 hidden) into the dedicated clean
+ *  cart-window regions (CW_OFF_SPR_*). The FMV producer adds DMA slots
+ *  that push these to VRAM word 28864 / CGADD 128 / OAM every frame, so
+ *  they render on top of BG1. M2/M3 will rewrite the OAM live from input.
+ * ---------------------------------------------------------------- */
+static uint16_t spr_bgr555(int r, int g, int b) {
+    return (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
+}
+
+/* Build one 8x8 4bpp SNES tile from an 8-row 1-bit mask: set bit -> color
+ * index 1, clear bit -> 0 (transparent). Plane 0 carries the mask; 1-3 = 0. */
+static void spr_build_tile_idx1(uint8_t tile[32], const uint8_t mask[8]) {
+    memset(tile, 0, 32);
+    for (int y = 0; y < 8; y++) tile[2 * y] = mask[y];   /* plane 0 = mask row */
+}
+
+/* Overlay state: cursor = sprite 0; bulletholes = a FIFO pool in sprite slots
+ * 1..31. Stamping past 31 recycles the oldest (it "jumps" to the new spot) —
+ * the 31-sprite-pool demo. */
+#define OV_POOL_FIRST  1u
+#define OV_POOL_LAST   31u
+static struct {
+    int      cx, cy;          /* cursor position (screen px) */
+    uint8_t  prev_left;       /* left-button edge detect */
+    uint8_t  cursor_hidden;   /* hide cursor while right button held */
+    unsigned next_hole;       /* FIFO write cursor (1..31) */
+    uint32_t rng;             /* LCG for palette variety */
+    struct { uint8_t x, y, pal, active; } hole[32];   /* [1..31] used */
+} s_ov;
+
+/* Build the full 544 B OAM from the overlay state and push it to the live CW
+ * region (the producer's SF1/2/3 OAM slots DMA it to PPU OAM). */
+static void fmv_overlay_write_oam(void) {
+    uint8_t oam[CW_SPR_OAM_BYTES];
+    memset(oam, 0, sizeof oam);
+    for (int i = 0; i < 128; i++) oam[i * 4 + 1] = 240u;   /* hide all */
+
+    if (!s_ov.cursor_hidden) {                              /* sprite 0: cursor */
+        oam[0] = (uint8_t)s_ov.cx;
+        oam[1] = (uint8_t)s_ov.cy;
+        oam[2] = (uint8_t)(CW_SPR_TILE_CURSOR & 0xFFu);
+        oam[3] = (uint8_t)((3u << 4) | (0u << 1) | ((CW_SPR_TILE_CURSOR >> 8) & 1u)); /* prio3,pal0 */
+    }
+
+    for (unsigned i = OV_POOL_FIRST; i <= OV_POOL_LAST; i++) {   /* sprites 1..31: holes */
+        if (!s_ov.hole[i].active) continue;
+        oam[i * 4 + 0] = s_ov.hole[i].x;
+        oam[i * 4 + 1] = s_ov.hole[i].y;
+        oam[i * 4 + 2] = (uint8_t)(CW_SPR_TILE_HOLE & 0xFFu);
+        oam[i * 4 + 3] = (uint8_t)((2u << 4) | ((s_ov.hole[i].pal & 7u) << 1) | ((CW_SPR_TILE_HOLE >> 8) & 1u));
+    }
+    cart_window_load_blob(CW_OFF_SPR_OAM, oam, sizeof oam);
+}
+
+static void fmv_overlay_setup(void) {
+    /* CHR: cursor crosshair (tile 269) + bullethole splat (tile 270). */
+    static const uint8_t cursor[8] = { 0x18,0x18,0x18,0xFF,0xFF,0x18,0x18,0x18 };
+    static const uint8_t hole[8]   = { 0x3C,0x7E,0xFF,0xFF,0xFF,0xFF,0x7E,0x3C };
+    uint8_t chr[CW_SPR_CHR_BYTES];
+    spr_build_tile_idx1(chr,      cursor);
+    spr_build_tile_idx1(chr + 32, hole);
+    cart_window_load_blob(CW_OFF_SPR_CHR, chr, sizeof chr);
+
+    /* OBJ CGRAM (CGADD 128): pal 0 cursor green; pal 1-3 hole colors. OBJ color
+     * index 0 is always transparent, so only [pal*16+1] matters here. */
+    uint16_t cg[CW_SPR_CGRAM_BYTES / 2];   /* 64 entries = OBJ pal 0-3 */
+    memset(cg, 0, sizeof cg);
+    cg[0 * 16 + 1] = spr_bgr555( 40, 255,  80);   /* pal 0: bright green cursor */
+    cg[1 * 16 + 1] = spr_bgr555(170,  30,  30);   /* pal 1: dark red hole  */
+    cg[2 * 16 + 1] = spr_bgr555(110, 110, 110);   /* pal 2: gray hole      */
+    cg[3 * 16 + 1] = spr_bgr555(120,  70,  30);   /* pal 3: brown hole     */
+    cart_window_load_blob(CW_OFF_SPR_CGRAM, cg, sizeof cg);
+
+    /* Init overlay state + write the initial OAM (cursor centered, no holes). */
+    memset(&s_ov, 0, sizeof s_ov);
+    s_ov.cx = 124; s_ov.cy = 100;
+    s_ov.next_hole = OV_POOL_FIRST;
+    s_ov.rng = 0x1234567u;
+    fmv_overlay_write_oam();
+}
+
+/* Per-SNES-frame (called from on_frame_done): the port-2 SNES Mouse moves the
+ * cursor; LEFT click stamps a bullethole (random palette) into the FIFO pool;
+ * RIGHT click clears the whole pool and hides the cursor while held. Then
+ * rewrite the live OAM. Mouse deltas/buttons come from the embedder via
+ * mgapi_post_mouse → cart_window_consume_mouse (bit0=left, bit1=right). */
+static void fmv_overlay_tick(void) {
+    int dx = 0, dy = 0;
+    uint8_t mb = 0;
+    cart_window_consume_mouse(&dx, &dy, &mb);
+    s_ov.cx += dx;
+    s_ov.cy += dy;
+    if (s_ov.cx < 8)   s_ov.cx = 8;
+    if (s_ov.cx > 240) s_ov.cx = 240;
+    if (s_ov.cy < 8)   s_ov.cy = 8;
+    if (s_ov.cy > 200) s_ov.cy = 200;
+
+    uint8_t left  = mb & 1u;
+    uint8_t right = (mb >> 1) & 1u;
+
+    if (right) {                             /* clear pool + hide cursor while held */
+        for (unsigned i = OV_POOL_FIRST; i <= OV_POOL_LAST; i++) s_ov.hole[i].active = 0u;
+        s_ov.next_hole = OV_POOL_FIRST;
+    }
+    s_ov.cursor_hidden = right;
+
+    if (left && !s_ov.prev_left) {           /* left press edge -> stamp a hole */
+        s_ov.rng = s_ov.rng * 1664525u + 1013904223u;
+        uint8_t pal = (uint8_t)(1u + ((s_ov.rng >> 28) % 3u));   /* pal 1..3 */
+        unsigned h = s_ov.next_hole;
+        s_ov.hole[h].x = (uint8_t)s_ov.cx;
+        s_ov.hole[h].y = (uint8_t)s_ov.cy;
+        s_ov.hole[h].pal = pal;
+        s_ov.hole[h].active = 1u;
+        s_ov.next_hole = (h >= OV_POOL_LAST) ? OV_POOL_FIRST : (h + 1u);
+    }
+    s_ov.prev_left = left;
+
+    fmv_overlay_write_oam();
+}
+
 bool fmv_player_start(int fd) {
     if (fd < 0) return false;
     /* Self-heal: a prior FMV demo that didn't tear down cleanly (e.g. it hung
@@ -144,6 +269,11 @@ bool fmv_player_start(int fd) {
     s_kicked  = false;
     s_sf_idx  = 0;
     s_stop_pending = false;
+
+    /* M1: stage the static cursor/hole CHR + palettes + OAM before releasing
+     * to the bsnes thread, so the very first burst already has them resident. */
+    fmv_overlay_setup();
+
     atomic_store(&s_state, FMV_STATUS_PLAYING);
     atomic_store(&s_active, true);    /* release: hands off to the bsnes thread */
     return true;
@@ -210,6 +340,10 @@ int fmv_player_on_frame_done(void) {
     /* Guard against a stray FRAME_DONE from a pre-FMV (clean_slate) frame
      * arriving before the first kickoff — close it out cleanly. */
     if (!s_kicked) return MG_ADVANCE_EMPTY;
+
+    /* Sprite overlay: update cursor + bullethole pool from the pad and rewrite
+     * the live OAM once per SNES frame (this runs every FRAME_DONE). */
+    fmv_overlay_tick();
 
     /* More sub-frames of the active frame? Load the next one + publish its
      * siphon third (src/vram advanced by the new sub-frame index). */

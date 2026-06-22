@@ -266,6 +266,11 @@ void mgapi_post_joypads(const uint16_t pads[4]) {
     cart_window_post_pads(pads);
 }
 
+void mgapi_post_mouse(int dx, int dy, unsigned buttons) {
+    if (!g_initialized) return;
+    cart_window_post_mouse(dx, dy, (uint8_t)buttons);
+}
+
 /* ----------------------------------------------------------------
  *  Diagnostic: cart-bus access tracking
  *

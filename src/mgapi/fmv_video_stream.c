@@ -5,6 +5,7 @@
 #include "fmv_video_stream.h"
 
 #include "cart_frame_types.h"     /* MgCompleteFrame, StagedSlot, mg_bg_sc, mg_chr_page */
+#include "cart_window.h"          /* CW_OFF_SPR_* sprite-overlay regions */
 #include "vm/vm_host_fs.h"        /* vm_host_fs_route_read */
 
 #include <stdlib.h>
@@ -48,6 +49,7 @@
 /* DMA descriptor encodings (copro_mg_state.c). */
 #define BBUS_VMDATAL 0x18u
 #define BBUS_CGDATA  0x22u
+#define BBUS_OAMDATA 0x04u   /* $2104 — sprite-overlay OAM */
 #define DMAP_1B_1R   0x00u
 #define DMAP_2B_2R   0x01u
 
@@ -123,25 +125,38 @@ static bool fmv_video_fill(void *vctx, void *slot) {
 
     f->payload_used = PAYLOAD_USED;
 
-    /* Sub-frames — 15 fps full-burst, 4 vblank sub-frames (each ≤ ~7452 B):
-     *   SF0 = CGRAM + tilemap + C1, SF1 = C2, SF2 = C3, SF3 = C4. */
+    /* Sub-frames — 15 fps full-burst, 4 vblank sub-frames (each ≤ ~7452 B).
+     * Sprite overlay: the cursor + pool are sprites 0..31, so each frame pushes
+     * only their 128 B low-OAM — small enough to ride ALL four sub-frames →
+     * 60 Hz cursor. SF3 instead pushes the full 544 B (once per 4-frame cycle)
+     * to keep sprites 32..127 hidden. Static sprite CHR + OBJ CGRAM ride SF1's
+     * slack. The high OAM table stays all-zero (8x8, X<256), so the low-only
+     * 128 B updates are correct between full pushes. Budgets:
+     *   SF0 7104+128=7232, SF1 6720+64+128+128=7040, SF2 6720+128=6848,
+     *   SF3 6720+544=7264 — all < ~7452. */
     SubFrame *sf0 = &f->subframes[0];
-    sf0->slot_count = 3;
+    sf0->slot_count = 4;
     sf0->slots[0] = (StagedSlot){ .bbus=BBUS_CGDATA,  .dmap=DMAP_1B_1R, .prep=0u,       .src=OFF_CGRAM, .size=FMV_CGRAM_BYTES };
     sf0->slots[1] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=back_tm,  .src=OFF_TM,    .size=TM_BYTES };
     sf0->slots[2] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=back_chr, .src=OFF_C1,    .size=CHR_C1 };
+    sf0->slots[3] = (StagedSlot){ .bbus=BBUS_OAMDATA, .dmap=DMAP_1B_1R, .prep=0u, .src=CW_OFF_SPR_OAM, .size=CW_SPR_OAM_ACTIVE_BYTES };
 
     SubFrame *sf1 = &f->subframes[1];
-    sf1->slot_count = 1;
+    sf1->slot_count = 4;
     sf1->slots[0] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)(back_chr + CHR_C1/2u),               .src=OFF_C2, .size=CHR_C2 };
+    sf1->slots[1] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)CW_SPR_VRAM_WORD, .src=CW_OFF_SPR_CHR,   .size=CW_SPR_CHR_BYTES };
+    sf1->slots[2] = (StagedSlot){ .bbus=BBUS_CGDATA,  .dmap=DMAP_1B_1R, .prep=128u,                       .src=CW_OFF_SPR_CGRAM, .size=CW_SPR_CGRAM_BYTES };
+    sf1->slots[3] = (StagedSlot){ .bbus=BBUS_OAMDATA, .dmap=DMAP_1B_1R, .prep=0u, .src=CW_OFF_SPR_OAM, .size=CW_SPR_OAM_ACTIVE_BYTES };
 
     SubFrame *sf2 = &f->subframes[2];
-    sf2->slot_count = 1;
+    sf2->slot_count = 2;
     sf2->slots[0] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)(back_chr + (CHR_C1+CHR_C2)/2u),      .src=OFF_C3, .size=CHR_C3 };
+    sf2->slots[1] = (StagedSlot){ .bbus=BBUS_OAMDATA, .dmap=DMAP_1B_1R, .prep=0u, .src=CW_OFF_SPR_OAM, .size=CW_SPR_OAM_ACTIVE_BYTES };
 
     SubFrame *sf3 = &f->subframes[3];
-    sf3->slot_count = 1;
+    sf3->slot_count = 2;
     sf3->slots[0] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)(back_chr + (CHR_C1+CHR_C2+CHR_C3)/2u), .src=OFF_C4, .size=CHR_C4 };
+    sf3->slots[1] = (StagedSlot){ .bbus=BBUS_OAMDATA, .dmap=DMAP_1B_1R, .prep=0u, .src=CW_OFF_SPR_OAM, .size=CW_SPR_OAM_BYTES };
 
     f->subframe_count = 4;
 
@@ -150,9 +165,10 @@ static bool fmv_video_fill(void *vctx, void *slot) {
      * main, vofs = -1 (the demo's 1px content shift). */
     memset(&f->ppu_batch, 0, sizeof f->ppu_batch);
     f->ppu_batch.bgmode  = 0x01u;                       /* MG_BG_MODE_1 */
+    f->ppu_batch.obsel   = CW_SPR_OBSEL;                /* OBJ CHR base 0x6000, 8/16 size pair */
     f->ppu_batch.bg1sc   = mg_bg_sc(front_tm, 0u);      /* 32×32 */
     f->ppu_batch.bg12nba = mg_chr_page(front_chr);
-    f->ppu_batch.tm      = 0x01u;                       /* BG1 on main screen */
+    f->ppu_batch.tm      = 0x01u | 0x10u;               /* BG1 + OBJ on main screen */
     f->ppu_batch.bg1vofs = (uint16_t)0xFFFFu;           /* vofs = -1 */
 
     memset(&f->mode7, 0, sizeof f->mode7);
