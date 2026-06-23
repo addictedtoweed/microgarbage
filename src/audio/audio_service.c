@@ -467,6 +467,13 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
          * 2 MB total at 16 tracks. */
         chans[i].buffer_samples = 32768;
         chans[i].volume         = Q15_ONE;
+        /* #62: cubic interpolation, not the default linear. Under the drift-
+         * sync PLL every channel resamples (even rate-matched ones like the
+         * 44.1 kHz FMV voice), and the non-trivial phase the correction
+         * introduces makes 2-tap LINEAR audibly crackle on sustained audio.
+         * Cubic is the quality ceiling for this and desktop has the headroom
+         * ("M4: CUBIC everywhere is comfortable" per audio_mixer.h). */
+        chans[i].interp         = MIXER_INTERP_CUBIC;
     }
     MixerOutputFormat out = { .bits = 16, .is_signed = true,
                               .storage_bits = 16, .channels = 2 };
