@@ -36,6 +36,7 @@ static uint32_t       s_audio_voice;           /* #73: the FMV music voice (0 = 
 static bool           s_audio_started;         /* #73: voice opened (pre-roll begun) */
 static int            s_preroll;               /* #73: SNES frames left to hold video while audio fills the output pipe */
 static int            s_preroll_cfg = 11;      /* #73: A/V pre-roll frames (~190ms @ 60Hz ≈ audio pipeline latency); $env:MG_FMV_AV_PREROLL */
+static uint32_t       s_bullet_sfx;             /* pool handle for the left-click bullet SFX (0 = none/unloaded), loaded once */
 
 /* ---- bsnes-owned (kickoff + consumer) ---- */
 static MgCompleteFrame s_cur;       /* the active, on-screen frame */
@@ -239,6 +240,17 @@ static void fmv_overlay_tick(void) {
         s_ov.hole[h].pal = pal;
         s_ov.hole[h].active = 1u;
         s_ov.next_hole = (h >= OV_POOL_LAST) ? OV_POOL_FIRST : (h + 1u);
+
+        /* Fire the bullet SFX on a fresh mixer track, panned by where on
+         * screen the shot landed — each click layers over the FMV music and
+         * any still-ringing earlier shots (one track per trigger), demoing the
+         * mixer the same way the audio_mixer demo does. */
+        if (s_bullet_sfx) {
+            int32_t pan = ((int32_t)s_ov.cx - 124) * 280;   /* cx 8..240 -> ~±32k */
+            if (pan >  32767) pan =  32767;
+            if (pan < -32767) pan = -32767;
+            (void)vm_host_audio_sfx_trigger(s_bullet_sfx, 0x6000u, pan);
+        }
     }
     s_ov.prev_left = left;
 
@@ -309,6 +321,12 @@ bool fmv_player_start(int fd) {
     /* M1: stage the static cursor/hole CHR + palettes + OAM before releasing
      * to the bsnes thread, so the very first burst already has them resident. */
     fmv_overlay_setup();
+
+    /* Load the left-click bullet SFX into the shared 4 MB audio pool once and
+     * cache it (host-owned). Missing /host/bullet.wav just leaves it 0 → clicks
+     * stay silent but still stamp holes. Done here (worker thread, pre-playback)
+     * so the trigger on the bsnes thread is a cheap fire-and-forget. */
+    if (!s_bullet_sfx) s_bullet_sfx = vm_host_audio_sfx_load("bullet.wav");
 
     atomic_store(&s_state, FMV_STATUS_PLAYING);
     atomic_store(&s_active, true);    /* release: hands off to the bsnes thread */

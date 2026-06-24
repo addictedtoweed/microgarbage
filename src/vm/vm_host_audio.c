@@ -214,6 +214,41 @@ static void copy_guest_str(VmCpu *cpu, uint32_t addr, char *dst, size_t cap) {
     dst[i] = 0;
 }
 
+/* Read + parse a WAV at an absolute host path, stage it as native-rate mono
+ * PCM16, and load it into the audio pool owned by `owner_vm` (0 = host-owned).
+ * Returns the pool object handle, or 0 on any failure. Shared by the guest
+ * SYS_AUDIO_LOAD_WAV ecall and the host-side vm_host_audio_sfx_load. */
+static uint32_t load_wav_to_pool(const char *hostpath, uint16_t owner_vm) {
+    if (!g_staging || !hostpath) return 0;
+
+    FILE *fp = fopen(hostpath, "rb");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return 0; }
+    uint8_t *filebuf = malloc((size_t)sz);
+    if (!filebuf) { fclose(fp); return 0; }
+    size_t rd = fread(filebuf, 1, (size_t)sz, fp);
+    fclose(fp);
+
+    WavInfo info;
+    if (wav_parse(filebuf, rd, &info) != WAV_OK) { free(filebuf); return 0; }
+
+    /* Stage at the WAV's NATIVE rate; the mixer interpolates per-channel at
+     * play time (a2 of LOAD_STAGED carries the rate). */
+    uint32_t max_frames = (uint32_t)(g_staging_cap / sizeof(int16_t));
+    audio_lock();
+    uint32_t frames = wav_to_mono_pcm16(&info, (int16_t *)g_staging, max_frames);
+    free(filebuf);
+    if (frames == 0) { audio_unlock(); return 0; }
+    uint32_t status = 0, handle = 0;
+    bool ok = audio_call_locked(REQ_AUDIO_LOAD_STAGED, frames * sizeof(int16_t),
+                                owner_vm, info.sample_rate, 0, &status, &handle);
+    audio_unlock();
+    return (ok && status == 0) ? handle : 0;
+}
+
 static void handle_load_wav(VmCpu *cpu, void *system) {
     (void)system;
     uint32_t path_addr = cpu->regs[VM_REG_A0];   /* read arg BEFORE clearing */
@@ -231,43 +266,7 @@ static void handle_load_wav(VmCpu *cpu, void *system) {
 
     char hostpath[512];
     snprintf(hostpath, sizeof(hostpath), "%s/%s", g_host_fs_root, rest);
-
-    FILE *fp = fopen(hostpath, "rb");
-    if (!fp) return;
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0) { fclose(fp); return; }
-    uint8_t *filebuf = malloc((size_t)sz);
-    if (!filebuf) { fclose(fp); return; }
-    size_t rd = fread(filebuf, 1, (size_t)sz, fp);
-    fclose(fp);
-
-    WavInfo info;
-    if (wav_parse(filebuf, rd, &info) != WAV_OK) { free(filebuf); return; }
-
-    /* v2.00: stage SFX at their NATIVE sample rate; the mixer
-     * interpolates per-channel at play time (the design intent from
-     * docs/audio-architecture.md — "per-channel source rate + linear
-     * /cubic interpolation"). This preserves pool-space (no 2×
-     * upsample-and-store) and avoids a second resample pass before
-     * the mixer's own resampler. The rate is communicated to the
-     * audio service via the REQ_AUDIO_LOAD_STAGED a2 arg and stored
-     * on the pool object; svc_sink_start reads it back and configures
-     * the mixer channel before playback. */
-    uint32_t max_frames = (uint32_t)(g_staging_cap / sizeof(int16_t));
-    audio_lock();
-    uint32_t frames = wav_to_mono_pcm16(&info, (int16_t *)g_staging, max_frames);
-    free(filebuf);
-    if (frames == 0) { audio_unlock(); return; }
-    uint32_t status = 0, handle = 0;
-    /* a2 carries the source sample rate so the mixer can interpolate
-     * at play time. 0 would mean "assume mixer rate" (legacy callers). */
-    bool ok = audio_call_locked(REQ_AUDIO_LOAD_STAGED, frames * sizeof(int16_t),
-                                cpu->vm_id, info.sample_rate, 0,
-                                &status, &handle);
-    audio_unlock();
-    cpu->regs[VM_REG_A0] = (ok && status == 0) ? handle : 0;
+    cpu->regs[VM_REG_A0] = load_wav_to_pool(hostpath, cpu->vm_id);
 }
 /* ---- SYS_AUDIO_STREAM_WAV (path) -> voice handle or 0 ----
  * Unlike LOAD_WAV (which decodes the whole file into the pool), this
@@ -400,6 +399,22 @@ void vm_host_audio_fmv_close(uint32_t voice) {
     if (!g_channel) return;
     uint32_t status = 0, h = 0;
     audio_call(REQ_AUDIO_FMV_CLOSE, voice, 0u, 0u, 0u, &status, &h);
+}
+
+uint32_t vm_host_audio_sfx_load(const char *host_relname) {
+    if (!g_host_fs_root || !host_relname) return 0;
+    char hostpath[512];
+    snprintf(hostpath, sizeof(hostpath), "%s/%s", g_host_fs_root, host_relname);
+    return load_wav_to_pool(hostpath, 0u);   /* host-owned (vm 0) */
+}
+
+uint32_t vm_host_audio_sfx_trigger(uint32_t obj, uint32_t gain_q15, int32_t pan_q15) {
+    if (!g_channel || !obj) return 0;
+    uint32_t status = 0, voice = 0;
+    if (!audio_call(REQ_AUDIO_TRIGGER_SFX, obj, gain_q15, (uint32_t)pan_q15, 0u,
+                    &status, &voice))
+        return 0;
+    return (status == 0) ? voice : 0;   /* 0 = no free track / rejected */
 }
 
 /* Adapter so the sweep can ride vm_system's unload-hook seam (called

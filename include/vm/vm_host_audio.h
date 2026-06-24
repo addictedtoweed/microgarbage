@@ -66,4 +66,14 @@ void vm_host_audio_sweep_vm(uint16_t vm_id);
 uint32_t vm_host_audio_fmv_open(void);
 void     vm_host_audio_fmv_close(uint32_t voice);
 
+/* Host-driven one-shot SFX (e.g. the FMV player's bullet sound on left-click),
+ * loaded into the SAME 4 MB audio pool and mixed on a free channel — layering
+ * over the FMV music voice exactly like the audio_mixer demo's guest SFX.
+ * _load resolves "<name>" under the /host root, parses the WAV, stages it into
+ * the pool (owner vm 0); returns an object handle (0 = fail) — load once and
+ * cache. _trigger plays it one-shot on a free mixer track (gain Q15, pan Q15
+ * signed, 0 = centre); returns a voice handle (0 = no free track). */
+uint32_t vm_host_audio_sfx_load(const char *host_relname);
+uint32_t vm_host_audio_sfx_trigger(uint32_t obj, uint32_t gain_q15, int32_t pan_q15);
+
 #endif /* VM_HOST_AUDIO_H */
