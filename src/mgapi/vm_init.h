@@ -36,6 +36,14 @@ void mgapi_vm_set_l2_backing(void *base, size_t size);
  * (preserves the standalone-shell behavior). */
 void mgapi_vm_set_disable_default_stdio(int flag);
 
+/* Set the program the shell autostarts on boot — typically read from the
+ * loaded .sfc cart's MGBOOT tag, making that cart a bootable "game" (the path
+ * is seeded into /td0/etc/autostart, which the shell runs at _start). An empty
+ * or NULL path means "no cart-specified program"; vm_init then falls back to
+ * the connect-PuTTY boot banner. Call BEFORE mgapi_vm_init; the string is
+ * copied. */
+void mgapi_vm_set_autostart_path(const char *path);
+
 /* Bring up VmSystem, install bridges, mount both volumes, load the
  * embedded shell.elf. `cart_volume_handle` is the trashfs volume
  * stage 2c stood up; we register it as the "cart" mount. Returns 0

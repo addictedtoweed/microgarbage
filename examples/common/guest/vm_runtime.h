@@ -185,6 +185,9 @@
 #define SYS_FMV_STATUS           1234  /* () → 0 idle / 1 playing / 2 eof */
 #define SYS_FMV_SET_HTIME        1235  /* (htime) → 0; live siphon HTIME tune */
 
+/* Port-2 SNES Mouse read (1236). → packed buttons|dx<<8|dy<<16. */
+#define SYS_MG_READ_MOUSE        1236
+
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
  * Clobber a0 (return), preserve a1..a6 (they're used as inputs).

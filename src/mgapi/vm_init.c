@@ -70,6 +70,8 @@ extern const unsigned char demo_fmv_player_elf [];
 extern const size_t        demo_fmv_player_elf_len;
 extern const unsigned char demo_nmi_smoke_elf [];
 extern const size_t        demo_nmi_smoke_elf_len;
+extern const unsigned char demo_boot_banner_elf [];
+extern const size_t        demo_boot_banner_elf_len;
 
 /* v2.30.7 Phase 3b: cart_window frame_consumed hook → VM scheduler.
  * Called whenever cart_window's port-7-read callback bumps
@@ -187,6 +189,7 @@ static int           g_shell_loaded;
 static void   *g_vm_l2_base;
 static size_t  g_vm_l2_size;
 static int     g_disable_default_stdio;
+static char    g_autostart_path[256];   /* "" = none (fall back to banner) */
 
 void mgapi_vm_set_l2_backing(void *base, size_t size) {
     g_vm_l2_base = base;
@@ -195,6 +198,15 @@ void mgapi_vm_set_l2_backing(void *base, size_t size) {
 
 void mgapi_vm_set_disable_default_stdio(int flag) {
     g_disable_default_stdio = flag ? 1 : 0;
+}
+
+void mgapi_vm_set_autostart_path(const char *path) {
+    size_t i = 0;
+    if (path) {
+        for (; i + 1 < sizeof g_autostart_path && path[i]; i++)
+            g_autostart_path[i] = path[i];
+    }
+    g_autostart_path[i] = '\0';
 }
 
 int mgapi_vm_init(void *cart_volume_handle) {
@@ -401,6 +413,31 @@ static void install_bundled_demos(void) {
     install_demo("/demos/fmv_still.elf",   demo_fmv_still_elf,   demo_fmv_still_elf_len);
     install_demo("/demos/fmv_player.elf",  demo_fmv_player_elf,  demo_fmv_player_elf_len);
     install_demo("/demos/nmi_smoke.elf",   demo_nmi_smoke_elf,   demo_nmi_smoke_elf_len);
+    install_demo("/demos/boot_banner.elf", demo_boot_banner_elf, demo_boot_banner_elf_len);
+
+    /* Seed /td0/etc/autostart, which the shell's _start runs on cold boot.
+     * Priority: a path from the loaded .sfc cart's MGBOOT tag (set via
+     * mgapi_vm_set_autostart_path) makes that cart a bootable game; with no
+     * tag, fall back to the connect-PuTTY boot banner (which renders + exits,
+     * leaving its splash in VRAM until a demo overwrites it). */
+    {
+        const char *as = g_autostart_path[0] ? g_autostart_path : NULL;
+        if (!as && demo_boot_banner_elf_len > 0) as = "/td0/demos/boot_banner.elf";
+        if (as) {
+            char line[260];
+            size_t n = 0;
+            for (; n + 2 < sizeof line && as[n]; n++) line[n] = as[n];
+            line[n++] = '\n';
+            (void)trashfs_mkdir(&g_td0_vol, "/etc", /*now=*/0);
+            TrashfsFile f;
+            if (trashfs_open(&g_td0_vol, "/etc/autostart",
+                             TRASHFS_O_CREAT | TRASHFS_O_TRUNC, &f) == TRASHFS_OK) {
+                uint32_t written = 0;
+                (void)trashfs_write(&f, line, (uint32_t)n, &written, /*now=*/0);
+                (void)trashfs_close(&f);
+            }
+        }
+    }
 }
 
 void mgapi_vm_shutdown(void) {

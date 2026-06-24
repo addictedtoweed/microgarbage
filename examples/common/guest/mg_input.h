@@ -62,6 +62,19 @@ bool mg_pad_held    (MgPad p, uint16_t btn);
 bool mg_pad_pressed (MgPad p, uint16_t btn);
 bool mg_pad_released(MgPad p, uint16_t btn);
 
+/* Port-2 SNES Mouse. dx/dy are relative motion since the last read (the
+ * runtime accumulates + drains them per call); buttons is the current
+ * level. Same hardware the FMV player's cursor/bullet overlay uses, so a
+ * guest menu can be driven by clicks with no PuTTY shell. */
+enum { MG_MOUSE_LEFT = 0x01, MG_MOUSE_RIGHT = 0x02 };
+
+typedef struct {
+    int8_t  dx, dy;
+    uint8_t buttons;   /* MG_MOUSE_* mask */
+} MgMouse;
+
+MgMouse mg_mouse(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -187,6 +187,22 @@ static void h_read_pads(VmCpu *cpu, void *system) {
     cpu->regs[VM_REG_A0] = 0;
 }
 
+/* SYS_MG_READ_MOUSE() → packed: bits 0-7 = buttons (bit0 left, bit1 right),
+ * bits 8-15 = dx (int8), bits 16-23 = dy (int8). Drains the port-2 mouse
+ * mailbox — the same source the FMV overlay reads (cart_window_consume_mouse),
+ * so a guest menu can act on clicks with no PuTTY shell. */
+static void h_read_mouse(VmCpu *cpu, void *system) {
+    (void)system;
+    int dx = 0, dy = 0;
+    uint8_t buttons = 0;
+    cart_window_consume_mouse(&dx, &dy, &buttons);
+    if (dx >  127) dx =  127; else if (dx < -128) dx = -128;
+    if (dy >  127) dy =  127; else if (dy < -128) dy = -128;
+    cpu->regs[VM_REG_A0] = (uint32_t)buttons
+                         | ((uint32_t)(uint8_t)(int8_t)dx <<  8)
+                         | ((uint32_t)(uint8_t)(int8_t)dy << 16);
+}
+
 /* SYS_COPRO_RESET_COUNT() → uint32 reset counter
  *
  * Monotonically incrementing counter that bumps on every
@@ -247,6 +263,7 @@ bool mgapi_install_copro_ecalls(VmSystem *sys) {
     if (!vm_ecall_register(r, SYS_COPRO_STAGE_DMA_SLOT, h_stage_dma_slot))  return false;
     if (!vm_ecall_register(r, SYS_COPRO_FRAME_COMMIT,   h_frame_commit))    return false;
     if (!vm_ecall_register(r, SYS_COPRO_READ_PADS,      h_read_pads))       return false;
+    if (!vm_ecall_register(r, SYS_MG_READ_MOUSE,        h_read_mouse))      return false;
     if (!vm_ecall_register(r, SYS_COPRO_WAIT_VBLANK,    h_wait_vblank))     return false;
     if (!vm_ecall_register(r, SYS_COPRO_RESET_COUNT,    h_reset_count))     return false;
     return true;

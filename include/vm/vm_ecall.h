@@ -457,6 +457,12 @@
 #define SYS_FMV_STATUS  1234  /* () → 0 idle / 1 playing / 2 eof */
 #define SYS_FMV_SET_HTIME 1235 /* (htime 1..254) → 0; live siphon force-blank tune */
 
+/* Port-2 SNES Mouse read (1236). Drains the same mouse mailbox the FMV
+ * overlay uses (cart_window_consume_mouse). Returns packed: bits 0-7 =
+ * buttons (bit0 = left, bit1 = right), bits 8-15 = dx (int8), bits 16-23
+ * = dy (int8). Lets a guest menu act on clicks without a PuTTY shell. */
+#define SYS_MG_READ_MOUSE 1236  /* () → packed buttons|dx<<8|dy<<16 */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */

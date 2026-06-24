@@ -62,3 +62,12 @@ bool mg_pad_released(MgPad p, uint16_t btn) {
     if (p.index >= 4) return false;
     return !(p.bits & btn) && (s_prev_bits[p.index] & btn);
 }
+
+MgMouse mg_mouse(void) {
+    uint32_t packed = _vm_sys0(SYS_MG_READ_MOUSE);
+    MgMouse m;
+    m.buttons = (uint8_t)(packed & 0xFFu);
+    m.dx      = (int8_t)((packed >> 8)  & 0xFFu);
+    m.dy      = (int8_t)((packed >> 16) & 0xFFu);
+    return m;
+}

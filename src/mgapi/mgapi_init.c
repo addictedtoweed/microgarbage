@@ -173,6 +173,7 @@ int mgapi_init(const MgapiConfig *cfg) {
      * allocator (mgapi_l2_init) owns the carve inside this slice. */
     mgapi_vm_set_l2_backing(g_psram.l2, g_psram.l2_size);
     mgapi_vm_set_disable_default_stdio(cfg->disable_default_stdio);
+    mgapi_vm_set_autostart_path(cfg->autostart_path);   /* .sfc MGBOOT tag, or NULL */
     rc = mgapi_vm_init(mgapi_cart_volume_handle());
     if (rc != 0) {
         mgapi_l2_shutdown();

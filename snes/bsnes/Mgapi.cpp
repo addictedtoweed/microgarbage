@@ -64,6 +64,36 @@ static bool resolve(DllHandle h, const char *name, F &out) {
   return true;
 }
 
+// Scan the loaded .sfc cart for an "MGBOOT:<path>" tag (the path runs to the
+// next NUL / newline / control byte). A "release cart" appends this tag to a
+// base ROM so it boots straight into the named program — the path is handed to
+// the DLL as autostart_path, which seeds /td0/etc/autostart. cartridge.cpp has
+// already loaded + checksummed memory::cartrom before it calls try_load(), so
+// the bytes are present here. Returns a static buffer, or nullptr if no tag.
+static const char *mgapi_scan_autostart() {
+  static char path[256];
+  const uint8 *rom = memory::cartrom.data();
+  unsigned n = memory::cartrom.size();
+  if(!rom || n < 8) return nullptr;
+  static const char tag[7] = {'M','G','B','O','O','T',':'};
+  for(unsigned i = 0; i + 7 <= n; i++) {
+    bool hit = true;
+    for(unsigned j = 0; j < 7; j++) if(rom[i+j] != (uint8)tag[j]) { hit = false; break; }
+    if(!hit) continue;
+    unsigned p = i + 7, k = 0;
+    while(p < n && k + 1 < sizeof(path)) {
+      uint8 c = rom[p++];
+      if(c == 0 || c == '\n' || c == '\r' || c < 0x20) break;
+      path[k++] = (char)c;
+    }
+    path[k] = '\0';
+    if(k == 0) return nullptr;
+    fprintf(stderr, "mgapi: MGBOOT autostart = %s\n", path);
+    return path;
+  }
+  return nullptr;
+}
+
 bool Mgapi::try_load() {
   if(dll_handle) return true;
   DllHandle h = dll_open("mgapi.dll");
@@ -111,9 +141,11 @@ bool Mgapi::try_load() {
   cfg.audio_frames_max  = 4096;
   cfg.tcp_listen_port   = 2323;
   cfg.pad_count         = 2;
-  cfg.rom_select        = 0;        // MGAPI_ROM_SMOKE
+  cfg.rom_select        = 1;        // MGAPI_ROM_BOOT: kernel + copro + shell/autostart
+                                    // (the legacy 65816 SELECT-DEMO smoke menu is
+                                    //  now opt-in via $MGAPI_ROM_SELECT=smoke)
   cfg.shell_elf_path    = nullptr;
-  cfg.autostart_path    = nullptr;
+  cfg.autostart_path    = mgapi_scan_autostart();   // .sfc MGBOOT:<path> tag, or nullptr
   cfg.reset.hold_ms     = 50;       // CIC-equivalent + window stabilization
   cfg.disable_default_stdio = 1;    // shell exits cleanly; PuTTY on :2323
 
