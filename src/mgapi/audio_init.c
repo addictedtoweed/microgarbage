@@ -677,3 +677,25 @@ uint32_t mgapi_audio_drain(int16_t *dst_stereo, uint32_t frames) {
 
 uint32_t mgapi_audio_ring_used(void)     { return ring_used_from_consumer(); }
 uint32_t mgapi_audio_ring_capacity(void) { return AUDIO_RING_FRAMES; }
+
+/* #73: expose the audio service's FMV clip-audio ring (NULL if audio isn't up). */
+AudioRingStream *mgapi_audio_fmv_ring(void) {
+    return g_service ? audio_service_fmv_ring(g_service) : NULL;
+}
+
+/* #73: SNES master-clock feedback for FMV A/V drift sync. The embedder calls
+ * this from its audio-output cadence (mgapi_audio_pull) — once per SNES output
+ * sample. bsnes' Enter loop and the mgapi mixer are BOTH pinned at 44100, so
+ * the cumulative pull count IS the SNES master clock in mixer-rate units (no
+ * scaling). We publish it into the FMV ring; audio_service_render feeds it to
+ * the mixer's drift PLL so the WASAPI-paced audio tracks the SNES clock. This
+ * is the emulator twin of the H745's hardware SNES-master-clock feedback. */
+static _Atomic uint64_t g_snes_clock;
+
+void mgapi_audio_note_snes_clock(uint32_t frames) {
+    if (!g_service || frames == 0u) return;
+    uint64_t now = atomic_fetch_add_explicit(&g_snes_clock, frames,
+                                             memory_order_relaxed) + frames;
+    AudioRingStream *r = audio_service_fmv_ring(g_service);
+    if (r) audio_ring_stream_set_external_clock(r, now);
+}

@@ -419,6 +419,13 @@ void music_update(MusicPlayer *mp) {
      * the source advances at the render/drain rate. Capped to the
      * streaming buffer too. */
     size_t cap  = mixer_channel_capacity(mp->cfg.mixer, mp->cfg.mixer_channel);
+    /* Cap how full we let the channel run when the caller wants bounded
+     * output latency (FMV A/V sync). Without this the channel fills to its
+     * full capacity (e.g. 743 ms for a 32768-frame SFX ring), which is fine
+     * for music but puts the audio ~0.8 s behind a near-instant video path. */
+    if (mp->cfg.max_channel_fill_samples &&
+        mp->cfg.max_channel_fill_samples < cap)
+        cap = mp->cfg.max_channel_fill_samples;
     size_t fill = mixer_channel_buffered(mp->cfg.mixer, mp->cfg.mixer_channel);
     size_t target = (cap > fill) ? (cap - fill) : 0;
     if (target > mp->cfg.streaming_buffer_samples)

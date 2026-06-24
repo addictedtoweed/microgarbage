@@ -421,6 +421,14 @@ int32_t mixer_observe_sync(AudioMixer *m,
  * For non-sync mixers, this is a no-op. */
 void mixer_reset_sync(AudioMixer *m);
 
+/* Set the playback-rate correction DIRECTLY, in parts-per-million (positive =
+ * play faster, negative = slower), bypassing the observe_sync drift estimator.
+ * For callers that derive the correction from their own control loop — e.g. an
+ * FMV A/V sync that steers playback to hold a producer ring at a steady fill
+ * (a smooth signal), rather than from noisy clock-counter snapshots. Clamped to
+ * the mixer's max_correction. No-op for non-sync mixers. */
+void mixer_set_drift_ppm(AudioMixer *m, int32_t ppm);
+
 /* ============================================================
  *  Introspection
  * ============================================================ */

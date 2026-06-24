@@ -92,7 +92,15 @@ struct AudioMixer {
     /* Sync state (v2). sync_enabled is true when the mixer was
      * created with mixer_create_with_sync. */
     bool      sync_enabled;
-    q15_t     sync_correction;       /* current smoothed correction, q15 */
+    q15_t     sync_correction;       /* current smoothed correction, q15 (diag) */
+    /* High-precision correction accumulator. The smoothing filter and the
+     * per-channel step adjustment run on THIS, not the q15 sync_correction:
+     * a slow drift (e.g. FMV's ~0.16%) needs a target correction of only
+     * ~52 in q15 units, and `error * smoothing / Q15_ONE` rounds that to 0 —
+     * the rate would never ramp in. Carrying SYNC_ACC_BITS extra fractional
+     * bits lets the correction accumulate and apply in tiny increments.
+     * Units: q15 << SYNC_ACC_BITS. */
+    int64_t   sync_corr_acc;
     q15_t     sync_smoothing;        /* low-pass coefficient, q15        */
     q15_t     sync_max_correction;   /* clamp magnitude, q15             */
     uint64_t  sync_external_ticks_per_second;
@@ -396,6 +404,7 @@ static AudioMixer *mixer_create_internal(
     if (sync) {
         m->sync_enabled                    = true;
         m->sync_correction                 = 0;
+        m->sync_corr_acc                   = 0;
         m->sync_smoothing                  = sync->correction_smoothing;
         m->sync_max_correction             = sync->max_correction;
         m->sync_external_ticks_per_second  = sync->external_ticks_per_second;
@@ -1016,6 +1025,12 @@ size_t mixer_channel_capacity(const AudioMixer *m, size_t channel) {
  *  by zero in degenerate cases.
  * ============================================================ */
 
+/* Extra fractional bits the correction accumulator carries beyond q15, so a
+ * slow drift can ramp in/apply in increments smaller than a q15 unit (which
+ * the per-observation smoothing would otherwise round to zero). */
+#define SYNC_ACC_BITS 16
+#define SYNC_ACC_ONE  ((int64_t)Q15_ONE << SYNC_ACC_BITS)
+
 static void update_channel_steps(AudioMixer *m) {
     /* Recompute c->step for every resampling channel from c->base_step
      * and the current correction value. */
@@ -1023,12 +1038,13 @@ static void update_channel_steps(AudioMixer *m) {
         MixerChannel *c = &m->channels[i];
         if (!c->needs_resample) continue;
 
-        /* delta = base_step * correction / Q15_ONE.
-         * In 64-bit math this is safe: base_step is up to a few × 2^32,
-         * correction fits in q15 (well under 2^16). Product fits in 64
-         * bits with room to spare. */
-        int64_t delta = (int64_t)c->base_step * (int64_t)m->sync_correction;
-        delta /= Q15_ONE;
+        /* delta = base_step * corr_acc / SYNC_ACC_ONE. Using the high-precision
+         * accumulator (not the q15 sync_correction) means the step adjusts in
+         * tiny continuous increments instead of 30-PPM q15 jumps. base_step is
+         * up to a few × 2^32 and corr_acc is clamped to ~2% × 2^16, so the
+         * product stays well within int64. */
+        int64_t delta = (int64_t)c->base_step * m->sync_corr_acc;
+        delta /= SYNC_ACC_ONE;
         int64_t new_step = (int64_t)c->base_step + delta;
         if (new_step < 1) new_step = 1;   /* never go negative or zero */
         c->step = (uint64_t)new_step;
@@ -1067,40 +1083,67 @@ int32_t mixer_observe_sync(AudioMixer *m,
 
     int64_t drift = delta_external - expected_external;
 
-    /* Convert drift to q15 fractional rate error.
-     *   raw = drift * Q15_ONE / expected_external
-     * Sign matters: positive drift = external advanced more than
-     * expected = external clock is faster = mixer needs to play
-     * faster too. */
-    int64_t raw_correction = (drift * (int64_t)Q15_ONE) / expected_external;
+    /* Reject phase-jitter outliers. internal_frames and external_ticks come
+     * from two free-running clocks/threads; a single observation can sample
+     * them mid-burst, so its implied rate error swings far past any real clock
+     * drift (which is well under 1%). Those swings, fed to the filter, make the
+     * playback rate warble. Real drift is small and persistent, so it survives
+     * many observations — discard any whose drift exceeds ~6% of expected and
+     * let the clean ones through. (Also covers the delta_external==0 "internal
+     * ran ahead of external" case, which would otherwise read as -100%.) */
+    int64_t reject = expected_external / 16;   /* ~6.25% */
+    if (drift > reject || drift < -reject)
+        return (int32_t)(m->sync_corr_acc * 1000000 / SYNC_ACC_ONE);
 
-    /* Exponential smoothing (low-pass filter) toward the raw value:
+    /* Convert drift to a high-precision fractional rate error (q15 << ACC).
+     *   raw = drift * SYNC_ACC_ONE / expected_external
+     * Sign matters: positive drift = external advanced more than expected =
+     * external clock is faster = mixer needs to play faster too. Computing in
+     * the accumulator's units (not q15) preserves sub-q15 drift so the loop
+     * doesn't quantize a slow drift to zero. */
+    int64_t raw_correction = (drift * SYNC_ACC_ONE) / expected_external;
+
+    /* Exponential smoothing (low-pass filter) toward the raw value, in the
+     * high-precision accumulator:
      *   new = old + smoothing * (raw - old)
-     * With constant drift, this converges to a steady state where
-     * new == raw. Smoothing in (0, Q15_ONE]: smaller = slower
-     * convergence, smoother output. */
-    int64_t error = raw_correction - (int64_t)m->sync_correction;
+     * With constant drift, this converges to a steady state where new == raw.
+     * Smoothing in (0, Q15_ONE]: smaller = slower convergence, smoother. */
+    int64_t error = raw_correction - m->sync_corr_acc;
     int64_t step  = (error * (int64_t)m->sync_smoothing) / Q15_ONE;
-    int64_t new_correction = (int64_t)m->sync_correction + step;
+    int64_t new_acc = m->sync_corr_acc + step;
 
-    /* Clamp to max magnitude. */
-    int64_t max_corr = (int64_t)m->sync_max_correction;
-    if (new_correction >  max_corr) new_correction =  max_corr;
-    if (new_correction < -max_corr) new_correction = -max_corr;
+    /* Clamp to max magnitude (q15 max promoted to accumulator units). */
+    int64_t max_acc = (int64_t)m->sync_max_correction << SYNC_ACC_BITS;
+    if (new_acc >  max_acc) new_acc =  max_acc;
+    if (new_acc < -max_acc) new_acc = -max_acc;
 
-    m->sync_correction = (q15_t)new_correction;
+    m->sync_corr_acc   = new_acc;
+    m->sync_correction = (q15_t)(new_acc >> SYNC_ACC_BITS);   /* diag/inspection */
     update_channel_steps(m);
 
-    /* Return PPM (parts per million) for diagnostics.
-     *   1 PPM = 1e-6 = Q15_ONE / 1000000. So PPM ≈ correction * 1000000 / Q15_ONE */
-    return (int32_t)((int64_t)m->sync_correction * 1000000 / Q15_ONE);
+    /* Return PPM (parts per million) for diagnostics, from the full-precision
+     * accumulator. 1.0 == SYNC_ACC_ONE, so PPM = acc * 1e6 / SYNC_ACC_ONE. */
+    return (int32_t)(m->sync_corr_acc * 1000000 / SYNC_ACC_ONE);
 }
 
 void mixer_reset_sync(AudioMixer *m) {
     if (!m || !m->sync_enabled) return;
     m->sync_correction    = 0;
+    m->sync_corr_acc      = 0;
     m->sync_have_last_obs = false;
     m->sync_last_internal = 0;
     m->sync_last_external = 0;
     update_channel_steps(m);   /* resets c->step to c->base_step everywhere */
+}
+
+void mixer_set_drift_ppm(AudioMixer *m, int32_t ppm) {
+    if (!m || !m->sync_enabled) return;
+    /* ppm -> accumulator units (q15 << SYNC_ACC_BITS). */
+    int64_t acc = (int64_t)ppm * SYNC_ACC_ONE / 1000000;
+    int64_t max_acc = (int64_t)m->sync_max_correction << SYNC_ACC_BITS;
+    if (acc >  max_acc) acc =  max_acc;
+    if (acc < -max_acc) acc = -max_acc;
+    m->sync_corr_acc   = acc;
+    m->sync_correction = (q15_t)(acc >> SYNC_ACC_BITS);
+    update_channel_steps(m);
 }

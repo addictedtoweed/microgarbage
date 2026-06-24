@@ -110,6 +110,13 @@ enum {
     REQ_AUDIO_PCM_STREAM_FEED  = 0x010F,
     REQ_AUDIO_PCM_STREAM_CLOSE = 0x0110,
 
+    /* #73: host-driven FMV clip audio via a music_player voice fed by the
+     * service's fmv_ring. OPEN (a0 = owner_vm) creates+primes+plays at video
+     * kickoff and returns a voice; CLOSE (a0 = voice) stops it. The FMV video
+     * producer pushes the clip's audio chunks into the ring directly. */
+    REQ_AUDIO_FMV_OPEN  = 0x0111,
+    REQ_AUDIO_FMV_CLOSE = 0x0112,
+
     /* file (0x02xx) — reserved for the M4-owns-SD proxy */
     REQ_FILE_OPEN   = 0x0200,
     REQ_FILE_READ   = 0x0201,

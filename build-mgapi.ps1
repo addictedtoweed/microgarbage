@@ -312,6 +312,11 @@ $audioSrcs = @(
     "src\audio\audio_fft_kernel.c",
     "src\audio\audio_wav_read.c",
     "src\audio\audio_file_stream.c",
+    # #73: push-fed SPSC ring that IS a music_stream_fn source — the FMV
+    # video producer pushes each frame's muxed audio into it; an FMV music
+    # voice (vm_host_audio_fmv_open) drains it through music_player so FMV
+    # audio rides the same mixer/arbiter/sync path as streaming music.
+    "src\audio\audio_ring_stream.c",
     # v1.89: direct Win32 audio output. audio_sink_wav.c already owns
     # the AudioSink dispatcher (open/write/close — selects backend by
     # name); audio_sink_waveout.c is the actual waveOut driver. We

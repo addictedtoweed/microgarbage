@@ -18,6 +18,7 @@
 #define MGAPI_AUDIO_INIT_H
 
 #include "vm/vm_system.h"
+#include "audio/audio_ring_stream.h"   /* AudioRingStream (FMV clip audio, #73) */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -73,6 +74,16 @@ uint32_t mgapi_audio_drain(int16_t *dst_stereo, uint32_t frames);
 /* Dev: snapshot of ring fill level (frames), for the host test. */
 uint32_t mgapi_audio_ring_used(void);
 uint32_t mgapi_audio_ring_capacity(void);
+
+/* #73: the audio service's FMV clip-audio ring (NULL if audio isn't up). The
+ * FMV video producer pushes the clip's muxed audio into it; the FMV music voice
+ * (opened via vm_host_audio_fmv_open) drains it. */
+AudioRingStream *mgapi_audio_fmv_ring(void);
+
+/* #73: feed the SNES master clock to FMV A/V drift sync. Call once per SNES
+ * output sample from the embedder's audio-output cadence (mgapi_audio_pull),
+ * passing the frame count pulled. No-op until audio is up. */
+void mgapi_audio_note_snes_clock(uint32_t frames);
 
 #ifdef __cplusplus
 }

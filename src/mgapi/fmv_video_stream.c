@@ -62,6 +62,7 @@ typedef struct {
     uint32_t     unit_bytes;
     uint8_t      prev_pal[FMV_CGRAM_BYTES];  /* frame N-1's palette (pairing) */
     MgDmaEngine *dma;
+    AudioRingStream *audio_ring;             /* FMV clip audio sink (#73, may be NULL) */
     bool         eof;
 } FmvVideoCtx;
 
@@ -85,6 +86,14 @@ static bool fmv_video_fill(void *vctx, void *slot) {
     if (read_full(c->fd, c->unit, c->unit_bytes) != (int)c->unit_bytes) {
         c->eof = true; return false;
     }
+
+    /* #73: push this frame's muxed audio (the unit's leading abytes, int16
+     * stereo) into the FMV audio ring as we produce it. The FMV music voice
+     * drains it; the ring's look-ahead becomes the audio cushion, and play is
+     * primed + started at video kickoff so A/V line up. */
+    if (c->audio_ring)
+        audio_ring_stream_push(c->audio_ring, (const int16_t *)c->unit,
+                               c->abytes / 4u);
 
     /* Split the unit: [audio abytes][CGRAM 256][tilemap 1560][CHR 24960]. */
     const uint8_t *cg  = c->unit + c->abytes;
@@ -197,7 +206,8 @@ static void fmv_video_close(void *vctx) {
 }
 
 StreamHandle fmv_video_stream_open(int fd, uint32_t abytes, uint32_t nframes,
-                                   MgDmaEngine *dma, uint32_t depth) {
+                                   MgDmaEngine *dma, uint32_t depth,
+                                   AudioRingStream *audio_ring) {
     if (fd < 0 || !dma) return STREAM_HANDLE_INVALID;
 
     FmvVideoCtx *c = (FmvVideoCtx *)calloc(1, sizeof *c);
@@ -206,6 +216,7 @@ StreamHandle fmv_video_stream_open(int fd, uint32_t abytes, uint32_t nframes,
     c->abytes     = abytes;
     c->nframes    = nframes;
     c->dma        = dma;
+    c->audio_ring = audio_ring;
     c->unit_bytes = abytes + FMV_VIDEO_BLOCK_BYTES;
     c->unit       = (uint8_t *)malloc(c->unit_bytes);
     if (!c->unit) { free(c); return STREAM_HANDLE_INVALID; }

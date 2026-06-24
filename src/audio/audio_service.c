@@ -17,6 +17,7 @@
 
 #include "audio/audio_service.h"
 #include "audio/audio_fft.h"
+#include "audio/audio_ring_stream.h"   /* #73: FMV clip audio ring source */
 
 #include <stdio.h>   /* v2.35 DIAG: fprintf/stderr for the drift readout */
 #include <stdlib.h>
@@ -28,6 +29,15 @@
  * are allocated at 2 int16/frame). */
 #define MUSIC_STREAM_FRAMES   8192
 #define MUSIC_HEAD_FRAMES     1024
+
+/* #73 FMV A/V sync: the FMV voice must stay phase-aligned with the near-instant
+ * video path, so its output latency has to be SMALL — unlike background music,
+ * where deep buffering is free. The fmv_ring upstream (743 ms) is the real
+ * underrun cushion, so the music_player's own staging can be tiny: a small
+ * streaming buffer + a hard cap on how far ahead it fills the mixer channel
+ * (which otherwise runs to the channel's full 743 ms capacity). */
+#define FMV_STREAM_FRAMES     2048   /* ~46 ms streaming buffer  */
+#define FMV_CHANNEL_FILL      2048   /* ~46 ms max channel prefill */
 
 /* Per-VM FFT-enable tracking range (matches the scheduler's VM id
  * space). VMs with ids beyond this still get a working meter, but their
@@ -56,6 +66,7 @@ typedef struct {
     uint32_t            track;       /* mixer channel it feeds */
     MusicPlayer        *player;
     bool                is_file;     /* true: file_ctx source; else stream_ctx */
+    bool                is_fmv;      /* true: svc->fmv_ring source (#73)       */
     AudioPoolStreamCtx  stream_ctx;  /* binds pool objects -> player */
     AudioFileStreamCtx  file_ctx;    /* file-backed stream source (is_file) */
     /* per-instance buffers (contiguous SRAM staging, NOT block pool).
@@ -85,6 +96,26 @@ struct AudioService {
      * future stream feeds at a different rate. */
     uint64_t        total_fed;
     uint64_t        total_output;
+
+    /* #73 FMV A/V drift sync: when an FMV voice is playing, each render
+     * feeds the mixer PLL with (total_output, fmv_ring.external_clock) so
+     * the WASAPI-paced audio tracks the SNES/video master clock instead of
+     * free-running (would drift ~0.16%/clip otherwise). Unlike the PCM-FEED
+     * path this observes a SMOOTH per-sample external clock, not a bursty
+     * per-frame feed — so it corrects drift without the PLL-hunting crackle. */
+    bool            fmv_sync_active;
+    uint32_t        fmv_diag_frames;   /* render frames since last diag line   */
+    int32_t         fmv_diag_ppm;      /* last applied rate correction (PPM)    */
+    /* FMV A/V sync via ring-level control. The FMV producer fills fmv_ring at
+     * the SNES/video frame rate, so steering playback to hold the SMOOTHED ring
+     * fill constant locks audio rate to video rate — a clean low-noise signal,
+     * unlike clock-snapshot drift estimation. */
+    int32_t         ring_ema_ms_q8;    /* low-passed ring fill, ms in Q8        */
+    bool            ring_seeded;       /* EMA primed                            */
+    int32_t         ring_target_ms;    /* setpoint, -1 until captured           */
+    uint32_t        ring_settle;       /* frames left before capturing target   */
+    int32_t         fmv_kp;            /* proportional gain, PPM per ms          */
+    bool            fmv_diag_on;       /* $env:MG_FMV_AUDIO_DIAG: log to file    */
 
     /* shared staging buffer for staged loads */
     uint8_t        *staging;
@@ -127,6 +158,13 @@ struct AudioService {
     AudioFft        fft;
     uint32_t        fft_enable_count;
     uint8_t         fft_vm_on[AUDIO_SERVICE_FFT_MAX_VMS];
+
+    /* #73: host-driven FMV clip audio. The FMV video producer pushes the
+     * clip's muxed audio chunks into this ring (worker thread); the FMV
+     * music voice's stream_fn drains it (service thread). pend_is_fmv is the
+     * single-call handoff for svc_sink_start (mirrors pend_is_stream). */
+    AudioRingStream fmv_ring;
+    bool            pend_is_fmv;
 
     /* Scratch buffer for moving PCM from the pool into a mixer
      * channel on SFX start. Sized to one block. */
@@ -271,6 +309,69 @@ static bool svc_sink_start(void *ctx, uint32_t track, AudioVoiceKind kind,
             return true;
         }
 
+        /* --- FMV clip audio (#73): a music voice fed by svc->fmv_ring, which
+         * the FMV video producer pushes the clip's muxed audio into. Posted at
+         * video kickoff so the ring is already filling → prime reads a real
+         * head and play lines up with the first shown frame. Play once (no
+         * loop): at clip end the ring stream returns short and the voice ends.
+         * Crucially it never calls mixer_observe_sync (no PCM-FEED), so it
+         * doesn't drive the drift PLL — the crackle's root cause. */
+        if (svc->pend_is_fmv) {
+            ms->is_fmv = true;
+            if (p) {
+                mixer_set_volume(svc->mixer, track, (q15_t)p->gain);
+                mixer_set_pan(svc->mixer, track, (q15_t)p->pan);
+            }
+            mixer_channel_reset(svc->mixer, track);
+            MusicPlayerConfig rpc = {
+                .mixer            = svc->mixer,
+                .mixer_channel    = track,
+                .format           = MIXER_SRC_PCM16_STEREO,
+                .stream_fn        = audio_ring_stream_read,
+                .stream_user_data = &svc->fmv_ring,
+                .intro_stream_id  = 0,
+                .loop_stream_id   = MUSIC_STREAM_NONE,   /* play once */
+                .streaming_buffer = ms->streaming_buf,
+                .streaming_buffer_samples = FMV_STREAM_FRAMES,
+                .max_channel_fill_samples = FMV_CHANNEL_FILL,
+                .intro_head_buffer  = ms->intro_head,
+                .intro_head_samples = MUSIC_HEAD_FRAMES,
+                .loop_head_buffer   = NULL,
+                .loop_head_samples  = 0,
+            };
+            ms->player = music_create(&rpc);
+            if (!ms->player) { ms->is_fmv = false; return false; }
+            ms->track  = track;
+            ms->in_use = true;
+            music_prime_intro(ms->player);
+            music_play(ms->player);
+            /* Arm A/V drift sync: re-baseline the PLL (counters are
+             * cumulative; a stale baseline would read the whole pre-clip
+             * gap as drift and slam the clamp) and start observing the
+             * SNES master clock each render. */
+            svc->total_fed = svc->total_output;
+            mixer_reset_sync(svc->mixer);
+            svc->fmv_sync_active = true;
+            svc->fmv_diag_frames = 0;
+            svc->fmv_diag_ppm    = 0;
+            /* Ring-level A/V controller state. Let the buffer settle past the
+             * pre-roll transient before capturing the fill setpoint; then a
+             * gentle proportional law holds it there. Kp (PPM per ms of ring
+             * error) and settle time are env-tunable for by-ear adjustment. */
+            svc->ring_ema_ms_q8 = 0;
+            svc->ring_seeded    = false;
+            svc->ring_target_ms = -1;
+            svc->ring_settle    = (uint32_t)svc->sample_rate * 3u;   /* ~3 s */
+            svc->fmv_kp         = 20;
+            { const char *e = getenv("MG_FMV_SYNC_KP");
+              if (e) { int v = atoi(e); if (v >= 0 && v <= 1000) svc->fmv_kp = v; } }
+            { const char *e = getenv("MG_FMV_SYNC_SETTLE_MS");
+              if (e) { int v = atoi(e); if (v >= 0 && v <= 60000)
+                       svc->ring_settle = (uint32_t)((uint64_t)svc->sample_rate * (uint32_t)v / 1000u); } }
+            svc->fmv_diag_on = (getenv("MG_FMV_AUDIO_DIAG") != NULL);
+            return true;
+        }
+
         /* --- pool-backed music voice (intro + optional loop object) ---
          * `object` is the INTRO pool object (the arbiter reffed it); the
          * loop object is in svc->pend_loop. We take an extra ref on the
@@ -399,7 +500,13 @@ static void svc_sink_stop(void *ctx, uint32_t track) {
     MusicSlot *ms = music_slot_for_track(svc, track);
     if (ms) {
         if (ms->player) { music_destroy(ms->player); ms->player = NULL; }
-        if (ms->is_file) {
+        if (ms->is_fmv) {
+            ms->is_fmv = false;   /* fmv_ring is service-owned; nothing to free */
+            /* Stop driving the drift PLL and clear any correction it built,
+             * so later non-FMV audio plays at its native rate. */
+            svc->fmv_sync_active = false;
+            mixer_reset_sync(svc->mixer);
+        } else if (ms->is_file) {
             audio_file_stream_close(&ms->file_ctx);
             ms->is_file = false;
         } else {
@@ -423,6 +530,11 @@ static void svc_sink_stop(void *ctx, uint32_t track) {
 static bool svc_sink_is_done(void *ctx, uint32_t track) {
     AudioService *svc = (AudioService *)ctx;
     return mixer_channel_buffered(svc->mixer, track) == 0;
+}
+
+/* #73: the FMV clip-audio ring (the FMV video producer pushes into it). */
+AudioRingStream *audio_service_fmv_ring(AudioService *svc) {
+    return svc ? &svc->fmv_ring : NULL;
 }
 
 /* ---- create / destroy ---- */
@@ -486,7 +598,13 @@ AudioService *audio_service_create(const AudioServiceConfig *cfg) {
      * video rate); clamp Q15/50 (~2%) so a bad sample can't run away. */
     MixerSyncConfig sync_cfg = {
         .external_ticks_per_second = (uint64_t)svc->sample_rate,
-        .correction_smoothing      = (q15_t)(Q15_ONE / 64),
+        /* Slow filter (~1.5 s time constant at the ~86 obs/s render cadence).
+         * Drift is a constant crystal mismatch, so a slow loop is ideal: it
+         * averages out residual per-observation jitter (the warble source)
+         * while still locking the steady rate. The high-precision accumulator
+         * (audio_mixer sync_corr_acc) makes a coefficient this small work
+         * without quantizing to zero, which the old q15-only path could not. */
+        .correction_smoothing      = (q15_t)(Q15_ONE / 128),
         .max_correction            = (q15_t)(Q15_ONE / 50),
     };
     svc->mixer = mixer_create_with_sync(chans, tracks, svc->sample_rate, out, 0,
@@ -896,6 +1014,27 @@ static void handle_one(AudioService *svc, const ChannelMsg *m) {
         respond(svc, m, (uint32_t)r, 0);
         break;
     }
+    case REQ_AUDIO_FMV_OPEN: {
+        /* #73 host-driven FMV audio: build a music voice fed by svc->fmv_ring
+         * (the FMV producer pushes the clip's muxed audio into it). a0 =
+         * owner_vm (0 = host). create+prime+play happens in svc_sink_start's
+         * pend_is_fmv branch; post this at video kickoff. Returns a voice. */
+        svc->pend_is_fmv = true;
+        AudioVoiceParams p = { .gain = Q15_ONE, .pan = 0, .priority = 0, .loop = 0 };
+        AudioVoiceHandle v;
+        AudioArbResult r = audio_arbiter_play_external(&svc->arbiter, &p,
+                                                       (uint16_t)m->a0, &v);
+        svc->pend_is_fmv = false;
+        respond(svc, m, (uint32_t)r, (r == AUDIO_ARB_OK) ? v : 0);
+        break;
+    }
+    case REQ_AUDIO_FMV_CLOSE: {
+        /* a0 = voice. Stops the FMV voice + frees its track. */
+        AudioVoiceHandle voice = m->a0;
+        AudioArbResult r = audio_arbiter_stop(&svc->arbiter, voice);
+        respond(svc, m, (uint32_t)r, 0);
+        break;
+    }
     default:
         respond(svc, m, (uint32_t)AUDIO_ARB_INVALID_ARG, 0);
         break;
@@ -935,6 +1074,50 @@ void audio_service_render(AudioService *svc, int16_t *out, uint32_t frames) {
     if (!svc || !out) return;
     mixer_render(svc->mixer, out, frames);
     svc->total_output += frames;   /* v2.35: internal clock for drift sync */
+
+    /* #73: FMV A/V sync via ring-level control. The producer fills fmv_ring at
+     * the SNES/video frame rate; steering playback to hold the smoothed fill at
+     * a setpoint makes consume-rate == produce-rate == video rate. Low-pass the
+     * fill (kills the per-frame push sawtooth), capture a setpoint once the
+     * pre-roll settles, then apply a gentle proportional correction. Smooth ring
+     * signal -> smooth rate -> no warble (unlike clock-snapshot drift). */
+    if (svc->fmv_sync_active) {
+        uint32_t avail = audio_ring_stream_avail(&svc->fmv_ring);
+        int32_t  ms    = (int32_t)((uint64_t)avail * 1000u
+                                   / (uint32_t)svc->sample_rate);
+        if (!svc->ring_seeded) { svc->ring_ema_ms_q8 = ms << 8; svc->ring_seeded = true; }
+        else svc->ring_ema_ms_q8 += ((ms << 8) - svc->ring_ema_ms_q8) >> 7; /* ~1.5 s TC */
+        int32_t ema_ms = svc->ring_ema_ms_q8 >> 8;
+
+        if (svc->ring_settle > frames)      svc->ring_settle -= frames;
+        else if (svc->ring_target_ms < 0)   svc->ring_target_ms = ema_ms;
+
+        if (svc->ring_target_ms >= 0) {
+            int32_t ppm = svc->fmv_kp * (ema_ms - svc->ring_target_ms);
+            if (ppm >  18000) ppm =  18000;   /* stay inside the mixer clamp */
+            if (ppm < -18000) ppm = -18000;
+            svc->fmv_diag_ppm = ppm;
+            mixer_set_drift_ppm(svc->mixer, ppm);
+        }
+        /* Diagnostic ($env:MG_FMV_AUDIO_DIAG): once/sec, log ring underruns,
+         * fill, the smoothed level vs setpoint, and the applied correction —
+         * for A/V-sync tuning (and the MCU port later). Writes to its own file
+         * in the process CWD so it needs no stderr capture; off by default. */
+        if (svc->fmv_diag_on && (svc->fmv_diag_frames += frames,
+                                 svc->fmv_diag_frames >= (uint32_t)svc->sample_rate)) {
+            svc->fmv_diag_frames = 0;
+            uint32_t ur  = audio_ring_stream_underruns(&svc->fmv_ring);
+            uint32_t av  = audio_ring_stream_avail(&svc->fmv_ring);
+            static FILE *dfp;
+            if (!dfp) dfp = fopen("mgapi_fmv_audio.log", "w");
+            FILE *o = dfp ? dfp : stderr;
+            fprintf(o, "fmv-audio: underruns=%u ring=%ums ema=%dms tgt=%dms corr=%dppm\n",
+                    ur, (unsigned)(av * 1000u / (unsigned)svc->sample_rate),
+                    (int)(svc->ring_ema_ms_q8 >> 8), (int)svc->ring_target_ms,
+                    (int)svc->fmv_diag_ppm);
+            fflush(o);
+        }
+    }
     /* RT-safe: append the mixed output to the FFT capture window.
      * No-op when meters are disabled. The FFT itself runs in the
      * non-RT process loop (audio_fft_update), never here. */

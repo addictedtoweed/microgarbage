@@ -44,6 +44,7 @@
 #include "audio/audio_arbiter.h"
 #include "audio/audio_pool_stream.h"
 #include "audio/audio_file_stream.h"
+#include "audio/audio_ring_stream.h"
 #include "audio/audio_mixer.h"
 #include "audio/music_player.h"
 
@@ -121,5 +122,10 @@ void audio_service_sweep_vm(AudioService *svc, uint16_t vm_id);
 AudioPool    *audio_service_pool(AudioService *svc);
 AudioArbiter *audio_service_arbiter(AudioService *svc);
 AudioMixer   *audio_service_mixer(AudioService *svc);
+
+/* #73: the FMV clip-audio ring. The FMV video producer pushes the clip's
+ * muxed audio (interleaved stereo PCM16) into it; the FMV music voice
+ * (REQ_AUDIO_FMV_OPEN) drains it. Valid for the life of the service. */
+AudioRingStream *audio_service_fmv_ring(AudioService *svc);
 
 #endif /* AUDIO_SERVICE_H */

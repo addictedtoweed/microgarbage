@@ -384,6 +384,24 @@ void vm_host_audio_sweep_vm(uint16_t vm_id) {
     audio_call(REQ_AUDIO_SWEEP_VM, vm_id, 0, 0, 0, &status, &h);
 }
 
+/* ---- Host-driven FMV clip audio (#73, no VM) — the FMV player opens/closes a
+ * music_player voice fed by the audio service's fmv_ring (the FMV video
+ * producer pushes the clip's audio into that ring directly). owner_vm = 0
+ * (host-owned); the player closes it explicitly. */
+uint32_t vm_host_audio_fmv_open(void) {
+    if (!g_channel) return 0;
+    uint32_t status = 0, voice = 0;
+    if (!audio_call(REQ_AUDIO_FMV_OPEN, 0u, 0u, 0u, 0u, &status, &voice))
+        return 0;
+    return (status == 0) ? voice : 0;
+}
+
+void vm_host_audio_fmv_close(uint32_t voice) {
+    if (!g_channel) return;
+    uint32_t status = 0, h = 0;
+    audio_call(REQ_AUDIO_FMV_CLOSE, voice, 0u, 0u, 0u, &status, &h);
+}
+
 /* Adapter so the sweep can ride vm_system's unload-hook seam (called
  * before the VM's CPU/regions are freed). Idempotent + safe even if the
  * VM never touched audio (the service ignores an unknown vm_id). */

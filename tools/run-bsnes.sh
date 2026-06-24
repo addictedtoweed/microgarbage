@@ -40,6 +40,7 @@ ROM=""
 SMOKE=0
 NO_BUILD=0
 TRACE=0
+CAPTURE=0
 TRACE_LOG="mgdma.log"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +51,11 @@ while [[ $# -gt 0 ]]; do
         --no-build)  NO_BUILD=1;     shift   ;;
         --trace)     TRACE=1;        shift   ;;
         --trace-log) TRACE_LOG="$2"; shift 2 ;;
+        # Capture the child's stderr to a file WITHOUT the MG_DMA_TRACE
+        # firehose — for lightweight diagnostics (e.g. the once/sec
+        # "fmv-audio:" lines) where the per-frame DMA trace would both
+        # bury the signal and perturb the timing being measured.
+        --log)       TRACE_LOG="$2"; CAPTURE=1; shift 2 ;;
         -h|--help)
             sed -n '3,20p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (use -h for usage)" ;;
@@ -217,18 +223,19 @@ step "launching..."
 # Resolve the trace log path BEFORE the subshell cd's into BSNES_HOME,
 # so a relative --trace-log is anchored to the user's cwd, not bsnes's
 # install dir.
-if (( TRACE )); then
+if (( TRACE || CAPTURE )); then
     case "$TRACE_LOG" in
         /*|[A-Za-z]:[/\\]*) TRACE_LOG_ABS="$TRACE_LOG" ;;
         *)                  TRACE_LOG_ABS="$PWD/$TRACE_LOG" ;;
     esac
-    step "MG_DMA_TRACE=1 -> stderr to $TRACE_LOG_ABS"
+    if (( TRACE )); then step "MG_DMA_TRACE=1 -> stderr to $TRACE_LOG_ABS"
+    else                 step "stderr -> $TRACE_LOG_ABS (no DMA trace)"; fi
 fi
 (
     cd "$BSNES_HOME"
     # nohup-style: detach so bash returns immediately. The user
     # presumably wants the bsnes GUI plus their bash prompt back.
-    if (( TRACE )); then
+    if (( TRACE || CAPTURE )); then
         "$BSNES_EXE" "$ROM_W" 2> "$TRACE_LOG_ABS" &
     else
         "$BSNES_EXE" "$ROM_W" &

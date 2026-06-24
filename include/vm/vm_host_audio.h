@@ -59,4 +59,11 @@ bool vm_host_install_audio(VmSystem *sys, const VmHostAudioConfig *cfg);
  * worker thread, so it's serialized against the mixer pump. */
 void vm_host_audio_sweep_vm(uint16_t vm_id);
 
+/* #73: host-driven FMV clip audio — open/close a music_player voice fed by the
+ * audio service's fmv_ring (the FMV video producer pushes the clip's audio into
+ * it). open: returns a voice handle (0 = fail/none); close: stops it. Called by
+ * the FMV player (open at video kickoff so play lines up with the first frame). */
+uint32_t vm_host_audio_fmv_open(void);
+void     vm_host_audio_fmv_close(uint32_t voice);
+
 #endif /* VM_HOST_AUDIO_H */

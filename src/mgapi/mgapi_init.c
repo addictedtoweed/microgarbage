@@ -461,6 +461,9 @@ void mgapi_step(uint64_t elapsed_ns) {
 
 uint32_t mgapi_audio_pull(int16_t *dst_stereo, uint32_t frames) {
     if (!g_initialized) return 0;
+    /* #73: the embedder calls this once per SNES output sample, so it is the
+     * emulator's SNES master-clock tick — publish it for FMV A/V drift sync. */
+    mgapi_audio_note_snes_clock(frames);
     return mgapi_audio_drain(dst_stereo, frames);
 }
 

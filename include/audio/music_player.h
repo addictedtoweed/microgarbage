@@ -189,6 +189,17 @@ typedef struct {
     void             *streaming_buffer;
     size_t            streaming_buffer_samples;
 
+    /* Upper bound on how many source frames the player keeps queued in
+     * the mixer channel ahead of the render position. 0 = fill to the
+     * channel's full capacity (the default — best underrun immunity for
+     * background music / SFX, where output latency is irrelevant). A
+     * small non-zero value caps the channel-buffering LATENCY, which
+     * matters when the audio must stay phase-aligned with an external
+     * clock (e.g. FMV A/V sync): the upstream source ring is the real
+     * underrun cushion, so the channel need only hold a few render
+     * quanta. Clamped to the channel capacity. */
+    size_t            max_channel_fill_samples;
+
     /* Pinned head storage. NULL or zero size means "no pinned head
      * for this segment" — restart will incur full callback latency. */
     void             *intro_head_buffer;

@@ -11,6 +11,9 @@
 #include "dma_engine.h"
 #include "io/stream_arbiter.h"
 #include "vm/vm_host_fs.h"        /* vm_host_fs_route_read / _close */
+#include "audio_init.h"           /* mgapi_audio_fmv_ring (#73) */
+#include "audio/audio_ring_stream.h"  /* audio_ring_stream_reset / _set_eof */
+#include "vm/vm_host_audio.h"     /* vm_host_audio_fmv_open / _close */
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -28,6 +31,11 @@ static uint32_t       s_nframes;
 static uint32_t       s_abytes;
 static bool           s_stop_pending;
 static uint8_t        s_siphon_htime = 155;   /* H-counter fire pos (validated in siphon_dbuf_test); $env:MG_SIPHON_HTIME */
+static AudioRingStream *s_audio_ring;          /* #73: FMV clip-audio sink (producer pushes, music voice drains) */
+static uint32_t       s_audio_voice;           /* #73: the FMV music voice (0 = none) */
+static bool           s_audio_started;         /* #73: voice opened (pre-roll begun) */
+static int            s_preroll;               /* #73: SNES frames left to hold video while audio fills the output pipe */
+static int            s_preroll_cfg = 11;      /* #73: A/V pre-roll frames (~190ms @ 60Hz ≈ audio pipeline latency); $env:MG_FMV_AV_PREROLL */
 
 /* ---- bsnes-owned (kickoff + consumer) ---- */
 static MgCompleteFrame s_cur;       /* the active, on-screen frame */
@@ -93,6 +101,14 @@ static void fmv_player_finalize(void) {
         uint8_t off[6] = {0};
         cart_window_load_blob(CW_OFF_SIPHON_CONFIG, off, sizeof off);
     }
+    /* #73: tear the audio voice down first. Mark the ring EOF so the music
+     * voice drains its tail and ends cleanly, then stop/close it. Resetting
+     * happens at the next start(), so a late drain here is harmless. */
+    if (s_audio_ring) { audio_ring_stream_set_eof(s_audio_ring); }
+    if (s_audio_voice) { vm_host_audio_fmv_close(s_audio_voice); s_audio_voice = 0; }
+    s_audio_ring = NULL;
+    s_audio_started = false;
+    s_preroll = 0;
     if (s_video_h != STREAM_HANDLE_INVALID) {
         stream_arbiter_unregister(s_video_h);
         s_video_h = STREAM_HANDLE_INVALID;
@@ -250,7 +266,15 @@ bool fmv_player_start(int fd) {
     MgDmaEngine *dma = mg_dma_create(&s_dma_ops);
     if (!dma) return false;
 
-    StreamHandle h = fmv_video_stream_open(fd, abytes, nframes, dma, FMV_RING_DEPTH);
+    /* #73: hand the producer the audio service's FMV ring so it pushes each
+     * frame's muxed audio as it produces video. Reset it now (empties any tail
+     * from a prior clip) before the producer starts writing. NULL if audio is
+     * down — the producer just skips the push and the clip plays silent. */
+    s_audio_ring = mgapi_audio_fmv_ring();
+    if (s_audio_ring) audio_ring_stream_reset(s_audio_ring);
+
+    StreamHandle h = fmv_video_stream_open(fd, abytes, nframes, dma,
+                                           FMV_RING_DEPTH, s_audio_ring);
     if (h == STREAM_HANDLE_INVALID) { mg_dma_destroy(dma); return false; }
 
     s_fd      = fd;
@@ -266,8 +290,20 @@ bool fmv_player_start(int fd) {
         if (e) { int v = atoi(e); if (v > 0 && v < 256) s_siphon_htime = (uint8_t)v; }
     }
 
+    /* #73: A/V pre-roll — how many SNES frames to hold video after the audio
+     * voice opens, so the audio output pipeline (WASAPI's 100ms buffer + the
+     * mixer/music_player buffering, all of which the near-instant video path
+     * lacks) is full when frame 0 is finally shown. Tune by ear: if audio still
+     * LAGS video, raise it; if it now LEADS, lower it. 0 disables. */
+    {
+        const char *e = getenv("MG_FMV_AV_PREROLL");
+        if (e) { int v = atoi(e); if (v >= 0 && v < 240) s_preroll_cfg = v; }
+    }
+
     s_kicked  = false;
     s_sf_idx  = 0;
+    s_audio_started = false;
+    s_preroll = 0;
     s_stop_pending = false;
 
     /* M1: stage the static cursor/hole CHR + palettes + OAM before releasing
@@ -329,11 +365,38 @@ static bool fmv_player_try_kickoff(void) {
 }
 
 uint8_t fmv_player_frame_ready_byte(void) {
+    /* Called once per SNES NMI (the kernel reads frame_ready at the top of
+     * every handler), so this doubles as a reliable per-SNES-frame tick we use
+     * to time the A/V pre-roll. */
+
     /* EOF: keep the kernel idle (and don't re-arm a stale frame_ready). */
     if (atomic_load(&s_state) == FMV_STATUS_EOF) return 0u;
-    /* Pre-roll: not yet loaded → try to kick; 0 until a frame is resident. */
-    if (!s_kicked) return fmv_player_try_kickoff() ? 1u : 0u;
-    return 1u;
+
+    if (s_kicked) return 1u;   /* steady state: frame is loaded, keep bursting */
+
+    /* --- startup A/V pre-roll (#73) ---
+     * Audio has ~100ms+ of output buffering (WASAPI + mixer + music_player)
+     * the near-instant video path lacks, so starting both together makes audio
+     * lag. Instead: (1) open the audio voice as soon as the producer has pushed
+     * real audio, (2) hold video black for s_preroll_cfg SNES frames while that
+     * audio fills the output pipe, (3) THEN release frame 0 — so it's SEEN as
+     * its audio is HEARD. */
+    if (!s_audio_started) {
+        /* Need ≥1 produced frame so the ring has real audio for the voice to
+         * prime against (the producer pushes audio + video together). */
+        if (stream_arbiter_chunks_available(s_video_h) < 1u &&
+            !stream_arbiter_is_eof(s_video_h))
+            return 0u;
+        if (s_audio_ring && !s_audio_voice)
+            s_audio_voice = vm_host_audio_fmv_open();
+        s_audio_started = true;
+        s_preroll = (s_audio_ring && s_audio_voice) ? s_preroll_cfg : 0;
+        return 0u;   /* hold video this frame */
+    }
+    if (s_preroll > 0) { s_preroll--; return 0u; }   /* still filling the pipe */
+
+    /* Pipe primed → load frame 0 (waits for the video ring's own ≥2 lookahead). */
+    return fmv_player_try_kickoff() ? 1u : 0u;
 }
 
 int fmv_player_on_frame_done(void) {
