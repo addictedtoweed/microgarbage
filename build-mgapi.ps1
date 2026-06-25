@@ -216,18 +216,12 @@ if (-not $NoGuest) {
             @{ src = "tools\guests\l2_test.c"; sym = "l2_test_elf"; out = "l2_test.elf"; gen = "l2_test_elf_data.c"; extra = @() },
             @{ src = "tools\guests\menu.c";    sym = "menu_elf";    out = "menu.elf";    gen = "menu_elf_data.c";    extra = @() },
             @{ src = "tools\guests\demos\demo_palette.c";   sym = "demo_palette_elf";   out = "demo_palette.elf";   gen = "demo_palette_elf_data.c";   extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_letterbox.c"; sym = "demo_letterbox_elf"; out = "demo_letterbox.elf"; gen = "demo_letterbox_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_dynamic_letterbox.c"; sym = "demo_dynamic_letterbox_elf"; out = "demo_dynamic_letterbox.elf"; gen = "demo_dynamic_letterbox_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_sprite.c";    sym = "demo_sprite_elf";    out = "demo_sprite.elf";    gen = "demo_sprite_elf_data.c";    extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_mode7.c";     sym = "demo_mode7_elf";     out = "demo_mode7.elf";     gen = "demo_mode7_elf_data.c";     extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_mode7_3d.c";  sym = "demo_mode7_3d_elf";  out = "demo_mode7_3d.elf";  gen = "demo_mode7_3d_elf_data.c";  extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_audio_mixer.c"; sym = "demo_audio_mixer_elf"; out = "demo_audio_mixer.elf"; gen = "demo_audio_mixer_elf_data.c"; extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_pcm_stream.c"; sym = "demo_pcm_stream_elf"; out = "demo_pcm_stream.elf"; gen = "demo_pcm_stream_elf_data.c"; extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_fmv.c";        sym = "demo_fmv_elf";        out = "demo_fmv.elf";        gen = "demo_fmv_elf_data.c";        extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_fmv_flip.c";   sym = "demo_fmv_flip_elf";   out = "demo_fmv_flip.elf";   gen = "demo_fmv_flip_elf_data.c";   extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_fmv_still.c";  sym = "demo_fmv_still_elf";  out = "demo_fmv_still.elf";  gen = "demo_fmv_still_elf_data.c";  extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_fmv_player.c"; sym = "demo_fmv_player_elf"; out = "demo_fmv_player.elf"; gen = "demo_fmv_player_elf_data.c"; extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_nmi_smoke.c";  sym = "demo_nmi_smoke_elf";  out = "demo_nmi_smoke.elf";  gen = "demo_nmi_smoke_elf_data.c";  extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_boot_banner.c"; sym = "demo_boot_banner_elf"; out = "demo_boot_banner.elf"; gen = "demo_boot_banner_elf_data.c"; extra = $mgGuestImpls }
         )
         foreach ($g in $guestSources) {

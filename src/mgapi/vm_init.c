@@ -46,8 +46,6 @@ extern const size_t        shell_elf_len;
  * fallback as shell_elf. */
 extern const unsigned char demo_palette_elf  [];
 extern const size_t        demo_palette_elf_len;
-extern const unsigned char demo_letterbox_elf[];
-extern const size_t        demo_letterbox_elf_len;
 extern const unsigned char demo_dynamic_letterbox_elf[];
 extern const size_t        demo_dynamic_letterbox_elf_len;
 extern const unsigned char demo_sprite_elf   [];
@@ -58,18 +56,8 @@ extern const unsigned char demo_mode7_3d_elf [];
 extern const size_t        demo_mode7_3d_elf_len;
 extern const unsigned char demo_audio_mixer_elf [];
 extern const size_t        demo_audio_mixer_elf_len;
-extern const unsigned char demo_pcm_stream_elf [];
-extern const size_t        demo_pcm_stream_elf_len;
-extern const unsigned char demo_fmv_elf [];
-extern const size_t        demo_fmv_elf_len;
-extern const unsigned char demo_fmv_flip_elf [];
-extern const size_t        demo_fmv_flip_elf_len;
-extern const unsigned char demo_fmv_still_elf [];
-extern const size_t        demo_fmv_still_elf_len;
 extern const unsigned char demo_fmv_player_elf [];
 extern const size_t        demo_fmv_player_elf_len;
-extern const unsigned char demo_nmi_smoke_elf [];
-extern const size_t        demo_nmi_smoke_elf_len;
 extern const unsigned char demo_boot_banner_elf [];
 extern const size_t        demo_boot_banner_elf_len;
 
@@ -401,18 +389,12 @@ static void install_bundled_demos(void) {
      * twice (which mgapi_vm_init guards against via EALREADY). */
     (void)trashfs_mkdir(&g_td0_vol, "/demos", /*now=*/0);
     install_demo("/demos/palette.elf",   demo_palette_elf,   demo_palette_elf_len);
-    install_demo("/demos/letterbox.elf", demo_letterbox_elf, demo_letterbox_elf_len);
     install_demo("/demos/dynamic_letterbox.elf", demo_dynamic_letterbox_elf, demo_dynamic_letterbox_elf_len);
     install_demo("/demos/sprite.elf",    demo_sprite_elf,    demo_sprite_elf_len);
     install_demo("/demos/mode7.elf",     demo_mode7_elf,     demo_mode7_elf_len);
     install_demo("/demos/mode7_3d.elf",    demo_mode7_3d_elf,    demo_mode7_3d_elf_len);
     install_demo("/demos/audio_mixer.elf", demo_audio_mixer_elf, demo_audio_mixer_elf_len);
-    install_demo("/demos/pcm_stream.elf",  demo_pcm_stream_elf,  demo_pcm_stream_elf_len);
-    install_demo("/demos/fmv.elf",         demo_fmv_elf,         demo_fmv_elf_len);
-    install_demo("/demos/fmv_flip.elf",    demo_fmv_flip_elf,    demo_fmv_flip_elf_len);
-    install_demo("/demos/fmv_still.elf",   demo_fmv_still_elf,   demo_fmv_still_elf_len);
     install_demo("/demos/fmv_player.elf",  demo_fmv_player_elf,  demo_fmv_player_elf_len);
-    install_demo("/demos/nmi_smoke.elf",   demo_nmi_smoke_elf,   demo_nmi_smoke_elf_len);
     install_demo("/demos/boot_banner.elf", demo_boot_banner_elf, demo_boot_banner_elf_len);
 
     /* Seed /td0/etc/autostart, which the shell's _start runs on cold boot.

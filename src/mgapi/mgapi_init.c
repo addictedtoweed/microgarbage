@@ -591,8 +591,6 @@ MGAPI_API int mgapi_dev_run_l2_test(void) {
  * load OK, negative on load failure) so the test can report it. */
 extern const unsigned char demo_palette_elf  [];
 extern const size_t        demo_palette_elf_len;
-extern const unsigned char demo_letterbox_elf[];
-extern const size_t        demo_letterbox_elf_len;
 extern const unsigned char demo_sprite_elf   [];
 extern const size_t        demo_sprite_elf_len;
 extern const unsigned char demo_mode7_elf    [];
@@ -654,7 +652,6 @@ MGAPI_API int mgapi_dev_spawn_demo_for_steps(const char *name, uint32_t steps) {
     size_t                len  = 0;
     if (!name) return -EINVAL;
     if      (strcmp(name, "palette")   == 0) { bytes = demo_palette_elf;   len = demo_palette_elf_len; }
-    else if (strcmp(name, "letterbox") == 0) { bytes = demo_letterbox_elf; len = demo_letterbox_elf_len; }
     else if (strcmp(name, "sprite")    == 0) { bytes = demo_sprite_elf;    len = demo_sprite_elf_len; }
     else if (strcmp(name, "mode7")     == 0) { bytes = demo_mode7_elf;     len = demo_mode7_elf_len; }
     else if (strcmp(name, "mode7_3d")  == 0) { bytes = demo_mode7_3d_elf;  len = demo_mode7_3d_elf_len; }
