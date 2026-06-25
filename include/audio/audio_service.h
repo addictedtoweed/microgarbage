@@ -128,4 +128,11 @@ AudioMixer   *audio_service_mixer(AudioService *svc);
  * (REQ_AUDIO_FMV_OPEN) drains it. Valid for the life of the service. */
 AudioRingStream *audio_service_fmv_ring(AudioService *svc);
 
+/* Host-side FFT band-meter access (FMV spectrum overlay). hold(true/false) is a
+ * refcounted enable (balance the calls); read() copies up to `max` of the
+ * AUDIO_FFT_BANDS latest levels (0..255) and returns the count. Lock-free /
+ * visualizer-grade — see the .c for the threading note. */
+void     audio_service_fft_hold(AudioService *svc, bool on);
+uint32_t audio_service_fft_read(AudioService *svc, uint8_t *out, uint32_t max);
+
 #endif /* AUDIO_SERVICE_H */

@@ -537,6 +537,24 @@ AudioRingStream *audio_service_fmv_ring(AudioService *svc) {
     return svc ? &svc->fmv_ring : NULL;
 }
 
+/* Host-side FFT meter access (the FMV overlay's spectrum bars). hold() is a
+ * refcounted enable matching REQ_AUDIO_FFT_ENABLE — call once with true at the
+ * start of a consumer and once with false at the end (NOT idempotent per call;
+ * balance them). read() copies the latest band levels. Both touch svc->fft from
+ * the CALLER's thread (the meter is updated on the service thread); for a
+ * visualizer the worst case is a one-frame torn/stale byte, which is invisible,
+ * so no lock is taken. */
+void audio_service_fft_hold(AudioService *svc, bool on) {
+    if (!svc) return;
+    if (on) svc->fft_enable_count++;
+    else if (svc->fft_enable_count) svc->fft_enable_count--;
+    audio_fft_set_enabled(&svc->fft, svc->fft_enable_count > 0);
+}
+uint32_t audio_service_fft_read(AudioService *svc, uint8_t *out, uint32_t max) {
+    if (!svc || !out) return 0;
+    return audio_fft_get_bands(&svc->fft, out, max);
+}
+
 /* ---- create / destroy ---- */
 
 AudioService *audio_service_create(const AudioServiceConfig *cfg) {

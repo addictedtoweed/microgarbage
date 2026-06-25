@@ -683,6 +683,15 @@ AudioRingStream *mgapi_audio_fmv_ring(void) {
     return g_service ? audio_service_fmv_ring(g_service) : NULL;
 }
 
+/* FMV spectrum overlay: refcounted enable of the band meter + a band read.
+ * No-ops gracefully when audio isn't up. */
+void mgapi_audio_fft_hold(bool on) {
+    if (g_service) audio_service_fft_hold(g_service, on);
+}
+uint32_t mgapi_audio_fft_read(uint8_t *out, uint32_t max) {
+    return g_service ? audio_service_fft_read(g_service, out, max) : 0u;
+}
+
 /* #73: SNES master-clock feedback for FMV A/V drift sync. The embedder calls
  * this from its audio-output cadence (mgapi_audio_pull) — once per SNES output
  * sample. bsnes' Enter loop and the mgapi mixer are BOTH pinned at 44100, so

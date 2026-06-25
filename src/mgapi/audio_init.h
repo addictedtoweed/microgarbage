@@ -80,6 +80,13 @@ uint32_t mgapi_audio_ring_capacity(void);
  * (opened via vm_host_audio_fmv_open) drains it. */
 AudioRingStream *mgapi_audio_fmv_ring(void);
 
+/* FMV spectrum overlay: refcounted enable of the FFT band meter, and a band
+ * read (copies up to `max` levels 0..255, returns count). No-op/0 if audio is
+ * down. The meter runs over the final mixed output, so it tracks the movie's
+ * own audio. */
+void     mgapi_audio_fft_hold(bool on);
+uint32_t mgapi_audio_fft_read(uint8_t *out, uint32_t max);
+
 /* #73: feed the SNES master clock to FMV A/V drift sync. Call once per SNES
  * output sample from the embedder's audio-output cadence (mgapi_audio_pull),
  * passing the frame count pulled. No-op until audio is up. */

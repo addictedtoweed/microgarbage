@@ -96,6 +96,7 @@ static void promote_current(void) {
 }
 
 static void fmv_player_finalize(void) {
+    mgapi_audio_fft_hold(false);   /* release the spectrum-meter enable (refcounted) */
     /* Disable the siphon in the cart window so the next (non-FMV) demo's
      * kernel doesn't cache a stale config and fire per-scanline DMAs. */
     {
@@ -206,6 +207,36 @@ static void fmv_overlay_setup(void) {
     fmv_overlay_write_oam();
 }
 
+/* --- FFT spectrum bands (folded from the mixer's 16 to FFT_BARS) ---------- */
+#define FFT_BARS 8
+static uint8_t s_fft[FFT_BARS];        /* smoothed band level 0..255 */
+
+/* Pull the live band meter (computed over the final mixed output, so it tracks
+ * the movie's own audio), fold 16 -> 8 by max-of-pairs, and smooth: instant
+ * attack, slow decay for a natural meter fall. MG_FFT_DIAG logs periodically so
+ * we can confirm the data path before the bars exist. */
+static void fmv_fft_sample(void) {
+    uint8_t b[16];
+    uint32_t n = mgapi_audio_fft_read(b, 16);
+    for (int i = 0; i < FFT_BARS; i++) {
+        uint8_t a = ((unsigned)(2*i)   < n) ? b[2*i]   : 0u;
+        uint8_t c = ((unsigned)(2*i+1) < n) ? b[2*i+1] : 0u;
+        uint8_t v = a > c ? a : c;
+        if (v >= s_fft[i]) s_fft[i] = v;                                /* attack */
+        else s_fft[i] = (uint8_t)(s_fft[i] - ((s_fft[i] - v) >> 2));    /* decay 1/4 */
+    }
+    const char *e = getenv("MG_FFT_DIAG");
+    if (e && *e) {
+        static unsigned fc = 0;
+        if ((fc++ % 15u) == 0u) {
+            fprintf(stderr, "[fft] %3u %3u %3u %3u %3u %3u %3u %3u\n",
+                    s_fft[0], s_fft[1], s_fft[2], s_fft[3],
+                    s_fft[4], s_fft[5], s_fft[6], s_fft[7]);
+            fflush(stderr);
+        }
+    }
+}
+
 /* Per-SNES-frame (called from on_frame_done): the port-2 SNES Mouse moves the
  * cursor; LEFT click stamps a bullethole (random palette) into the FIFO pool;
  * RIGHT click clears the whole pool and hides the cursor while held. Then
@@ -254,6 +285,7 @@ static void fmv_overlay_tick(void) {
     }
     s_ov.prev_left = left;
 
+    fmv_fft_sample();
     fmv_overlay_write_oam();
 }
 
@@ -328,6 +360,7 @@ bool fmv_player_start(int fd) {
      * so the trigger on the bsnes thread is a cheap fire-and-forget. */
     if (!s_bullet_sfx) s_bullet_sfx = vm_host_audio_sfx_load("bullet.wav");
 
+    mgapi_audio_fft_hold(true);       /* enable the FFT band meter for the overlay */
     atomic_store(&s_state, FMV_STATUS_PLAYING);
     atomic_store(&s_active, true);    /* release: hands off to the bsnes thread */
     return true;
