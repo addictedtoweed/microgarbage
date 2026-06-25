@@ -65,6 +65,37 @@
     ; 0, but assert it defensively since the kernel never wrote $2133.
     stz SETINI
 
+    ; --- PPU baseline: zero the window-mask + color-math registers ---
+    ; (task #37) These ($2123-$212B, $212E-$2132) are NEVER written during
+    ; a frame — neither the PPU batch nor any guest API touches them — so
+    ; whatever value the PPU powers up with would persist forever. Zero
+    ; them once here to guarantee a clean baseline for every demo:
+    ;   - W12SEL/W34SEL/WOBJSEL/WH0-3/WBGLOG/WOBJLOG: no window clipping
+    ;   - TMW/TSW: window area doesn't blank any main/sub layer
+    ;   - CGWSEL/CGADSUB/COLDATA: color math off, fixed color black
+    ; This removes a whole class of "phantom tint / clipped band / wrong
+    ; OBJ fetch timing" baseline bugs, and matters for the H-blank VRAM
+    ; siphon: a stale window/color-math/OBJ-interlace state changes what
+    ; the PPU does during H-blank and can collide with the siphon's DMA.
+    stz W12SEL
+    stz W34SEL
+    stz WOBJSEL
+    stz WH0
+    stz WH1
+    stz WH2
+    stz WH3
+    stz WBGLOG
+    stz WOBJLOG
+    stz TMW
+    stz TSW
+    stz CGWSEL
+    stz CGADSUB
+    ; COLDATA: $00 would select NO channel (a no-op). Write $E0 = select
+    ; R+G+B with intensity 0 to actually drive the fixed color to black.
+    ; (Moot while CGWSEL/CGADSUB are 0, but keeps the baseline truly clean.)
+    lda #$E0
+    sta COLDATA
+
     ; --- per-frame state (cached by @loop, consumed by the IRQ) ---
     stz K_FRAME_STATE       ; 0 = state A (blank + burst)
     stz K_FRAME_READY       ; no staged frame yet

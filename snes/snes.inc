@@ -34,6 +34,24 @@ CGADD     = $2121      ; CGRAM word address
 CGDATA    = $2122      ; CGRAM data write
 TM        = $212C      ; main-screen layer enable
 TS        = $212D      ; sub-screen layer enable
+; --- window mask + color-math registers ($2123-$212B, $212E-$2132) ---
+; The kernel never writes these during a frame; they only ever hold their
+; PPU power-on values. boot zeroes them so a guest gets a clean baseline
+; (no stray window clip / color-math tint / OBJ-interlace fetch timing).
+W12SEL    = $2123      ; window mask settings BG1/BG2
+W34SEL    = $2124      ; window mask settings BG3/BG4
+WOBJSEL   = $2125      ; window mask settings OBJ/color
+WH0       = $2126      ; window 1 left position
+WH1       = $2127      ; window 1 right position
+WH2       = $2128      ; window 2 left position
+WH3       = $2129      ; window 2 right position
+WBGLOG    = $212A      ; window mask logic for BG
+WOBJLOG   = $212B      ; window mask logic for OBJ/color
+TMW       = $212E      ; window area main-screen disable
+TSW       = $212F      ; window area sub-screen disable
+CGWSEL    = $2130      ; color addition select
+CGADSUB   = $2131      ; color math designation
+COLDATA   = $2132      ; fixed color data
 SETINI    = $2133      ; screen mode / interlace (bit0 = interlace)
 SLHV      = $2137      ; software latch of H/V counters (read to latch)
 OPVCT     = $213D      ; V counter (read low then high; bit8 in high byte)

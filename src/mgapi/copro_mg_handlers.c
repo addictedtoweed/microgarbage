@@ -1034,6 +1034,18 @@ static void h_ppu_clean_slate(VmCpu *cpu, void *sys_) {
      * before the CHR upload at slot 1, the per-layer tilemap clear
      * is redundant AND destructive for Mode 7 -- skip it. */
 
+    /* Window-mask + color-math + SETINI baseline ($2123-$212B, $212E-
+     * $2133): NOT reset here. The kernel zeroes these once at boot
+     * (kernel.s) and nothing — neither the PPU batch nor any guest
+     * ecall — ever writes them again, so they are permanently at the
+     * clean baseline (no clip windows, color math off, non-interlace).
+     * clean_slate therefore inherits that baseline for free. If a
+     * future guest API ever exposes one of these (a fade via color
+     * math, a window wipe, OBJ interlace), it MUST add a shadow field +
+     * PpuBatch byte so the kernel re-asserts it per frame and
+     * mg_state_reset() above clears it on clean_slate — exactly the
+     * pattern TM/TS already follow. Until then, boot init owns it. */
+
     cpu->regs[VM_REG_A0] = MG_R_OK;
 }
 
