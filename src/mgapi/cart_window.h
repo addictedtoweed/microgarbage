@@ -272,11 +272,30 @@ extern "C" {
 #define CW_SPR_CHR_BYTES   64u
 #define CW_SPR_CGRAM_BYTES 128u
 #define CW_SPR_OAM_BYTES   544u
-#define CW_SPR_OAM_ACTIVE_BYTES 128u   /* sprites 0-31 low table — the 60 Hz per-frame push */
+#define CW_SPR_OAM_ACTIVE_BYTES 256u   /* sprites 0-63 low table — 60 Hz push (cursor+holes 0-31, FFT bars 32-63) */
 #define CW_SPR_VRAM_WORD   28880u   /* tile 269 @ OBSEL base 0x6000 (24576+269*16) */
 #define CW_SPR_TILE_CURSOR 269u     /* OAM tile number for the cursor (CHR @ 28880) */
 #define CW_SPR_TILE_HOLE   270u     /* OAM tile number for the bullethole          */
 #define CW_SPR_OBSEL       0x03u    /* size pair 8/16, namesel 0, base 3 (0x6000) */
+
+/* FFT spectrum-meter overlay (increment 2): fill-level + cap tiles uploaded
+ * ONCE (FMV frame 0) to OBJ tile 271+, then driven by per-frame OAM only. The
+ * OBJ region (word 28880+) is never touched by the FMV BG CHR (tops out at word
+ * 28864), so a one-time upload persists. These regions sit above the OAM table
+ * (0x7B40+544 = 0x7D60) in otherwise-free cart-window space. */
+/* All 12 OBJ tiles (cursor 269, hole 270, fill 0-8 = 271..279, cap 280) live in
+ * ONE contiguous region uploaded as a single early CHR slot to VRAM word 28880
+ * — the cursor/hole have always landed reliably there, and folding the FFT fill
+ * tiles into the same slot lets them land too (a separate late slot gets starved
+ * by the cycle-budgeted chainer). */
+#define CW_OFF_SPR_FFT_CHR   0x7D60u   /* 384 B (12 tiles: cursor,hole,fill0-8,cap) */
+#define CW_OFF_SPR_FFT_CGRAM 0x7EE0u   /* 128 B: OBJ palettes 4-7 (gradient+cap)  */
+#define CW_SPR_FFT_CHR_BYTES   384u
+#define CW_SPR_FFT_CGRAM_BYTES 128u
+#define CW_SPR_FFT_TILE0       271u    /* tiles 271..279 = fill level 0..8        */
+#define CW_SPR_FFT_TILE_CAP    280u    /* peak-cap tile                           */
+#define CW_SPR_FFT_VRAM_WORD   28880u  /* tile 269 @ OBSEL base 0x6000 — combined start */
+#define CW_SPR_FFT_CGADD       192u    /* OBJ palette 4 = CGRAM word 128 + 4*16   */
 
 /* Both moved out of $7E00/$7F00 — those are now INSIDE the HDMA tables
  * pool ($7A00..$7EFF after v1.20's layout shift). Tucked into the gap

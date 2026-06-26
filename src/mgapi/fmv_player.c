@@ -156,6 +156,36 @@ static struct {
     struct { uint8_t x, y, pal, active; } hole[32];   /* [1..31] used */
 } s_ov;
 
+/* --- FFT spectrum bars (lower-left): 8 bands, 8px wide, up to 24px tall, with a
+ * green->yellow->red gradient + falling peak-hold caps. Driven by the live band
+ * meter (s_fft), rendered into OAM sprites 32..63 each frame (4 per band: 3 fill
+ * rows + 1 cap). Fill tiles + gradient palette are uploaded once via
+ * fmv_fft_build_assets(). --- */
+#define FFT_BARS      8
+#define FFT_ROWS      3                 /* 3 rows * 8px = 24px max bar height */
+#define FFT_MAXH      (FFT_ROWS * 8)
+#define FFT_BASE_X    16u               /* leftmost bar X (screen px)         */
+#define FFT_BAR_W     8u
+#define FFT_BASE_Y    200u              /* bar baseline (bottoms)             */
+#define FFT_SPR0      32u               /* first FFT OAM slot (after cursor+holes) */
+#define FFT_FLOOR     16                /* noise-floor subtract before scaling */
+
+static uint8_t s_fft[FFT_BARS];         /* smoothed band level 0..255 */
+static uint8_t s_peak[FFT_BARS];        /* peak-hold height 0..FFT_MAXH (falls slowly) */
+
+/* Per-band gain (x256): maps each band's musical peak to ~FFT_MAXH after the
+ * floor subtract, compensating the natural bass->treble rolloff so the high
+ * bands aren't stuck at 1px. Tuned from live spectra; adjust to taste. */
+static const uint16_t s_fft_gain[FFT_BARS] = { 40, 39, 38, 45, 51, 59, 96, 256 };
+
+static uint8_t fft_band_height(int b) {
+    int v = (int)s_fft[b] - FFT_FLOOR;
+    if (v < 0) v = 0;
+    int h = (v * (int)s_fft_gain[b]) >> 8;
+    if (h > FFT_MAXH) h = FFT_MAXH;
+    return (uint8_t)h;
+}
+
 /* Build the full 544 B OAM from the overlay state and push it to the live CW
  * region (the producer's SF1/2/3 OAM slots DMA it to PPU OAM). */
 static void fmv_overlay_write_oam(void) {
@@ -177,18 +207,74 @@ static void fmv_overlay_write_oam(void) {
         oam[i * 4 + 2] = (uint8_t)(CW_SPR_TILE_HOLE & 0xFFu);
         oam[i * 4 + 3] = (uint8_t)((2u << 4) | ((s_ov.hole[i].pal & 7u) << 1) | ((CW_SPR_TILE_HOLE >> 8) & 1u));
     }
+
+    /* FFT spectrum bars: sprites 32..63 (4 per band = 3 fill rows + 1 peak cap).
+     * Row r covers screen rows [BASE_Y-8(r+1), BASE_Y-8r); its fill tile shows
+     * clamp(h-8r,0,8) lit pixels from the bottom. Empty rows hide (y=240). */
+    for (int b = 0; b < FFT_BARS; b++) {
+        uint8_t h = fft_band_height(b);
+        if (h >= s_peak[b]) s_peak[b] = h;                 /* attack: jump to peak  */
+        else if (s_peak[b] > 0) s_peak[b]--;               /* decay: 1px/frame      */
+        uint8_t   bx   = (uint8_t)(FFT_BASE_X + (unsigned)b * FFT_BAR_W);
+        unsigned  base = FFT_SPR0 + (unsigned)b * 4u;
+
+        /* Peak cap FIRST: sprite-vs-sprite layering is by OAM index (lowest =
+         * front), NOT the priority bits, so the cap must be the band's lowest
+         * index to sit in front of the fill rows it overlaps. Floats 2px above
+         * the held peak. */
+        unsigned cs    = base + 0u;
+        uint16_t ctile = (uint16_t)CW_SPR_FFT_TILE_CAP;
+        /* Cap floats 2px above the held peak; at rest (peak 0) it sits just above
+         * the baseline (200-0-2=198) rather than hiding, so quiet bands (esp. the
+         * high-frequency ones) keep a resting marker. */
+        oam[cs*4+0] = bx;
+        oam[cs*4+1] = (uint8_t)(FFT_BASE_Y - s_peak[b] - 2u);
+        oam[cs*4+2] = (uint8_t)(ctile & 0xFFu);
+        oam[cs*4+3] = (uint8_t)((3u<<4) | (4u << 1) | ((ctile >> 8) & 1u)); /* prio3, pal4 white */
+
+        for (int r = 0; r < FFT_ROWS; r++) {
+            int fill = (int)h - r * 8; if (fill < 0) fill = 0; if (fill > 8) fill = 8;
+            unsigned s    = base + 1u + (unsigned)r;       /* fill rows behind the cap */
+            uint16_t tile = (uint16_t)(CW_SPR_FFT_TILE0 + fill);
+            oam[s*4+0] = bx;
+            oam[s*4+1] = (fill > 0) ? (uint8_t)(FFT_BASE_Y - (unsigned)(r+1)*8u) : 240u;
+            oam[s*4+2] = (uint8_t)(tile & 0xFFu);
+            oam[s*4+3] = (uint8_t)((2u<<4) | ((5u + (unsigned)r) << 1) | ((tile >> 8) & 1u)); /* prio2, pal 5/6/7 */
+        }
+    }
     cart_window_load_blob(CW_OFF_SPR_OAM, oam, sizeof oam);
 }
 
-static void fmv_overlay_setup(void) {
-    /* CHR: cursor crosshair (tile 269) + bullethole splat (tile 270). */
+/* Build ALL 12 overlay tiles into the one contiguous CHR region uploaded each
+ * frame as a single early CHR slot (CW_OFF_SPR_FFT_CHR -> VRAM 28880):
+ *   269 cursor, 270 hole, 271..279 fill levels 0..8, 280 peak cap.
+ * Plus the gradient OBJ palettes 4-7 (cap-white, green, yellow, red). */
+static void fmv_fft_build_assets(void) {
     static const uint8_t cursor[8] = { 0x18,0x18,0x18,0xFF,0xFF,0x18,0x18,0x18 };
     static const uint8_t hole[8]   = { 0x3C,0x7E,0xFF,0xFF,0xFF,0xFF,0x7E,0x3C };
-    uint8_t chr[CW_SPR_CHR_BYTES];
-    spr_build_tile_idx1(chr,      cursor);
-    spr_build_tile_idx1(chr + 32, hole);
-    cart_window_load_blob(CW_OFF_SPR_CHR, chr, sizeof chr);
+    uint8_t chr[CW_SPR_FFT_CHR_BYTES];
+    memset(chr, 0, sizeof chr);
+    spr_build_tile_idx1(chr + 0 * 32, cursor);      /* OBJ tile 269 */
+    spr_build_tile_idx1(chr + 1 * 32, hole);        /* OBJ tile 270 */
+    for (int n = 0; n <= 8; n++) {                  /* OBJ tiles 271..279 = fill 0..8 */
+        uint8_t mask[8];
+        for (int row = 0; row < 8; row++) mask[row] = (row >= 8 - n) ? 0xFFu : 0x00u;
+        spr_build_tile_idx1(chr + (2 + n) * 32, mask);
+    }
+    { uint8_t cap[8] = { 0xFFu, 0xFFu, 0, 0, 0, 0, 0, 0 };   /* OBJ tile 280: 2px top line */
+      spr_build_tile_idx1(chr + 11 * 32, cap); }
+    cart_window_load_blob(CW_OFF_SPR_FFT_CHR, chr, sizeof chr);
 
+    uint16_t cg[CW_SPR_FFT_CGRAM_BYTES / 2];        /* 64 entries = OBJ pal 4-7 */
+    memset(cg, 0, sizeof cg);
+    cg[0 * 16 + 1] = spr_bgr555(255, 255, 255);     /* pal 4: peak cap (white) */
+    cg[1 * 16 + 1] = spr_bgr555( 40, 230,  60);     /* pal 5: green  (low)     */
+    cg[2 * 16 + 1] = spr_bgr555(240, 220,  40);     /* pal 6: yellow (mid)     */
+    cg[3 * 16 + 1] = spr_bgr555(240,  60,  40);     /* pal 7: red    (high)    */
+    cart_window_load_blob(CW_OFF_SPR_FFT_CGRAM, cg, sizeof cg);
+}
+
+static void fmv_overlay_setup(void) {
     /* OBJ CGRAM (CGADD 128): pal 0 cursor green; pal 1-3 hole colors. OBJ color
      * index 0 is always transparent, so only [pal*16+1] matters here. */
     uint16_t cg[CW_SPR_CGRAM_BYTES / 2];   /* 64 entries = OBJ pal 0-3 */
@@ -199,17 +285,18 @@ static void fmv_overlay_setup(void) {
     cg[3 * 16 + 1] = spr_bgr555(120,  70,  30);   /* pal 3: brown hole     */
     cart_window_load_blob(CW_OFF_SPR_CGRAM, cg, sizeof cg);
 
+    /* FFT spectrum-meter assets (fill/cap tiles + gradient palettes), staged
+     * into their cart-window regions for the producer's frame-0 one-time DMA. */
+    fmv_fft_build_assets();
+
     /* Init overlay state + write the initial OAM (cursor centered, no holes). */
     memset(&s_ov, 0, sizeof s_ov);
+    memset(s_peak, 0, sizeof s_peak);
     s_ov.cx = 124; s_ov.cy = 100;
     s_ov.next_hole = OV_POOL_FIRST;
     s_ov.rng = 0x1234567u;
     fmv_overlay_write_oam();
 }
-
-/* --- FFT spectrum bands (folded from the mixer's 16 to FFT_BARS) ---------- */
-#define FFT_BARS 8
-static uint8_t s_fft[FFT_BARS];        /* smoothed band level 0..255 */
 
 /* Pull the live band meter (computed over the final mixed output, so it tracks
  * the movie's own audio), fold 16 -> 8 by max-of-pairs, and smooth: instant

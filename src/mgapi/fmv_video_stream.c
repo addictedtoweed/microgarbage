@@ -30,10 +30,14 @@
  * siphon. Pixel-perfect (no active-display VRAM writes) AND correct speed for
  * the native-15fps movie.fmv. Each sub-frame <= the ~7452 B (8,8) burst budget:
  *   SF0 = CGRAM(256)+TM(2048)+C1(4800) = 7104;  SF1..3 = C2/C3/C4 = 6720 each. */
+/* CHR split rebalanced (v: FFT bars) so SF1 has room for the static FFT-overlay
+ * assets (fill tiles + gradient palette, 448 B) every frame: C2 shrinks by 448,
+ * redistributed to C3 (+320) and C4 (+128). Keeps each sub-frame under the
+ * ~7452 B burst budget. Sum stays 24960 (780 tiles). */
 #define CHR_C1  4800u   /* 150 tiles (SF0, after CGRAM+tilemap) */
-#define CHR_C2  6720u   /* 210 tiles (SF1) */
-#define CHR_C3  6720u   /* 210 tiles (SF2) */
-#define CHR_C4  6720u   /* 210 tiles (SF3) */
+#define CHR_C2  6272u   /* 196 tiles (SF1, room for FFT assets) */
+#define CHR_C3  7040u   /* 220 tiles (SF2) */
+#define CHR_C4  6848u   /* 214 tiles (SF3) */
 #define CHR_USED (CHR_C1 + CHR_C2 + CHR_C3 + CHR_C4)  /* 24960 = 780 tiles */
 #define TM_BYTES   2048u   /* 32×32 cells × 2 */
 
@@ -135,14 +139,16 @@ static bool fmv_video_fill(void *vctx, void *slot) {
     f->payload_used = PAYLOAD_USED;
 
     /* Sub-frames — 15 fps full-burst, 4 vblank sub-frames (each ≤ ~7452 B).
-     * Sprite overlay: the cursor + pool are sprites 0..31, so each frame pushes
-     * only their 128 B low-OAM — small enough to ride ALL four sub-frames →
-     * 60 Hz cursor. SF3 instead pushes the full 544 B (once per 4-frame cycle)
-     * to keep sprites 32..127 hidden. Static sprite CHR + OBJ CGRAM ride SF1's
-     * slack. The high OAM table stays all-zero (8x8, X<256), so the low-only
-     * 128 B updates are correct between full pushes. Budgets:
-     *   SF0 7104+128=7232, SF1 6720+64+128+128=7040, SF2 6720+128=6848,
-     *   SF3 6720+544=7264 — all < ~7452. */
+     * Sprite overlay: cursor+holes (0..31) + FFT bars (32..63), so each frame
+     * pushes 256 B low-OAM — rides SF0/1/2 for 60 Hz cursor/bars. SF3 pushes the
+     * full 544 B (once per cycle) to keep 64..127 hidden. Cursor CHR + OBJ pal
+     * 0-3 + the FFT fill tiles (OBJ tile 271+) + FFT gradient pal 4-7 all ride
+     * SF1 EVERY frame (static, but per-frame is robust vs a one-shot budget
+     * defer); the CHR split above is rebalanced so SF1 fits them. High OAM stays
+     * all-zero (8x8, X<256), so the low-only updates are correct between full
+     * pushes. Budgets:
+     *   SF0 4800+256+2048+256=7360,  SF1 6272+64+128+256+320+128=7168,
+     *   SF2 7040+256=7296,  SF3 6848+544=7392 — all < ~7452. */
     SubFrame *sf0 = &f->subframes[0];
     sf0->slot_count = 4;
     sf0->slots[0] = (StagedSlot){ .bbus=BBUS_CGDATA,  .dmap=DMAP_1B_1R, .prep=0u,       .src=OFF_CGRAM, .size=FMV_CGRAM_BYTES };
@@ -153,7 +159,7 @@ static bool fmv_video_fill(void *vctx, void *slot) {
     SubFrame *sf1 = &f->subframes[1];
     sf1->slot_count = 4;
     sf1->slots[0] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)(back_chr + CHR_C1/2u),               .src=OFF_C2, .size=CHR_C2 };
-    sf1->slots[1] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)CW_SPR_VRAM_WORD, .src=CW_OFF_SPR_CHR,   .size=CW_SPR_CHR_BYTES };
+    sf1->slots[1] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)CW_SPR_VRAM_WORD, .src=CW_OFF_SPR_FFT_CHR, .size=CW_SPR_FFT_CHR_BYTES };  /* cursor+hole+fill+cap, one slot */
     sf1->slots[2] = (StagedSlot){ .bbus=BBUS_CGDATA,  .dmap=DMAP_1B_1R, .prep=128u,                       .src=CW_OFF_SPR_CGRAM, .size=CW_SPR_CGRAM_BYTES };
     sf1->slots[3] = (StagedSlot){ .bbus=BBUS_OAMDATA, .dmap=DMAP_1B_1R, .prep=0u, .src=CW_OFF_SPR_OAM, .size=CW_SPR_OAM_ACTIVE_BYTES };
 
@@ -166,6 +172,12 @@ static bool fmv_video_fill(void *vctx, void *slot) {
     sf3->slot_count = 2;
     sf3->slots[0] = (StagedSlot){ .bbus=BBUS_VMDATAL, .dmap=DMAP_2B_2R, .prep=(uint16_t)(back_chr + (CHR_C1+CHR_C2+CHR_C3)/2u), .src=OFF_C4, .size=CHR_C4 };
     sf3->slots[1] = (StagedSlot){ .bbus=BBUS_OAMDATA, .dmap=DMAP_1B_1R, .prep=0u, .src=CW_OFF_SPR_OAM, .size=CW_SPR_OAM_BYTES };
+
+    /* FFT-overlay gradient palettes (OBJ pal 4-7), pushed EVERY frame on SF1 next
+     * to the cursor CGRAM that already lands reliably. The fill/cap tiles are NOT
+     * a separate slot — they're folded into SF1 slot[1] (the cursor CHR upload)
+     * above, so they ride the same early, reliable slot. */
+    sf1->slots[sf1->slot_count++] = (StagedSlot){ .bbus=BBUS_CGDATA, .dmap=DMAP_1B_1R, .prep=(uint16_t)CW_SPR_FFT_CGADD, .src=CW_OFF_SPR_FFT_CGRAM, .size=CW_SPR_FFT_CGRAM_BYTES };
 
     f->subframe_count = 4;
 

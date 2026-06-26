@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* The embedded shell ELF, baked in by bin2c at build time
@@ -405,6 +406,10 @@ static void install_bundled_demos(void) {
     {
         const char *as = g_autostart_path[0] ? g_autostart_path : NULL;
         if (!as && demo_boot_banner_elf_len > 0) as = "/td0/demos/boot_banner.elf";
+        /* $MGAPI_AUTOSTART overrides everything — a /td0 path to autostart
+         * instead of the banner. Handy for a kiosk that boots straight into a
+         * demo, and for testing one without the PuTTY/MGBOOT dance. */
+        { const char *env = getenv("MGAPI_AUTOSTART"); if (env && *env) as = env; }
         if (as) {
             char line[260];
             size_t n = 0;
