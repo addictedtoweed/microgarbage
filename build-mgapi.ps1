@@ -147,6 +147,17 @@ $mgapiSrcs += (Join-Path $MgapiSrcDir "l2_ecalls.c")
 $mgapiSrcs += (Join-Path $MgapiSrcDir "copro_mg_state.c")
 $mgapiSrcs += (Join-Path $MgapiSrcDir "copro_mg_handlers.c")
 
+# Native 3D renderer service (SYS_R3D_*). The polygon engine (src/video/r3d.c)
+# runs host-side; the guest issues scene commands and asks for frames, which
+# copro_r3d stages through the same cart-window transport as the SYS_MG_* path.
+# Pulls in the shared fixed-point math the engine needs (host-native here; the
+# same sources also compile into guest ELFs that want CORDIC trig).
+$mgapiSrcs += (Join-Path $MgapiSrcDir "copro_r3d.c")
+$mgapiSrcs += (Join-Path $MgapiSrcDir "r3d_ecalls.c")
+$mgapiSrcs += (Join-Path $RepoRoot "src\video\r3d.c")
+$mgapiSrcs += (Join-Path $RepoRoot "src\math\trig_q16.c")
+$mgapiSrcs += (Join-Path $RepoRoot "src\math\fixed_point.c")
+
 # Stage 4: TCP listener for PuTTY shell sessions.
 $mgapiSrcs += (Join-Path $MgapiSrcDir "tcp_listen.c")
 
@@ -209,7 +220,7 @@ if (-not $NoGuest) {
         $mgGuestImpls = @(
             "mg_bg.c","mg_frame.c","mg_gfx.c","mg_hdma.c","mg_input.c",
             "mg_mode7.c","mg_panic.c","mg_sprite.c","mg_audio.c","mg_actor.c",
-            "mg_stream.c","mg_nmi.c"
+            "mg_stream.c","mg_nmi.c","mg_r3d.c"
         ) | ForEach-Object { Join-Path $guestCommon $_ }
         $mgGuestImpls += (Join-Path $RepoRoot "src\math\trig_q16.c")
         $guestSources = @(
@@ -222,7 +233,8 @@ if (-not $NoGuest) {
             @{ src = "tools\guests\demos\demo_mode7_3d.c";  sym = "demo_mode7_3d_elf";  out = "demo_mode7_3d.elf";  gen = "demo_mode7_3d_elf_data.c";  extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_audio_mixer.c"; sym = "demo_audio_mixer_elf"; out = "demo_audio_mixer.elf"; gen = "demo_audio_mixer_elf_data.c"; extra = $mgGuestImpls },
             @{ src = "tools\guests\demos\demo_fmv_player.c"; sym = "demo_fmv_player_elf"; out = "demo_fmv_player.elf"; gen = "demo_fmv_player_elf_data.c"; extra = $mgGuestImpls },
-            @{ src = "tools\guests\demos\demo_boot_banner.c"; sym = "demo_boot_banner_elf"; out = "demo_boot_banner.elf"; gen = "demo_boot_banner_elf_data.c"; extra = $mgGuestImpls }
+            @{ src = "tools\guests\demos\demo_boot_banner.c"; sym = "demo_boot_banner_elf"; out = "demo_boot_banner.elf"; gen = "demo_boot_banner_elf_data.c"; extra = $mgGuestImpls },
+            @{ src = "tools\guests\demos\demo_cube3d.c"; sym = "demo_cube3d_elf"; out = "demo_cube3d.elf"; gen = "demo_cube3d_elf_data.c"; extra = $mgGuestImpls }
         )
         foreach ($g in $guestSources) {
             $srcPath = Join-Path $RepoRoot $g.src
@@ -243,7 +255,7 @@ if (-not $NoGuest) {
     }
 }
 if (-not $baked) {
-    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_dynamic_letterbox_elf[] = {0};`nconst size_t demo_dynamic_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`nconst unsigned char demo_audio_mixer_elf[] = {0};`nconst size_t demo_audio_mixer_elf_len = 0;`nconst unsigned char demo_pcm_stream_elf[] = {0};`nconst size_t demo_pcm_stream_elf_len = 0;`nconst unsigned char demo_fmv_elf[] = {0};`nconst size_t demo_fmv_elf_len = 0;`nconst unsigned char demo_fmv_still_elf[] = {0};`nconst size_t demo_fmv_still_elf_len = 0;`nconst unsigned char demo_fmv_player_elf[] = {0};`nconst size_t demo_fmv_player_elf_len = 0;`nconst unsigned char demo_nmi_smoke_elf[] = {0};`nconst size_t demo_nmi_smoke_elf_len = 0;`nconst unsigned char demo_boot_banner_elf[] = {0};`nconst size_t demo_boot_banner_elf_len = 0;`n" |
+    "#include <stddef.h>`nconst unsigned char shell_elf[] = {0};`nconst size_t shell_elf_len = 0;`nconst unsigned char l2_test_elf[] = {0};`nconst size_t l2_test_elf_len = 0;`nconst unsigned char menu_elf[] = {0};`nconst size_t menu_elf_len = 0;`nconst unsigned char demo_palette_elf[] = {0};`nconst size_t demo_palette_elf_len = 0;`nconst unsigned char demo_letterbox_elf[] = {0};`nconst size_t demo_letterbox_elf_len = 0;`nconst unsigned char demo_dynamic_letterbox_elf[] = {0};`nconst size_t demo_dynamic_letterbox_elf_len = 0;`nconst unsigned char demo_sprite_elf[] = {0};`nconst size_t demo_sprite_elf_len = 0;`nconst unsigned char demo_mode7_elf[] = {0};`nconst size_t demo_mode7_elf_len = 0;`nconst unsigned char demo_mode7_3d_elf[] = {0};`nconst size_t demo_mode7_3d_elf_len = 0;`nconst unsigned char demo_audio_mixer_elf[] = {0};`nconst size_t demo_audio_mixer_elf_len = 0;`nconst unsigned char demo_pcm_stream_elf[] = {0};`nconst size_t demo_pcm_stream_elf_len = 0;`nconst unsigned char demo_fmv_elf[] = {0};`nconst size_t demo_fmv_elf_len = 0;`nconst unsigned char demo_fmv_still_elf[] = {0};`nconst size_t demo_fmv_still_elf_len = 0;`nconst unsigned char demo_fmv_player_elf[] = {0};`nconst size_t demo_fmv_player_elf_len = 0;`nconst unsigned char demo_nmi_smoke_elf[] = {0};`nconst size_t demo_nmi_smoke_elf_len = 0;`nconst unsigned char demo_boot_banner_elf[] = {0};`nconst size_t demo_boot_banner_elf_len = 0;`nconst unsigned char demo_cube3d_elf[] = {0};`nconst size_t demo_cube3d_elf_len = 0;`n" |
         Set-Content -Path $shellDataC -Encoding ASCII
 }
 $mgapiSrcs += $shellDataC

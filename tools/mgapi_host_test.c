@@ -658,7 +658,7 @@ int main(int argc, char **argv) {
      * see frames committed, just confirm load + first PC steps work. */
     printf("\n--- bundled demos: install check (/td0/demos/) ---\n");
     if (p_td0) {
-        static const char *DEMOS[] = { "palette", "letterbox", "sprite", "mode7", "mode7_3d" };
+        static const char *DEMOS[] = { "palette", "letterbox", "sprite", "mode7", "mode7_3d", "cube3d" };
         for (int i = 0; i < (int)(sizeof DEMOS / sizeof DEMOS[0]); i++) {
             int sz = p_td0(DEMOS[i]);
             printf("  /td0/demos/%s.elf  size = %d\n", DEMOS[i], sz);
@@ -671,7 +671,7 @@ int main(int argc, char **argv) {
 
     printf("\n--- bundled demos (load + step probe) ---\n");
     if (p_dem) {
-        static const char *DEMOS[] = { "palette", "letterbox", "sprite", "mode7", "mode7_3d" };
+        static const char *DEMOS[] = { "palette", "letterbox", "sprite", "mode7", "mode7_3d", "cube3d" };
         for (int i = 0; i < (int)(sizeof DEMOS / sizeof DEMOS[0]); i++) {
             int rc = p_dem(DEMOS[i], 5000);
             printf("  spawn '%-9s' for_steps rc = %d\n", DEMOS[i], rc);
@@ -688,7 +688,7 @@ int main(int argc, char **argv) {
 
     printf("\n--- bundled demos (slurp from /td0/ + spawn) ---\n");
     if (p_dtf) {
-        static const char *DEMOS[] = { "palette", "letterbox", "sprite", "mode7", "mode7_3d" };
+        static const char *DEMOS[] = { "palette", "letterbox", "sprite", "mode7", "mode7_3d", "cube3d" };
         for (int i = 0; i < (int)(sizeof DEMOS / sizeof DEMOS[0]); i++) {
             int rc = p_dtf(DEMOS[i]);
             printf("  trashfs+spawn '%-9s' rc = %d\n", DEMOS[i], rc);

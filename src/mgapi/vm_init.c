@@ -26,6 +26,7 @@
 #include "io/stream_arbiter.h"
 #include "io/stream_ecalls.h"
 #include "fmv_ecalls.h"
+#include "r3d_ecalls.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -61,6 +62,8 @@ extern const unsigned char demo_fmv_player_elf [];
 extern const size_t        demo_fmv_player_elf_len;
 extern const unsigned char demo_boot_banner_elf [];
 extern const size_t        demo_boot_banner_elf_len;
+extern const unsigned char demo_cube3d_elf [];
+extern const size_t        demo_cube3d_elf_len;
 
 /* v2.30.7 Phase 3b: cart_window frame_consumed hook → VM scheduler.
  * Called whenever cart_window's port-7-read callback bumps
@@ -304,6 +307,13 @@ int mgapi_vm_init(void *cart_volume_handle) {
      * FMV_VIDEO producer registers as a stream. */
     if (!mgapi_install_fmv_ecalls(&g_sys)) goto fail_sys;
 
+    /* Native 3D renderer service (SYS_R3D_*). The renderer runs in
+     * firmware (host-side r3d); the guest issues scene commands
+     * (add/move/rotate objects, camera) and asks for frames, which the
+     * service stages through the same mg_state transport as the SYS_MG_*
+     * path. See copro_r3d.{c,h}. */
+    if (!mgapi_install_r3d_ecalls(&g_sys)) goto fail_sys;
+
     /* 4. Mount table:
      *      /td0/  small RAM-disk scratch (writable, this DLL's BSS)
      *      /cart/ large PSRAM read-mostly bulk (the volume stage 2c
@@ -397,6 +407,7 @@ static void install_bundled_demos(void) {
     install_demo("/demos/audio_mixer.elf", demo_audio_mixer_elf, demo_audio_mixer_elf_len);
     install_demo("/demos/fmv_player.elf",  demo_fmv_player_elf,  demo_fmv_player_elf_len);
     install_demo("/demos/boot_banner.elf", demo_boot_banner_elf, demo_boot_banner_elf_len);
+    install_demo("/demos/cube3d.elf",      demo_cube3d_elf,      demo_cube3d_elf_len);
 
     /* Seed /td0/etc/autostart, which the shell's _start runs on cold boot.
      * Priority: a path from the loaded .sfc cart's MGBOOT tag (set via

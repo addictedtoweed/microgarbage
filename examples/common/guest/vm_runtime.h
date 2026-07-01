@@ -188,6 +188,17 @@
 /* Port-2 SNES Mouse read (1236). → packed buttons|dx<<8|dy<<16. */
 #define SYS_MG_READ_MOUSE        1236
 
+/* Native 3D renderer service (1240..1246). Keep in sync with
+ * include/vm/vm_ecall.h. The renderer runs in firmware; the guest issues
+ * scene commands (Q16.16) and asks for a frame. See mg_r3d.h. */
+#define SYS_R3D_RESET            1240  /* () → 0 */
+#define SYS_R3D_CAMERA           1241  /* (ex,ey,ez,yaw,pitch,roll,focal) → 0 */
+#define SYS_R3D_ADD              1242  /* (mesh_id) → handle or -1 */
+#define SYS_R3D_MOVE             1243  /* (obj,x,y,z) → 0 */
+#define SYS_R3D_ROTATE           1244  /* (obj,rx,ry,rz) → 0 */
+#define SYS_R3D_SHOW             1245  /* (obj,visible) → 0 */
+#define SYS_R3D_RENDER           1246  /* () → 0 staged / -1 in-flight */
+
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
  * Clobber a0 (return), preserve a1..a6 (they're used as inputs).
@@ -239,6 +250,37 @@ static inline uint32_t _vm_sys5(uint32_t n, uint32_t x0, uint32_t x1,
     register uint32_t a7 asm("a7") = n;
     asm volatile ("ecall" : "+r"(a0)
                   : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+                  : "memory");
+    return a0;
+}
+static inline uint32_t _vm_sys6(uint32_t n, uint32_t x0, uint32_t x1,
+                                 uint32_t x2, uint32_t x3, uint32_t x4,
+                                 uint32_t x5) {
+    register uint32_t a0 asm("a0") = x0;
+    register uint32_t a1 asm("a1") = x1;
+    register uint32_t a2 asm("a2") = x2;
+    register uint32_t a3 asm("a3") = x3;
+    register uint32_t a4 asm("a4") = x4;
+    register uint32_t a5 asm("a5") = x5;
+    register uint32_t a7 asm("a7") = n;
+    asm volatile ("ecall" : "+r"(a0)
+                  : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
+                  : "memory");
+    return a0;
+}
+static inline uint32_t _vm_sys7(uint32_t n, uint32_t x0, uint32_t x1,
+                                 uint32_t x2, uint32_t x3, uint32_t x4,
+                                 uint32_t x5, uint32_t x6) {
+    register uint32_t a0 asm("a0") = x0;
+    register uint32_t a1 asm("a1") = x1;
+    register uint32_t a2 asm("a2") = x2;
+    register uint32_t a3 asm("a3") = x3;
+    register uint32_t a4 asm("a4") = x4;
+    register uint32_t a5 asm("a5") = x5;
+    register uint32_t a6 asm("a6") = x6;
+    register uint32_t a7 asm("a7") = n;
+    asm volatile ("ecall" : "+r"(a0)
+                  : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7)
                   : "memory");
     return a0;
 }

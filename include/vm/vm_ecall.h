@@ -463,6 +463,18 @@
  * = dy (int8). Lets a guest menu act on clicks without a PuTTY shell. */
 #define SYS_MG_READ_MOUSE 1236  /* () → packed buttons|dx<<8|dy<<16 */
 
+/* --- Native 3D renderer service (1240..1246) ---
+ * The renderer runs in firmware (host-side r3d); the guest issues scene
+ * commands and asks for a frame. See examples/common/guest/mg_r3d.h and
+ * src/mgapi/copro_r3d.{c,h}. Coords/angles are Q16.16. */
+#define SYS_R3D_RESET   1240  /* () → 0; clear scene, default camera, clean-slate */
+#define SYS_R3D_CAMERA  1241  /* (ex,ey,ez, yaw,pitch,roll, focal) → 0 */
+#define SYS_R3D_ADD     1242  /* (mesh_id) → object handle (>=0) or -1 */
+#define SYS_R3D_MOVE    1243  /* (obj, x,y,z) → 0; translate */
+#define SYS_R3D_ROTATE  1244  /* (obj, rx,ry,rz) → 0; Euler radians */
+#define SYS_R3D_SHOW    1245  /* (obj, visible) → 0 */
+#define SYS_R3D_RENDER  1246  /* () → 0 staged / -1 in-flight (retry after wait) */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */
