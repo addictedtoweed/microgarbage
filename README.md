@@ -1,16 +1,42 @@
-#MicroGarbage OS
+# Microgarbage OS
 ## Powered by AI slop and shamelessness
 
-A small library of reusable C modules for embedded and bare-metal
-projects. Public domain (CC0). No warranty.
+Microgarbage OS is a multitasking operating system for
+microcontrollers. It brings enterprise- and desktop-class
+capabilities — loadable, sandboxed applications, a real read/write
+filesystem, an interactive shell, live multi-channel audio,
+inter-core services, and cooperative (optionally preemptive)
+scheduling — down to M0/M3/M4-class parts, with nothing
+architecture-specific baked into the core.
 
-The targets in mind are M0/M3/M4-class microcontrollers, but
-nothing here is architecture-specific — these will work fine on a
-hosted system too.
+Applications are **off-the-shelf RISC-V binaries**: ordinary
+RV32IMC ELFs built with a stock `riscv32-unknown-elf-gcc` (or clang)
+toolchain, loaded and sandboxed at runtime with no MMU required. The
+application ABI is fixed and every machine-dependent detail sits
+behind the OS's hardware-abstraction layer, so the same app binary
+runs on any board you've brought the HAL up on — bring the HAL, run
+the apps.
 
-Every file in this repository is CC0 — there is no third-party or
-vendored code. File storage is provided by `trashfs`, the native
-public-domain RAM-disk filesystem.
+The same OS also ships as the runtime inside a **Super Nintendo
+coprocessor cartridge**. The cartridge's coprocessor is an **ARM**
+chip running the *exact same RV32IMC VM* as the mainstream
+microcontroller build — so the identical RISC-V application binaries
+run there unmodified; the CPU underneath is just another host the
+HAL is brought up on. In this deployment the OS drives the SNES
+PPU/APU across a cart-window DMA seam, letting a homebrew game
+offload the heavy lifting (3D, full-motion video, audio mixing) to a
+modern CPU while the 65816 stays the game logic.
+
+Public domain (CC0), no warranty — and CC0 all the way down: no
+third-party or vendored code anywhere, not even the filesystem
+(`trashfs` is a native public-domain implementation).
+
+Under the hood the OS is assembled from small, independent,
+caller-owns-the-memory C modules — data structures, fixed-point
+math, an audio engine, storage, allocators, and the RV32IMC virtual
+machine that runs the applications. They compose into the OS, but
+each also stands alone if you just want to lift one into another
+project. The rest of this README documents them.
 
 ## Layout
 
