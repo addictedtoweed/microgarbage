@@ -73,17 +73,27 @@ uint8_t  mg_force_blank_top(void);
 uint8_t  mg_force_blank_bottom(void);
 ```
 
-**Model**: the runtime's hot path owns per-frame DMA dispatch, a
-timer-tuned vblank window (early-blank or late-blank trick), joypad
-poll, mailbox read, and publishes a frame-ready producer. `mg_wait_frame`
-blocks on the producer; on return, pads are fresh and staging tables
-are clear. `mg_frame_commit` is non-blocking; the runtime picks up
-the staging tables at its next DMA-prep tick.
+**Model**: `mg_frame_commit` hands the staging tables (the DMA
+descriptor list + dirty shadow buffers) back to the runtime and
+returns immediately; `mg_wait_frame` blocks until the SNES side has
+consumed a frame, at which point pads are fresh and the staging
+tables are clear. On the cart side the transfer is driven by the
+**virtual-NMI kernel** ([[snes-cart-kernel]]) — NMI off, a single
+self-chaining H+V timer IRQ that runs a cycle-budgeted DMA chainer
+inside a **dynamic force-blank letterbox**: it reads the live beam,
+streams as many bytes as the blank window can afford (~160 B/line,
+measured safe on hardware), and defers the overflow to the next
+frame. A payload too big for one window simply streams over several
+frames. The design direction is for a game to compose its own
+frame-shape-tailored transfer handler via the guest **NMI builder**
+(`mg_nmi.h`) rather than lean on the generic kernel path — the
+`mg_frame_*` contract here is unchanged either way.
 
 **Force-blank**: trades visible scanlines for DMA budget. Each
-blanked scanline yields ~117 bytes/frame. `(0, 0)` is the 224-line
-visible baseline; `(8, 8)` is the FMV path's 208 visible. Documented
-presets in the header.
+blanked scanline the chainer reclaims yields ~160 bytes at the
+measured-safe rate. `(0, 0)` is the 224-line visible baseline;
+`(8, 8)` is the FMV path's 208 visible. Documented presets in the
+header.
 
 ### Input (`mg_input.h`)
 

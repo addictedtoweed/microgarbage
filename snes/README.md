@@ -1,9 +1,23 @@
 # SNES kernel (cart side)
 
 A small 65816 kernel for the SNES half of the coprocessor system — **no
-pvsneslib**. The STM32 coprocessor *is* the cartridge ROM; this code boots the
-SNES, pulls a kernel the copro stages into WRAM, and runs a per-frame lockstep
-loop that DMAs copro-prepared PPU data each vblank.
+pvsneslib**. The coprocessor *is* the cartridge ROM; this code boots the SNES,
+pulls a kernel the copro stages into WRAM, and then gets out of the way.
+
+The kernel is deliberately **thin — a generic transfer substrate, not frame
+logic**. It runs **NMI-off**, driven by a single self-chaining H+V timer IRQ
+that force-blanks a **dynamic letterbox** window and runs a **cycle-budgeted DMA
+chainer**: it reads the live beam position before each transfer and streams as
+many bytes as the remaining blank window can afford (**~160 B/line, measured
+safe on real hardware**), deferring the rest to the next frame. Large frames
+(e.g. a full-screen CHR upload) simply span several frames.
+
+The design direction is that each RISC-V **application** owns its own per-frame
+transfer: rather than tweaking this 65816 kernel, an app composes a tailored
+handler on the copro side via the guest **NMI builder** (`examples/common/guest/
+mg_nmi.h`), emitting minimal, frame-shape-specific 65816 for lowest overhead and
+maximum DMA throughput. One generic kernel; the frame-specific logic lives in
+the app.
 
 ## Hardware model
 
@@ -48,46 +62,43 @@ vectors) — everything below it is fair game as the data channel.
 
 ## Per-frame loop (`kernel.s`, runs from WRAM)
 
+The kernel runs **NMI-off** (the NMI vector is parked at a bare `RTI`). A single
+self-chaining H+V timer IRQ (`irq`) drives every frame as a two-state machine —
+a "virtual NMI" that also owns the force-blank letterbox:
+
 ```
-(NMI just returned from vblank DMA -- we're at the start of active display)
-read joypads     -> bit-bang $4016/$4017 (4 pads, multitap-capable)
-post 4 pads      -> 8 read-strobes at JOYPORT_P[0..3]_LO/HI  (acks prev frame)
-wai              -> sleep until next vblank
-(at vblank) NMI:
-    read COPRO_FRAME_RDY -- if 0, RTI (previous frame stays on screen)
-    walk COPRO_DMA_LIST (8 slots * 8 bytes):
-        if slot.bbus == 0: skip
-        else:
-            program channel 0: BBAD0/DMAP0/A1T0/DAS0  (A1B0=COPRO_BANK preset)
-            prep (based on bbus):
-                $22 (CGDATA)  -> write CGADD = slot.prep low byte
-                $18 (VMDATAL) -> VMAIN=$80; VMADDL/H = slot.prep
-                $04 (OAMDATA) -> OAMADDL/H = slot.prep
-            sta MDMAEN          ; fire channel 0; CPU paused until slot done
+state B  (top-letterbox scanline):     unblank -- INIDISP = brightness
+   ...active display...
+   joypads bit-banged here ($4016/$4017, 4 pads, multitap; auto-read off)
+   post 4 pads -> JOYPORT_P[0..3]_LO/HI read-strobes (acks prev frame)
+state A  (bottom-letterbox scanline):  force-blank (INIDISP.7 = 1), then run the
+    CYCLE-BUDGETED DMA CHAINER over the blank window (vblank + letterbox):
+        read COPRO_FRAME_RDY -- if 0, leave VRAM as-is (last frame persists)
+        walk COPRO_DMA_LIST (8 slots x 8 bytes); per slot:
+            re-read the live beam (OPVCT); if this slot's bytes won't fit the
+              window still remaining, DEFER the rest to the next frame and stop
+            else program channel 0 (BBAD0/DMAP0/A1T0/DAS0; A1B0=COPRO_BANK preset),
+              prep by bbus ($22 CGDATA / $18 VMDATAL / $04 OAMDATA), fire MDMAEN
+        strobe COPRO_FRAME_DONE -- the copro advances to the next sub-frame
+    re-arm both IRQ targets for the next field
 ```
 
-The protocol is **frame-ready flag + DMA descriptor list**: the copro stages the
-per-frame payload at `COPRO_DATA`, fills `COPRO_DMA_LIST` with up to 8 descriptors
-(bbus / dmap / src / size / prep), then writes `COPRO_FRAME_RDY` to a non-zero
-value to signal "list is complete, go." Each descriptor names one DMA -- the
-copro composes whatever combination of CGRAM / VRAM / OAM transfers it needs
-each frame. The kernel marshalls the list every vblank; channel 0 is reused
-across slots (SNES DMA channels never run in parallel anyway, so reusing is
-functionally identical to using all 8). Reads are idempotent: if the copro
-doesn't update before the next vblank, the kernel re-runs the same list and
-the picture is unchanged.
-
-See `copro.inc` for the 8-byte descriptor layout.
-
-The vblank DMA is where the letterbox forced-blank budget applies (54-line
-window @208 active → fits a 26,776 B frame over 3 vblanks @20 fps).
+The protocol is still **frame-ready flag + DMA descriptor list** (`COPRO_FRAME_RDY`
++ `COPRO_DMA_LIST`; see `copro.inc` for the 8-byte descriptor layout). What changed
+from the original design is that the transfer is now **cycle-budgeted and
+letterbox-widened**: the chainer spends the whole vblank + force-blank window at
+~160 B/line and defers overflow across frames, and `COPRO_FRAME_DONE` lets the copro
+drive **multi-sub-frame delivery** of a payload too big for one window (a full 240×208
+frame streams over ~4 frames). Channel 0 is reused across slots (SNES DMA channels
+never run in parallel). Reads are idempotent — if the copro doesn't update, the last
+picture persists.
 
 ## Files
 
 | file        | role |
 |-------------|------|
 | `boot.s`    | reset, init, handshake, copy-to-RAM, vectors + trampolines |
-| `kernel.s`  | RAM-resident main loop + vblank NMI DMA (stub) |
+| `kernel.s`  | RAM-resident kernel: virtual-NMI timer IRQ + cycle-budgeted DMA chainer + force-blank letterbox |
 | `smoke.s`   | standalone smoke-test kernel (cycle backdrop on button) |
 | `copro.inc` | the SNES↔copro interface: window/read-ports/status/payload map |
 | `snes.inc`  | the SNES registers used |
@@ -117,29 +128,34 @@ plain HiROM, yet still exercises WRAM execution, the ROM→RAM NMI trampoline,
 vblank timing, auto-joypad read, and CGRAM writes — and stays valid once the
 custom mapper is wired in.
 
-## Status / open items
+## Status
 
-This is a **stub**: control flow, handshake, joypad path, and the full DMA
-dispatch (CGRAM / VRAM / OAM, generic per-slot from a copro-staged list) are
-real; the higher-level frame composition is what's left.
+**Live, not a stub.** `demo_fmv` streams full-motion video at 15–20 fps on real
+hardware and in bsnes-plus over this kernel, and the 3D renderer stages frames
+through the same path. Control flow, handshake, joypad path, the cycle-budgeted
+DMA chainer, and the dynamic force-blank letterbox are all real and verified.
 
-- Addresses in `copro.inc` (data-window bank, port/status offsets) are
-  **placeholders** — confirm against the mapper's decode.
-- *(done)* Manual joypad read in active display (`read_joypads` in `kernel.s`)
-  with auto-read disabled — the full 54-line forced-blank window is now
-  available for the DMA burst.
-- *(done)* Per-frame DMA dispatch via the **frame-ready flag + 8-slot list**
-  protocol (`COPRO_FRAME_RDY` + `COPRO_DMA_LIST`). Main loop is `wai`-driven;
-  NMI walks the slots and programs channel 0 from each. Supersedes the earlier
-  bitmask `COPRO_DMACTRL` design.
-- **Double-buffering** is TODO: the copro currently puts each frame's data at
-  the same VRAM addresses; flipping `BG1SC` / `BG12NBA` between two banks each
-  frame is a small extension on top of the list (the copro just varies the
-  slot `prep` values).
-- **Letterbox forced-blank extension** is TODO — needed for the full 26.8 KB
-  FMV block (which doesn't fit a standard 38-line vblank). The DMA dispatch is
-  in place; this just needs an IRQ at line ~209 to assert `INIDISP.7` and a
-  matching clear before line 9 of the next frame.
+Done since the original design:
+
+- **Virtual-NMI kernel** — NMI off; a single self-chaining H+V timer IRQ drives
+  the frame, runs a live-beam (OPVCT) cycle-budgeted DMA chainer with
+  defer/resume, and strobes `COPRO_FRAME_DONE`.
+- **Force-blank letterbox** — the IRQ asserts/clears `INIDISP.7` at the letterbox
+  lines, widening the DMA window on demand. ~160 B/line measured safe on hardware,
+  so a full-screen frame streams over ~4 frames.
+- **Multi-sub-frame delivery + double-buffering** — a payload too big for one
+  window streams across several frames; the copro pipelines depth-2 (commit-ahead)
+  so the kernel never idles between frames.
+- **Manual joypad read** in active display (auto-read off), freeing the whole
+  force-blank window for the DMA burst.
+
+Open / direction:
+
+- **App-composed transfer via the NMI builder** — the direction (see the intro)
+  is for each RISC-V app to emit its own frame-shape-tailored transfer handler on
+  the copro side (`mg_nmi`) rather than leaning on the generic kernel path, for
+  lowest overhead + maximum DMA. Reconciling the builder with the virtual-NMI
+  (timer-IRQ) kernel is the active work.
 - Read-as-signal relies on the copro only acting on reads in the port region —
   safe because the kernel runs from WRAM (prefetch never hits the cart) and the
   DMA-source range is kept disjoint from the ports.
