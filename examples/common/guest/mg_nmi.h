@@ -1,39 +1,58 @@
 /* ============================================================
  *  mg_nmi.h — guest-side NMI handler builder (Phase 2)
  *
- *  Each .elf can install its own 65816 NMI handler tailored to
- *  its frame shape, replacing the generic kernel NMI. The guest
- *  composes the handler by calling emit_* primitives, then ships
- *  it to the host via mg_nmi_install which invokes the
- *  SYS_MG_NMI_INSTALL ecall. The host stages the bytes into the
- *  cart-window NMI region and bumps the version byte; the SNES
- *  kernel's @loop polls the version, MVN-copies the new code to
- *  K_NMI_CODE_BASE ($0E00), and rewrites RAMVEC_NMI to point at
- *  the freshly-copied handler.
+ *  BODY MODEL (v2.44) — the current, supported shape.
+ *  The virtual-NMI kernel owns the per-frame timing skeleton: it
+ *  force-blanks at the bottom-letterbox line, and at that point
+ *  calls a "transfer body" to move the staged frame into the PPU,
+ *  then unblanks at the top-letterbox line. By default the body is
+ *  the kernel's proven cycle-budgeted chainer (frame_dma). A guest
+ *  can install its OWN body to do frame-shape-specific things the
+ *  generic path can't — while still reusing the proven engine.
  *
- *  Design point: emit primitives are mid-level coherent blocks
- *  (prologue, frame-gate, DMA-walk, etc.) rather than per-opcode
- *  helpers. This keeps cycle accounting tractable and the API
- *  ergonomic. Per-opcode emit_imm8/store/etc are provided for
- *  the cases where a specific inline register write is needed
- *  (e.g. BG12NBA flip for FMV double-buffer).
+ *  A body is entered force-blanked, A8/I16, DBR=$00, with A/X/Y
+ *  already saved by the kernel ISR, and returns with `rts` (it is
+ *  JSR'd, NOT an interrupt handler — no RDNMI ack, no RTI). It must
+ *  NOT touch INIDISP (the kernel state machine owns blank/unblank).
+ *
+ *  The kernel publishes its proven routines at a fixed ABI
+ *  jump-table (MG_ABI_* below) so a body can call them by a stable
+ *  address. The common case:
+ *      mg_nmi_emit_call_default(&b);   // jsr the cycle-budgeted chainer
+ *  plus any inline register writes (emit_store_imm8/16) for the
+ *  guest's delta, e.g. a BG12NBA double-buffer flip.
+ *
+ *  The host stages the assembled bytes into the cart-window NMI
+ *  region and bumps the version byte; the SNES kernel's @loop polls
+ *  the version, copies the code to K_NMI_CODE_BASE ($0E00), and
+ *  raises K_NMI_CUSTOM so state A jsr's the body instead of the
+ *  built-in frame_dma. Version 0 (host, on VM unload) uninstalls.
+ *
+ *  USAGE — reproduce the default (byte-behaviorally identical):
+ *      MgNmi b;
+ *      mg_nmi_build_default(&b);       // begin + call_default + rts
+ *      if (mg_nmi_finish(&b, 16) < 0) mg_panic("nmi overrun");
+ *      mg_nmi_install(&b);
+ *
+ *  USAGE — a custom body (chainer + an inline BG12NBA flip):
+ *      MgNmi b;
+ *      mg_nmi_begin(&b);
+ *      mg_nmi_emit_call_default(&b);           // do the staged transfer
+ *      mg_nmi_emit_store_imm8(&b, 0x210B, v);  // then flip BG12NBA
+ *      mg_nmi_emit_body_end(&b);               // rts
+ *      if (mg_nmi_finish(&b, 16) < 0) mg_panic("nmi overrun");
+ *      mg_nmi_install(&b);
+ *
+ *  LEGACY full-ISR primitives (prologue / frame_ready_gate /
+ *  dma_list_walk / epilogue) predate the virtual-NMI kernel: they
+ *  emit a self-contained NMI handler that acks RDNMI and ends in
+ *  RTI. They are INCOMPATIBLE with the body-model seam (an RTI in a
+ *  JSR'd body corrupts the stack) and are kept only for reference —
+ *  do not mix them with the body model.
  *
  *  Cycle accounting is in 65816 CPU cycles (worst-case, native
  *  mode E=0). The validator multiplies by 8 master/cycle (slowrom
  *  conservative) and compares against vblank + force_blank budget.
- *
- *  USAGE:
- *      MgNmi b;
- *      mg_nmi_begin(&b);
- *      mg_nmi_emit_prologue(&b);
- *      mg_nmi_emit_frame_ready_gate(&b);
- *      mg_nmi_emit_inidisp(&b, 0x80);     // force blank
- *      mg_nmi_emit_dma_list_walk(&b);
- *      mg_nmi_emit_inidisp(&b, 0x0F);     // unblank
- *      mg_nmi_emit_out_label(&b);
- *      mg_nmi_emit_epilogue(&b);
- *      if (mg_nmi_finish(&b, 16) < 0) mg_panic("nmi overrun");
- *      mg_nmi_install(&b);
  *
  *  Public domain (CC0). No warranty.
  * ============================================================ */
@@ -55,6 +74,11 @@ extern "C" {
 /* The SNES kernel copies installed code to K_NMI_CODE_BASE in WRAM. */
 #define MG_NMI_LOAD_ADDR       0x0E00u
 
+/* Kernel ABI jump-table (mirrors snes/copro.inc K_ABI_*). A transfer body
+ * calls these by fixed address to reuse the proven kernel routines. */
+#define MG_ABI_FRAME_DMA       0x0DE0u   /* full default transfer (cycle-budgeted chainer) */
+#define MG_ABI_CALC_BYTES_REM  0x0DE3u   /* live-beam remaining-window byte budget */
+
 /* Errors (negative). */
 #define MG_NMI_OK              0
 #define MG_NMI_E_BUF_FULL     -1
@@ -75,6 +99,31 @@ typedef struct {
 
 /* Reset builder. */
 void mg_nmi_begin(MgNmi *b);
+
+/* ---------- Body model (v2.44, current) ---------- */
+
+/* Emit `jsr K_ABI_FRAME_DMA` — run the kernel's proven cycle-budgeted
+ * chainer (PPU batch + HDMA + DMA-list walk) as the body's transfer
+ * step. The body is already force-blanked by the kernel; this reuses
+ * the whole default engine. M=1, X=0 in/out. */
+void mg_nmi_emit_call_default(MgNmi *b);
+
+/* Emit `jsr K_ABI_CALC_BYTES_REM` — refresh the live-beam remaining
+ * blank-window budget (K_BYTES_REM) for a body rolling its own walk. */
+void mg_nmi_emit_call_calc_budget(MgNmi *b);
+
+/* Emit `rts` — end a transfer body (it is JSR'd by the kernel state
+ * machine, not an interrupt handler). */
+void mg_nmi_emit_body_end(MgNmi *b);
+
+/* Convenience: assemble a body byte-behaviorally identical to the
+ * kernel default (begin + call_default + rts). Caller still runs
+ * mg_nmi_finish + mg_nmi_install. */
+void mg_nmi_build_default(MgNmi *b);
+
+/* ---------- Legacy full-ISR primitives (pre-v2.44) ---------- */
+/* See the header banner: these emit a self-contained NMI handler
+ * (RDNMI ack + RTI) and are INCOMPATIBLE with the body-model seam. */
 
 /* Emit standard prologue: rep #$30, pha, phx, phy, sep #$20,
  * lda f:$004210 (ack RDNMI). Caller arrives with M=1, X=1 per

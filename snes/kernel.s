@@ -106,6 +106,28 @@
     sta K_LAYOUT_VIS_END    ; 224 - bot_lb (bot_lb = 0 at boot)
     stz K_SIPHON_BYTES
 
+    ; v2.44 optional custom transfer body: no guest handler installed yet,
+    ; so state A runs the built-in frame_dma. K_NMI_VERSION is the poll
+    ; baseline (the host's cart-window version byte also starts at 0).
+    stz K_NMI_CUSTOM
+    stz K_NMI_VERSION
+
+    ; v2.44: build the kernel ABI jump-table so an installed guest body can
+    ; reach the proven routines by fixed address. Each entry is `JMP abs`
+    ; ($4C lo hi); a `jsr K_ABI_*` from the body runs the routine and its
+    ; rts returns to the body (the JMP is transparent to call/return). A8/I16.
+    lda #$4C                        ; JMP abs opcode
+    sta K_ABI_FRAME_DMA
+    sta K_ABI_CALC_BYTES_REM
+    rep #$20
+    .a16
+    lda #.loword(frame_dma)
+    sta K_ABI_FRAME_DMA+1
+    lda #.loword(calc_bytes_rem)
+    sta K_ABI_CALC_BYTES_REM+1
+    sep #$20
+    .a8
+
     ; --- arm the self-chaining H+V IRQ: state A at V=VIS_END, H=22 ---
     ; H+V mode (NMITIMEN bits 4+5) fires once per frame at an exact
     ; (V,H). NMI (b7) OFF; auto-joypad (b0) OFF — the kernel bit-bangs
@@ -218,6 +240,32 @@
     sta K_SIPHON_LINE_BASE
     lda f:COPRO_SIPHON_HTIME_L
     sta K_SIPHON_HTIME
+
+    ; v2.44: poll the custom transfer-body version. On a bump, byte-copy the
+    ; guest-staged 1 KB handler from the cart window into WRAM at
+    ; K_NMI_CODE_BASE and raise K_NMI_CUSTOM so state A jsr's it instead of
+    ; the built-in frame_dma. A version of 0 (host writes it on VM unload)
+    ; means "uninstall" -> drop back to the built-in body. Rare (only on
+    ; install/uninstall) and runs here in idle active display, so the copy
+    ; is free. A8/I16 on entry (X is 16-bit for the copy loop).
+    lda f:COPRO_NMI_VERSION_L
+    cmp K_NMI_VERSION
+    beq @nmi_body_current           ; unchanged -> nothing to do
+    sta K_NMI_VERSION               ; latch the new version
+    bne @nmi_body_install           ; non-zero -> install the staged body
+    stz K_NMI_CUSTOM                ; zero -> uninstall (fall back to frame_dma)
+    bra @nmi_body_current
+@nmi_body_install:
+    ldx #$0000
+@nmi_body_copy:
+    lda f:COPRO_NMI_CODE_L,x
+    sta a:K_NMI_CODE_BASE,x
+    inx
+    cpx #COPRO_NMI_CODE_BYTES
+    bne @nmi_body_copy
+    lda #$01
+    sta K_NMI_CUSTOM                ; state A now runs the custom body
+@nmi_body_current:
 
     ; Sleep until the next H+V IRQ event (state A blank+burst at VIS_END,
     ; or state B unblank at top_lb). The IRQ does all per-frame PPU work;
@@ -822,8 +870,17 @@
     sta INIDISP
     lda K_FRAME_READY
     beq @a_schedule         ; no staged frame -> keep letterbox, skip DMA
+    ; v2.44: run the guest-installed transfer body if one is present, else
+    ; the proven built-in frame_dma (the default/backup). Both are entered
+    ; force-blanked, A8/I16, DBR=$00, and return A8 via rts.
+    lda K_NMI_CUSTOM
+    beq @a_default_body
+    jsr K_NMI_CODE_BASE     ; custom transfer body at $0E00
+    bra @a_body_done
+@a_default_body:
     jsr frame_dma           ; PPU batch + HDMA ch1-6 + DMA-list walk
-    sep #$20                ; frame_dma is A8 on return, but be explicit
+@a_body_done:
+    sep #$20                ; body is A8 on return, but be explicit
     .a8
 @a_schedule:
     ; schedule the unblank at V = top_lb (state B)

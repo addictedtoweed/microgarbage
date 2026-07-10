@@ -110,6 +110,35 @@ void mg_nmi_begin(MgNmi *b) {
     b->err = MG_NMI_OK;
 }
 
+/* ---------- Body model (v2.44) ---------- */
+
+void mg_nmi_emit_call_default(MgNmi *b) {
+    if (!b || b->err) return;
+    /* jsr K_ABI_FRAME_DMA   20 lo hi   6 cyc (callee cost accounted per-frame) */
+    emit_byte(b, 0x20); emit_word_le(b, (uint16_t)MG_ABI_FRAME_DMA); add_cycles(b, 6);
+}
+
+void mg_nmi_emit_call_calc_budget(MgNmi *b) {
+    if (!b || b->err) return;
+    /* jsr K_ABI_CALC_BYTES_REM   20 lo hi   6 cyc */
+    emit_byte(b, 0x20); emit_word_le(b, (uint16_t)MG_ABI_CALC_BYTES_REM); add_cycles(b, 6);
+}
+
+void mg_nmi_emit_body_end(MgNmi *b) {
+    if (!b || b->err) return;
+    /* rts   60   6 cyc */
+    emit_byte(b, 0x60); add_cycles(b, 6);
+}
+
+void mg_nmi_build_default(MgNmi *b) {
+    if (!b) return;
+    mg_nmi_begin(b);
+    mg_nmi_emit_call_default(b);
+    mg_nmi_emit_body_end(b);
+}
+
+/* ---------- Legacy full-ISR primitives (pre-v2.44) ---------- */
+
 void mg_nmi_emit_prologue(MgNmi *b) {
     if (!b || b->err) return;
     /* rep #$30        C2 30        3 cyc  M=0, X=0 */

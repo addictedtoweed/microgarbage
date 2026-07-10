@@ -64,6 +64,8 @@ extern const unsigned char demo_boot_banner_elf [];
 extern const size_t        demo_boot_banner_elf_len;
 extern const unsigned char demo_cube3d_elf [];
 extern const size_t        demo_cube3d_elf_len;
+extern const unsigned char demo_nmibody_elf [];
+extern const size_t        demo_nmibody_elf_len;
 
 /* v2.30.7 Phase 3b: cart_window frame_consumed hook → VM scheduler.
  * Called whenever cart_window's port-7-read callback bumps
@@ -408,6 +410,7 @@ static void install_bundled_demos(void) {
     install_demo("/demos/fmv_player.elf",  demo_fmv_player_elf,  demo_fmv_player_elf_len);
     install_demo("/demos/boot_banner.elf", demo_boot_banner_elf, demo_boot_banner_elf_len);
     install_demo("/demos/cube3d.elf",      demo_cube3d_elf,      demo_cube3d_elf_len);
+    install_demo("/demos/nmibody.elf",     demo_nmibody_elf,     demo_nmibody_elf_len);
 
     /* Seed /td0/etc/autostart, which the shell's _start runs on cold boot.
      * Priority: a path from the loaded .sfc cart's MGBOOT tag (set via

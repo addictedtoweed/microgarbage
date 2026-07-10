@@ -253,7 +253,12 @@ K_VLO           = $0212         ; chainer: V-counter assembly (K_VLO/K_VHI
 K_VHI           = $0213         ;   adjacent so a 16-bit load reads both)
 K_BYTES_REM     = $0214         ; chainer: bytes the blank window can still
                                 ; sink before the unblank deadline (16-bit)
-                                ; $0216-$021F: free
+K_NMI_CUSTOM    = $0216         ; v2.44: 0 = state A runs the built-in frame_dma
+                                ; (the proven default/backup transfer body);
+                                ; non-zero = a guest installed a custom transfer
+                                ; body at K_NMI_CODE_BASE, so state A jsr's there
+                                ; instead. Set/cleared by the @loop version poll.
+                                ; $0217-$021F: free
 PADS            = $0220         ; 4 pads x 16 bits = 8 bytes (PADS+0..+7); see
                                 ; read_joypads in kernel.s for layout. Order
                                 ; mirrors auto-joypad register format ($4218):
@@ -263,6 +268,17 @@ K_NMI_VERSION   = $022A         ; v2.18: cached COPRO_NMI_VERSION (last value
                                 ; we acted on by copying the cart-window NMI
                                 ; region to K_NMI_CODE_BASE). Initialized to
                                 ; $00 by boot.s (WRAM is zeroed).
+; v2.44: kernel ABI jump-table. kmain writes a 3-byte `JMP abs` at each entry
+; at boot, so a guest-installed transfer body (running from K_NMI_CODE_BASE) can
+; call the proven kernel routines by a FIXED address — their real addresses
+; shift every time the kernel is rebuilt. A body reuses the cycle-budgeted
+; chainer via `jsr K_ABI_FRAME_DMA` and only adds its own delta; the JMP is
+; transparent to call/return (frame_dma's rts returns to the body). The table
+; MUST sit above the KERNEL segment end and below K_NMI_CODE_BASE; the kernel
+; currently ends ~$0A81, so the $0DE0 placement shares the same single
+; "kernel must not grow past here" boundary as the $0E00 code window.
+K_ABI_FRAME_DMA      = $0DE0    ; JMP frame_dma       — full default transfer body
+K_ABI_CALC_BYTES_REM = $0DE3    ; JMP calc_bytes_rem  — live-beam window budget
 K_NMI_CODE_BASE = $0E00         ; v2.18: runnable custom NMI handler lives in
                                 ; this 1 KB WRAM window. Initial RAMVEC_NMI
                                 ; still points at the kernel.s nmi proc; the
