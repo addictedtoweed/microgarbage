@@ -78,6 +78,25 @@ extern "C" {
  * calls these by fixed address to reuse the proven kernel routines. */
 #define MG_ABI_FRAME_DMA       0x0DE0u   /* full default transfer (cycle-budgeted chainer) */
 #define MG_ABI_CALC_BYTES_REM  0x0DE3u   /* live-beam remaining-window byte budget */
+#define MG_ABI_JOYPAD          0x0DE6u   /* v2.46 emitter: read+mailbox all 4 pads */
+
+/* ---------- Full-emitter ISR primitives (v2.46) ---------- *
+ * The RISC-V side builds the ENTIRE H/V-counter virtual-NMI. No kernel state
+ * machine, no descriptor slot walk. The native IRQ vector reaches the fixed WRAM
+ * entry $0E00, which holds a `JMP abs`; routines PATCH its 2 target bytes to swap.
+ * All DMA is baked by mg_nmi_emit_dma_direct (immediates), not read from a list.
+ * See docs/emitter-kernel.md. These emit for the H/V (TIMEUP) IRQ and end in RTI —
+ * do NOT mix with the body-model seam (call_default/body_end). */
+
+/* Entry point the native IRQ vector reaches; holds `JMP abs` the guest patches. */
+#define MG_NMI_ENTRY_ADDR      0x0E00u
+#define MG_NMI_ENTRY_JMP_OPND  0x0E01u   /* the 2 target bytes of the entry JMP */
+
+/* B-bus destinations for emit_dma_direct's compile-time prep dispatch. */
+#define MG_DMA_TO_VRAM         0x18u     /* VMDATAL: prep -> VMAIN($80)+VMADDL */
+#define MG_DMA_TO_CGRAM        0x22u     /* CGDATA:  prep(low) -> CGADD        */
+#define MG_DMA_TO_OAM          0x04u     /* OAMDATA: prep -> OAMADDL           */
+/* Prototypes are below the MgNmi typedef (see "Full-emitter ISR primitives"). */
 
 /* Errors (negative). */
 #define MG_NMI_OK              0
@@ -120,6 +139,41 @@ void mg_nmi_emit_body_end(MgNmi *b);
  * kernel default (begin + call_default + rts). Caller still runs
  * mg_nmi_finish + mg_nmi_install. */
 void mg_nmi_build_default(MgNmi *b);
+
+/* ---------- Full-emitter ISR primitives (v2.46) ---------- *
+ * See the MG_ABI_JOYPAD / MG_NMI_ENTRY_ADDR / MG_DMA_TO_* block above and
+ * docs/emitter-kernel.md. These emit for the H/V (TIMEUP) IRQ and end in RTI —
+ * do NOT mix with the body-model seam (call_default/body_end). */
+
+/* ISR prologue: rep#$30; pha/phx/phy; sep#$20; lda f:$004211 (ack H/V timer).
+ * Arrives M=1,X=1 (IRQ convention); leaves M=1, X=0, A/X/Y saved. */
+void mg_nmi_emit_isr_prologue(MgNmi *b);
+
+/* ISR end: rep#$30; ply; plx; pla; rti. */
+void mg_nmi_emit_isr_end(MgNmi *b);
+
+/* Re-arm the V-counter IRQ target for the next event line (VTIMEL=line, VTIMEH=0).
+ * HTIME + NMITIMEN(H+V) are left as boot set them. M=1 required. */
+void mg_nmi_emit_arm_vtime(MgNmi *b, uint8_t line);
+
+/* Patch the $0E00 entry JMP to point at `target_abs` (a WRAM address, typically
+ * MG_NMI_LOAD_ADDR + a routine's offset). One 16-bit store to $0E01. M=1 in/out. */
+void mg_nmi_emit_patch_entry(MgNmi *b, uint16_t target_abs);
+
+/* Emit `jsr abs` to a kernel ABI routine (e.g. MG_ABI_JOYPAD). M=1 in/out. */
+void mg_nmi_emit_call_abi(MgNmi *b, uint16_t abs_addr);
+
+/* Emit `lda f:abs_long` — a read whose ACCESS is the message (e.g. strobe
+ * COPRO_FRAME_DONE_L = $C079C1 to bump frame_consumed). M=1. */
+void mg_nmi_emit_strobe(MgNmi *b, uint32_t abs_long);
+
+/* Bake ONE channel-0 DMA as immediates (no descriptor read): program BBAD0/DMAP0/
+ * A1T0L(src)/DAS0L(size), then a COMPILE-TIME prep dispatch on `bbus` (VRAM: VMAIN
+ * $80 + VMADDL=prep; CGRAM: CGADD=prep low; OAM: OAMADDL=prep), then fire MDMAEN.
+ * The A-bus bank (A1B0) is assumed already set once per routine by the caller via
+ * mg_nmi_emit_store_imm8(b, 0x4304, COPRO_BANK). M=1 in/out. */
+void mg_nmi_emit_dma_direct(MgNmi *b, uint8_t bbus, uint8_t dmap,
+                            uint16_t src, uint16_t size, uint16_t prep);
 
 /* ---------- Legacy full-ISR primitives (pre-v2.44) ---------- */
 /* See the header banner: these emit a self-contained NMI handler

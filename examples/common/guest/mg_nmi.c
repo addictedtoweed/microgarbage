@@ -31,10 +31,14 @@
 #define HW_CGADD       0x2121
 #define HW_CGDATA      0x2122   /* bbus byte */
 #define HW_RDNMI       0x4210
+#define HW_VTIMEL      0x4209   /* v2.46 H/V-timer IRQ V target low */
+#define HW_VTIMEH      0x420A
+#define HW_TIMEUP      0x004211u /* read (long) to ack an H/V-timer IRQ */
 #define HW_MDMAEN      0x420B
 #define HW_DMAP0       0x4300
 #define HW_BBAD0       0x4301
 #define HW_A1T0L       0x4302
+#define HW_A1B0        0x4304
 #define HW_DAS0L       0x4305
 
 /* Cart window addresses (24-bit; long-mode lda f:). */
@@ -363,6 +367,93 @@ void mg_nmi_emit_epilogue(MgNmi *b) {
     emit_byte(b, 0x68); add_cycles(b, 4);
     /* rti             40           6 cyc */
     emit_byte(b, 0x40); add_cycles(b, 6);
+}
+
+/* ---------- Full-emitter ISR primitives (v2.46) ---------- *
+ * Build the ENTIRE H/V-counter virtual-NMI: guest owns timing, bars, DMA, vector.
+ * All DMA is baked (mg_nmi_emit_dma_direct) — no descriptor read. See mg_nmi.h /
+ * docs/emitter-kernel.md. */
+
+void mg_nmi_emit_isr_prologue(MgNmi *b) {
+    if (!b || b->err) return;
+    emit_byte(b, 0xC2); emit_byte(b, 0x30); add_cycles(b, 3);   /* rep #$30   -> M=0,X=0 */
+    emit_byte(b, 0x48); add_cycles(b, 4);                       /* pha */
+    emit_byte(b, 0xDA); add_cycles(b, 4);                       /* phx */
+    emit_byte(b, 0x5A); add_cycles(b, 4);                       /* phy */
+    emit_byte(b, 0xE2); emit_byte(b, 0x20); add_cycles(b, 3);   /* sep #$20   -> M=1 */
+    emit_byte(b, 0xAF); emit_long_le(b, HW_TIMEUP); add_cycles(b, 5); /* lda f:$004211  ack */
+}
+
+void mg_nmi_emit_isr_end(MgNmi *b) {
+    if (!b || b->err) return;
+    emit_byte(b, 0xC2); emit_byte(b, 0x30); add_cycles(b, 3);   /* rep #$30 */
+    emit_byte(b, 0x7A); add_cycles(b, 4);                       /* ply */
+    emit_byte(b, 0xFA); add_cycles(b, 4);                       /* plx */
+    emit_byte(b, 0x68); add_cycles(b, 4);                       /* pla */
+    emit_byte(b, 0x40); add_cycles(b, 6);                       /* rti */
+}
+
+void mg_nmi_emit_arm_vtime(MgNmi *b, uint8_t line) {
+    if (!b || b->err) return;
+    emit_byte(b, 0xA9); emit_byte(b, line); add_cycles(b, 2);         /* lda #line */
+    emit_byte(b, 0x8D); emit_word_le(b, HW_VTIMEL); add_cycles(b, 4); /* sta $4209 VTIMEL */
+    emit_byte(b, 0x9C); emit_word_le(b, HW_VTIMEH); add_cycles(b, 4); /* stz $420A VTIMEH */
+}
+
+void mg_nmi_emit_patch_entry(MgNmi *b, uint16_t target_abs) {
+    if (!b || b->err) return;
+    emit_byte(b, 0xC2); emit_byte(b, 0x20); add_cycles(b, 3);            /* rep #$20 -> M=0 */
+    emit_byte(b, 0xA9); emit_word_le(b, target_abs); add_cycles(b, 3);   /* lda #target */
+    emit_byte(b, 0x8D); emit_word_le(b, MG_NMI_ENTRY_JMP_OPND); add_cycles(b, 5); /* sta $0E01 */
+    emit_byte(b, 0xE2); emit_byte(b, 0x20); add_cycles(b, 3);            /* sep #$20 -> M=1 */
+}
+
+void mg_nmi_emit_call_abi(MgNmi *b, uint16_t abs_addr) {
+    if (!b || b->err) return;
+    emit_byte(b, 0x20); emit_word_le(b, abs_addr); add_cycles(b, 6);     /* jsr abs */
+}
+
+void mg_nmi_emit_strobe(MgNmi *b, uint32_t abs_long) {
+    if (!b || b->err) return;
+    emit_byte(b, 0xAF); emit_long_le(b, abs_long); add_cycles(b, 5);     /* lda f:abs */
+}
+
+void mg_nmi_emit_dma_direct(MgNmi *b, uint8_t bbus, uint8_t dmap,
+                            uint16_t src, uint16_t size, uint16_t prep) {
+    if (!b || b->err) return;
+    /* lda #bbus / sta BBAD0 */
+    emit_byte(b, 0xA9); emit_byte(b, bbus); add_cycles(b, 2);
+    emit_byte(b, 0x8D); emit_word_le(b, HW_BBAD0); add_cycles(b, 4);
+    /* lda #dmap / sta DMAP0 */
+    emit_byte(b, 0xA9); emit_byte(b, dmap); add_cycles(b, 2);
+    emit_byte(b, 0x8D); emit_word_le(b, HW_DMAP0); add_cycles(b, 4);
+    /* rep#$20; lda #src; sta A1T0L; lda #size; sta DAS0L; sep#$20 */
+    emit_byte(b, 0xC2); emit_byte(b, 0x20); add_cycles(b, 3);
+    emit_byte(b, 0xA9); emit_word_le(b, src); add_cycles(b, 3);
+    emit_byte(b, 0x8D); emit_word_le(b, HW_A1T0L); add_cycles(b, 5);
+    emit_byte(b, 0xA9); emit_word_le(b, size); add_cycles(b, 3);
+    emit_byte(b, 0x8D); emit_word_le(b, HW_DAS0L); add_cycles(b, 5);
+    emit_byte(b, 0xE2); emit_byte(b, 0x20); add_cycles(b, 3);
+    /* compile-time prep dispatch — only the path for this bbus is emitted */
+    if (bbus == MG_DMA_TO_VRAM) {
+        emit_byte(b, 0xA9); emit_byte(b, 0x80); add_cycles(b, 2);         /* lda #$80 */
+        emit_byte(b, 0x8D); emit_word_le(b, HW_VMAIN); add_cycles(b, 4);  /* sta VMAIN */
+        emit_byte(b, 0xC2); emit_byte(b, 0x20); add_cycles(b, 3);         /* rep #$20 */
+        emit_byte(b, 0xA9); emit_word_le(b, prep); add_cycles(b, 3);      /* lda #prep */
+        emit_byte(b, 0x8D); emit_word_le(b, HW_VMADDL); add_cycles(b, 5); /* sta VMADDL */
+        emit_byte(b, 0xE2); emit_byte(b, 0x20); add_cycles(b, 3);         /* sep #$20 */
+    } else if (bbus == MG_DMA_TO_CGRAM) {
+        emit_byte(b, 0xA9); emit_byte(b, (uint8_t)(prep & 0xFFu)); add_cycles(b, 2); /* lda #prep.lo */
+        emit_byte(b, 0x8D); emit_word_le(b, HW_CGADD); add_cycles(b, 4);  /* sta CGADD */
+    } else if (bbus == MG_DMA_TO_OAM) {
+        emit_byte(b, 0xC2); emit_byte(b, 0x20); add_cycles(b, 3);
+        emit_byte(b, 0xA9); emit_word_le(b, prep); add_cycles(b, 3);
+        emit_byte(b, 0x8D); emit_word_le(b, HW_OAMADDL); add_cycles(b, 5);
+        emit_byte(b, 0xE2); emit_byte(b, 0x20); add_cycles(b, 3);
+    }
+    /* lda #$01 / sta MDMAEN */
+    emit_byte(b, 0xA9); emit_byte(b, 0x01); add_cycles(b, 2);
+    emit_byte(b, 0x8D); emit_word_le(b, HW_MDMAEN); add_cycles(b, 4);
 }
 
 int mg_nmi_finish(MgNmi *b, uint8_t force_blank_lines) {

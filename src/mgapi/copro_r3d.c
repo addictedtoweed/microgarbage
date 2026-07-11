@@ -91,6 +91,7 @@ static bool        s_need_clear;
 static bool        s_inited;
 static int         s_deliver;       /* rolling delivery index 0..NBANDS-1 */
 static bool        s_init_done;     /* tilemap + palette staged into VRAM once */
+static bool        s_fb_armed;      /* v2.46: framebuffer vector-swap handed off */
 
 /* render scratch */
 static uint8_t  s_fbuf[VW * VH];
@@ -155,6 +156,7 @@ void copro_r3d_reset(void) {
     s_need_clear = true;
     s_deliver = 0;
     s_init_done = false;
+    s_fb_armed = false;
 
     /* scene constants (mirrors the demo_cube preview) */
     s_scene.near_z  = q16_from_double(0.5);
@@ -296,6 +298,25 @@ int copro_r3d_render(void) {
 
     int d    = s_deliver;
     int band = s_band_order[d];
+
+    /* v2.46: after the state machine has delivered one full frame (which applied
+     * the PPU batch/tilemap/palette — those registers persist), hand the V-IRQ to
+     * the kernel's fb_finish/fb_start vector-swap routines. They walk these same
+     * DMA-list slots + drive the letterbox bars, with no state machine or chainer
+     * (dead-simple-kernel). Fires once, on the second wrap to band-order index 0. */
+    if (d == 0 && s_init_done && !s_fb_armed) {
+        static int fb_enable = -1;
+        if (fb_enable < 0) {
+            const char *e = getenv("MG_FB");        /* MG_FB=1 -> hand off to fb mode */
+            fb_enable = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (fb_enable) {
+            static const uint8_t on = 1;
+            cart_window_load_blob(CW_OFF_FB_MODE, &on, 1);
+            fprintf(stderr, "[r3d] fb-mode ARMED (COPRO_FB_MODE=1)\n");
+        }
+        s_fb_armed = true;
+    }
 
     if (d == 0) {                                   /* new displayed frame */
         build_scene();

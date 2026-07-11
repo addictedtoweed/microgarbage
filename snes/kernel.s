@@ -105,6 +105,8 @@
     lda #224
     sta K_LAYOUT_VIS_END    ; 224 - bot_lb (bot_lb = 0 at boot)
     stz K_SIPHON_BYTES
+    stz K_FB_MODE           ; v2.46: start on the state-machine path (not fb mode)
+    stz K_ISR_MODE          ; v2.46: not in full-emitter ISR mode yet
 
     ; v2.44 optional custom transfer body: no guest handler installed yet,
     ; so state A runs the built-in frame_dma. K_NMI_VERSION is the poll
@@ -119,14 +121,36 @@
     lda #$4C                        ; JMP abs opcode
     sta K_ABI_FRAME_DMA
     sta K_ABI_CALC_BYTES_REM
+    sta K_ABI_JOYPAD                ; v2.46 emitter joypad ABI
     rep #$20
     .a16
     lda #.loword(frame_dma)
     sta K_ABI_FRAME_DMA+1
     lda #.loword(calc_bytes_rem)
     sta K_ABI_CALC_BYTES_REM+1
+    lda #.loword(joypad_mailbox)
+    sta K_ABI_JOYPAD+1
     sep #$20
     .a8
+
+    ; v2.46: seed a SAFE stub at K_NMI_CODE_BASE ($0E00) so an H/V IRQ that
+    ; reaches ISR mode before a guest ISR image is installed can't run garbage.
+    ; Preserves A (pha/pla) + P (rti) and acks TIMEUP; the install copy later
+    ; overwrites this with the guest ISR's `JMP` entry. A8, so 7 inline bytes:
+    lda #$48                        ; pha
+    sta a:K_NMI_CODE_BASE+0
+    lda #$AF                        ; lda f:$004211  (ack H/V timer)
+    sta a:K_NMI_CODE_BASE+1
+    lda #$11
+    sta a:K_NMI_CODE_BASE+2
+    lda #$42
+    sta a:K_NMI_CODE_BASE+3
+    lda #$00
+    sta a:K_NMI_CODE_BASE+4
+    lda #$68                        ; pla
+    sta a:K_NMI_CODE_BASE+5
+    lda #$40                        ; rti
+    sta a:K_NMI_CODE_BASE+6
 
     ; --- arm the self-chaining H+V IRQ: state A at V=VIS_END, H=22 ---
     ; H+V mode (NMITIMEN bits 4+5) fires once per frame at an exact
@@ -164,36 +188,35 @@
     ; DMA is skipped (visible as checker/partial CHR).
     sep #$20
     .a8
+
+    ; v2.46: once the copro requests framebuffer VECTOR-SWAP mode (fb_finish/
+    ; fb_start) OR full-emitter ISR mode (guest ISR at $0E00), the guest side
+    ; owns the V-IRQ and self-chains. @loop then only refreshes the cached bar
+    ; layout and sleeps — the state machine, chainer, siphon and NMI-body seam
+    ; are all bypassed. (ISR mode does its own joypad via K_ABI_JOYPAD.)
+    lda K_FB_MODE
+    ora K_ISR_MODE
+    beq @sm_dispatch
+    lda f:COPRO_LAYOUT_TOP_LB_L
+    sta K_LAYOUT_TOP_LB
+    lda f:COPRO_LAYOUT_BOT_LB_L
+    sta K_LAYOUT_BOT_LB
+    lda #224
+    sec
+    sbc K_LAYOUT_BOT_LB
+    sta K_LAYOUT_VIS_END
+    wai
+    jmp @loop
+@sm_dispatch:
     lda K_FRAME_STATE
     beq @do_handshake               ; state 0 (A next) -> do the per-frame handshake
     jmp @wait_only                  ; states 1/2 (B / SIPHON) -> wait only
 @do_handshake:
 
-    ; 1) manual joypad read (auto-joypad is disabled in NMITIMEN). Fills PADS,
-    ;    16 bits per pad, order matching the auto-read register layout.
-    jsr read_joypads
-
-    ; 2) forward all 4 pads to the copro: 8 page-aligned read-strobes. The
-    ;    access *is* the message (the copro decodes pad index + lo/hi from
-    ;    the high address bits); each is a single clean bus read because the
-    ;    base is page-aligned and the 8-bit index can't cross the page. This
-    ;    also acks the previous frame and asks for the next.
-    ldx PADS+0
-    lda f:JOYPORT_P0_LO_L,x
-    ldx PADS+1
-    lda f:JOYPORT_P0_HI_L,x
-    ldx PADS+2
-    lda f:JOYPORT_P1_LO_L,x
-    ldx PADS+3
-    lda f:JOYPORT_P1_HI_L,x
-    ldx PADS+4
-    lda f:JOYPORT_P2_LO_L,x
-    ldx PADS+5
-    lda f:JOYPORT_P2_HI_L,x
-    ldx PADS+6
-    lda f:JOYPORT_P3_LO_L,x
-    ldx PADS+7
-    lda f:JOYPORT_P3_HI_L,x
+    ; 1+2) read + mailbox all 4 pads (auto-joypad is off in NMITIMEN). This also
+    ;    acks the previous frame and asks for the next. Extracted to joypad_mailbox
+    ;    so the K_ABI_JOYPAD emitter ABI shares the exact same sequence.
+    jsr joypad_mailbox
 
     rep #$10
     .i16
@@ -266,6 +289,52 @@
     lda #$01
     sta K_NMI_CUSTOM                ; state A now runs the custom body
 @nmi_body_current:
+
+    ; v2.46: enter framebuffer VECTOR-SWAP mode when the copro requests it.
+    ; Hand the V-IRQ to fb_finish (fires at the bottom bar); fb_finish/fb_start
+    ; self-chain and own all per-frame work from here. HTIME/NMITIMEN (H+V) stay
+    ; as set by boot, so the fb routines only swap RAMVEC_IRQ + VTIME. Latches
+    ; via K_FB_MODE so it runs exactly once. A8/I16 here.
+    lda f:COPRO_FB_MODE_L
+    beq @fb_entry_done
+    lda K_FB_MODE
+    bne @fb_entry_done
+    lda #$01
+    sta K_FB_MODE
+    rep #$20
+    .a16
+    lda #.loword(fb_finish)
+    sta RAMVEC_IRQ
+    sep #$20
+    .a8
+    lda K_LAYOUT_VIS_END
+    sta VTIMEL
+    stz VTIMEH
+@fb_entry_done:
+
+    ; v2.46: enter full-emitter ISR mode. Once the copro sets COPRO_ISR_MODE and
+    ; a guest ISR image is installed at $0E00 (K_NMI_VERSION != 0), point the
+    ; V-IRQ vector straight at $0E00 — the guest ISR owns ack/bars/DMA/joypad/
+    ; VTIME/vector-patch and self-chains. Latches via K_ISR_MODE (runs once).
+    ; HTIME/NMITIMEN (H+V) stay as boot set them. A8/I16 here.
+    lda f:COPRO_ISR_MODE_L
+    beq @isr_entry_done
+    lda K_ISR_MODE
+    bne @isr_entry_done
+    lda K_NMI_VERSION               ; ISR image actually installed at $0E00?
+    beq @isr_entry_done
+    lda #$01
+    sta K_ISR_MODE
+    rep #$20
+    .a16
+    lda #K_NMI_CODE_BASE            ; RAMVEC_IRQ -> $0E00 guest ISR entry
+    sta RAMVEC_IRQ
+    sep #$20
+    .a8
+    lda K_LAYOUT_VIS_END            ; first fire at the bottom bar
+    sta VTIMEL
+    stz VTIMEH
+@isr_entry_done:
 
     ; Sleep until the next H+V IRQ event (state A blank+burst at VIS_END,
     ; or state B unblank at top_lb). The IRQ does all per-frame PPU work;
@@ -973,6 +1042,151 @@
 .endproc
 
 ; ------------------------------------------------------------------
+; fb_finish / fb_start — v2.46 framebuffer VECTOR-SWAP mode (dead-simple-kernel /
+; 60-colour 3D). RAMVEC_IRQ alternates between these two self-chaining routines
+; (no state machine, no cycle chainer). The copro feeds one band's DMA slots
+; (COPRO_DMA_LIST) + CHR + frame_ready per band; bars from the cached layout.
+;
+;   fb_finish (V = VIS_END, bottom bar): force-blank, walk the band's DMA slots
+;     (channel 0, fire each), strobe FRAME_DONE, re-arm V = top_lb -> fb_start.
+;   fb_start  (V = top_lb, top bar):     unblank, bit-bang + post joypads, re-arm
+;     V = VIS_END -> fb_finish.
+; Entered from @loop when COPRO_FB_MODE is set. Both A8/I16 on exit via rti.
+; ------------------------------------------------------------------
+.proc fb_finish
+    rep #$30
+    .a16
+    .i16
+    pha
+    phx
+    phy
+    sep #$20
+    .a8
+    lda TIMEUP                   ; ack the timer IRQ
+    lda #$80
+    sta INIDISP                  ; force-blank -> opens the DMA window
+
+    lda f:COPRO_FRAME_RDY_L      ; a band staged this frame?
+    beq @rearm                   ; no -> keep VRAM, just swap to fb_start
+
+    lda #COPRO_BANK
+    sta A1B0                     ; channel-0 source bank (shared by all slots)
+    ldx #$0000                   ; X = slot cursor * 8
+@slot:
+    cpx #(8 * 8)                 ; walked all 8 slots? -> strobe
+    beq @strobe
+    lda f:COPRO_DMA_LIST_L+0,x    ; bbus (0 => empty = end of list)
+    beq @strobe
+    sta BBAD0
+    lda f:COPRO_DMA_LIST_L+1,x    ; dmap
+    sta DMAP0
+    rep #$20
+    .a16
+    lda f:COPRO_DMA_LIST_L+2,x    ; src offset
+    sta A1T0L
+    lda f:COPRO_DMA_LIST_L+4,x    ; byte count
+    sta DAS0L
+    sep #$20
+    .a8
+    ; prep dispatch: CGDATA($22)->CGADD ; VMDATAL($18)->VMAIN + VMADDL
+    lda f:COPRO_DMA_LIST_L+0,x    ; re-read bbus (B-bus regs aren't readable)
+    cmp #<CGDATA
+    bne :+
+    lda f:COPRO_DMA_LIST_L+6,x
+    sta CGADD
+    bra @fire
+:
+    cmp #<VMDATAL
+    bne @fire
+    lda #$80
+    sta VMAIN
+    rep #$20
+    .a16
+    lda f:COPRO_DMA_LIST_L+6,x
+    sta VMADDL
+    sep #$20
+    .a8
+@fire:
+    lda #$01
+    sta MDMAEN                   ; fire channel 0 (CPU pauses until done)
+    .repeat 8
+    inx
+    .endrepeat
+    jmp @slot
+@strobe:
+    lda f:COPRO_FRAME_DONE_L      ; host bumps frame_consumed + clears frame_ready
+@rearm:
+    rep #$20
+    .a16
+    lda #.loword(fb_start)
+    sta RAMVEC_IRQ               ; VECTOR SWAP -> fb_start next
+    sep #$20
+    .a8
+    lda K_LAYOUT_TOP_LB
+    sta VTIMEL                   ; fb_start fires at the top bar
+    stz VTIMEH
+    rep #$30
+    .a16
+    .i16
+    ply
+    plx
+    pla
+    rti
+.endproc
+
+.proc fb_start
+    rep #$30
+    .a16
+    .i16
+    pha
+    phx
+    phy
+    sep #$30
+    .a8
+    .i8
+    lda TIMEUP                   ; ack
+    lda #$0F
+    sta INIDISP                  ; unblank the visible region
+    stz CGADD                    ; CGADD reset after re-enabling rendering
+
+    jsr read_joypads             ; bit-bang 4 pads into PADS
+    ; post 4 pads -> 8 page-aligned read-strobes (acks band, asks for next)
+    ldx PADS+0
+    lda f:JOYPORT_P0_LO_L,x
+    ldx PADS+1
+    lda f:JOYPORT_P0_HI_L,x
+    ldx PADS+2
+    lda f:JOYPORT_P1_LO_L,x
+    ldx PADS+3
+    lda f:JOYPORT_P1_HI_L,x
+    ldx PADS+4
+    lda f:JOYPORT_P2_LO_L,x
+    ldx PADS+5
+    lda f:JOYPORT_P2_HI_L,x
+    ldx PADS+6
+    lda f:JOYPORT_P3_LO_L,x
+    ldx PADS+7
+    lda f:JOYPORT_P3_HI_L,x
+
+    rep #$20
+    .a16
+    lda #.loword(fb_finish)
+    sta RAMVEC_IRQ               ; VECTOR SWAP -> fb_finish next
+    sep #$20
+    .a8
+    lda K_LAYOUT_VIS_END
+    sta VTIMEL                   ; fb_finish fires at the bottom bar
+    stz VTIMEH
+    rep #$30
+    .a16
+    .i16
+    ply
+    plx
+    pla
+    rti
+.endproc
+
+; ------------------------------------------------------------------
 ; siphon_isr — LEAN per-scanline VRAM siphon handler. State B installs this
 ; in RAMVEC_IRQ for the siphon phase; the main loop tight-wai's at state 2.
 ;
@@ -1105,6 +1319,37 @@
 ;
 ; In/Out: A8/I8 (caller's responsibility to bracket with sep/rep).
 ; ------------------------------------------------------------------
+; ------------------------------------------------------------------
+; joypad_mailbox — read all 4 pads (read_joypads) then forward them to the copro
+; as 8 page-aligned read-strobes (the ACCESS is the message; also acks the frame
+; and asks for the next). A8/I8 on entry+exit; clobbers A,X,Y. Published at the
+; K_ABI_JOYPAD jump-table slot so a guest-emitted ISR can `jsr` it. The 8-bit
+; index can't cross the page-aligned base, so each is one clean bus read.
+; ------------------------------------------------------------------
+.proc joypad_mailbox
+    sep #$30
+    .a8
+    .i8
+    jsr read_joypads
+    ldx PADS+0
+    lda f:JOYPORT_P0_LO_L,x
+    ldx PADS+1
+    lda f:JOYPORT_P0_HI_L,x
+    ldx PADS+2
+    lda f:JOYPORT_P1_LO_L,x
+    ldx PADS+3
+    lda f:JOYPORT_P1_HI_L,x
+    ldx PADS+4
+    lda f:JOYPORT_P2_LO_L,x
+    ldx PADS+5
+    lda f:JOYPORT_P2_HI_L,x
+    ldx PADS+6
+    lda f:JOYPORT_P3_LO_L,x
+    ldx PADS+7
+    lda f:JOYPORT_P3_HI_L,x
+    rts
+.endproc
+
 .proc read_joypads
     ; latch: $01 then $00 to $4016 -- pads load their shift registers
     lda #$01

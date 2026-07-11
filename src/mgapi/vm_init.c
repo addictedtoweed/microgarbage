@@ -424,6 +424,9 @@ static void install_bundled_demos(void) {
          * instead of the banner. Handy for a kiosk that boots straight into a
          * demo, and for testing one without the PuTTY/MGBOOT dance. */
         { const char *env = getenv("MGAPI_AUTOSTART"); if (env && *env) as = env; }
+        fprintf(stderr, "mgapi: MGAPI_AUTOSTART env = \"%s\"; seeding /td0/etc/autostart = \"%s\"\n",
+                getenv("MGAPI_AUTOSTART") ? getenv("MGAPI_AUTOSTART") : "(unset)",
+                as ? as : "(none -> banner)");
         if (as) {
             char line[260];
             size_t n = 0;

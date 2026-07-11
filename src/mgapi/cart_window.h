@@ -238,6 +238,12 @@ extern "C" {
  * Driven by $env:MG_SIPHON_HTIME so it can be swept without a rebuild. */
 #define CW_OFF_SIPHON_HTIME           0x79C2u
 
+/* v2.46: framebuffer VECTOR-SWAP mode flag (see copro.inc COPRO_FB_MODE). When
+ * non-zero, the kernel hands the V-IRQ to fb_finish/fb_start (60-colour 3D band
+ * transport) instead of the state-machine frame_dma. The copro sets it AFTER the
+ * first full frame has applied the PPU batch/tilemap/palette (those persist). */
+#define CW_OFF_FB_MODE                0x79C3u
+
 /* DEBUG (v2.37m): burst-start budget probe window. The kernel reads
  * CW_OFF_DBG_BUDGET + (K_BYTES_REM>>8) on the first slot of each burst;
  * the host logs the offset (= budget in 256-byte units) to find why

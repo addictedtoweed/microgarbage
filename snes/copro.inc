@@ -110,6 +110,21 @@ COPRO_SIPHON_LINES_L          = (COPRO_BANK << 16) | $79C0
 COPRO_FRAME_DONE_L            = (COPRO_BANK << 16) | $79C1
 COPRO_SIPHON_HTIME_L          = (COPRO_BANK << 16) | $79C2  ; live siphon HTIME knob
 
+; v2.46 framebuffer vector-swap mode (dead-simple-kernel / 60-colour 3D). When
+; the copro sets this byte non-zero, the kernel @loop hands the V-IRQ to a pair
+; of self-chaining routines (fb_finish at VIS_END: force-blank + walk the band's
+; DMA slots + strobe FRAME_DONE; fb_start at top_lb: unblank + joypad) that swap
+; RAMVEC_IRQ between themselves — no state machine, no chainer. The copro feeds
+; one band's slots (COPRO_DMA_LIST) + CHR per frame; bars come from COPRO_LAYOUT.
+COPRO_FB_MODE_L               = (COPRO_BANK << 16) | $79C3
+
+; v2.46 full-emitter ISR mode (docs/emitter-kernel.md). When non-zero AND a guest
+; ISR image has been installed at K_NMI_CODE_BASE ($0E00), the kernel points
+; RAMVEC_IRQ straight at $0E00 — the guest-emitted routine owns the ENTIRE H/V
+; ISR (ack, bars, baked DMA, joypad via K_ABI_JOYPAD, VTIME re-arm, vector patch).
+; The state machine / chainer / slot walk are fully bypassed.
+COPRO_ISR_MODE_L              = (COPRO_BANK << 16) | $79C4
+
 ; DEBUG (v2.37m): burst-start budget probe. The kernel reads
 ; COPRO_DBG_BUDGET_L + (K_BYTES_REM >> 8) on the first slot of each burst;
 ; the host logs the low-byte offset = the budget in 256-byte units. A
@@ -281,6 +296,7 @@ K_NMI_VERSION   = $022A         ; v2.18: cached COPRO_NMI_VERSION (last value
 ; "kernel must not grow past here" boundary as the $0E00 code window.
 K_ABI_FRAME_DMA      = $0DE0    ; JMP frame_dma       — full default transfer body
 K_ABI_CALC_BYTES_REM = $0DE3    ; JMP calc_bytes_rem  — live-beam window budget
+K_ABI_JOYPAD         = $0DE6    ; JMP joypad_mailbox  — v2.46 emitter: read+post 4 pads
 K_NMI_CODE_BASE = $0E00         ; v2.18: runnable custom NMI handler lives in
                                 ; this 1 KB WRAM window. Initial RAMVEC_NMI
                                 ; still points at the kernel.s nmi proc; the
@@ -330,3 +346,8 @@ K_HIRQ_DEFAULT      = $023D     ; cached address of default_hirq_handler so the
 K_SIPHON_LINE_REM   = $023F     ; running scanline counter (State SIPHON dec→0)
 K_SIPHON_HTIME      = $0240     ; cached HTIME for the per-scanline siphon IRQ
 K_SIPHON_VLINE      = $0241     ; running V target — re-armed per siphon scanline
+K_ISR_MODE          = $0243     ; v2.46: 1 = guest ISR at $0E00 owns RAMVEC_IRQ
+                                ; (full-emitter mode); state machine bypassed
+K_FB_MODE           = $0242     ; v2.46: 0 = normal state-machine kernel; 1 = the
+                                ; framebuffer vector-swap routines own RAMVEC_IRQ
+                                ; (@loop entered fb mode on COPRO_FB_MODE != 0)

@@ -14,9 +14,14 @@
 #include "vm/vm_core.h"
 #include "vm/vm_ecall.h"
 
+#include <stdio.h>
+
 /* SYS_R3D_RESET() → 0 */
 static void h_r3d_reset(VmCpu *cpu, void *system) {
     (void)system;
+    static int once = 0;
+    if (!once) { once = 1;
+        fprintf(stderr, "mgapi: SYS_R3D_RESET received -- cube3d guest is running\n"); }
     copro_r3d_reset();
     cpu->regs[VM_REG_A0] = 0;
 }
