@@ -72,7 +72,7 @@ SLOW_DIV = 15          ; advance one band every 15 frames (~watchable roll)
     ; scroll image down 4px (BGVOFS = -4 = $3FC) to centre in the 12/12 letterbox
     stz BG1HOFS
     stz BG1HOFS
-    lda #$FC
+    lda #$F8
     sta BG1VOFS
     lda #$03
     sta BG1VOFS
