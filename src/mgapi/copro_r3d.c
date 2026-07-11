@@ -40,6 +40,16 @@
  * tile once its CHR lands. */
 #define NBANDS 4
 static const int s_band_t0[NBANDS + 1] = { 0, 188, 375, 563, 750 };
+/* delivery order: bottom-3 first, TOP band LAST (roll_test.s convention). */
+static const int s_band_order[NBANDS] = { 1, 2, 3, 0 };
+
+/* cart-window payload offsets for DIRECT band staging (bypasses mg_state's
+ * subframe/commit-ahead/reupload machinery — see [[3d-renderer-design]]). */
+#define R3D_OFF_BG1   0x0000u   /* band BG1 4bpp CHR (<= ~6 KB)   */
+#define R3D_OFF_BG3   0x1800u   /* band BG3 2bpp CHR (<= ~3 KB)   */
+#define R3D_OFF_TMAP1 0x3000u   /* BG1 tilemap  (2 KB, init only) */
+#define R3D_OFF_TMAP3 0x3800u   /* BG3 tilemap  (2 KB, init only) */
+#define R3D_OFF_PAL   0x4000u   /* palette (40 B, init only)      */
 /* VRAM word layout (dual-layer). Tilemap bases are 0x400-word units (BGxSC),
  * CHR bases are 0x1000-word units (BGxxNBA). BG1 4bpp CHR (780*16w=12480w) fits
  * 0x2000..0x50C0; BG3 2bpp CHR (780*8w=6240w) at 0x6000..0x7860. */
@@ -79,13 +89,16 @@ static R3dInstance s_objs[R3D_MAX_OBJECTS];
 static R3dCam      s_cam;
 static bool        s_need_clear;
 static bool        s_inited;
-static int         s_band;          /* rolling delivery: 0..NBANDS-1 */
-static bool        s_tilemap_done;  /* fixed tilemap staged once (static thereafter) */
+static int         s_deliver;       /* rolling delivery index 0..NBANDS-1 */
+static bool        s_init_done;     /* tilemap + palette staged into VRAM once */
 
 /* render scratch */
 static uint8_t  s_fbuf[VW * VH];
-static uint8_t  s_chr [NTILES][32];   /* BG1 4bpp base CHR */
+static uint8_t  s_chr [NTILES][32];   /* BG1 4bpp base CHR (whole frame) */
 static uint8_t  s_chr2[NTILES][16];   /* BG3 2bpp sub  CHR */
+static uint8_t  s_tmap1[2048];        /* BG1 tilemap (host, fixed) */
+static uint8_t  s_tmap3[2048];        /* BG3 tilemap */
+static uint16_t s_pal[20];            /* CGRAM 0-19 (16 base + 4 sub) */
 static R3dScene s_scene;
 static R3dObject s_robjs[R3D_MAX_OBJECTS];
 
@@ -113,10 +126,10 @@ static const uint8_t s_cube_base[12] = {   /* 6 hues, one per face (hue<<2) */
 };
 static R3dMesh s_mesh_cube;
 
-/* 60-colour palette: CGRAM 0-15 = 4bpp base hues, 16-19 = 2bpp sub levels. */
-static void build_palette(uint16_t *cg) {
-    for (int i = 0; i < 16; i++) cg[i]      = hc_base[i];
-    for (int i = 0; i < 4;  i++) cg[16 + i] = hc_sub[i];
+/* 60-colour palette into the host buffer: CGRAM 0-15 = base hues, 16-19 = sub. */
+static void build_palette(void) {
+    for (int i = 0; i < 16; i++) s_pal[i]      = hc_base[i];
+    for (int i = 0; i < 4;  i++) s_pal[16 + i] = hc_sub[i];
 }
 
 void copro_r3d_init(void) {
@@ -140,8 +153,8 @@ void copro_r3d_reset(void) {
     s_cam.yaw = 0; s_cam.pitch = 0; s_cam.roll = 0;
     s_cam.focal = q16_from_int(160);
     s_need_clear = true;
-    s_band = 0;
-    s_tilemap_done = false;
+    s_deliver = 0;
+    s_init_done = false;
 
     /* scene constants (mirrors the demo_cube preview) */
     s_scene.near_z  = q16_from_double(0.5);
@@ -220,24 +233,20 @@ static void build_scene(void) {
  * (only the CHR content does), so it's staged once per displayed frame with
  * band 0. BG3 cells carry palette 4 (sub colours read CGRAM 16-19). */
 static void fill_tilemaps(void) {
-    uint8_t *map1 = mg_state()->bg[0].shadow;
-    uint8_t *map3 = mg_state()->bg[2].shadow;
     for (int i = 0; i < 1024; i++) {
-        map1[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
-        map1[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
-        map3[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
-        map3[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
+        s_tmap1[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
+        s_tmap1[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
+        s_tmap3[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
+        s_tmap3[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
     }
     for (int t = 0; t < NTILES; t++) {
         int r = t / TW, c = t % TW;
         int cell = (r + 1) * 32 + (c + 1);
-        map1[cell*2 + 0] = (uint8_t)(t & 0xFF);
-        map1[cell*2 + 1] = (uint8_t)((t >> 8) & 0xFF);
-        map3[cell*2 + 0] = (uint8_t)(t & 0xFF);
-        map3[cell*2 + 1] = (uint8_t)(((t >> 8) & 0xFF) | BG3_PAL_HI);
+        s_tmap1[cell*2 + 0] = (uint8_t)(t & 0xFF);
+        s_tmap1[cell*2 + 1] = (uint8_t)((t >> 8) & 0xFF);
+        s_tmap3[cell*2 + 0] = (uint8_t)(t & 0xFF);
+        s_tmap3[cell*2 + 1] = (uint8_t)(((t >> 8) & 0xFF) | BG3_PAL_HI);
     }
-    mg_state_dirty_bg(0, 0, MG_BG_TILEMAP_BYTES);
-    mg_state_dirty_bg(2, 0, MG_BG_TILEMAP_BYTES);
 }
 
 /* Dual-layer encode of the WHOLE frame: split s_fbuf (value = hue<<2 |
@@ -264,6 +273,18 @@ static void encode_dual(void) {
     }
 }
 
+static void set_slot(unsigned i, uint8_t bbus, uint8_t dmap,
+                     uint16_t src, uint16_t size, uint16_t prep) {
+    CartDmaSlot sl;
+    sl.bbus = bbus; sl.dmap = dmap; sl.src = src; sl.size = size; sl.prep = prep;
+    cart_window_set_dma_slot(i, &sl);
+}
+
+/* DIRECT staging: write one band straight into the cart window (band CHR +
+ * DMA-list slots + frame_ready), bypassing mg_state_build_frame's subframe
+ * packing / commit-ahead / bg-reupload — the kernel's frame_dma delivers it as
+ * one clean frame. Static setup (batch, tilemap, palette, letterbox) staged
+ * once. Bands delivered bottom-3-first, TOP-LAST; render at delivery 0. */
 int copro_r3d_render(void) {
     if (!s_inited) copro_r3d_init();
 
@@ -273,64 +294,63 @@ int copro_r3d_render(void) {
         s_trace = (e && *e && *e != '0') ? 1 : 0;
     }
 
-    /* --- band 0: start a new displayed frame (render, encode) ---
-     * No commit-ahead gate: the guest paces one band per mg_wait_frame, so the
-     * pipeline is naturally serialized (depth 1). A gate that returns -1 here
-     * would DEADLOCK — demo_cube3d calls mg_wait_frame() unconditionally, so a
-     * dropped (unstaged) render leaves it waiting on a frame that never comes. */
-    if (s_band == 0) {
+    int d    = s_deliver;
+    int band = s_band_order[d];
+
+    if (d == 0) {                                   /* new displayed frame */
         build_scene();
         r3d_render_dither(&s_scene, s_fbuf, VW, VH);
-        if (s_need_clear) {
-            mg_state_arm_clean_slate_vram_clear();
-            s_need_clear = false;
-        }
         encode_dual();                              /* whole frame -> s_chr/s_chr2 */
     }
 
-    MgState *s = mg_state();
+    unsigned slot = 0;
 
-    /* --- this band's CHR slice: tiles [t0, t1) --- */
-    int t0 = s_band_t0[s_band], t1 = s_band_t0[s_band + 1];
-    for (int c = t0; c < t1; c += CHUNK_TILES) {
-        int n = (t1 - c < CHUNK_TILES) ? (t1 - c) : CHUNK_TILES;
-        mg_state_queue_dma_transient(&s_chr[c][0], (uint32_t)n * 32u,
-                                     0x18, 0x01, (uint16_t)(CHR_W + c * 16));
-    }
-    for (int c = t0; c < t1; c += CHUNK_TILES) {
-        int n = (t1 - c < CHUNK_TILES) ? (t1 - c) : CHUNK_TILES;
-        mg_state_queue_dma_transient(&s_chr2[c][0], (uint32_t)n * 16u,
-                                     0x18, 0x01, (uint16_t)(CHR3_W + c * 8));
+    if (!s_init_done) {
+        /* Letterbox: top 8 + bottom 16 force-blanked -> ~62-line DMA window
+         * (a ~9 KB band fits one force-blank burst) AND hides the tilemap
+         * margins. Visible region = lines 8..208 = our 200px frame. */
+        cart_window_store_u16_le(CW_OFF_KERNEL_LAYOUT, (uint16_t)(8u | (16u << 8)));
+        /* No HDMA in framebuffer mode: zero frame_dma's ch1-6 config. */
+        static const uint8_t zeros[7 * 8] = {0};
+        cart_window_load_blob(0x7968u /* COPRO_HDMA_CONFIG */, zeros, sizeof zeros);
+        /* PPU batch: Mode 1, BG1 4bpp main + BG3 2bpp sub, half-add colour math. */
+        PpuBatch b; memset(&b, 0, sizeof b);
+        b.bgmode  = 1;
+        b.bg1sc   = (uint8_t)((TMAP_W  / 0x400u) << 2);
+        b.bg3sc   = (uint8_t)((TMAP3_W / 0x400u) << 2);
+        b.bg12nba = (uint8_t)(CHR_W  / 0x1000u);
+        b.bg34nba = (uint8_t)(CHR3_W / 0x1000u);
+        b.tm = 0x01; b.ts = 0x04;                   /* BG1 main, BG3 sub */
+        b.cgwsel = 0x02; b.cgadsub = 0x41;          /* colour math: BG1, half, add */
+        cart_window_set_ppu_batch(&b);
+        /* Static palette + tilemaps into the cart window + their DMA slots. */
+        build_palette();
+        fill_tilemaps();
+        cart_window_load_blob(R3D_OFF_PAL,   s_pal,   sizeof s_pal);
+        cart_window_load_blob(R3D_OFF_TMAP1, s_tmap1, sizeof s_tmap1);
+        cart_window_load_blob(R3D_OFF_TMAP3, s_tmap3, sizeof s_tmap3);
+        set_slot(slot++, 0x22, 0x00, R3D_OFF_PAL,   (uint16_t)sizeof s_pal, 0);    /* CGRAM */
+        set_slot(slot++, 0x18, 0x01, R3D_OFF_TMAP1, 2048, TMAP_W);
+        set_slot(slot++, 0x18, 0x01, R3D_OFF_TMAP3, 2048, TMAP3_W);
+        s_init_done = true;
     }
 
-    /* --- band 0 also carries palette + layer/colour-math setup, and the
-     * fixed tilemap the first time (static thereafter). --- */
-    if (s_band == 0) {
-        build_palette(s->cgram_shadow);
-        mg_state_dirty_cgram(0, 40);                /* 20 entries * 2 B */
-        s->bgmode = 1;
-        s->bg[0].tilemap_word = TMAP_W;
-        s->bg[0].chr_word     = CHR_W;
-        s->bg[0].size_code    = 0;
-        s->bg[0].enabled_main = true;
-        s->bg[2].tilemap_word = TMAP3_W;
-        s->bg[2].chr_word     = CHR3_W;
-        s->bg[2].size_code    = 0;
-        s->bg[2].enabled_sub  = true;
-        mg_state_set_color_math(true);              /* CGWSEL=$02 / CGADSUB=$41 */
-        if (!s_tilemap_done) {
-            fill_tilemaps();                        /* fixed grid -> bg shadow */
-            s_tilemap_done = true;
-        }
-    }
+    /* This band's CHR into the cart window + its two DMA slots. */
+    int t0 = s_band_t0[band], t1 = s_band_t0[band + 1];
+    uint16_t bg1_len = (uint16_t)((t1 - t0) * 32);
+    uint16_t bg3_len = (uint16_t)((t1 - t0) * 16);
+    cart_window_load_blob(R3D_OFF_BG1, &s_chr[t0][0],  bg1_len);
+    cart_window_load_blob(R3D_OFF_BG3, &s_chr2[t0][0], bg3_len);
+    set_slot(slot++, 0x18, 0x01, R3D_OFF_BG1, bg1_len, (uint16_t)(CHR_W  + t0 * 16));
+    set_slot(slot++, 0x18, 0x01, R3D_OFF_BG3, bg3_len, (uint16_t)(CHR3_W + t0 * 8));
+    set_slot(slot, 0, 0, 0, 0, 0);                  /* terminator */
+
+    cart_window_set_frame_ready(1);
 
     if (s_trace)
-        fprintf(stderr, "[r3d] band %d: tiles [%d,%d) chr~%uB%s\n",
-                s_band, t0, t1, (unsigned)((t1 - t0) * (32u + 16u)),
-                (s_band == 0 && !s_tilemap_done) ? " +tilemap" : "");
+        fprintf(stderr, "[r3d] deliver %d -> band %d tiles [%d,%d) bg1=%uB bg3=%uB\n",
+                d, band, t0, t1, bg1_len, bg3_len);
 
-    mg_state_build_frame();
-    cart_window_set_frame_ready(1);
-    s_band = (s_band + 1) % NBANDS;
+    s_deliver = (d + 1) % NBANDS;
     return 0;
 }
