@@ -27,7 +27,10 @@ void _start(void) {
     const int32_t Z = MG_Q16(6);          /* depth in front of the camera */
     int32_t ax = 0, ay = 0;               /* tumble angles (Q16 radians)   */
     int32_t bx = 0, by = 0;               /* bounce position (Q16 world)   */
-    int32_t vx = 5000, vy = 3500;         /* bounce velocity / frame        */
+    int32_t vx = 1250, vy = 875;          /* bounce velocity / iter (slow — the
+                                           * copro only samples at band 0, i.e.
+                                           * every 4th call, so keep per-iter
+                                           * motion small for tear-free bands) */
     const int32_t BX_LIM = MG_Q16(2);     /* +/- 2.0 world units            */
     const int32_t BY_LIM = (MG_Q16(3) / 2); /* +/- 1.5                      */
 
@@ -35,9 +38,9 @@ void _start(void) {
         MgPads pads = mg_pads();
         if (mg_pad_pressed(pads.p0, MG_BTN_START)) sys_exit(0);
 
-        /* slow two-axis tumble (~0.044 / 0.029 rad per frame) */
-        ay += 2900;
-        ax += 1900;
+        /* slow two-axis tumble (quartered — see vx/vy note) */
+        ay += 725;
+        ax += 475;
 
         /* bounce within the playfield */
         bx += vx; if (bx >  BX_LIM) { bx =  BX_LIM; vx = -vx; }
