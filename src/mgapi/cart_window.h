@@ -339,7 +339,9 @@ typedef struct {
     uint8_t  tm;          /* $212C main-screen designation            */
     uint8_t  ts;          /* $212D sub-screen designation             */
     uint8_t  mosaic;      /* $2106 MOSAIC                             */
-    uint8_t  _reserved[5];
+    uint8_t  cgwsel;      /* $2130 CGWSEL — colour-math source select */
+    uint8_t  cgadsub;     /* $2131 CGADSUB — colour-math designation  */
+    uint8_t  _reserved[3];
     /* Scrolls: each is 16-bit value the kernel writes low then high
      * (the write-twice PPU registers). H first, then V. */
     uint16_t bg1hofs, bg1vofs;

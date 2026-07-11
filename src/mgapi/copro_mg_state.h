@@ -94,6 +94,7 @@ typedef struct {
 
     /* Mode / global PPU state. */
     uint8_t  bgmode;              /* 0..7                              */
+    bool     color_math;          /* dual-layer 60-colour half-add on  */
 
     /* Force-blank window. Each scanline yields ~117 more DMA bytes per
      * frame. Default 0,0 = no forced blank, baseline budget. */
@@ -133,6 +134,10 @@ void mg_state_shutdown(void);
 /* Reset shadow state to defaults (called at mgapi reset or game
  * boot to recover from a previous game's residual state). */
 void mg_state_reset   (void);
+
+/* Enable/disable BG1+sub half-add colour math for the next frame (the
+ * dual-layer 60-colour path). Off after mg_state_reset. */
+void mg_state_set_color_math(bool on);
 
 /* -------- Accessors used by the handlers -------- */
 

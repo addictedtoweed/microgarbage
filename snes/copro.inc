@@ -191,6 +191,8 @@ PB_BG34NBA      = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $07)
 PB_TM           = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $08)
 PB_TS           = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $09)
 PB_MOSAIC       = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $0A)
+PB_CGWSEL       = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $0B)   ; $2130 colour-math select
+PB_CGADSUB      = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $0C)   ; $2131 colour-math designation
 PB_SCROLLS      = (COPRO_BANK << 16) | (COPRO_PPU_BATCH + $10)
 
 ; --- Mode 7 batch offsets --------------------------------------

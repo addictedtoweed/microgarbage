@@ -322,6 +322,13 @@
     sta TS
     lda f:PB_MOSAIC
     sta MOSAIC
+    ; v2.45: colour-math registers (dual-layer 60-colour path). Zero unless a
+    ; frame opts in via mg_state_set_color_math; when set, CGWSEL=$02 / CGADSUB=
+    ; $41 turn on BG1+sub half-add so the BG3 sub layer composites.
+    lda f:PB_CGWSEL
+    sta CGWSEL
+    lda f:PB_CGADSUB
+    sta CGADSUB
 
     ; Scrolls — write-twice 16-bit. The PPU latches low byte first,
     ; then high byte (9-bit value). We read each 16-bit batch entry

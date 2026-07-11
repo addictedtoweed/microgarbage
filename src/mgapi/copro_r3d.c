@@ -16,10 +16,13 @@
 #include "cart_window.h"
 
 #include "video/r3d.h"
+#include "video/hicolor.h"
 #include "math/mat_q16.h"
 #include "math/fixed_point.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ---- 4bpp tiled target (matches the FMV / canyon4 resolution) ---- */
 #define VW 240
@@ -28,19 +31,24 @@
 #define TH (VH/8)            /* 26 tiles tall  */
 #define NTILES (TW*TH)       /* 780            */
 #define CHR_BYTES (NTILES*32)/* 24960          */
-#define TMAP_W 0x0000        /* BG1 tilemap VRAM word base */
-#define CHR_W  0x2000        /* BG1 CHR VRAM word base (char base unit 2) */
-#define BLANK_TILE NTILES    /* tile 780 = zeroed VRAM = backdrop, for margins */
+/* VRAM word layout (dual-layer). Tilemap bases are 0x400-word units (BGxSC),
+ * CHR bases are 0x1000-word units (BGxxNBA). BG1 4bpp CHR (780*16w=12480w) fits
+ * 0x2000..0x50C0; BG3 2bpp CHR (780*8w=6240w) at 0x6000..0x7860. */
+#define TMAP_W  0x0000       /* BG1 tilemap  (SC base 0)  */
+#define TMAP3_W 0x0400       /* BG3 tilemap  (SC base 1)  */
+#define CHR_W   0x2000       /* BG1 4bpp CHR (NBA unit 2) */
+#define CHR3_W  0x6000       /* BG3 2bpp CHR (NBA unit 6) */
+#define BLANK_TILE NTILES    /* tile 780 = zeroed VRAM = transparent, for margins */
+#define BG3_PAL_HI 0x10      /* tilemap word palette 4 (<<10) -> high byte bit 4 */
 
 /* CHR chunking: one DMA slot must stay under MG_SUBFRAME_BYTE_BUDGET (9180).
- * 260 tiles * 32 B = 8320 B/chunk -> 3 chunks for the 780-tile frame. */
+ * 260 4bpp tiles * 32 B = 8320 B/chunk; 2bpp is 16 B/tile so chunks are half. */
 #define CHUNK_TILES 260
 
-/* ---- palette: 3 hue ramps (red/green/blue), 5 shades each, idx 0 = backdrop. ---- */
-#define RAMP4    5
-#define RED_BASE   1
-#define GREEN_BASE 6
-#define BLUE_BASE  11
+/* ---- 60-colour dual-layer palette (see video/hicolor.h): fb value packs
+ * (hue<<2 | brightness); BG1 base = hue (CGRAM 0-15), BG3 sub = brightness
+ * (CGRAM 16-19), composited by half-add. Cube faces use 6 hues. ---- */
+#define HUE(h) ((uint8_t)((h) << 2))
 
 #define R3D_MAX_OBJECTS 8
 #define CAM_Z_DEFAULT q16_from_double(6.0)
@@ -65,7 +73,8 @@ static bool        s_inited;
 
 /* render scratch */
 static uint8_t  s_fbuf[VW * VH];
-static uint8_t  s_chr[NTILES][32];
+static uint8_t  s_chr [NTILES][32];   /* BG1 4bpp base CHR */
+static uint8_t  s_chr2[NTILES][16];   /* BG3 2bpp sub  CHR */
 static R3dScene s_scene;
 static R3dObject s_robjs[R3D_MAX_OBJECTS];
 
@@ -83,31 +92,20 @@ static const uint16_t s_cube_t[36] = {
     3,7,6,  3,6,2,    /* +Y */
     0,1,5,  0,5,4,    /* -Y */
 };
-static const uint8_t s_cube_base[12] = {
-    RED_BASE,   RED_BASE,
-    RED_BASE,   RED_BASE,
-    GREEN_BASE, GREEN_BASE,
-    GREEN_BASE, GREEN_BASE,
-    BLUE_BASE,  BLUE_BASE,
-    BLUE_BASE,  BLUE_BASE,
+static const uint8_t s_cube_base[12] = {   /* 6 hues, one per face (hue<<2) */
+    HUE(1),  HUE(1),   /* +Z red    */
+    HUE(3),  HUE(3),   /* -Z yellow */
+    HUE(5),  HUE(5),   /* +X green  */
+    HUE(7),  HUE(7),   /* -X cyan   */
+    HUE(9),  HUE(9),   /* +Y blue   */
+    HUE(11), HUE(11),  /* -Y magenta*/
 };
 static R3dMesh s_mesh_cube;
 
-#define BGR555(r,g,b) ((uint16_t)((r) | ((g) << 5) | ((b) << 10)))
-
-static uint16_t lerp555(uint16_t a, uint16_t b, int num, int den) {
-    int ar = a & 31, ag = (a >> 5) & 31, ab = (a >> 10) & 31;
-    int br = b & 31, bg = (b >> 5) & 31, bb = (b >> 10) & 31;
-    return BGR555(ar + (br - ar) * num / den, ag + (bg - ag) * num / den, ab + (bb - ab) * num / den);
-}
-
+/* 60-colour palette: CGRAM 0-15 = 4bpp base hues, 16-19 = 2bpp sub levels. */
 static void build_palette(uint16_t *cg) {
-    cg[0] = BGR555(2, 2, 4);
-    for (int s = 0; s < RAMP4; s++) {
-        cg[RED_BASE   + s] = lerp555(BGR555(7, 2, 2), BGR555(31, 12, 10), s, RAMP4 - 1);
-        cg[GREEN_BASE + s] = lerp555(BGR555(2, 7, 2), BGR555(12, 31, 12), s, RAMP4 - 1);
-        cg[BLUE_BASE  + s] = lerp555(BGR555(2, 3, 8), BGR555(12, 16, 31), s, RAMP4 - 1);
-    }
+    for (int i = 0; i < 16; i++) cg[i]      = hc_base[i];
+    for (int i = 0; i < 4;  i++) cg[16 + i] = hc_sub[i];
 }
 
 void copro_r3d_init(void) {
@@ -139,8 +137,8 @@ void copro_r3d_reset(void) {
                                                        q16_from_double(-0.73)));
     s_scene.ambient = q16_from_double(0.30);
     s_scene.diffuse = q16_from_double(0.70);
-    s_scene.base    = RED_BASE;
-    s_scene.ramp    = RAMP4;
+    s_scene.base    = 0;            /* per-face tri_base (hue<<2) overrides this */
+    s_scene.ramp    = HC_RAMP;      /* 4 brightness levels -> fb = hue<<2 | bright */
 }
 
 void copro_r3d_set_camera(int32_t ex, int32_t ey, int32_t ez,
@@ -204,38 +202,85 @@ static void build_scene(void) {
     s_scene.nobjs = n;
 }
 
-/* swizzle s_fbuf (8bpp) -> s_chr planar 4bpp tiles + fill the BG1 shadow tilemap */
-static void encode_4bpp(void) {
-    uint8_t *map = mg_state()->bg[0].shadow;        /* 32x32 cells, 2 B each */
+/* Dual-layer encode WITH non-blank tile dedup: split s_fbuf (value =
+ * hue<<2 | brightness) via the hicolor LUT into BG1 4bpp base CHR + BG3
+ * 2bpp sub CHR, but ONLY emit tiles the object actually covers (any
+ * non-backdrop pixel). Backdrop tiles point the tilemap at BLANK_TILE
+ * (unwritten, clean-slate-zeroed VRAM). This keeps the per-frame payload
+ * to the object's footprint (~a few KB) instead of the full 42 KB dual
+ * frame, which overflows the 28 KB cart-window payload. Returns the count
+ * of emitted tiles k (compact indices 0..k-1). BG3 cells carry palette 4
+ * so sub colours read CGRAM 16-19. Swizzle round-trip verified in
+ * src/video/tests/hc_preview.c. */
+static int encode_dual(void) {
+    uint8_t *map1 = mg_state()->bg[0].shadow;       /* BG1 tilemap (32x32) */
+    uint8_t *map3 = mg_state()->bg[2].shadow;       /* BG3 tilemap (32x32) */
     for (int i = 0; i < 1024; i++) {
-        map[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
-        map[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
+        map1[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
+        map1[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
+        map3[i*2 + 0] = (uint8_t)(BLANK_TILE & 0xFF);
+        map3[i*2 + 1] = (uint8_t)(BLANK_TILE >> 8);
     }
-    memset(s_chr, 0, sizeof s_chr);
+    int k = 0;
     for (int t = 0; t < NTILES; t++) {
         int tx = (t % TW) * 8, ty = (t / TW) * 8;
+
+        int blank = 1;
+        for (int yy = 0; yy < 8 && blank; yy++)
+            for (int xx = 0; xx < 8; xx++)
+                if (s_fbuf[(ty + yy) * VW + (tx + xx)]) { blank = 0; break; }
+        if (blank) continue;                        /* backdrop -> BLANK_TILE */
+
+        memset(s_chr[k],  0, 32);
+        memset(s_chr2[k], 0, 16);
         for (int yy = 0; yy < 8; yy++) for (int xx = 0; xx < 8; xx++) {
-            int bi  = s_fbuf[(ty + yy) * VW + (tx + xx)] & 0x0F;
+            uint8_t v = s_fbuf[(ty + yy) * VW + (tx + xx)];
+            int b   = hc_base_of(v);                /* 4bpp base (hue)       */
+            int sub = hc_sub_of(v);                 /* 2bpp sub  (brightness)*/
             int bit = 7 - xx;
-            s_chr[t][yy*2 + 0]      |= (uint8_t)(((bi >> 0) & 1) << bit);
-            s_chr[t][yy*2 + 1]      |= (uint8_t)(((bi >> 1) & 1) << bit);
-            s_chr[t][16 + yy*2 + 0] |= (uint8_t)(((bi >> 2) & 1) << bit);
-            s_chr[t][16 + yy*2 + 1] |= (uint8_t)(((bi >> 3) & 1) << bit);
+            s_chr[k][yy*2 + 0]      |= (uint8_t)(((b   >> 0) & 1) << bit);
+            s_chr[k][yy*2 + 1]      |= (uint8_t)(((b   >> 1) & 1) << bit);
+            s_chr[k][16 + yy*2 + 0] |= (uint8_t)(((b   >> 2) & 1) << bit);
+            s_chr[k][16 + yy*2 + 1] |= (uint8_t)(((b   >> 3) & 1) << bit);
+            s_chr2[k][yy*2 + 0]     |= (uint8_t)(((sub >> 0) & 1) << bit);
+            s_chr2[k][yy*2 + 1]     |= (uint8_t)(((sub >> 1) & 1) << bit);
         }
         int r = t / TW, c = t % TW;
         int cell = (r + 1) * 32 + (c + 1);          /* centered, 1-tile margin */
-        map[cell*2 + 0] = (uint8_t)(t & 0xFF);
-        map[cell*2 + 1] = (uint8_t)((t >> 8) & 0xFF);
+        map1[cell*2 + 0] = (uint8_t)(k & 0xFF);
+        map1[cell*2 + 1] = (uint8_t)((k >> 8) & 0xFF);
+        map3[cell*2 + 0] = (uint8_t)(k & 0xFF);
+        map3[cell*2 + 1] = (uint8_t)(((k >> 8) & 0xFF) | BG3_PAL_HI);  /* palette 4 */
+        k++;
     }
     mg_state_dirty_bg(0, 0, MG_BG_TILEMAP_BYTES);
+    mg_state_dirty_bg(2, 0, MG_BG_TILEMAP_BYTES);
+    return k;
 }
 
 int copro_r3d_render(void) {
     if (!s_inited) copro_r3d_init();
 
-    /* commit-ahead gate: don't stage past depth 2 (mirror h_frame_commit). */
-    if ((cart_window_frame_staged() - cart_window_frame_consumed()) >= 2u)
+    static int s_trace = -1;
+    if (s_trace < 0) {
+        const char *e = getenv("MG_DMA_TRACE");
+        s_trace = (e && *e && *e != '0') ? 1 : 0;
+    }
+
+    /* commit-ahead gate: don't stage past depth 2. SIGNED — cart-window
+     * counters accumulate across demos and a leaked consumed>staged (e.g.
+     * a prior demo's Ctrl-C teardown) makes the old unsigned subtract wrap
+     * huge -> perma-drop every render. Signed treats that as "not in flight"
+     * so the 3D path recovers instead of jamming. */
+    unsigned staged   = cart_window_frame_staged();
+    unsigned consumed = cart_window_frame_consumed();
+    int32_t  inflight = (int32_t)(staged - consumed);
+    if (inflight >= 2) {
+        if (s_trace)
+            fprintf(stderr, "[r3d] gate DROP: staged=%u consumed=%u inflight=%d\n",
+                    staged, consumed, inflight);
         return -1;
+    }
 
     build_scene();
     r3d_render_dither(&s_scene, s_fbuf, VW, VH);
@@ -246,26 +291,46 @@ int copro_r3d_render(void) {
         s_need_clear = false;
     }
 
-    /* palette -> shadow CGRAM */
+    /* palette -> shadow CGRAM (20 entries: 16 base + 4 sub) */
     build_palette(mg_state()->cgram_shadow);
-    mg_state_dirty_cgram(0, 32);                    /* 16 entries * 2 B */
+    mg_state_dirty_cgram(0, 40);                    /* 20 entries * 2 B */
 
-    /* CHR swizzle + tilemap shadow */
-    encode_4bpp();
+    /* dual-layer CHR swizzle + both tilemap shadows (dedup: nt tiles emitted) */
+    int nt = encode_dual();
 
-    /* BG1 = 4bpp Mode-1 main layer */
+    /* Mode 1: BG1 4bpp main, BG3 2bpp sub (half-add colour math). */
     MgState *s = mg_state();
     s->bgmode = 1;
     s->bg[0].tilemap_word = TMAP_W;
     s->bg[0].chr_word     = CHR_W;
     s->bg[0].size_code    = 0;                      /* 32x32 */
     s->bg[0].enabled_main = true;
+    s->bg[2].tilemap_word = TMAP3_W;
+    s->bg[2].chr_word     = CHR3_W;
+    s->bg[2].size_code    = 0;
+    s->bg[2].enabled_sub  = true;                   /* BG3 on the SUB screen */
+    mg_state_set_color_math(true);                  /* CGWSEL/CGADSUB: half-add */
 
-    /* CHR as transient slot chunks (each under the sub-frame byte budget) */
-    for (int c = 0; c < NTILES; c += CHUNK_TILES) {
-        int n = (NTILES - c < CHUNK_TILES) ? (NTILES - c) : CHUNK_TILES;
+    /* BG1 4bpp CHR: 32 B/tile -> 260-tile chunks (only the nt used tiles). */
+    for (int c = 0; c < nt; c += CHUNK_TILES) {
+        int n = (nt - c < CHUNK_TILES) ? (nt - c) : CHUNK_TILES;
         mg_state_queue_dma_transient(&s_chr[c][0], (uint32_t)n * 32u,
                                      0x18, 0x01, (uint16_t)(CHR_W + c * 16));
+    }
+    /* BG3 2bpp CHR: 16 B/tile -> same 260-tile chunks (8 words/tile). */
+    for (int c = 0; c < nt; c += CHUNK_TILES) {
+        int n = (nt - c < CHUNK_TILES) ? (nt - c) : CHUNK_TILES;
+        mg_state_queue_dma_transient(&s_chr2[c][0], (uint32_t)n * 16u,
+                                     0x18, 0x01, (uint16_t)(CHR3_W + c * 8));
+    }
+
+    if (s_trace) {
+        int nz = 0;
+        for (int i = 0; i < VW * VH; i++) if (s_fbuf[i]) nz++;
+        uint32_t bytes = (uint32_t)nt * (32u + 16u) + 40u + 2u * 2048u;
+        fprintf(stderr,
+            "[r3d] stage: inflight=%d fb_nz=%d tiles=%d (of %d) payload~%uB\n",
+            inflight, nz, nt, NTILES, bytes);
     }
 
     mg_state_build_frame();

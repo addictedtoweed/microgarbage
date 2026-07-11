@@ -366,6 +366,7 @@ void mg_state_reset(void) {
     s_state.spr.chr_base1_word = 0;
 
     s_state.bgmode = 0;
+    s_state.color_math = false;
 
     s_state.force_blank_top    = 0;
     s_state.force_blank_bottom = 0;
@@ -620,6 +621,8 @@ void mg_state_dirty_oam(uint16_t lo, uint16_t hi) {
     if (lo >= hi || hi > MG_OAM_BYTES) return;
     widen_range(&s_state.oam_dirty_lo, &s_state.oam_dirty_hi, lo, hi);
 }
+
+void mg_state_set_color_math(bool on) { s_state.color_math = on; }
 
 void mg_state_dirty_cgram(uint16_t lo, uint16_t hi) {
     if (lo >= hi || hi > MG_CGRAM_BYTES) return;
@@ -1147,6 +1150,12 @@ static void emit_ppu_batch(void) {
 
     /* MOSAIC stub — handler doesn't track yet. */
     b.mosaic = 0;
+
+    /* Colour math (dual-layer 60-colour path). Off by default; a frame opts
+     * in via mg_state_set_color_math -> CGWSEL=$02 (always, use sub screen),
+     * CGADSUB=$41 (BG1 participates, half, add). Matches snes/cmtest.s. */
+    b.cgwsel  = s->color_math ? 0x02u : 0x00u;
+    b.cgadsub = s->color_math ? 0x41u : 0x00u;
 
     /* Scrolls. The kernel writes them low-byte then high-byte to the
      * write-twice PPU register. */
