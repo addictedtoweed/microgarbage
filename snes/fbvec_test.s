@@ -26,14 +26,17 @@ BG3_CHR  = $2000       ; char base unit 2
 BG1_MAP  = $1000
 BG3_MAP  = $2800
 
-FIN_LINE   = 208       ; bottom-bar line: force-blank + band DMA
-START_LINE = 8         ; top-of-visible: unblank
+FIN_LINE   = 212       ; bottom-bar line: force-blank + band DMA (12/12 letterbox)
+START_LINE = 12        ; top-of-visible: unblank
 
 ; direct-page state
 FC     = $00           ; band-within-frame counter 0..3
 TGT    = $01           ; frame currently rolling in (0=A, 1=B)
+SLOW   = $02           ; frame divider so the roll wipe is watchable
 IRQVEC = $10           ; 2-byte pointer the IRQ trampoline jmp ()s through
 TMPW   = $12
+
+SLOW_DIV = 15          ; advance one band every 15 frames (~watchable roll)
 
 .segment "CODE"
 
@@ -66,14 +69,19 @@ TMPW   = $12
     sta BG12NBA
     lda #(BG3_CHR / $1000)  ; BG3 char base (BG34NBA low nibble)
     sta BG34NBA
+    ; scroll image down 4px (BGVOFS = -4 = $3FC) to centre in the 12/12 letterbox
     stz BG1HOFS
     stz BG1HOFS
-    stz BG1VOFS
-    stz BG1VOFS
+    lda #$FC
+    sta BG1VOFS
+    lda #$03
+    sta BG1VOFS
     stz BG3HOFS
     stz BG3HOFS
-    stz BG3VOFS
-    stz BG3VOFS
+    lda #$FC
+    sta BG3VOFS
+    lda #$03
+    sta BG3VOFS
     lda #$01
     sta TM                  ; BG1 on main
     lda #$04
@@ -152,6 +160,8 @@ TMPW   = $12
     stz FC
     lda #1
     sta TGT                 ; roll in B next
+    lda #SLOW_DIV
+    sta SLOW
 
     ; --- arm the vector-swap V-IRQ: first event = finish (bottom bar) ---
     rep #$20
@@ -190,6 +200,10 @@ TMPW   = $12
     lda #$80
     sta INIDISP            ; force-blank (opens the DMA window)
 
+    dec SLOW               ; only advance the roll every SLOW_DIV frames
+    bne @rearm
+    lda #SLOW_DIV
+    sta SLOW
     ; band = band_order[FC]  (bottom-3-first, TOP-LAST)
     rep #$20
     .a16
@@ -200,13 +214,12 @@ TMPW   = $12
     .a8
     lda band_order,x
     jsr write_band         ; A = band index
-
     inc FC
     lda FC
     cmp #4
-    bne :+
-    stz FC                 ; wrap handled at start_irq (frame flip)
-:
+    bne @rearm
+    stz FC                 ; wrap -> start_irq flips A/B
+@rearm:
     rep #$20
     .a16
     lda #.loword(start_irq)
