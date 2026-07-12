@@ -92,6 +92,7 @@ static bool        s_inited;
 static int         s_deliver;       /* rolling delivery index 0..NBANDS-1 */
 static bool        s_init_done;     /* tilemap + palette staged into VRAM once */
 static bool        s_fb_armed;      /* v2.46: framebuffer vector-swap handed off */
+static bool        s_have_frame;     /* v2.46: s_chr holds a rendered frame (ahead) */
 
 /* render scratch */
 static uint8_t  s_fbuf[VW * VH];
@@ -157,6 +158,7 @@ void copro_r3d_reset(void) {
     s_deliver = 0;
     s_init_done = false;
     s_fb_armed = false;
+    s_have_frame = false;
 
     /* scene constants (mirrors the demo_cube preview) */
     s_scene.near_z  = q16_from_double(0.5);
@@ -507,10 +509,16 @@ int copro_r3d_render(void) {
         s_fb_armed = true;
     }
 
-    if (d == 0) {                                   /* new displayed frame */
+    /* v2.46 ahead-render: keep s_chr ONE displayed-frame ahead so every band
+     * delivery (incl. d==0) is a fast memcpy from a resident frame — never a slow
+     * just-in-time raster that F[0] could beat mid-fill (the source of the shear).
+     * Startup renders frame 0; thereafter the NEXT frame is rendered at the last
+     * band (below), after that band's CHR has been copied out. */
+    if (!s_have_frame) {
         build_scene();
         r3d_render_dither(&s_scene, s_fbuf, VW, VH);
-        encode_dual();                              /* whole frame -> s_chr/s_chr2 */
+        encode_dual();
+        s_have_frame = true;
     }
 
     unsigned slot = 0;
@@ -560,6 +568,14 @@ int copro_r3d_render(void) {
     if (s_trace)
         fprintf(stderr, "[r3d] deliver %d -> band %d tiles [%d,%d) bg1=%uB bg3=%uB\n",
                 d, band, t0, t1, bg1_len, bg3_len);
+
+    /* Render the NEXT frame ahead, now that this frame's last band CHR is copied
+     * out of s_chr. Keeps d==0 a fast memcpy next cycle (see ahead-render above). */
+    if (d == NBANDS - 1) {
+        build_scene();
+        r3d_render_dither(&s_scene, s_fbuf, VW, VH);
+        encode_dual();
+    }
 
     s_deliver = (d + 1) % NBANDS;
     return 0;
