@@ -32,19 +32,23 @@ TOP_ROWS    = 8            ; rows 0..7   -> top third (shared)
 MID_ROWS    = 8            ; rows 8..15  -> mid third
 BOT_ROWS    = 9            ; rows 16..24 -> bot third
 
-; solid-colour tile indices within each base (chosen to hit 0/256/512)
-IDX_RED     = 0            ; mid_A  @ 0x0000, base_A idx 0
-IDX_GREEN   = 256          ; bot_A  @ 0x1000, base_A idx 256
-IDX_WHITE_A = 512          ; top    @ 0x2000, base_A idx 512
-IDX_WHITE_B = 0            ; top    @ 0x2000, base_B idx 0
-IDX_BLUE    = 256          ; mid_B  @ 0x3000, base_B idx 256
-IDX_YELLOW  = 512          ; bot_B  @ 0x4000, base_B idx 512
+; tilemap entries = tile index | palette (bit10 = $0400 = palette 1), chosen to
+; hit indices 0/256/512 so the shared tilemap drives BOTH BG1 and BG3.
+PAL1        = $0400
+IDX_RED     = 0   | PAL1   ; mid_A  base_A idx 0
+IDX_GREEN   = 256 | PAL1   ; bot_A  base_A idx 256
+IDX_WHITE_A = 512 | PAL1   ; top    base_A idx 512
+IDX_WHITE_B = 0   | PAL1   ; top    base_B idx 0
+IDX_BLUE    = 256 | PAL1   ; mid_B  base_B idx 256
+IDX_YELLOW  = 512 | PAL1   ; bot_B  base_B idx 512
 
-; BG12NBA (CHR base, 0x1000-word units) and BG1SC (tilemap base, 0x400-word units)
-NBA_A       = $00          ; base_A = 0x0000
-NBA_B       = $02          ; base_B = 0x2000
-SC_A        = $78          ; tilemap_A @ 0x7800 -> (0x7800/0x400)<<2 = 0x78
-SC_B        = $7C          ; tilemap_B @ 0x7C00 -> 0x7C
+; BG12NBA/BG34NBA (CHR base, 0x1000w units); BG1SC/BG3SC (tilemap base, 0x400w).
+NBA_A       = $00          ; BG1 base_A  = 0x0000
+NBA_B       = $02          ; BG1 base_B  = 0x2000
+NBA3_A      = $05          ; BG3 base3_A = 0x5000
+NBA3_B      = $06          ; BG3 base3_B = 0x6000
+SC_A        = $78          ; tilemap_A @ 0x7800 (shared by BG1+BG3)
+SC_B        = $7C          ; tilemap_B @ 0x7C00
 
 ; --- direct page ---
 frame_par   = $00          ; 0 = showing A, 1 = showing B
@@ -66,6 +70,10 @@ flip_ctr    = $01          ; frame countdown to next flip
     lda #$8F
     sta INIDISP             ; force-blank during setup
     stz NMITIMEN
+
+    jsr clean_slate         ; zero the whole PPU control bank (power-on garbage
+                            ; here intermittently blanks the screen once colour
+                            ; math is on — memory: ppu-baseline-registers)
 
     ; --- clear all VRAM to 0 ---
     stz VMAIN
@@ -98,32 +106,58 @@ flip_ctr    = $01          ; frame countdown to next flip
     stz BG1VOFS
     stz BG1VOFS
 
-    ; --- CGRAM: palette 0 colours 1..5 = red,green,white,blue,yellow (BGR555) ---
-    stz CGADD               ; start at colour 0
-    lda #$00                ; colour 0 = black (lo)
+    ; --- CGRAM (palette 1, shared-tilemap 60-colour trick) ---
+    ; BG3 2bpp palette 1 -> CGRAM 4..7  = brightness ramp (4=none/black for
+    ;   half-add, 5..7 = increasing grey added to the hue).
+    ; BG1 4bpp palette 1 -> CGRAM 16..31; we use 17..21 = red,green,white,blue,
+    ;   yellow hues.  4..7 and 16..31 do NOT overlap -> both layers coexist.
+    ; clear ALL 256 CGRAM entries to black first (backdrop @0 + any unset entry
+    ; the half-add subscreen could read = uninitialised garbage otherwise).
+    stz CGADD
+    ldx #256
+@cgclr:
+    stz CGDATA
+    stz CGDATA
+    dex
+    bne @cgclr
+
+    lda #4
+    sta CGADD               ; start at CGRAM 4 (BG3 palette-1 entry 0)
+    stz CGDATA              ; 4 = brightness 0 = black $0000
+    stz CGDATA
+    lda #$4A                ; 5 = dark  grey $294A
     sta CGDATA
-    stz CGDATA              ; (hi)
-    ; colour 1 red   = $001F
-    lda #$1F
+    lda #$29
+    sta CGDATA
+    lda #$94                ; 6 = mid   grey $5294
+    sta CGDATA
+    lda #$52
+    sta CGDATA
+    lda #$DE                ; 7 = light grey $6BDE
+    sta CGDATA
+    lda #$6B
+    sta CGDATA
+    ; --- BG1 hues at CGRAM 16..21 (palette 1 entries 0..5) ---
+    lda #16
+    sta CGADD
+    stz CGDATA              ; 16 = hue 0 (unused, backdrop) $0000
+    stz CGDATA
+    lda #$1F                ; 17 red    $001F
     sta CGDATA
     stz CGDATA
-    ; colour 2 green = $03E0
-    lda #$E0
+    lda #$E0                ; 18 green   $03E0
     sta CGDATA
     lda #$03
     sta CGDATA
-    ; colour 3 white = $7FFF
-    lda #$FF
+    lda #$FF                ; 19 white   $7FFF
     sta CGDATA
     lda #$7F
     sta CGDATA
-    ; colour 4 blue  = $7C00
-    lda #$00
+    lda #$00                ; 20 blue    $7C00
     sta CGDATA
     lda #$7C
     sta CGDATA
-    ; colour 5 yellow= $03FF
-    lda #$FF
+    lda #$FF                ; 21 yellow  $03FF
     sta CGDATA
     lda #$03
     sta CGDATA
@@ -160,17 +194,48 @@ flip_ctr    = $01          ; frame countdown to next flip
     sta $06
     ldx #$4000
     jsr write_solid_tile
+    ; --- BG3 2bpp brightness tiles (8 words each) at the BG3 bases; SAME indices
+    ; as BG1 (0/256/512) so the shared tilemap drives both. top=3, mid=2, bot=1. ---
+    lda #$FFFF             ; top3  @0x6000 bright3 (SHARED)  bp0+bp1
+    sta $04
+    ldx #$6000
+    jsr write_solid_tile2
+    lda #$FF00             ; mid3_A @0x5000 bright2  bp1
+    sta $04
+    ldx #$5000
+    jsr write_solid_tile2
+    lda #$FF00             ; mid3_B @0x6800 bright2
+    sta $04
+    ldx #$6800
+    jsr write_solid_tile2
+    lda #$00FF             ; bot3_A @0x5800 bright1  bp0
+    sta $04
+    ldx #$5800
+    jsr write_solid_tile2
+    lda #$00FF             ; bot3_B @0x7000 bright1
+    sta $04
+    ldx #$7000
+    jsr write_solid_tile2
     sep #$20
     .a8
 
     ; --- build tilemap_A @ 0x7800 and tilemap_B @ 0x7C00 ---
     jsr build_tilemaps
 
-    ; --- show frame A ---
+    ; --- show frame A + BG3 sub layer + half-add colour math (60-colour) ---
     lda #NBA_A
     sta BG12NBA
+    lda #NBA3_A
+    sta BG34NBA
     lda #SC_A
     sta BG1SC
+    sta BG3SC              ; BG3 SHARES the same tilemap (palette 1)
+    lda #$04
+    sta TS                 ; BG3 on subscreen
+    lda #$02
+    sta CGWSEL             ; add subscreen
+    lda #$41
+    sta CGADSUB            ; half + add, BG1 affected (60-colour composite)
     stz frame_par
     lda #40
     sta flip_ctr
@@ -184,6 +249,77 @@ flip_ctr    = $01          ; frame countdown to next flip
 @idle:
     wai
     bra @idle
+.endproc
+
+; Zero the entire PPU control-register bank to a known baseline (mirrors the
+; kernel's clean_slate). Called under force-blank at reset; eliminates power-on
+; garbage that intermittently blanks the screen once colour math is on. A8/I16.
+.proc clean_slate
+    .a8
+    .i16
+    lda #$80
+    sta $2100               ; INIDISP force-blank
+    stz $2101               ; OBSEL
+    stz $2102               ; OAMADDL
+    stz $2103               ; OAMADDH
+    stz $2105               ; BGMODE
+    stz $2106               ; MOSAIC
+    stz $2107               ; BG1SC
+    stz $2108               ; BG2SC
+    stz $2109               ; BG3SC
+    stz $210A               ; BG4SC
+    stz $210B               ; BG12NBA
+    stz $210C               ; BG34NBA
+    stz $210D               ; scrolls $210D..$2114 (each write-twice)
+    stz $210D
+    stz $210E
+    stz $210E
+    stz $210F
+    stz $210F
+    stz $2110
+    stz $2110
+    stz $2111
+    stz $2111
+    stz $2112
+    stz $2112
+    stz $2113
+    stz $2113
+    stz $2114
+    stz $2114
+    stz $2115               ; VMAIN
+    stz $211A               ; M7SEL
+    stz $211B               ; M7A..M7Y $211B..$2120 (each write-twice)
+    stz $211B
+    stz $211C
+    stz $211C
+    stz $211D
+    stz $211D
+    stz $211E
+    stz $211E
+    stz $211F
+    stz $211F
+    stz $2120
+    stz $2120
+    stz $2121               ; CGADD
+    stz $2123               ; W12SEL
+    stz $2124               ; W34SEL
+    stz $2125               ; WOBJSEL
+    stz $2126               ; WH0
+    stz $2127               ; WH1
+    stz $2128               ; WH2
+    stz $2129               ; WH3
+    stz $212A               ; WBGLOG
+    stz $212B               ; WOBJLOG
+    stz $212C               ; TM
+    stz $212D               ; TS
+    stz $212E               ; TMW
+    stz $212F               ; TSW
+    stz $2130               ; CGWSEL
+    stz $2131               ; CGADSUB
+    lda #$E0
+    sta $2132               ; COLDATA = black fixed colour
+    stz $2133               ; SETINI
+    rts
 .endproc
 
 ; Write a solid 4bpp tile at VRAM word X: 8 words of plane01 ($04) then 8 words of
@@ -204,6 +340,20 @@ flip_ctr    = $01          ; frame countdown to next flip
     sta VMDATAL
     dey
     bne @p2
+    rts
+.endproc
+
+; Write a solid 2bpp tile at VRAM word X: 8 words of plane01 ($04). A16/I16.
+.proc write_solid_tile2
+    .a16
+    .i16
+    stx VMADDL
+    ldy #8
+@p:
+    lda $04
+    sta VMDATAL
+    dey
+    bne @p
     rts
 .endproc
 
@@ -322,19 +472,25 @@ flip_ctr    = $01          ; frame countdown to next flip
     sta flip_ctr
     lda frame_par
     bne @to_a
-    ; -> show B
+    ; -> show B : the 4-register reveal (BG12NBA+BG34NBA+BG1SC+BG3SC), in vblank
     lda #NBA_B
     sta BG12NBA
+    lda #NBA3_B
+    sta BG34NBA
     lda #SC_B
     sta BG1SC
+    sta BG3SC
     lda #$01
     sta frame_par
     bra @done
 @to_a:
     lda #NBA_A
     sta BG12NBA
+    lda #NBA3_A
+    sta BG34NBA
     lda #SC_A
     sta BG1SC
+    sta BG3SC
     stz frame_par
 @done:
     rep #$30
