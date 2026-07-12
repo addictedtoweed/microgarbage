@@ -56,6 +56,38 @@ each frame re-render + refill the 4 bands' CHR at their fixed cart-window offset
 emitted finish routines' baked src offsets point at those. Centre later via PB_SCROLLS
 (-8) once displaying.
 
+## Tear-free 240×200 20 fps (thirds double-buffer, overlapping bases)
+Locked 2026-07-11 (John): full 240×200 60-colour, tear-free, commits ALL 64 KB VRAM
+(OBJ off). Two SNES limits force the scheme: VRAM 32768 words AND the 10-bit tilemap
+tile index (1024 tiles/BG). Thirds (3 bands, from 3 subframes @20 fps) need only
+1.67 buffers; the tile index is beaten by OVERLAPPING the two CHR bases so the shared
+band lives in the overlap, reachable from both frames' bases at different indices.
+
+VRAM word map (0x0000-0x7FFF):
+- BG1 4bpp CHR (base step 0x1000w, two bases 0x2000 apart):
+  mid_A 0x0000 | bot_A 0x1000 | top 0x2000(SHARED) | mid_B 0x3000 | bot_B 0x4000
+  base_A=0x0000 (BG12NBA=0)   base_B=0x2000 (BG12NBA=2)
+- BG3 2bpp CHR (base step 0x1000w, two bases 0x1000 apart):
+  mid3_A 0x5000 | bot3_A 0x5800 | top3 0x6000(SHARED) | mid3_B 0x6800 | bot3_B 0x7000
+  base3_A=0x5000 (BG34NBA=5)  base3_B=0x6000 (BG34NBA=6)
+- Tilemaps (SHARED by BG1+BG3, palette field 4): tilemap_A 0x7800, tilemap_B 0x7C00.
+Tile indices (identical BG1 & BG3): frame A mid->0/bot->256/top->512; frame B
+top->0/mid->256/bot->512. Full VRAM used; ~720w of alignment gaps at unused indices
+(250-255 etc.) hold the reserved blank tile.
+
+Shared tilemap keeps 60 colours: 4bpp scales palette ×16, 2bpp ×4, so palette field 4
+lands them NON-overlapping — BG1 hues -> CGRAM 64-79, BG3 brightness -> CGRAM 16-19.
+
+Reveal on subframe 3 (last/shared band, during force-blank) = 4 register writes:
+  show A: BG12NBA=0 BG34NBA=5 BG1SC=BG3SC=0x7800(>>? SC field 0x400w units)
+  show B: BG12NBA=2 BG34NBA=6 BG1SC=BG3SC=0x7C00
+Delivery: bottom-2 thirds into the building frame's off-screen slots (subframes 1-2),
+top/shared third into the shared slot during subframe-3 blank, then flip -> atomic.
+ISR fits 1 KB via SELF-MODIFY: one set of 3 finish routines whose VMADDL dest
+immediates + the reveal registers are PATCHED by the reveal each frame to ping-pong
+A<->B (no 2nd baked routine set). ~4 B/line siphon tops off the 62-line burst per
+third (11160 B burst, 12000 B/third). Renderer: NBANDS=3, thirds of 250 tiles.
+
 ## Sequencing
 1. Emitter core (direct-DMA + ISR skeleton + patch-entry) + kernel ISR-mode + $0E00
    stub. 2. cube3d emitter → cube on screen. 3. FMV player (band + partial-OAM +
