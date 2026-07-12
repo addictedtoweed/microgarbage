@@ -244,6 +244,10 @@ extern "C" {
  * first full frame has applied the PPU batch/tilemap/palette (those persist). */
 #define CW_OFF_FB_MODE                0x79C3u
 
+/* v2.46 full-emitter ISR mode (docs/emitter-kernel.md). Non-zero + an installed
+ * ISR image at $0E00 -> the kernel points RAMVEC_IRQ straight at the guest ISR. */
+#define CW_OFF_ISR_MODE               0x79C4u
+
 /* DEBUG (v2.37m): burst-start budget probe window. The kernel reads
  * CW_OFF_DBG_BUDGET + (K_BYTES_REM>>8) on the first slot of each burst;
  * the host logs the offset (= budget in 256-byte units) to find why
