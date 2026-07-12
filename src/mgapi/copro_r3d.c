@@ -167,6 +167,30 @@ static const uint8_t s_cube_base[12] = {   /* 6 hues, one per face (hue<<2) */
 };
 static R3dMesh s_mesh_cube;
 
+/* ---- morph: same 8-vert / 12-tri / 6-hue topology as the cube, but the verts
+ * flow between key shapes (cube -> pyramid -> twist -> roof -> cube) like the old
+ * "3D Flying Objects" screensaver. Smooth vertex lerp with a hold at each shape.
+ * Degenerate faces (collapsed verts) just rasterise to nothing -> clean silhouettes. */
+#define MORPH_NKEYS 4
+#define MORPH_HOLD  36            /* frames holding each shape (~1.8s @ 20fps) */
+#define MORPH_TRANS 20            /* frames morphing between   (~1.0s)         */
+#define MORPH_SEG   (MORPH_HOLD + MORPH_TRANS)
+#define QF(x)       ((q16_16_t)((x) * 65536.0))   /* double -> Q16.16 (init only) */
+static const double s_morph_kd[MORPH_NKEYS][8][3] = {
+  /* cube */
+  {{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},{-1,-1,1},{1,-1,1},{1,1,1},{-1,1,1}},
+  /* pyramid: the 4 top (+Y) verts collapse to a single apex */
+  {{-1,-1,-1},{1,-1,-1},{0,1.4,0},{0,1.4,0},{-1,-1,1},{1,-1,1},{0,1.4,0},{0,1.4,0}},
+  /* twist antiprism: the top square rotated 45 deg about Y */
+  {{-1,-1,-1},{1,-1,-1},{1.414,1,0},{0,1,-1.414},{-1,-1,1},{1,-1,1},{0,1,1.414},{-1.414,1,0}},
+  /* roof / triangular prism: the top face collapses to a ridge edge */
+  {{-1,-1,-1},{1,-1,-1},{0,1.4,-1},{0,1.4,-1},{-1,-1,1},{1,-1,1},{0,1.4,1},{0,1.4,1}},
+};
+static vec3_q16 s_morph_key[MORPH_NKEYS][8];
+static vec3_q16 s_morph_v[8];
+static R3dMesh  s_mesh_morph;
+static unsigned s_morph_frame;
+
 /* 60-colour palette into the host buffer: CGRAM 0-15 = base hues, 16-19 = sub. */
 /* Palette-1 layout for the shared tilemap: BG1 hues -> CGRAM 16-31, BG3 brightness
  * -> CGRAM 4-7 (non-overlapping; 4bpp scales the palette field x16, 2bpp x4). */
@@ -185,6 +209,15 @@ void copro_r3d_init(void) {
     s_mesh_cube.verts = s_cube_v; s_mesh_cube.nverts = 8;
     s_mesh_cube.tris  = s_cube_t; s_mesh_cube.ntris  = 12;
     s_mesh_cube.tri_base = s_cube_base;
+    /* morph mesh: same topology/hues as the cube, verts flow between key shapes */
+    for (int k = 0; k < MORPH_NKEYS; k++)
+        for (int i = 0; i < 8; i++)
+            s_morph_key[k][i] = vec3_q16_make(QF(s_morph_kd[k][i][0]),
+                                              QF(s_morph_kd[k][i][1]),
+                                              QF(s_morph_kd[k][i][2]));
+    for (int i = 0; i < 8; i++) s_morph_v[i] = s_morph_key[0][i];
+    s_mesh_morph = s_mesh_cube;          /* copy tris + face hues */
+    s_mesh_morph.verts = s_morph_v;      /* but point at the flowing vertices */
     s_inited = true;
     copro_r3d_reset();
 }
@@ -264,7 +297,7 @@ static void build_scene(void) {
         mat3_q16 rot = mat3_q16_mul(mat3_q16_rotation_z(s_objs[i].rz),
                        mat3_q16_mul(mat3_q16_rotation_y(s_objs[i].ry),
                                     mat3_q16_rotation_x(s_objs[i].rx)));
-        s_robjs[n].mesh  = &s_mesh_cube;          /* only the cube for now */
+        s_robjs[n].mesh  = &s_mesh_morph;         /* cube morphing through shapes */
         s_robjs[n].xform = affine3_q16_compose(
             affine3_q16_from_translation(vec3_q16_make(s_objs[i].px, s_objs[i].py, s_objs[i].pz)),
             affine3_q16_from_rotation(rot));
@@ -741,10 +774,38 @@ static void plasma_composite(unsigned t) {
     }
 }
 
-/* Build one logical frame: cube over the animated plasma, then split to
+/* Advance the cube<->shapes morph one frame: lerp the 8 verts between the
+ * current key pair, holding at each shape and easing the transition. */
+static q16_16_t smoothstep_q16(q16_16_t t) {         /* 3t^2 - 2t^3, t in [0,1] Q16 */
+    int64_t tt  = ((int64_t)t * t) >> 16;
+    int64_t ttt = (tt * t) >> 16;
+    return (q16_16_t)(3 * tt - 2 * ttt);
+}
+static void morph_update(void) {
+    unsigned seg = (s_morph_frame / MORPH_SEG) % MORPH_NKEYS;
+    unsigned pos =  s_morph_frame % MORPH_SEG;
+    unsigned k0  = seg, k1 = (seg + 1u) % MORPH_NKEYS;
+    q16_16_t t;
+    if (pos < MORPH_HOLD) {
+        t = 0;                                       /* holding shape k0 */
+    } else {
+        q16_16_t f = (q16_16_t)((((int64_t)(pos - MORPH_HOLD)) << 16) / MORPH_TRANS);
+        t = smoothstep_q16(f);
+    }
+    for (int i = 0; i < 8; i++) {
+        vec3_q16 a = s_morph_key[k0][i], b = s_morph_key[k1][i];
+        s_morph_v[i].x = a.x + (q16_16_t)((((int64_t)(b.x - a.x)) * t) >> 16);
+        s_morph_v[i].y = a.y + (q16_16_t)((((int64_t)(b.y - a.y)) * t) >> 16);
+        s_morph_v[i].z = a.z + (q16_16_t)((((int64_t)(b.z - a.z)) * t) >> 16);
+    }
+    s_morph_frame++;
+}
+
+/* Build one logical frame: morphing cube over the animated plasma, then split to
  * the BG1(hue)/BG3(brightness) CHR. Called ahead-of-delivery. */
 static void render_frame(void) {
     if (!s_lut_ready) plasma_build_lut();
+    morph_update();
     build_scene();
     r3d_render(&s_scene, s_fbuf, VW, VH);      /* flat per-face shade (no dither) */
     plasma_composite(s_plasma_t);              /* animated 60-colour background   */

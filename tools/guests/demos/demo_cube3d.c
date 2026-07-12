@@ -27,10 +27,10 @@ void _start(void) {
     const int32_t Z = MG_Q16(6);          /* depth in front of the camera */
     int32_t ax = 0, ay = 0;               /* tumble angles (Q16 radians)   */
     int32_t bx = 0, by = 0;               /* bounce position (Q16 world)   */
-    int32_t vx = 1250, vy = 875;          /* bounce velocity / iter (slow — the
-                                           * copro only samples at band 0, i.e.
-                                           * every 4th call, so keep per-iter
-                                           * motion small for tear-free bands) */
+    int32_t vx = 3000, vy = 2100;         /* bounce velocity / iter. The whole
+                                           * frame is rendered atomically (no
+                                           * per-band tearing), so we can travel
+                                           * briskly — ~2.4x the old creep. */
     const int32_t BX_LIM = MG_Q16(2);     /* +/- 2.0 world units            */
     const int32_t BY_LIM = (MG_Q16(3) / 2); /* +/- 1.5                      */
 
