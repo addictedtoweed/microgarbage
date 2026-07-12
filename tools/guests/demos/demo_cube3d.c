@@ -38,9 +38,12 @@ void _start(void) {
         MgPads pads = mg_pads();
         if (mg_pad_pressed(pads.p0, MG_BTN_START)) sys_exit(0);
 
-        /* slow two-axis tumble (quartered — see vx/vy note) */
-        ay += 725;
-        ax += 475;
+        /* brisk two-axis tumble. The copro samples rotation once per logical
+         * frame (~3 iters), so the visible rate is ~3x these per 20fps frame:
+         * ay ~= 115 deg/s, ax ~= 77 deg/s — fast enough to flex the 20fps motion
+         * so the cube reads as genuinely spinning, not stepping. */
+        ay += 2100;
+        ax += 1400;
 
         /* bounce within the playfield */
         bx += vx; if (bx >  BX_LIM) { bx =  BX_LIM; vx = -vx; }

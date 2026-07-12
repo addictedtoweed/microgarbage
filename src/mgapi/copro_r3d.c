@@ -18,6 +18,7 @@
 #include "video/r3d.h"
 #include "video/hicolor.h"
 #include "math/mat_q16.h"
+#include "math/trig_q16.h"     /* q16_sin -> plasma sine LUT (no libm) */
 #include "math/fixed_point.h"
 
 #include <string.h>
@@ -512,12 +513,23 @@ static void e_init(unsigned *startpatch_imm) {
     e_stimm8(0x04, 0x212D);                          /* TS = BG3 sub */
     e_stimm8(0x02, 0x2130);                          /* CGWSEL */
     e_stimm8(0x41, 0x2131);                          /* CGADSUB: BG1, half, add */
-    /* BGVOFS = -8 ($3F8) on both layers -> centre cell-row-1 in the 12/12 letterbox.
-     * Write-twice ($F8 low, $03 high). */
-    ie8(0xA9); ie8(0xF8); ie8(0x8D); ie16(0x210E);   /* BG1VOFS */
+    /* BGVOFS = -13 ($3F3) on both layers. Clean vertical window is exactly 2px
+     * wide: top floor screen row 12 (the late-unblank primes the fetch over lines
+     * 9-11), bottom floor screen row 213 (last line before the finish force-blank).
+     * That 202-line slot holds the 200-line image with 2px of play: -12 = 12/12
+     * dead centre, -14 = 14/10 (2px low, bottom row on the floor), -13 = 13/11 the
+     * middle. Below -14 the bottom rows drop into the blank and flicker.
+     * Write-twice ($F3 low, $03 high). */
+    ie8(0xA9); ie8(0xF3); ie8(0x8D); ie16(0x210E);   /* BG1VOFS */
     ie8(0xA9); ie8(0x03); ie8(0x8D); ie16(0x210E);
-    ie8(0xA9); ie8(0xF8); ie8(0x8D); ie16(0x2112);   /* BG3VOFS */
+    ie8(0xA9); ie8(0xF3); ie8(0x8D); ie16(0x2112);   /* BG3VOFS */
     ie8(0xA9); ie8(0x03); ie8(0x8D); ie16(0x2112);
+    /* BGHOFS = -8 ($3F8) on both layers -> centre the 240-wide image in the
+     * 256-wide screen (8px margin each side). Write-twice ($F8 low, $03 high). */
+    ie8(0xA9); ie8(0xF8); ie8(0x8D); ie16(0x210D);   /* BG1HOFS */
+    ie8(0xA9); ie8(0x03); ie8(0x8D); ie16(0x210D);
+    ie8(0xA9); ie8(0xF8); ie8(0x8D); ie16(0x2111);   /* BG3HOFS */
+    ie8(0xA9); ie8(0x03); ie8(0x8D); ie16(0x2111);
     /* initial display = parity A */
     e_stimm8(NBA1_A,   0x210B);                       /* BG12NBA */
     e_stimm8(NBA3_A,   0x210C);                       /* BG34NBA */
@@ -692,6 +704,54 @@ static void install_isr_image(void) {
     fprintf(stderr, "[r3d] ISR image installed (%u bytes) -> ISR mode ARMED\n", s_isrn);
 }
 
+/* ------------------------------------------------------------------ *
+ * Real-time 60-colour plasma background. r3d clears the fb to 0 and
+ * z-tests, and the cube uses hues >= 1, so every 0-pixel is background:
+ * we fill those with an animated plasma AFTER the cube rasterises, so
+ * the framebuffer shows its full colour range behind the model instead
+ * of flat black. Sine LUT is built once from the fixed-point trig (M7-
+ * friendly: no per-pixel transcendental, no libm).                   */
+static uint8_t  s_sinlut[256];
+static int      s_lut_ready;
+static unsigned s_plasma_t;
+
+static void plasma_build_lut(void) {
+    for (int i = 0; i < 256; i++) {
+        q16_16_t ang = (q16_16_t)(((int64_t)i * 411775) >> 8); /* i * 2pi/256 (Q16.16) */
+        int32_t  s   = q16_sin(ang);                           /* -65536..65536       */
+        s_sinlut[i]  = (uint8_t)(31 + ((s * 31) >> 16));       /* 0..62               */
+    }
+    s_lut_ready = 1;
+}
+
+static void plasma_composite(unsigned t) {
+    for (int y = 0; y < VH; y++) {
+        int ty  = (int)((unsigned)(y * 2 + (t >> 1)) & 255u);   /* per-row vertical wave */
+        int dxy = (int)((unsigned)(y + (t << 1)) & 255u);       /* diagonal phase        */
+        for (int x = 0; x < VW; x++) {
+            int i = y * VW + x;
+            if (s_fbuf[i]) continue;                            /* cube pixel — keep     */
+            int s = s_sinlut[(unsigned)(x * 2 + t) & 255u]
+                  + s_sinlut[ty]
+                  + s_sinlut[(unsigned)(x + dxy) & 255u];       /* 0..186                */
+            int hue    = 1 + (s % 15);                          /* 1..15 flowing bands   */
+            int bright = (s_sinlut[(unsigned)(x + y + t) & 255u] >> 4) & 3; /* decorrel. */
+            s_fbuf[i]  = (uint8_t)((hue << 2) | bright);
+        }
+    }
+}
+
+/* Build one logical frame: cube over the animated plasma, then split to
+ * the BG1(hue)/BG3(brightness) CHR. Called ahead-of-delivery. */
+static void render_frame(void) {
+    if (!s_lut_ready) plasma_build_lut();
+    build_scene();
+    r3d_render(&s_scene, s_fbuf, VW, VH);      /* flat per-face shade (no dither) */
+    plasma_composite(s_plasma_t);              /* animated 60-colour background   */
+    encode_dual();
+    s_plasma_t += 3;                           /* scroll the plasma each frame    */
+}
+
 /* DIRECT staging: write one band straight into the cart window (band CHR +
  * DMA-list slots + frame_ready), bypassing mg_state_build_frame's subframe
  * packing / commit-ahead / bg-reupload — the kernel's frame_dma delivers it as
@@ -709,9 +769,7 @@ int copro_r3d_render(void) {
     /* Ahead-render: keep s_chr ONE frame ahead so every third delivery is a fast
      * memcpy from a resident frame, never a just-in-time raster (avoids shear). */
     if (!s_have_frame) {
-        build_scene();
-        r3d_render(&s_scene, s_fbuf, VW, VH);      /* flat per-face shade (no dither) */
-        encode_dual();
+        render_frame();
         s_have_frame = true;
     }
 
@@ -779,9 +837,7 @@ int copro_r3d_render(void) {
     if (s_deliver >= NBANDS) {
         s_deliver      = 0;
         s_build_parity ^= 1;
-        build_scene();
-        r3d_render(&s_scene, s_fbuf, VW, VH);      /* flat per-face shade (no dither) */
-        encode_dual();
+        render_frame();
     }
     return 0;
 }
