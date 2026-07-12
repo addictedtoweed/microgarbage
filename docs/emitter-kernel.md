@@ -88,6 +88,96 @@ immediates + the reveal registers are PATCHED by the reveal each frame to ping-p
 A<->B (no 2nd baked routine set). ~4 B/line siphon tops off the 62-line burst per
 third (11160 B burst, 12000 B/third). Renderer: NBANDS=3, thirds of 250 tiles.
 
+## Integration (copro_r3d.c) — Stage A LANDED (green build), Stage B (siphon) TODO
+DONE + correct: overlapping-base VRAM constants, palette-1 CGRAM (build_palette:
+hues->16-31, brightness->4-7), two-parity shared tilemaps (fill_tilemaps: tmap_idx_A/B
+with the overlap index math), cart-window layout (R3D_STAGE_BG1 0x0000 / R3D_STAGE_BG3
+0x2000 / TMAP_A 0x3000 / TMAP_B 0x3800 / PAL 0x4000 / mailbox R3D_MB 0x4100:
+bg1dst u16, bg3dst u16, reveal u8, nba1/nba3/sc u8).
+
+DONE render (copro_r3d_render): s_build_parity(0=A,1=B) + s_deliver(0..2). Per subframe
+third = s_deliver_order[sub] (2=bot,1=mid,0=top). Stages s_chr[third_t0]->R3D_STAGE_BG1
+(THIRD_BG1_BYTES), s_chr2->R3D_STAGE_BG3 (THIRD_BG3_BYTES). Mailbox bg1dst/bg3dst =
+slot_for(third, build_parity) [third0=BG1_TOP/BG3_TOP shared; mid/bot A/B]. reveal=1
+only on third==0, nba1/nba3/sc = build_parity's regs. frame_ready. On wrap flips
+s_build_parity + ahead-renders. init-once stages both tilemaps + palette + letterbox
+12/12 + install_isr_image; seeds build_parity=1 (init displays A, first frame builds B
+-> 1-frame startup glitch, accepted).
+
+DONE Stage-A emitter (install_isr_image = entry JMP + init + ONE mailbox finish + start):
+- init: force-blank; NMITIMEN=$20 (V-IRQ only, NMI off, no auto-joy); BGMODE1/TM1/TS4/
+  CGWSEL2/CGADSUB$41; BGVOFS -8; display parity A; DMA palette->CGRAM0, both tilemaps
+  ->0x7800/0x7C00; entry->start; VTIME=top_lb.
+- finish (V=VIS_END): force-blank; e_dma_vram_mb BG1 (src R3D_STAGE_BG1, dest=[MB_BG1DST])
+  + BG3 (src R3D_STAGE_BG3, dest=[MB_BG3DST]) BOTH burst in blank; e_reveal (beq on
+  [MB_REVEAL], latch BG12NBA/BG34NBA/BG1SC/BG3SC from mailbox); strobe FRAME_DONE;
+  entry->start; VTIME=top_lb.
+- start (V=top_lb): unblank; stz CGADD; jsr K_ABI_JOYPAD; entry->finish; VTIME=VIS_END.
+Helpers added: e_lda_long ($AF), e_dma_vram_mb (VMADDL from cart mailbox), e_reveal.
+KNOWN Stage-A defect: 12 KB (BG1 8 KB + BG3 4 KB) burst overruns the ~10.5 KB blank
+window by ~9 lines -> ~9-line black bar at the TOP each frame. Proves the architecture
+(reveal / mailbox dest / palette-1 / ping-pong) before the siphon.
+
+TODO Stage B (siphon) — reclaim the ~9 lines: split BG1 (finish burst, fits ~8 KB) from
+BG3 (per-line H-blank siphon, 4000 B / 200 lines = 20 B/line). finish sets up the BG3
+siphon channel ONCE (src R3D_STAGE_BG3, dest [MB_BG3DST]) + seeds count; start enables
+per-line H-IRQ (HTIME ~260 right margin, NMITIMEN adds H); emitted siphon HIRQ per line
+reloads DAS0, MDMAEN a ~20 B chunk (src/VMADDL auto-advance via WRAM state), dec remain,
+on 0 disables H + restores V vector. Recipe: snes/siphon_hdot_test.s (clean at 20 B/line,
+OBJ off). Working cube safe at git 59c668e; dbuf3_test proves reveal + palette-1 on ares.
+
+## BANKED idea — per-region BG char-base switching (kills the shared slot)
+John, 2026-07-12. The shared top third (overlapping CHR bases) is the root of the
+whole tear/delayed-siphon dance: because both display parities read ONE physical
+top slot, it can't be double-buffered, so its BG3 must be written after the beam
+scans it (the delayed siphon + finish-tail split + hdot tuning). The overlap is NOT
+the cause of the current siphon strip (that's H-blank timing/bandwidth), but it IS
+why the top is special at all.
+
+Alternative to explore: instead of overlapping bases, rewrite BG12NBA/BG34NBA
+($210B/$210C) mid-frame — via HDMA or the per-line H-IRQ we already run — at each
+third's top scanline boundary, so every third reads from its OWN non-overlapping,
+fully double-buffered CHR base. No shared slot -> no tear -> no delayed siphon /
+tail split; the siphon could then run plainly on the off-screen building parity.
+Cost/risk: an HDMA channel (or a few H-IRQ writes) for the two base regs; mid-frame
+char-base changes must be verified on ares + real HW (char base is latched per
+tile fetch, so switching exactly at an 8-line tile-row boundary should be clean, but
+this is unusual and untested here). VRAM math also changes (each third its own
+0x1000-word BG1 slot x2 parities = 6 slots = 0x6000 words + BG3 + tilemaps — may not
+fit 0x8000, so this likely pairs with a smaller letterbox or fewer tilemaps). See
+[[3d-renderer-design]]. Bank for after the cube demo ships.
+
+## VERIFIED on ares — snes/dogcat_test.s (standalone reference)
+John + 2026-07-12. Bare-metal .sfc (no VM/mgapi, HiROM 128KB, tools/gen_dogcat.c makes
+a dog + cat over a non-repeating 60-colour plasma) that runs the EXACT scheme: rolling
+thirds, overlapping-base shared-top double-buffer, palette-1 shared tilemap, per-line
+BG3 H-blank siphon + finish BG3-tail burst, atomic reveal, flipping dog<->cat. Build:
+snes/build-dogcat.ps1. Result: FULL 240x200 60-colour, tear-free, flip-clean, CENTRED,
+no top flicker. So the scheme is sound on accurate hardware — the mgapi copro flicker
+is a PIPELINE artifact (kernel-trampoline latency / DMA-rate), not the scheme.
+
+Two hard findings from the bring-up:
+- TOP-EDGE FIX (the "1 stale pixel row"): force-blank freezes the PPU tile-fetch, so the
+  first visible line after a full-line force-blank is stale. The fix is to UNBLANK LATE
+  in the scanline (HTIME dot ~240, right margin) instead of at dot 22 — force-blank then
+  still covers the left of that line while the fetch for the rows below primes, so line
+  12 is clean. PORT: move copro_r3d.c's emitted `start` unblank to a late HTIME. (A
+  transparent-tile letterbox — never force-blank near visible — is the other clean fix
+  but needs zeroed blank tiles; the late-unblank is far simpler.)
+- SIPHON hdot vs ISR latency: the siphon force-blank must land in the true H-blank; a
+  heavier ISR (e.g. reading OPVCT) needs the hdot pushed later to compensate.
+
+## Cleaner kernel direction — free-running H-IRQ + OPVCT + WRAM action table
+The VTIME/H-V-counter MARCHING (re-arm VTIME every line) was the fragile part. Better:
+fixed HTIME, NMITIMEN = H-IRQ every line, each ISR reads the scanline from OPVCT and
+dispatches via a WRAM table (0=nothing / 1=turn-on / 2=siphon / 4=burst). No counters;
+one table swap = dynamic letterbox (top+bottom bounds, which lines siphon, per-scanline
+effects). The copro DMAs a fresh table in each frame during the force-blank window. In
+dogcat_test this rendered + removed the top flicker but had a delivery bug traced to the
+OPVCT high/low read-toggle protocol — nail it in an INSTRUMENTED env (mgapi side, with
+logging/screenshots), not blind .sfc iteration. This is the target microgarbage kernel:
+dynamic letterbox DMA budget + H-blank siphon + free per-scanline H-IRQ effects.
+
 ## Sequencing
 1. Emitter core (direct-DMA + ISR skeleton + patch-entry) + kernel ISR-mode + $0E00
    stub. 2. cube3d emitter → cube on screen. 3. FMV player (band + partial-OAM +

@@ -239,3 +239,6 @@ local/
 # Pre-built ELFs are NOT committed: examples/NN_name/build.sh
 # rebuilds them via gcc-riscv64-unknown-elf.
 
+
+# standalone SNES test build artifacts
+snes/gen/
