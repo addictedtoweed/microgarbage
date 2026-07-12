@@ -87,9 +87,18 @@ TOP_LB      = 12
 ; Unblanking early (9 vs 12) shrinks it to ~1 line. Banked as the clean base.
 START_LN    = 9
 FINISH_LN   = 213
-SIP_FIRST   = 100
+; SIP_LINES/SIP_BYTES are -D overridable for the width sweep. SIP_FIRST is derived so
+; the siphon ends at FINISH_LN. For a PURE siphon-ceiling test set SIP_LINES*SIP_BYTES
+; >= THIRD_BG3 (4000): the tail vanishes (see the .if in main_finish) so the finish
+; burst is constant BG1-only and can't confound the result. Keep SIP_FIRST >= ~95 so
+; the shared-top third is scanned out before the siphon writes it (no tear).
+.ifndef SIP_LINES
 SIP_LINES   = 113
-SIP_BYTES   = 28                   ; proven-clean H-blank rate (no strip)
+.endif
+.ifndef SIP_BYTES                  ; override for the width sweep: ca65 -D SIP_BYTES=N
+SIP_BYTES   = 28                   ; per-line BG3 chunk (proven-clean at 28 on ares)
+.endif
+SIP_FIRST   = FINISH_LN - SIP_LINES
 HTIME_SIP   = 240
 ; LATE turn-on: main_start unblanks at dot 240 (right margin) instead of dot 22. The
 ; free-running test showed this kills the top-pixel stale line — the visible lines are
@@ -514,7 +523,8 @@ d_sc      = $1D
     .a8
     lda #$01
     sta MDMAEN
-    ; --- BG3 tail burst (src+SIP_DELIV -> dst+TAIL_WOFF) ---
+    ; --- BG3 tail burst (skipped when built -D NO_TAIL, i.e. siphon covers all BG3) ---
+.ifndef NO_TAIL
     lda d_b3bank
     sta A1B0
     rep #$20
@@ -533,6 +543,7 @@ d_sc      = $1D
     .a8
     lda #$01
     sta MDMAEN
+.endif
     ; --- reveal (atomic parity flip) if this was the top third ---
     lda d_reveal
     beq @norev

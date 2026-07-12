@@ -178,6 +178,37 @@ OPVCT high/low read-toggle protocol — nail it in an INSTRUMENTED env (mgapi si
 logging/screenshots), not blind .sfc iteration. This is the target microgarbage kernel:
 dynamic letterbox DMA budget + H-blank siphon + free per-scanline H-IRQ effects.
 
+## Coprocessor time budget + cart-busy sentinel (worked out 2026-07-12)
+For a 20 fps 240x200 60-colour frame the SNES pulls ~40 KB/logical-frame (BG1 24 KB +
+BG3 12 KB + tilemaps/palette) at ~163 B/line GP-DMA = ~245 lines-equiv of cart reads
+out of 786 lines (3 subframes) => cart demanded only ~31% of the logical frame, ~69%
+FREE for the M7. So a 50% (131-line) CONTIGUOUS quiet block in the first subframe is a
+scheduling problem, not a bandwidth one: keep the BG1 burst in the blank edges, defer
+the BG3 siphon to the subframe's back half / subframes 2-3, and lines ~12-142 are
+cart-quiet (~8.3 ms; ~2M M7 cycles even at a stalled ~240 MHz effective, ~4M at 480).
+For guaranteed 20 fps, render one logical frame AHEAD so a compute overrun slips
+delivery a subframe (acceptable dip) instead of tearing. Synergy: a WIDER siphon =>
+fewer siphon lines => later SIP_FIRST => the siphon vacates the TOP of the subframe,
+front-loading the quiet block. (We stay at 28 B/line — proven clean at the early
+no-spin hdot 240 on ares + bsnes-plus; not widening, so no gamble.)
+
+Cart-busy SENTINEL (robust to copro lockup): the ISR runs from WRAM (LowRAM `$0000-
+$1FFF`, e.g. `$0E00` or `$1111`) so it's live even while the copro holds the cart bus.
+It reads a 16-bit cart-window sentinel via `lda f:$C0xxxx` (24-bit long load); the copro
+publishes a READY value with DISTINCT bytes and a bus read during lockup returns the
+repeated-byte pattern `0xXYXY`. ISR check = read sentinel, compare hi vs lo; equal =>
+BUSY => skip this frame's cart DMA and hold the last complete frame (rti), else pull
+the fresh third. Graceful degradation, no tearing. NOTE: the ROM vectors are 16-bit
+`.word`s and the CPU forces PB=`$00` on IRQ, so the vector points at a bank-`$00`
+trampoline (`jmp (ramvec)` -> `$00:xxxx` WRAM); only the sentinel/cart reach is 24-bit.
+
+Width-sweep test rigs: snes/dogcat_test.s is `-D SIP_BYTES` / `-D SIP_LINES` /
+`-D NO_TAIL` overridable (default build = the committed 28+tail reference, unchanged).
+For a PURE siphon-ceiling test set SIP_LINES*SIP_BYTES >= 4000 + `-D NO_TAIL` so the
+finish burst stays constant BG1-only (else a smaller width -> bigger tail -> bigger
+finish burst is what flickers, NOT the siphon). siphon_hblank_test.s (`-D BYTES_PER_LINE`)
+is the diagonal-pattern equivalent for real-hardware (sd2snes) checks.
+
 ## Sequencing
 1. Emitter core (direct-DMA + ISR skeleton + patch-entry) + kernel ISR-mode + $0E00
    stub. 2. cube3d emitter → cube on screen. 3. FMV player (band + partial-OAM +
