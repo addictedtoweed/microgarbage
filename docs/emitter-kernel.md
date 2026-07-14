@@ -203,11 +203,65 @@ the fresh third. Graceful degradation, no tearing. NOTE: the ROM vectors are 16-
 trampoline (`jmp (ramvec)` -> `$00:xxxx` WRAM); only the sentinel/cart reach is 24-bit.
 
 Width-sweep test rigs: snes/dogcat_test.s is `-D SIP_BYTES` / `-D SIP_LINES` /
-`-D NO_TAIL` overridable (default build = the committed 28+tail reference, unchanged).
-For a PURE siphon-ceiling test set SIP_LINES*SIP_BYTES >= 4000 + `-D NO_TAIL` so the
-finish burst stays constant BG1-only (else a smaller width -> bigger tail -> bigger
-finish burst is what flickers, NOT the siphon). siphon_hblank_test.s (`-D BYTES_PER_LINE`)
-is the diagonal-pattern equivalent for real-hardware (sd2snes) checks.
+`-D NO_TAIL` / `-D HTIME_SIP` overridable (default build = the committed 28+tail
+reference, unchanged). For a PURE siphon-ceiling test set SIP_LINES*SIP_BYTES >= 4000 +
+`-D NO_TAIL` so the finish burst stays constant BG1-only (else a smaller width -> bigger
+tail -> bigger finish burst is what flickers, NOT the siphon). siphon_hblank_test.s
+(`-D BYTES_PER_LINE`) is the diagonal-pattern equivalent for real-hardware (sd2snes) checks.
+
+## Real-hardware finding (2026-07-13) — the siphon fails where emulators are clean
+Tested dogcat_test.sfc on a real SNES + CRT: the scheme WORKS INTERMITTENTLY ("worked
+for a short time") but the per-line SIPHON corrupts where both ares + bsnes-plus were
+clean. BG1 (hue, burst-delivered in the blank edges) lands fine — faces + colour survive.
+BG3 (brightness, siphon-delivered) fails — the fine plasma scrambles to noise and a hard
+BLACK rectangle appears lower-left. The glitch region == the siphon-active DISPLAY region
+(lines ~100-213); the top third (scanned out before the siphon starts) stays clean.
+Cause: the mid-line force-blank + 28B GP-DMA + unblank OVERRUNS the real H-blank window,
+so the unblank slips into the next line (left force-blank strip) and DMA writes land
+during active display (dropped/scrambled BG3). It is NOT IRQ jitter — siphon_isr is
+already WAI-anchored (main loop = `wai`/`bra`, CPU halted when the H-IRQ fires) with a
+branchless path to the force-blank, so IRQ->force-blank is already a constant cycle count.
+It's purely the DMA overrunning the (stricter-than-emulated) real ceiling.
+
+Two-axis hardware sweep built (snes/gen/dogcat_hsweep/): dogcat_h{240..200}.sfc (28B) +
+dogcat_b24_h{240..200}.sfc (24B). Moving HTIME_SIP LEFT starts force-blank+DMA+unblank
+earlier so it finishes before the next line (fixes the left strip); too far left blanks
+the image's RIGHT edge instead — the fix is the sweet spot between. 24B shifts load off
+the failing siphon onto the working finish burst (bigger tail, ends ~line 8). MASTER
+MEASUREMENT still owed: run snes/dma_rate_test.s on silicon for the REAL per-line H-blank
+byte ceiling (emulator claimed ~163 B/line; silicon is clearly stricter) — that number
+forks the fix between hdot-nudge / line-redistribution / depth-reduction.
+
+## Subframe release counter + vector-swap (per-TV-frame sequencing)
+A logical (20 fps) frame = 3 TV frames = subframes 0/1/2. Only subframe 0 needs to touch
+the RISC-V/M7 side; 1 and 2 are pure delivery. Encode that asymmetry so the M7's quiet
+block on subframe 0 is as large as possible and 1-2 spend ~nothing on housekeeping.
+
+Kernel state: a `subframe` counter (0->1->2->0) in WRAM, advanced once per TV frame at the
+FRAME_DONE point. Per-subframe behaviour, gated on the counter:
+- **Subframe 0 (full):** read joypad -> K_ABI_JOYPAD mailbox; check the cart-busy sentinel;
+  release the cart so the M7 gets its contiguous quiet block (lines ~12-142); deliver the
+  BOTTOM third (burst BG1 + siphon BG3).
+- **Subframe 1 (delivery-only):** NO joypad, NO cart release, NO M7 signal. Deliver the MID
+  third. The only kernel act is the vector swap.
+- **Subframe 2 (delivery-only + reveal):** deliver the TOP third (delayed/constrained
+  siphon — the shared VRAM) and REVEAL the built parity. Vector swap back to 0.
+
+Vector swap: all three subframes' ISR images are precomputed/emitted, so switching frames
+is just repointing `ramvec` (2 bytes in DP/WRAM) at the next pattern's entry — a handful of
+instructions, not a re-setup. Budget ~10 lines max for the swap; everything else on
+subframes 1-2 is idle -> DMA/quiet. microgarbage (RISC-V) resets `subframe`=0 on app-load
+so a new app always starts clean at the full subframe.
+
+Line-count lever (NOT bytes/line): the per-line byte ceiling is H-blank/PPU-gated, a
+hardware constant — freeing the CPU on subframes 1-2 does NOT raise bytes/line, it raises
+the number of usable siphon LINES. Subframes 0 & 1 deliver the bottom/mid thirds = the
+building parity's PRIVATE, off-screen VRAM (no shared-top tear), so their siphon may span
+the whole display (~200 lines) -> ~20 B/line, well under the real ceiling, with margin.
+Only subframe 2 (the SHARED top third) needs the delayed window (line ~100+, 28 B/line +
+tail). Caveat: spreading the siphon onto more display lines also spreads the per-line
+force-blank artifact onto them, so widen ONLY after the per-line timing is proven robust
+on silicon (the HTIME sweep). Net: the "24B for margin" happens for free on 2 of 3 frames.
 
 ## Sequencing
 1. Emitter core (direct-DMA + ISR skeleton + patch-entry) + kernel ISR-mode + $0E00

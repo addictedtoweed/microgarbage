@@ -99,7 +99,9 @@ SIP_LINES   = 113
 SIP_BYTES   = 28                   ; per-line BG3 chunk (proven-clean at 28 on ares)
 .endif
 SIP_FIRST   = FINISH_LN - SIP_LINES
-HTIME_SIP   = 240
+.ifndef HTIME_SIP                  ; override to sweep the siphon force-blank dot LEFT
+HTIME_SIP   = 240                  ; earlier = the DMA+unblank finishes sooner in the
+.endif                             ; line -> more margin before next line on real HW
 ; LATE turn-on: main_start unblanks at dot 240 (right margin) instead of dot 22. The
 ; free-running test showed this kills the top-pixel stale line — the visible lines are
 ; fetched/primed while force-blank is still up for the left of the line, so line 12 is
