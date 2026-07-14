@@ -99,6 +99,8 @@ VM_CORE_SRCS=(
     "${REPO_ROOT}/src/vm/vm_host_stdio_win32.c"
     "${REPO_ROOT}/src/vm/vm_host_platform.c"
     "${REPO_ROOT}/src/vm/vm_host_tui.c"
+    "${REPO_ROOT}/src/vm/vm_host_tui_tile.c"
+    "${REPO_ROOT}/src/vm/vm_host_tui_input.c"
     "${REPO_ROOT}/src/memory/bump.c"
     "${REPO_ROOT}/src/memory/slab_stack.c"
     "${REPO_ROOT}/src/containers/fifo_queue.c"
