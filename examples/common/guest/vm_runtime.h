@@ -199,6 +199,22 @@
 #define SYS_R3D_SHOW             1245  /* (obj,visible) → 0 */
 #define SYS_R3D_RENDER           1246  /* () → 0 staged / -1 in-flight */
 
+/* Hardware I/O (1250..1279). Transaction-oriented GPIO/I2C/SPI/ADC/PWM.
+ * Keep in sync with include/vm/vm_ecall.h. Wrappers: hwio.h. */
+#define SYS_GPIO_CONFIG          1250  /* (pin, mode) → 0/-errno */
+#define SYS_GPIO_WRITE           1251  /* (pin, level) → 0/-errno */
+#define SYS_GPIO_READ            1252  /* (pin) → 0/1 or -errno */
+#define SYS_GPIO_TOGGLE          1253  /* (pin) → 0/-errno */
+#define SYS_GPIO_WRITE_MASK      1254  /* (bank, mask, values) → 0/-errno */
+#define SYS_GPIO_READ_MASK       1255  /* (bank, mask) → sampled bits */
+#define SYS_I2C_CONFIG           1258  /* (bus, hz) → 0/-errno */
+#define SYS_I2C_XFER             1259  /* (bus, addr, wbuf, wlen, rbuf, rlen) → 0/-errno */
+#define SYS_SPI_CONFIG           1262  /* (bus, mode, hz) → 0/-errno */
+#define SYS_SPI_XFER             1263  /* (bus, cs, tx, rx, len) → 0/-errno */
+#define SYS_ADC_READ             1266  /* (channel) → value or -errno */
+#define SYS_PWM_CONFIG           1268  /* (channel, hz) → 0/-errno */
+#define SYS_PWM_SET              1269  /* (channel, duty_q16) → 0/-errno */
+
 /* ---------- Inline syscall helpers ----------
  * Six variants by arity. All return a0 unchanged from the syscall.
  * Clobber a0 (return), preserve a1..a6 (they're used as inputs).

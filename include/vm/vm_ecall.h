@@ -475,6 +475,41 @@
 #define SYS_R3D_SHOW    1245  /* (obj, visible) → 0 */
 #define SYS_R3D_RENDER  1246  /* () → 0 staged / -1 in-flight (retry after wait) */
 
+/* --- Hardware I/O (1250..1279) ---
+ * Portable GPIO / I2C / SPI / ADC / PWM surface for the dev-kit and
+ * costume targets (Pi Zero today; MCU later). See docs/rpi-port.md.
+ * Backed by the host_hwio_* weak platform layer (include/vm/host_hwio.h,
+ * src/host/platform_hwio_stub.c); installed opt-in via vm_host_install_hwio
+ * (include/vm/vm_host_hwio.h). Guest wrappers: examples/common/guest/hwio.h.
+ *
+ * Design rule: these are TRANSACTIONS, not per-edge pin-wiggles. One ecall
+ * does a whole bus transfer natively in the floor — timing-critical work
+ * (WS2812, 1-wire) never round-trips through the interpreter per bit. Any
+ * number with no host backend installed returns -VM_ENOSYS (e.g. ADC on a
+ * bare Pi Zero, which has no native analog input).
+ *
+ * Range note: the VM ecall router covers 1024..1279 (VM_ECALL_VM_RANGE_SIZE).
+ * Keep this family below 1280; bump the range size if it must grow past it. */
+#define SYS_GPIO_CONFIG      1250  /* (pin, mode HWIO_GPIO_*) → 0 or -errno       */
+#define SYS_GPIO_WRITE       1251  /* (pin, level 0/1) → 0 or -errno              */
+#define SYS_GPIO_READ        1252  /* (pin) → level 0/1, or -errno                */
+#define SYS_GPIO_TOGGLE      1253  /* (pin) → 0 or -errno                         */
+#define SYS_GPIO_WRITE_MASK  1254  /* (bank, mask, values) → 0 or -errno; batched */
+#define SYS_GPIO_READ_MASK   1255  /* (bank, mask) → sampled bits (reader idiom)  */
+
+#define SYS_I2C_CONFIG       1258  /* (bus, hz) → 0 or -errno                     */
+#define SYS_I2C_XFER         1259  /* (bus, addr7, wbuf, wlen, rbuf, rlen) → 0/-e;
+                                    * combined write-then-read (repeated START)   */
+
+#define SYS_SPI_CONFIG       1262  /* (bus, mode 0..3, hz) → 0 or -errno          */
+#define SYS_SPI_XFER         1263  /* (bus, cs, tx, rx, len) → 0/-errno; full-
+                                    * duplex; tx or rx may be 0 for half-duplex   */
+
+#define SYS_ADC_READ         1266  /* (channel) → value >=0, or -errno            */
+
+#define SYS_PWM_CONFIG       1268  /* (channel, hz) → 0 or -errno                 */
+#define SYS_PWM_SET          1269  /* (channel, duty_q16 0..65536) → 0 or -errno  */
+
 /* --- Cooperative scheduling (1040..1055) --- */
 #define SYS_YIELD           1040   /* relinquish remainder of quantum */
 #define SYS_CRITICAL_ENTER  1041   /* begin non-preemptible region */
