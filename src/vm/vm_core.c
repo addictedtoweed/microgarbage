@@ -30,6 +30,8 @@
 #endif
 
 #include "vm/vm_core.h"
+#include "config.h"              /* GARBAGE_MEM_PROTECT */
+#include "vm/vm_mem_protect.h"   /* tier-1 ownership hooks (no-op when off) */
 #include <string.h>
 
 /* ============================================================
@@ -110,6 +112,17 @@ static inline const uint8_t *xlat_read(VmCpu *cpu,
         cpu->trap_addr  = addr;
         return NULL;
     }
+#if GARBAGE_MEM_PROTECT
+    /* Shared region only (addr >= 0xC000_0000); private segments are
+     * per-VM and never reach the owner map. No-op while permissive. */
+    if (addr >= 0xC0000000u &&
+        !vm_mem_shared_access_ok(cpu, addr, size, false)) {
+        cpu->trap_cause = fault_cause;
+        cpu->trap_pc    = cpu->pc;
+        cpu->trap_addr  = addr;
+        return NULL;
+    }
+#endif
     return r->base + offset;
 }
 
@@ -131,6 +144,15 @@ static inline uint8_t *xlat_write(VmCpu *cpu,
         cpu->trap_addr  = addr;
         return NULL;
     }
+#if GARBAGE_MEM_PROTECT
+    if (addr >= 0xC0000000u &&
+        !vm_mem_shared_access_ok(cpu, addr, size, true)) {
+        cpu->trap_cause = TRAP_STORE_FAULT;
+        cpu->trap_pc    = cpu->pc;
+        cpu->trap_addr  = addr;
+        return NULL;
+    }
+#endif
     return r->base + offset;
 }
 

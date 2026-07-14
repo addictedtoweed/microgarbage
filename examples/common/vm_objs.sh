@@ -95,6 +95,7 @@ VM_CORE_SRCS=(
     "${REPO_ROOT}/src/vm/vm_sched_ops_coop.c"
     "${REPO_ROOT}/src/vm/vm_sched_ops_pre.c"
     "${REPO_ROOT}/src/vm/vm_system.c"
+    "${REPO_ROOT}/src/vm/vm_mem_protect.c"
     "${REPO_ROOT}/src/vm/vm_host_stdio.c"
     "${REPO_ROOT}/src/vm/vm_host_stdio_win32.c"
     "${REPO_ROOT}/src/vm/vm_host_platform.c"

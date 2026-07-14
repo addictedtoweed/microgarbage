@@ -18,6 +18,7 @@
 
 #include "vm/vm_system.h"
 #include "memory/slab_stack.h"
+#include "vm/vm_mem_protect.h"   /* tier-1 owner stamp (no-op when off) */
 
 #include <string.h>
 #include <stdio.h>
@@ -198,6 +199,9 @@ static void handle_alloc(VmCpu *cpu, void *system_p) {
         return;
     }
     uint32_t offset = (uint32_t)(ptr - base);
+#if GARBAGE_MEM_PROTECT
+    vm_mem_stamp_owner(cpu, offset, size);
+#endif
     cpu->regs[VM_REG_A0] = SHARED_GUEST_BASE + offset;
 }
 
