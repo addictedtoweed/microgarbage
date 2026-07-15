@@ -1,0 +1,118 @@
+#!/bin/bash
+# rvcc — microgarbage RISC-V guest compiler frontend.
+#
+# One stable command that freezes the guest ABI build: RV32IMC / ILP32,
+# freestanding, the SDK runtime + mini-libc, and the guest.ld region map
+# (the VM's 4-segment virtual-memory partitioning, used AS IS — there is
+# no custom linker). You provide a source file and at most two knobs:
+# optimization level and debug on/off. Output is a guest .elf the VM loads.
+#
+# Usage:
+#   rvcc [OPTIONS] SOURCE.c [MORE.c ...]
+#
+# Options:
+#   -o FILE     output ELF path            (default: <first-source>.elf)
+#   -O LEVEL    optimization 0|1|2|3|s      (default: 2)
+#   -g          debug info; keep symbols    (default: off, stripped)
+#   -I DIR      extra include directory (repeatable)
+#   -h, --help  this help
+#
+# Environment:
+#   RVCC_SDK      guest SDK dir      (default: repo examples/common/guest)
+#   RVCC_LD       linker script      (default: $RVCC_SDK/../guest.ld)
+#   GUEST_CC      RISC-V cross gcc   (default: autodetect riscv*-elf-gcc)
+#   RVCC_MODULES  extra SDK .c modules to link (space-separated basenames
+#                 under $RVCC_SDK, e.g. "mg_gfx mg_stream")
+#   RVCC_KEEP     non-empty: keep the scratch build dir (default: discard)
+#
+# Public domain (CC0). No warranty.
+set -e
+
+prog=rvcc
+die() { echo "$prog: $*" >&2; exit 1; }
+usage() { sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+
+# --- defaults ---
+OPT=2
+DEBUG=0
+OUT=""
+EXTRA_INC=()
+SOURCES=()
+
+# --- parse args (only rvcc's small, frozen surface) ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -o) shift; OUT="${1:-}" ;;
+    -o*) OUT="${1#-o}" ;;
+    -O) shift; OPT="${1:-}" ;;
+    -O*) OPT="${1#-O}" ;;
+    -g) DEBUG=1 ;;
+    -I) shift; EXTRA_INC+=("-I${1:-}") ;;
+    -I*) EXTRA_INC+=("-I${1#-I}") ;;
+    --) shift; while [ $# -gt 0 ]; do SOURCES+=("$1"); shift; done; break ;;
+    -*) die "unknown option '$1' (rvcc takes only -o, -O, -g, -I)" ;;
+    *) SOURCES+=("$1") ;;
+  esac
+  shift
+done
+
+[ ${#SOURCES[@]} -gt 0 ] || { usage; exit 2; }
+case "$OPT" in 0|1|2|3|s) ;; *) die "bad -O level '$OPT' (use 0|1|2|3|s)" ;; esac
+for s in "${SOURCES[@]}"; do [ -f "$s" ] || die "no such source '$s'"; done
+
+# --- locate the SDK (headers + runtime) and the linker script ---
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SDK="${RVCC_SDK:-$HERE/../examples/common/guest}"
+[ -f "$SDK/vm_runtime.c" ] || die "guest SDK not found at '$SDK' (set RVCC_SDK)"
+LD="${RVCC_LD:-$SDK/../guest.ld}"
+[ -f "$LD" ] || die "linker script not found at '$LD' (set RVCC_LD)"
+
+# --- locate a RISC-V cross compiler ---
+CC="${GUEST_CC:-}"
+if [ -z "$CC" ]; then
+  for c in riscv64-unknown-elf-gcc riscv-none-elf-gcc \
+           riscv32-unknown-elf-gcc riscv64-elf-gcc; do
+    command -v "$c" >/dev/null 2>&1 && { CC="$c"; break; }
+  done
+fi
+[ -n "$CC" ] || die "no RISC-V cross compiler found; set GUEST_CC="
+
+# --- default output name from the first source ---
+if [ -z "$OUT" ]; then
+  base="$(basename "${SOURCES[0]}")"
+  OUT="${base%.*}.elf"
+fi
+
+# --- runtime (crt0 + mini-libc) + tui + any opt-in modules ---
+RT=("$SDK/vm_runtime.c")
+[ -f "$SDK/tui.c" ] && RT+=("$SDK/tui.c")
+for m in ${RVCC_MODULES:-}; do
+  [ -f "$SDK/$m.c" ] || die "RVCC_MODULES: no module '$SDK/$m.c'"
+  RT+=("$SDK/$m.c")
+done
+
+# --- frozen flags: the guest ABI. NOT user-tunable. The guest.ld region
+#     map is the VM's virtual-memory partitioning; max-page-size=4 drops
+#     LOAD-segment alignment padding (the VM has no MMU). ---
+FROZEN=( -march=rv32imc -mabi=ilp32 -nostdlib -nostartfiles -ffreestanding
+         -ffunction-sections -fdata-sections
+         -Wl,--gc-sections -Wl,-z,max-page-size=4 -Wl,-T,"$LD" )
+INCS=( -I"$SDK" -I"$SDK/include" "${EXTRA_INC[@]}" )
+
+# debug keeps symbols; release strips them
+if [ "$DEBUG" = 1 ]; then DBG=(-g); else DBG=(-Wl,-s); fi
+
+# --- compile on scratch, keep only the .elf (mirrors the on-device
+#     trashfs-ramdisk / discard-artifacts model) ---
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/rvcc.XXXXXX")"
+cleanup() { [ -n "${RVCC_KEEP:-}" ] || rm -rf "$SCRATCH"; }
+trap cleanup EXIT
+TMP_ELF="$SCRATCH/out.elf"
+
+"$CC" "${FROZEN[@]}" "-O$OPT" "${DBG[@]}" "${INCS[@]}" \
+      -o "$TMP_ELF" "${SOURCES[@]}" "${RT[@]}"
+
+outdir="$(dirname "$OUT")"; [ -d "$outdir" ] || mkdir -p "$outdir"
+cp "$TMP_ELF" "$OUT"
+echo "$prog: built $OUT  (rv32imc -O$OPT$([ "$DEBUG" = 1 ] && echo ' -g'), $CC)"
