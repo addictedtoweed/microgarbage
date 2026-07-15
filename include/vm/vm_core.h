@@ -593,6 +593,12 @@ typedef struct VmCpu {
      * Treat this as opaque; do not read or write. */
     uint32_t _internal[5];
 
+    /* Tier-1 memory-protection view (see vm/vm_mem_protect.h). Points
+     * at the system-wide shared-region owner map; NULL when protection
+     * is disabled. Set at load. Costs 12 bytes/VM even when unused. */
+    uint8_t *shared_owner_map;
+    uint32_t shared_owner_slots;
+
 } VmCpu;
 
 /* ============================================================

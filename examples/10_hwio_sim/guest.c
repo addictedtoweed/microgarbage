@@ -67,6 +67,22 @@ void _start(void) {
     /* ADC: fake channel read. */
     gs("adc ch0        = "); gi(hwio_adc_read(0)); gs("\n");
 
+    /* Shared-region alloc round-trip — exercises the tier-1 ownership
+     * map (SYS_ALLOC stamps the block's slots to this VM; the writes/
+     * reads below flow through the shared-access check). 200 bytes
+     * spans several 32-byte slots. */
+    unsigned char *buf = (unsigned char *)(uintptr_t)_vm_sys1(SYS_ALLOC, 200);
+    if (buf) {
+        int ok = 1;
+        for (int i = 0; i < 200; i++) buf[i] = (unsigned char)(i * 7 + 3);
+        for (int i = 0; i < 200; i++)
+            if (buf[i] != (unsigned char)(i * 7 + 3)) ok = 0;
+        gs("shared alloc rw = "); gs(ok ? "ok" : "CORRUPT"); gs("\n");
+        _vm_sys1(SYS_FREE, (uint32_t)(uintptr_t)buf);
+    } else {
+        gs("shared alloc rw = alloc failed\n");
+    }
+
     gs("== done ==\n");
     sys_exit(0);
 }

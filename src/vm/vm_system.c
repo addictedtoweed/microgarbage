@@ -200,7 +200,8 @@ static void handle_alloc(VmCpu *cpu, void *system_p) {
     }
     uint32_t offset = (uint32_t)(ptr - base);
 #if GARBAGE_MEM_PROTECT
-    vm_mem_stamp_owner(cpu, offset, size);
+    vm_mem_stamp_owner(cpu, offset,
+                       (uint32_t)slab_block_size(sys->shared_slab, host_p));
 #endif
     cpu->regs[VM_REG_A0] = SHARED_GUEST_BASE + offset;
 }
@@ -225,6 +226,9 @@ static void handle_free(VmCpu *cpu, void *system_p) {
     }
 
     void *host_p = (uint8_t *)sys->config.shared_storage + offset;
+#if GARBAGE_MEM_PROTECT
+    uint32_t _block_bytes = (uint32_t)slab_block_size(sys->shared_slab, host_p);
+#endif
 
     /* Remove from this VM's tracking list. If the pointer isn't
      * tracked, it's either a double-free or a free across vm_ids
@@ -239,6 +243,9 @@ static void handle_free(VmCpu *cpu, void *system_p) {
         cpu->regs[VM_REG_A0] = (uint32_t)-((int32_t)VM_EINVAL);
         return;
     }
+#if GARBAGE_MEM_PROTECT
+    vm_mem_clear_owner(cpu, offset, _block_bytes);
+#endif
     cpu->regs[VM_REG_A0] = 0;
 }
 
@@ -1006,9 +1013,27 @@ bool vm_system_init(VmSystem *sys, const VmSystemConfig *cfg) {
         local_cfg.bucket_counts[b] += per_bin_slots;
     }
 
+    void  *local_base = sys->config.local_storage;
+    size_t local_size = sys->config.local_storage_size;
+#if GARBAGE_MEM_PROTECT
+    /* Carve the shared-region owner map from the front of local
+     * storage: one owner byte per 32-byte shared slot. The local slab
+     * then initializes on the remainder. */
+    {
+        uint32_t owner_slots = (uint32_t)(sys->config.shared_storage_size
+                                          / SLAB_MIN_BLOCK);
+        size_t   map_bytes   = owner_slots;   /* uint8 per slot */
+        if (local_size <= map_bytes) return false;   /* local pool too small */
+        sys->shared_owner_map   = (uint8_t *)local_base;
+        sys->shared_owner_slots = owner_slots;
+        memset(sys->shared_owner_map, VM_OWNER_UNOWNED, map_bytes);
+        local_base = (uint8_t *)local_base + map_bytes;
+        local_size -= map_bytes;
+    }
+#endif
     sr = slab_init(sys->local_slab,
-                   sys->config.local_storage,
-                   sys->config.local_storage_size,
+                   local_base,
+                   local_size,
                    &local_cfg,
                    slab_lk);
     if (sr != SLAB_OK) {
@@ -1130,6 +1155,11 @@ VmLoadVmResult vm_system_load_vm_with_mailbox(VmSystem *sys,
         goto fail;
     }
     sys->vms[assigned] = cpu;
+
+    /* Point the CPU at the shared-region owner map (NULL when
+     * protection is off — the ownership hooks then no-op). */
+    cpu->shared_owner_map   = sys->shared_owner_map;
+    cpu->shared_owner_slots = sys->shared_owner_slots;
 
     /* Zero the per-VM alloc tracking for this slot. vm_system_unload_vm
      * should have already cleared it, but be defensive — a slot
@@ -1293,6 +1323,12 @@ bool vm_system_unload_vm(VmSystem *sys, uint16_t vm_id) {
             t->count = 0;
         }
     }
+#if GARBAGE_MEM_PROTECT
+    /* Release any shared slots still owned by this VM — belt-and-braces
+     * for blocks freed above via slab_free (which bypasses handle_free's
+     * per-block clear), and so a reused vm_id inherits no stale slots. */
+    vm_mem_release_vm(cpu);
+#endif
 
     /* Free the mailbox storage. The mailbox wraps a FifoQueue
      * which wraps a RingBuffer; the storage pointer lives at

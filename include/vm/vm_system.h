@@ -306,6 +306,13 @@ typedef struct {
     void  *unload_hook_userdata[8];
     uint8_t unload_hook_count;
 
+    /* Tier-1 memory protection (see vm/vm_mem_protect.h). The
+     * shared-region owner map: one owner byte per 32-byte slot, carved
+     * from local_storage in vm_system_init. NULL when GARBAGE_MEM_PROTECT
+     * is off. */
+    uint8_t *shared_owner_map;
+    uint32_t shared_owner_slots;
+
 } VmSystem;
 
 /* ============================================================
