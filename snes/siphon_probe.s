@@ -176,6 +176,17 @@ jtmp     = $14      ; 16-bit  scratch
     sta BG2SC               ; BG2 tilemap base word $4400, 32x32
     lda #$01
     sta BG12NBA             ; BG1 char base 1 ($1000), BG2 char base 0 ($0000)
+    ; zero all BG scroll — power-on scroll values are GARBAGE; without this the
+    ; BG2 readout scrolls off-screen (the full-screen BG1 dog hides its own
+    ; offset, so only the readout goes missing). Write-twice (10-bit) each.
+    stz BG1HOFS
+    stz BG1HOFS
+    stz BG1VOFS
+    stz BG1VOFS
+    stz BG2HOFS
+    stz BG2HOFS
+    stz BG2VOFS
+    stz BG2VOFS
     stz A1B0                ; DMA A-bus bank 0 (.loword sources)
     lda #$80
     sta VMAIN               ; VRAM word increment after high-byte write
