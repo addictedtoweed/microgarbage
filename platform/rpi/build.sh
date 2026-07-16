@@ -41,14 +41,14 @@ echo "rpi: embedding guest ELF..."
 VM=( vm_core vm_loader vm_ecall vm_ecall_handlers vm_mailbox
      vm_sched vm_sched_ops_coop vm_system vm_mem_protect
      vm_host_platform )
-SRCS=( "$HERE/main.c" )
+SRCS=( "$HERE/main.c" "$HERE/mmu.c" )
 for s in "${VM[@]}"; do SRCS+=( "$REPO/src/vm/$s.c" ); done
 SRCS+=( "$REPO/src/memory/bump.c" "$REPO/src/memory/slab_stack.c" )
 SRCS+=( "$REPO/src/containers/fifo_queue.c" "$REPO/src/containers/ring_buffer.c" )
 SRCS+=( "$REPO/src/host/platform_stub.c" )   # host_platform_* time/sleep/stop
 
 echo "rpi: compiling ARM image (arm1176, rdimon semihosting)..."
-"$ACC" $CPU -specs=rdimon.specs -O2 -std=c11 -ffreestanding \
+"$ACC" $CPU -marm -specs=rdimon.specs -O2 -std=c11 -ffreestanding \
     -Wall -Wno-unused-parameter \
     -I"$REPO/include" -I"$BUILD" \
     -Wl,-Ttext-segment=0x8000 \

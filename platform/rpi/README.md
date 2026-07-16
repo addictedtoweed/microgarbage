@@ -46,16 +46,27 @@ host: RV32IMC interpreter, no OS.  guest: 1056-byte ELF
 - Runtime output uses newlib **`rdimon`** semihosting; the eventual real
   hardware floor swaps this for a UART / framebuffer.
 
+- **`mmu.c`** → ARMv6 **flat identity map + L1 I/D caches** (`mmu_enable`).
+  Not virtual memory — a 1:1 VA==PA map whose only job is memory
+  attributes: normal write-back/write-allocate for RAM (so it caches),
+  device for the 0x2000_0000 peripheral window. ARM1176 is uncached
+  without the MMU on, so this is the interpreter's biggest perf lever.
+
 ## Roadmap (see docs/rpi-port.md)
 
-This is Phase 0 (semihosting). Next, in order:
-1. **UART** output (BCM2835 PL011) — real serial instead of semihosting.
-2. **Flat cache page table** — MMU-on identity map for L1/L2 (ARM1176
-   is uncached without it; the interpreter wants cache).
-3. **Mailbox framebuffer** — first pixels on a TV (the real MVP).
-4. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
-   `host_hwio.h` seam (mirrors `src/host/platform_hwio_sim.c`), and the
-   PWM audio path.
+Phase 0, semihosting output.
 
-The interpreter runs uncached here (no page table yet), so it is not
-representative of real-hardware speed — that lands with step 2.
+**DONE — flat cache page table** (`mmu.c`): MMU-on ARMv6 identity map,
+L1 I/D caches enabled. Verified in QEMU: `SCTLR` M=C=I=1 and no
+translation faults across code/data/stack/guest execution.
+
+Next, in order:
+1. **UART** (BCM2835 PL011) — real serial instead of semihosting.
+2. **Mailbox framebuffer** — first pixels on a TV (the real MVP).
+3. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
+   `host_hwio.h` seam (mirrors `src/host/platform_hwio_sim.c`), plus PWM
+   audio.
+
+Note: QEMU is *functional* emulation with no cache-timing model, so the
+page table is verified **correct** here (map valid, MMU genuinely on);
+the cache **speedup** is a real-hardware property this can't show.
