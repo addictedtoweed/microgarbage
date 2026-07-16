@@ -108,12 +108,11 @@ int main(void) {
         uint32_t p5 = fb_pixel(fb_w * 5u / 8u + 2u, 2);
         printf("fb: readback bar0=0x%06lx bar5=0x%06lx (expect ffffff, ff0000)\n",
                (unsigned long)(p0 & 0xFFFFFFu), (unsigned long)(p5 & 0xFFFFFFu));
-        if (fb_dump_ppm("build/fb.ppm") == 0)
-            printf("fb: wrote build/fb.ppm (color bars) via semihosting\n");
     } else {
         printf("fb: mailbox request FAILED\n");
     }
 
     printf("== a RISC-V guest ran on an ARM CPU. first light. ==\n");
+    printf("(bare-metal kernel.img -- no semihosting -- halting)\n");
     return 0;
 }
