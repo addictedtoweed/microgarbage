@@ -43,8 +43,11 @@ host: RV32IMC interpreter, no OS.  guest: 1056-byte ELF
   win32/pthread/tui/fs/audio sources. `vm_host_stdio` is omitted (its
   TTY-raw path needs `termios`, which bare metal lacks); `printf` goes
   through the platform formatter instead.
-- Runtime output uses newlib **`rdimon`** semihosting; the eventual real
-  hardware floor swaps this for a UART / framebuffer.
+- **`uart.c`** → BCM2835 **PL011 UART0** driver (0x2020_1000). The C
+  library's `_write` is routed here, so `printf` is **real serial**
+  (verified: bytes land on QEMU's serial line with CR-LF). newlib
+  `rdimon` semihosting is now used only for startup / clean QEMU exit /
+  the heap — a real-hardware build swaps that for a boot.S + halt loop.
 
 - **`mmu.c`** → ARMv6 **flat identity map + L1 I/D caches** (`mmu_enable`).
   Not virtual memory — a 1:1 VA==PA map whose only job is memory
@@ -56,14 +59,15 @@ host: RV32IMC interpreter, no OS.  guest: 1056-byte ELF
 
 Phase 0, semihosting output.
 
-**DONE — flat cache page table** (`mmu.c`): MMU-on ARMv6 identity map,
-L1 I/D caches enabled. Verified in QEMU: `SCTLR` M=C=I=1 and no
-translation faults across code/data/stack/guest execution.
+**DONE:**
+- **flat cache page table** (`mmu.c`) — MMU-on ARMv6 identity map, L1 I/D
+  caches. Verified in QEMU: `SCTLR` M=C=I=1, no translation faults.
+- **PL011 UART** (`uart.c`) — real serial output, verified by capturing
+  QEMU's serial line to a file (CR-LF proves our driver, not semihosting).
 
 Next, in order:
-1. **UART** (BCM2835 PL011) — real serial instead of semihosting.
-2. **Mailbox framebuffer** — first pixels on a TV (the real MVP).
-3. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
+1. **Mailbox framebuffer** — first pixels on a TV (the real MVP).
+2. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
    `host_hwio.h` seam (mirrors `src/host/platform_hwio_sim.c`), plus PWM
    audio.
 

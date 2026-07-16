@@ -25,6 +25,7 @@
 
 void     mmu_enable(void);      /* platform/rpi/mmu.c — flat identity map + L1 caches */
 uint32_t mmu_read_sctlr(void);  /* CP15 c1, to prove MMU/caches engaged */
+void     uart_init(void);       /* platform/rpi/uart.c — PL011; printf now goes here */
 
 /* VM storage — static, host-owned (the VM never mallocs). ~2 MB of BSS,
  * trivial on the Pi Zero's 512 MB. */
@@ -37,9 +38,11 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered → each write hits semihosting */
 
     mmu_enable();   /* MMU-on flat identity map so the L1 I/D caches work */
+    uart_init();    /* PL011 up — everything below is real serial, not semihosting */
 
     uint32_t sctlr = mmu_read_sctlr();
     printf("== microgarbage on bare-metal ARM (raspi0 / arm1176) ==\n");
+    printf("uart: PL011 @0x20201000 up (this text is real serial)\n");
     printf("mmu: identity map on  SCTLR=0x%08lx  M=%lu C=%lu I=%lu\n",
            (unsigned long)sctlr, (unsigned long)(sctlr & 1u),
            (unsigned long)((sctlr >> 2) & 1u), (unsigned long)((sctlr >> 12) & 1u));
