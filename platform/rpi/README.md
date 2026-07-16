@@ -48,6 +48,12 @@ host: RV32IMC interpreter, no OS.  guest: 1056-byte ELF
   (verified: bytes land on QEMU's serial line with CR-LF). newlib
   `rdimon` semihosting is now used only for startup / clean QEMU exit /
   the heap — a real-hardware build swaps that for a boot.S + halt loop.
+- **`fb.c`** → **VideoCore mailbox framebuffer** (property interface,
+  channel 8). One tagged message sets physical/virtual size + depth,
+  allocates the buffer, and reads the pitch; then it draws color bars
+  and can dump the framebuffer to a PPM via semihosting (headless visual
+  proof). Message buffer is cache-cleaned around the GPU handoff (no-op
+  under QEMU; correct on real HW).
 
 - **`mmu.c`** → ARMv6 **flat identity map + L1 I/D caches** (`mmu_enable`).
   Not virtual memory — a 1:1 VA==PA map whose only job is memory
@@ -64,12 +70,13 @@ Phase 0, semihosting output.
   caches. Verified in QEMU: `SCTLR` M=C=I=1, no translation faults.
 - **PL011 UART** (`uart.c`) — real serial output, verified by capturing
   QEMU's serial line to a file (CR-LF proves our driver, not semihosting).
+- **Mailbox framebuffer** (`fb.c`) — 640×480×32 requested from the GPU,
+  color bars drawn, all 8 verified by sampling the dumped PPM.
 
 Next, in order:
-1. **Mailbox framebuffer** — first pixels on a TV (the real MVP).
-2. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
+1. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
    `host_hwio.h` seam (mirrors `src/host/platform_hwio_sim.c`), plus PWM
-   audio.
+   audio. (Then a boot.S + halt to drop semihosting for real HW.)
 
 Note: QEMU is *functional* emulation with no cache-timing model, so the
 page table is verified **correct** here (map valid, MMU genuinely on);

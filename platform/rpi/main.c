@@ -27,6 +27,13 @@ void     mmu_enable(void);      /* platform/rpi/mmu.c — flat identity map + L1
 uint32_t mmu_read_sctlr(void);  /* CP15 c1, to prove MMU/caches engaged */
 void     uart_init(void);       /* platform/rpi/uart.c — PL011; printf now goes here */
 
+/* platform/rpi/fb.c — VideoCore mailbox framebuffer */
+extern uint32_t fb_base, fb_size, fb_pitch, fb_w, fb_h, fb_bpp;
+int      fb_request(uint32_t w, uint32_t h, uint32_t bpp);
+void     fb_draw_bars(void);
+uint32_t fb_pixel(uint32_t x, uint32_t y);
+int      fb_dump_ppm(const char *filename);
+
 /* VM storage — static, host-owned (the VM never mallocs). ~2 MB of BSS,
  * trivial on the Pi Zero's 512 MB. */
 #define SHARED_BYTES (1024 * 1024)
@@ -86,6 +93,25 @@ int main(void) {
     printf("--- guest %s ---\n", done ? "halted cleanly" : "hit cycle cap");
 
     vm_system_destroy(&sys);
+
+    /* ---- framebuffer: first pixels via the VideoCore mailbox ---- */
+    printf("--- framebuffer (mailbox property interface) ---\n");
+    if (fb_request(640, 480, 32) == 0) {
+        printf("fb: %lux%lu x%lubpp  base=0x%08lx pitch=%lu size=%luKB\n",
+               (unsigned long)fb_w, (unsigned long)fb_h, (unsigned long)fb_bpp,
+               (unsigned long)fb_base, (unsigned long)fb_pitch,
+               (unsigned long)(fb_size / 1024u));
+        fb_draw_bars();
+        uint32_t p0 = fb_pixel(2, 2);
+        uint32_t p5 = fb_pixel(fb_w * 5u / 8u + 2u, 2);
+        printf("fb: readback bar0=0x%06lx bar5=0x%06lx (expect ffffff, ff0000)\n",
+               (unsigned long)(p0 & 0xFFFFFFu), (unsigned long)(p5 & 0xFFFFFFu));
+        if (fb_dump_ppm("build/fb.ppm") == 0)
+            printf("fb: wrote build/fb.ppm (color bars) via semihosting\n");
+    } else {
+        printf("fb: mailbox request FAILED\n");
+    }
+
     printf("== a RISC-V guest ran on an ARM CPU. first light. ==\n");
     return 0;
 }
