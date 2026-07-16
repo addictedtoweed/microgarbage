@@ -40,8 +40,8 @@ echo "rpi: embedding guest ELF..."
 # omitted — bare metal has no TTY.
 VM=( vm_core vm_loader vm_ecall vm_ecall_handlers vm_mailbox
      vm_sched vm_sched_ops_coop vm_system vm_mem_protect
-     vm_host_platform )
-SRCS=( "$HERE/main.c" "$HERE/mmu.c" "$HERE/uart.c" "$HERE/fb.c" )
+     vm_host_platform vm_host_hwio )
+SRCS=( "$HERE/main.c" "$HERE/mmu.c" "$HERE/uart.c" "$HERE/fb.c" "$HERE/platform_rpi.c" )
 for s in "${VM[@]}"; do SRCS+=( "$REPO/src/vm/$s.c" ); done
 SRCS+=( "$REPO/src/memory/bump.c" "$REPO/src/memory/slab_stack.c" )
 SRCS+=( "$REPO/src/containers/fifo_queue.c" "$REPO/src/containers/ring_buffer.c" )

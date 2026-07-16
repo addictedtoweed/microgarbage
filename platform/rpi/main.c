@@ -17,6 +17,7 @@
 #include "vm/vm_system.h"
 #include "vm/vm_host_stdio.h"
 #include "vm/vm_host_platform.h"
+#include "vm/vm_host_hwio.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -73,7 +74,8 @@ int main(void) {
     /* printf in the guest routes through SYS_FORMAT_AND_WRITE (platform),
      * so we don't need the raw-SYS_WRITE stdio module here. */
     VmHostPlatformConfig pc = {0};
-    if (!vm_host_install_platform(&sys, &pc)) {
+    if (!vm_host_install_platform(&sys, &pc)     /* printf */
+     || !vm_host_install_hwio(&sys)) {           /* GPIO -> real BCM2835 */
         printf("service install FAILED\n");
         return 1;
     }

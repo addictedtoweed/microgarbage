@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include "hwio.h"   /* portable GPIO/I2C/... — same header as the desktop sim */
 
 int main(void) {
     printf("  hello from the RV32 guest (interpreted on ARM)\n");
@@ -26,6 +27,15 @@ int main(void) {
     long sum = 0;
     for (int i = 1; i <= 100; i++) sum += i;
     printf("  sum(1..100) = %ld\n", sum);
+
+    /* Drive a real BCM2835 GPIO pin, through the portable hwio ecalls:
+     * guest -> SYS_GPIO_* -> vm_host_hwio -> platform_rpi.c -> registers.
+     * The identical calls run against the desktop sim in examples/10. */
+    hwio_gpio_config(17, HWIO_GPIO_OUT);
+    hwio_gpio_write(17, 1);
+    printf("  gpio17: write 1 -> reads %d\n", hwio_gpio_read(17));
+    hwio_gpio_toggle(17);
+    printf("  gpio17: toggle  -> reads %d\n", hwio_gpio_read(17));
 
     free(f);
     return 0;

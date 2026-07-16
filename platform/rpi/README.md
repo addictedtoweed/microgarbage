@@ -54,6 +54,11 @@ host: RV32IMC interpreter, no OS.  guest: 1056-byte ELF
   and can dump the framebuffer to a PPM via semihosting (headless visual
   proof). Message buffer is cache-cleaned around the GPU handoff (no-op
   under QEMU; correct on real HW).
+- **`platform_rpi.c`** → the real BCM2835 backend behind `host_hwio.h`
+  (the desktop `platform_hwio_sim.c` is its blueprint). Linked with
+  `vm_host_hwio.c` (the ecall handlers) and installed via
+  `vm_host_install_hwio`. GPIO is implemented + verified; I2C/SPI/ADC/PWM
+  return `-ENOSYS` pending real-hardware bring-up.
 
 - **`mmu.c`** → ARMv6 **flat identity map + L1 I/D caches** (`mmu_enable`).
   Not virtual memory — a 1:1 VA==PA map whose only job is memory
@@ -72,11 +77,16 @@ Phase 0, semihosting output.
   QEMU's serial line to a file (CR-LF proves our driver, not semihosting).
 - **Mailbox framebuffer** (`fb.c`) — 640×480×32 requested from the GPU,
   color bars drawn, all 8 verified by sampling the dumped PPM.
+- **`platform_rpi.c` GPIO** — a RISC-V guest drives real BCM2835 GPIO
+  through the hwio ecalls (config/write/read/toggle, verified in QEMU);
+  the identical calls hit the desktop sim in `examples/10_hwio_sim`.
 
 Next, in order:
-1. **`platform_rpi.c`** — the real GPIO/I2C/SPI/ADC backend behind the
-   `host_hwio.h` seam (mirrors `src/host/platform_hwio_sim.c`), plus PWM
-   audio. (Then a boot.S + halt to drop semihosting for real HW.)
+1. **boot.S + halt** — a proper startup that drops semihosting so it
+   boots as a real `kernel.img` on hardware.
+2. **I2C/SPI/PWM** — real BCM2835 drivers, written + verified against
+   attached devices (the temp-sensor dev-kit workflow; QEMU models
+   neither the buses nor slaves). BCM2835 has no ADC.
 
 Note: QEMU is *functional* emulation with no cache-timing model, so the
 page table is verified **correct** here (map valid, MMU genuinely on);
